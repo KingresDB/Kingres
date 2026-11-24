@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -48,12 +49,14 @@ func (s *Service) log() *slog.Logger {
 
 // Definitions returns the task definition.
 func (s *Service) Definitions() []task.Definition {
-	return []task.Definition{s.Runner.Definition(s.Runner.OnFail(func(ctx context.Context, id int64, outcome, text string) {
+	onFail := s.Runner.OnFail(func(ctx context.Context, id int64, outcome, text string) {
 		rows := &PGRows{Conns: s.Conns, TaskID: id}
 		if err := rows.Abandon(ctx, outcome, text); err != nil {
 			s.log().Warn("failover: closing the record of a run", "task", id, "error", err)
 		}
-	}))}
+	})
+	// The restore of the preferred primaries is the same steps over other groups: a second kind, the same runner.
+	return []task.Definition{s.Runner.Definition(onFail), s.Runner.DefinitionOf(KindRestore, onFail)}
 }
 
 func (s *Service) sys(ctx context.Context, f func(c *pgx.Conn) error) error {
@@ -139,12 +142,15 @@ func (s *Service) Resolve(ctx context.Context, actor, server string, req Request
 func (s *Service) Plan(ctx context.Context, in Input) (Plan, error) {
 	r := s.Runner
 	out := Plan{GeneratedAt: time.Now().UTC(), Kind: "failover", Mode: in.Mode, ServerID: &in.ServerID, Blockers: []Blocker{}, Groups: []GroupPlan{}}
+	if in.Mode == ModeRestore {
+		out.Kind, out.ServerID = "restorePreferredPrimaries", nil
+	}
 	if ref := r.Preflight(ctx, in); ref != nil {
 		out.Blockers = append(out.Blockers, Blocker{Code: ref.Code, ShardGroupID: ref.Group, Message: ref.Message})
 	}
 	nodes, _ := r.Cat.Nodes(ctx, SystemDB)
 	for _, g := range in.Groups {
-		gp := GroupPlan{ShardGroupID: g, IsMapGroup: g == 0, FromServerID: in.ServerID, Candidates: []CandidateOut{}, MovesTheManager: g == 0,
+		gp := GroupPlan{ShardGroupID: g, IsMapGroup: g == 0, FromServerID: in.oldOf(g), Candidates: []CandidateOut{}, MovesTheManager: g == 0,
 			Steps: stepNamesOf(in), DataLoss: DataLoss{Verdict: VerdictUnknown, AsyncDatabases: []string{}, UnreadableServerIDs: []string{}}}
 		recs, err := r.Plan.Standbys(ctx, g)
 		if err != nil {
@@ -165,9 +171,12 @@ func (s *Service) Plan(ctx context.Context, in Input) (Plan, error) {
 			cctx, cancel := context.WithTimeout(ctx, orDur(r.PositionTimeout, 5*time.Second))
 			pos, err := r.Peers.Position(cctx, st.Server, g)
 			cancel()
-			cd := Candidate{StandbyID: st.ID, Server: st.Server, Readable: err == nil, Pos: pos, Preferred: r.Plan.Preferred(ctx, g, st.Server), RingDist: r.Plan.Ring(in.ServerID, st.Server)}
-			if err != nil {
+			cd := Candidate{StandbyID: st.ID, Server: st.Server, Readable: err == nil, Pos: pos, Preferred: r.Plan.Preferred(ctx, g, st.Server), RingDist: r.Plan.Ring(in.oldOf(g), st.Server)}
+			switch {
+			case err != nil:
 				cd.Err = err.Error()
+			case in.graceful() && pos.ReceiverState != "streaming":
+				cd.Readable, cd.Err = false, "it does not stream from the primary"
 			}
 			reads = append(reads, cd)
 		}
@@ -179,10 +188,20 @@ func (s *Service) Plan(ctx context.Context, in Input) (Plan, error) {
 		d, l := marshalDecision(ch, facts, reads)
 		_ = json.Unmarshal(d, &gp.Candidates)
 		_ = json.Unmarshal(l, &gp.DataLoss)
+		if in.graceful() {
+			gp.DataLoss = DataLoss{Verdict: VerdictNone, Message: "A switchover loses nothing: the new primary is proven to hold everything the old one wrote, or the switchover does not happen.", AsyncDatabases: []string{}, UnreadableServerIDs: []string{}}
+		}
 		if ch.Chosen != nil {
 			to := ch.Chosen.Server
 			gp.ToServerID = &to
 			est := int64(30)
+			if in.graceful() {
+				// A switchover waits for the stop of the sessions, the clean stop and the proof: a minute is the order of magnitude, the writes
+				// are stopped for the part of it that is the stop, the proof and the promotion.
+				est = 60
+				pause := int64(10)
+				gp.WritesPausedSeconds = &pause
+			}
 			gp.EstimatedSeconds = &est
 		}
 		if !in.graceful() && !Accepts(ch.Verdict, in.AllowDataLoss) {
@@ -192,6 +211,14 @@ func (s *Service) Plan(ctx context.Context, in Input) (Plan, error) {
 		out.Groups = append(out.Groups, gp)
 	}
 	_ = nodes
+	// The groups a restore leaves alone are in the plan as they are in the report: a group with no target, no candidates and no steps and the member
+	// `skipped` (contract 0.18.0); dataLoss.message repeats the reason for a console that does not read the member.
+	for _, sk := range in.Skipped {
+		out.Groups = append(out.Groups, GroupPlan{ShardGroupID: sk.Group, IsMapGroup: sk.Group == 0, FromServerID: in.oldOf(sk.Group), Candidates: []CandidateOut{},
+			Steps: []string{}, MovesTheManager: sk.Group == 0, Skipped: &SkippedOut{Reason: sk.Reason, Message: sk.Text},
+			DataLoss: DataLoss{Verdict: VerdictNone, Message: "Skipped (" + sk.Reason + "): " + sk.Text, AsyncDatabases: []string{}, UnreadableServerIDs: []string{}}})
+	}
+	sort.Slice(out.Groups, func(i, j int) bool { return out.Groups[i].ShardGroupID < out.Groups[j].ShardGroupID })
 	out.CanProceed = len(out.Blockers) == 0
 	return out, nil
 }
@@ -291,8 +318,8 @@ type activeRun struct {
 func (s *Service) active(ctx context.Context) (*activeRun, error) {
 	var a activeRun
 	err := s.sys(ctx, func(c *pgx.Conn) error {
-		return c.QueryRow(ctx, `SELECT id, state, subject_id FROM kingres_cp.task WHERE kind = $1 AND state IN ('pending', 'running', 'paused')
-			ORDER BY id DESC LIMIT 1`, KindFailover).Scan(&a.ID, &a.State, &a.Server)
+		return c.QueryRow(ctx, `SELECT id, state, subject_id FROM kingres_cp.task WHERE kind IN ($1, $2) AND state IN ('pending', 'running', 'paused')
+			ORDER BY id DESC LIMIT 1`, KindFailover, KindRestore).Scan(&a.ID, &a.State, &a.Server)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -366,6 +393,7 @@ func (s *Service) run(eng *task.Engine, id int64) {
 // The read side: status and reports.
 
 type runSummary struct {
+	Kind        string
 	TaskID      int64
 	Trigger     string
 	Mode        string
@@ -380,7 +408,7 @@ type runSummary struct {
 }
 
 func (s *Service) runs(ctx context.Context, c *pgx.Conn, where string, args ...any) ([]runSummary, error) {
-	rows, err := c.Query(ctx, `SELECT r.task_id, r.trigger, coalesce(r.mode, ''), coalesce(r.server_id, ''), coalesce(r.requested_by, ''), coalesce(r.outcome, ''),
+	rows, err := c.Query(ctx, `SELECT r.task_id, r.kind, r.trigger, coalesce(r.mode, ''), coalesce(r.server_id, ''), coalesce(r.requested_by, ''), coalesce(r.outcome, ''),
 		r.started_at, r.finished_at, coalesce(r.error, ''), coalesce(t.state, ''), r.options
 		FROM kingres_cp.failover_run r LEFT JOIN kingres_cp.task t ON t.id = r.task_id WHERE `+where, args...)
 	if err != nil {
@@ -390,7 +418,7 @@ func (s *Service) runs(ctx context.Context, c *pgx.Conn, where string, args ...a
 	var out []runSummary
 	for rows.Next() {
 		var x runSummary
-		if err := rows.Scan(&x.TaskID, &x.Trigger, &x.Mode, &x.Server, &x.RequestedBy, &x.Outcome, &x.StartedAt, &x.FinishedAt, &x.Error, &x.TaskState, &x.Options); err != nil {
+		if err := rows.Scan(&x.TaskID, &x.Kind, &x.Trigger, &x.Mode, &x.Server, &x.RequestedBy, &x.Outcome, &x.StartedAt, &x.FinishedAt, &x.Error, &x.TaskState, &x.Options); err != nil {
 			return nil, err
 		}
 		out = append(out, x)
@@ -399,7 +427,7 @@ func (s *Service) runs(ctx context.Context, c *pgx.Conn, where string, args ...a
 }
 
 func summaryOf(c *pgx.Conn, ctx context.Context, x runSummary) (ReportSummary, error) {
-	out := ReportSummary{ID: x.TaskID, Kind: "failover", Trigger: x.Trigger, Outcome: x.Outcome, StartedAt: x.StartedAt, FinishedAt: x.FinishedAt, RequestedBy: x.RequestedBy}
+	out := ReportSummary{ID: x.TaskID, Kind: orStr(x.Kind, "failover"), Trigger: x.Trigger, Outcome: x.Outcome, StartedAt: x.StartedAt, FinishedAt: x.FinishedAt, RequestedBy: x.RequestedBy}
 	if x.Server != "" {
 		out.ServerID = &x.Server
 	}
@@ -457,7 +485,7 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 	err := s.sys(ctx, func(c *pgx.Conn) error {
 		var id int64
 		var state string
-		err := c.QueryRow(ctx, `SELECT id, state FROM kingres_cp.task WHERE kind = $1 AND state IN ('pending', 'running', 'paused') ORDER BY id DESC LIMIT 1`, KindFailover).Scan(&id, &state)
+		err := c.QueryRow(ctx, `SELECT id, state FROM kingres_cp.task WHERE kind IN ($1, $2) AND state IN ('pending', 'running', 'paused') ORDER BY id DESC LIMIT 1`, KindFailover, KindRestore).Scan(&id, &state)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
@@ -472,11 +500,15 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 			}
 			out.TaskID = &id
 			k := "failover"
-			out.Kind = &k
 			if len(runs) == 1 {
 				x := runs[0]
-				out.Trigger, out.ServerID, out.StartedAt = &x.Trigger, &x.Server, &x.StartedAt
+				k = orStr(x.Kind, "failover")
+				out.Trigger, out.StartedAt = &x.Trigger, &x.StartedAt
+				if x.Server != "" {
+					out.ServerID = &x.Server
+				}
 			}
+			out.Kind = &k
 			if t, gerr := s.Engine().Get(ctx, id); gerr == nil {
 				out.Cancellable = Cancellable(t)
 				if state == "paused" && t.Detail != "" {
@@ -525,6 +557,19 @@ func orID(p *int64) int64 {
 }
 
 func (s *Service) groupProgress(ctx context.Context, c *pgx.Conn, id int64) ([]GroupProgress, error) {
+	var mode string
+	_ = c.QueryRow(ctx, `SELECT coalesce(mode, '') FROM kingres_cp.failover_run WHERE task_id = $1`, id).Scan(&mode)
+	var steps []stepProgress
+	if mode == ModeGraceful || mode == ModeRestore {
+		var raw []byte
+		if c.QueryRow(ctx, `SELECT coalesce(progress->'steps', '[]'::jsonb) FROM kingres_cp.task WHERE id = $1`, id).Scan(&raw) == nil {
+			_ = json.Unmarshal(raw, &steps)
+		}
+	}
+	groupsPaused, perr := pausedSince(ctx, c, id)
+	if perr != nil {
+		return nil, perr
+	}
 	rows, err := c.Query(ctx, `SELECT group_id, state, coalesce(old_server, ''), new_server, nullif(error, '') FROM kingres_cp.failover_group WHERE task_id = $1 ORDER BY seq`, id)
 	if err != nil {
 		return nil, err
@@ -537,7 +582,14 @@ func (s *Service) groupProgress(ctx context.Context, c *pgx.Conn, id int64) ([]G
 			return nil, err
 		}
 		ph := phaseOf(g.State)
+		if steps != nil && g.State != "done" && g.State != "skipped" && g.State != "failed" {
+			ph = phaseOfSteps(steps, g.ShardGroupID, ph)
+		}
 		g.Phase = &ph
+		if t, ok := groupsPaused[g.ShardGroupID]; ok {
+			tt := t
+			g.WritesPausedSince = &tt
+		}
 		out = append(out, g)
 	}
 	return out, rows.Err()
@@ -822,4 +874,72 @@ func (s *Service) LastEnded(ctx context.Context) (map[int32]time.Time, error) {
 		return rows.Err()
 	})
 	return out, err
+}
+
+// stepProgress is a step of the task as GET /tasks reports it.
+type stepProgress struct {
+	Name  string `json:"name"`
+	State string `json:"state"`
+}
+
+// phaseOfSteps is the phase of a group of a switchover or a restore: the step it is at, the first of its steps that is not done (the
+// states of the group's row are too few to say "quiescing" or "verifying").
+func phaseOfSteps(steps []stepProgress, g int32, fallback string) string {
+	prefix := fmt.Sprintf("Group %d: ", g)
+	for _, st := range steps {
+		if !strings.HasPrefix(st.Name, prefix) {
+			continue
+		}
+		if st.State == "done" || st.State == "skipped" {
+			continue
+		}
+		switch strings.TrimPrefix(st.Name, prefix) {
+		case StepFreeze:
+			return "checking"
+		case StepChoose:
+			return "choosing"
+		case StepQuiesce:
+			return "quiescing"
+		case StepDrain:
+			return "waitingForTransactions"
+		case StepStopClean:
+			return "stopping"
+		case StepVerify:
+			return "verifying"
+		case StepLease:
+			return "waitingForLease"
+		case StepHandOver, StepPromote:
+			return "promoting"
+		case StepCatalog, StepCheckCat:
+			return "followingCatalog"
+		case StepRepoint, StepRecords, StepSyncNames:
+			return "repointing"
+		default:
+			return "finishing"
+		}
+	}
+	return fallback
+}
+
+// pausedSince says, per group of the run, when its writes stopped (the event quiesced) while they are still stopped: no later event says that
+// they were let in again (writesResumed) or that the switchover was rolled back.
+func pausedSince(ctx context.Context, c *pgx.Conn, id int64) (map[int32]time.Time, error) {
+	rows, err := c.Query(ctx, `SELECT e.group_id, e.at FROM kingres_cp.failover_event e
+		WHERE e.task_id = $1 AND e.kind = 'quiesced' AND e.group_id IS NOT NULL
+		  AND NOT EXISTS (SELECT 1 FROM kingres_cp.failover_event x WHERE x.task_id = e.task_id AND x.group_id = e.group_id
+		                  AND x.kind IN ('writesResumed', 'rolledBack', 'groupFailed') AND x.seq > e.seq)`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int32]time.Time{}
+	for rows.Next() {
+		var g int32
+		var at time.Time
+		if err := rows.Scan(&g, &at); err != nil {
+			return nil, err
+		}
+		out[g] = at
+	}
+	return out, rows.Err()
 }

@@ -55,6 +55,18 @@ type Ports interface {
 	// RecordTask inserts the task of the failover into the (now writable) system database, steps up to F7 done, and writes the
 	// report rows from the journal. It is idempotent for one journal id and returns the id of the task.
 	RecordTask(ctx context.Context, j journal.Journal) (int64, error)
+	// RecordPlanned marks the group 0 row of the old leader's task (a planned switchover) promoted, with the term and the timeline of the promotion, in the system
+	// database that this server promoted: the steps that the new leader's engine runs again read the term from it. It is idempotent.
+	RecordPlanned(ctx context.Context, taskID, termAfter, timeline int64) error
+	// PlannedRefused is what a planned switchover of the map group does when the standby could not prove the old leader's stop: this server lets go of the fence
+	// lease it holds (so that the old leader can win its own lease again) and tells the old leader, whose task rolls back and starts its primary again.
+	PlannedRefused(ctx context.Context, oldServer string, taskID int64, reason string) error
+	// ResumeOldLeader asks the old leader's server to end the hold of its primary of the map group, once this bootstrap is given up (F6-01): its task may be gone, and the system
+	// database is the primary that is held back, so nothing else would. Best effort; the old leader's own loop does it as well.
+	ResumeOldLeader(ctx context.Context, oldServer string) error
+	// PullProof reads how the stopped primary of the map group was left from the old leader's server (its kingresd answers while its instance is held back), for the
+	// case that the old leader's task, which sends the proof, did not (its kingresd ended after the stop).
+	PullProof(ctx context.Context, oldServer string) (checkpoint, clusterState string, err error)
 	// CheckAuthority says whether this server holds the key of the certificate authority (pki/ca.key). The leader holds it and no other
 	// server does: the new leader of a map group failover has none unless an operator put it there (design 3.4, 11.2).
 	CheckAuthority(ctx context.Context) (bool, error)
@@ -73,6 +85,10 @@ type Request struct {
 	RequestedBy   string
 	AllowDataLoss bool
 	Comment       string
+	// Planned is set by the old leader's own task for a planned switchover of the map group: the old server is alive, the task stops it cleanly
+	// and sends the proof afterwards, and the task row is the task's (the bootstrap records none). Nothing else may start a bootstrap for a live
+	// old server.
+	Planned *journal.Planned
 }
 
 // Result says how the run ended when it did not fail.
@@ -94,17 +110,21 @@ type Runner struct {
 	// run as a crash of kingresd would (the journal says where).
 	Fault func(point string) error
 
-	FreezeTTL     time.Duration // default 10 min
-	LeaseWait     time.Duration // the wait for the old lease, default 25 s
-	LeasePoll     time.Duration // default 1 s
-	QuorumWait    time.Duration // default 60 s
-	ReadBound     time.Duration // the positions must stop moving within this, default 15 s
-	PromoteWait   time.Duration // the promoted instance is waited for this long, default 3 min
-	CatalogWait   time.Duration // promote_node of the map group, repeated this long while the majority rule refuses, default 10 min
-	CatalogPause  time.Duration // default 5 s
-	LeaderWait    time.Duration // the other servers' answers show the new term within this, default 60 s
-	AlertAfter    time.Duration // failoverBlocked is raised after this, default 60 s
-	PromoteNodeOp failover.PromoteOptions
+	FreezeTTL      time.Duration // default 10 min
+	LeaseWait      time.Duration // the wait for the old lease, default 25 s
+	VerifyWait     time.Duration // a standby that has not replayed the shutdown checkpoint yet is asked again for this long, default 30 s
+	PlannedWait    time.Duration // the wait for the old leader's lease in a planned switchover (it is released by its clean stop), default 4 min
+	ProofWait      time.Duration // the wait for the proof of the clean stop in a planned switchover, default 4 min
+	ProofPullAfter time.Duration // the proof is read from the old leader's server when its task did not send it by then, default 20 s
+	LeasePoll      time.Duration // default 1 s
+	QuorumWait     time.Duration // default 60 s
+	ReadBound      time.Duration // the positions must stop moving within this, default 15 s
+	PromoteWait    time.Duration // the promoted instance is waited for this long, default 3 min
+	CatalogWait    time.Duration // promote_node of the map group, repeated this long while the majority rule refuses, default 10 min
+	CatalogPause   time.Duration // default 5 s
+	LeaderWait     time.Duration // the other servers' answers show the new term within this, default 60 s
+	AlertAfter     time.Duration // failoverBlocked is raised after this, default 60 s
+	PromoteNodeOp  failover.PromoteOptions
 }
 
 func (r *Runner) logf(f string, a ...any) {
@@ -191,15 +211,26 @@ func (r *Runner) Decide(ctx context.Context, req Request) (journal.Journal, erro
 		return journal.Journal{}, &Refusal{Code: "quorum_unavailable", Status: 503, Message: "This server cannot reach a majority of the servers; the map group is not promoted from a minority."}
 	}
 	if r.P.Live(ctx, req.OldServer) == "live" {
-		// The old server answers the liveness view: a partition on the leader's side, or a request of an operator for a switchover of the
-		// leader. Only an operator may go on: an automatic start for a server that is heard is refused (F4-05). B3 asks it to stop first.
+		// The old server answers the liveness view: a partition on the leader's side, or a request for a switchover of the leader. Neither is built
+		// (design, "the map group with a live old leader"): the calls that stop the old primary are the leader's, and this server is not the leader,
+		// so nothing here may pretend to ask it. An automatic start for a server that is heard stays the conflict of F4-05.
 		if nonEmpty(req.Trigger, "manual") == "automatic" {
 			return journal.Journal{}, &Refusal{Code: "conflict", Status: 409, Message: "The old server of the map group is live for this server; an automatic failover does not start."}
 		}
-		r.logf("mapgroup: the old server %s is live for this server; B3 asks it to demote", req.OldServer)
+		if req.Planned == nil {
+			return journal.Journal{}, &Refusal{Code: "unsupported_operation", Status: 422, Message: "The failover of the map group while its server is alive is not supported yet; stop that server, or use the documented SQL of the sharding extension."}
+		}
+		// A planned switchover: the old leader's own task made the request (the caller is checked by the receiver), it stops its primary cleanly
+		// and sends the proof; this server waits for its lease to be released and for the proof.
+	} else if req.Planned != nil {
+		return journal.Journal{}, &Refusal{Code: "conflict", Status: 409, Message: "A planned switchover of the map group needs the old leader alive; this server does not hear it."}
 	}
 	id := strconv.FormatInt(r.now().UnixNano(), 36)
-	return r.Journal.Begin(id, req.OldServer, term, nonEmpty(req.Trigger, "manual"), req.RequestedBy, req.AllowDataLoss)
+	j, err := r.Journal.Begin(id, req.OldServer, term, nonEmpty(req.Trigger, "manual"), req.RequestedBy, req.AllowDataLoss)
+	if err != nil || req.Planned == nil {
+		return j, err
+	}
+	return r.Journal.SetPlanned(*req.Planned)
 }
 
 func nonEmpty(s, d string) string {
@@ -272,8 +303,19 @@ func (r *Runner) resume(ctx context.Context, j journal.Journal) (Result, error) 
 		if r.Journal.IsDone(s.name) {
 			continue
 		}
+		// A bootstrap that was given up while a step ran does not go on to the next one (F6-02): the abandon released the lease and let the old leader start again.
+		if !r.Journal.Active() {
+			return res, failover.Fail(failover.CodeSwitchoverUnproven, false, "the bootstrap of the map group was given up; nothing more is done")
+		}
 		if err := r.fault(s.name + ":before"); err != nil {
 			return res, err
+		}
+		// The freeze of B2 lapses (ten minutes) and is memory of the agent that a restart may have lost: every step after it asks for it again,
+		// so a bootstrap that waits long (the old lease, a promoted instance that starts) or that a restart interrupted never runs without it.
+		if s.name != journal.StepDecide && s.name != journal.StepFreeze && r.Journal.IsDone(journal.StepFreeze) {
+			if err := r.P.FreezeLocal(ctx, dur(r.FreezeTTL, 10*time.Minute)); err != nil {
+				return res, err
+			}
 		}
 		cur, _ := r.Journal.Current()
 		stop, err := s.f(ctx, cur)
@@ -316,19 +358,22 @@ func (r *Runner) freeze(ctx context.Context, j journal.Journal) (bool, error) {
 	return false, r.Journal.Event(journal.StepFreeze, "frozen", nil)
 }
 
-// B3: as F3. A old server that answers is asked to demote first (design 3.5); then the fence lease is taken from a majority of all
-// the servers, which proves that a majority talks to this server, that the old holder's lease ran out at a majority and that it
-// can never be granted one again.
+// B3: as F3. The fence lease is taken from a majority of all the servers, which proves that a majority talks to this server, that the
+// old holder's lease ran out at a majority and that it can never be granted one again. An old server that is heard is not asked to
+// demote: the calls that stop a primary are the leader's, this server is not the leader, and Decide refuses a live old server until the
+// design "the map group with a live old leader" is built.
 func (r *Runner) takeFence(ctx context.Context, j journal.Journal) (bool, error) {
-	if st, err := r.P.State(ctx, j.OldServer); err == nil && len(st.OutOfRecovery()) > 0 {
-		ans, derr := r.P.Demote(ctx, j.OldServer, failover.DemoteRequest{Group: Group, Mode: "immediate", ExpectedTerm: j.Term, TransferTo: r.P.Self()})
-		_ = r.Journal.Event(journal.StepLease, "demote", map[string]any{"stopped": ans.Stopped, "transferred": ans.Transferred, "error": errText(derr)})
-	}
 	members, err := r.P.Members(ctx)
 	if err != nil {
 		return false, err
 	}
 	started := r.now()
+	// A planned switchover waits for the old leader to stop cleanly (it releases its lease then): the lease cannot be won before, and the wait
+	// is the stop, the replay of the mark and the verification, not the lapse of a lease.
+	leaseWait := dur(r.LeaseWait, 25*time.Second)
+	if j.Planned != nil {
+		leaseWait = dur(r.PlannedWait, 4*time.Minute)
+	}
 	var quorumSince time.Time
 	for {
 		if err := ctx.Err(); err != nil {
@@ -351,7 +396,7 @@ func (r *Runner) takeFence(ctx context.Context, j journal.Journal) (bool, error)
 			case err == nil && ans.Held:
 				waited := int(r.now().Sub(started).Milliseconds())
 				return false, r.Journal.Event(journal.StepLease, "leaseHeld", map[string]any{"waitMs": waited})
-			case err == nil && r.now().Sub(started) > dur(r.LeaseWait, 25*time.Second):
+			case err == nil && r.now().Sub(started) > leaseWait:
 				for h := range ans.RefusedBy {
 					if h == j.OldServer {
 						r.P.Alert(ctx, "failoverBlocked", "warning", "group:0", "A majority of the servers still hear the holder of the lease of the map group ("+h+"); its primary is alive for the cluster.", true)
@@ -383,6 +428,20 @@ func (r *Runner) pin(ctx context.Context, j journal.Journal) (bool, error) {
 	recs, err := r.P.Standbys(ctx)
 	if err != nil {
 		return false, err
+	}
+	if j.Planned != nil {
+		// The old leader's task chose this standby and had the mark replayed on it: no other one can be proven, so no other one is a choice.
+		for _, s := range recs {
+			if s.ID == j.Planned.StandbyID && s.State == "ready" && s.Server == r.P.Self() {
+				pinned, err := r.Journal.SetPin(journal.Pin{StandbyID: s.ID, Server: s.Server, Node: s.CatalogNode, Instance: s.InstanceID})
+				if err != nil {
+					return false, err
+				}
+				return false, r.Journal.Event(journal.StepPin, "pinned", map[string]any{"standby": pinned.StandbyID, "server": pinned.Server, "verdict": failover.VerdictNone,
+					"message": "A planned switchover loses nothing: the standby is proven to hold everything the old leader wrote, or it is not promoted."})
+			}
+		}
+		return false, failover.Fail(failover.CodeNoCandidate, true, "the standby %d that the old leader chose is not a ready standby of the map group on this server", j.Planned.StandbyID)
 	}
 	var ready []failover.StandbyRec
 	for _, s := range recs {
@@ -495,6 +554,9 @@ func (r *Runner) promote(ctx context.Context, j journal.Journal) (bool, error) {
 	}
 	deadline := r.now().Add(dur(r.PromoteWait, 3*time.Minute))
 	for {
+		if !r.Journal.Active() {
+			return false, failover.Fail(failover.CodeSwitchoverUnproven, false, "the bootstrap of the map group was given up before the promotion; nothing more is done")
+		}
 		if ans, err := r.P.Lease(ctx, r.P.Self(), failover.LeaseRequest{Group: Group, Role: failover.LeaseHolder, ExpectedTerm: j.Term}); err == nil && ans.Held {
 			break
 		}
@@ -506,11 +568,58 @@ func (r *Runner) promote(ctx context.Context, j journal.Journal) (bool, error) {
 		}
 	}
 	req := failover.PromoteRequest{Group: Group, StandbyID: j.Pin.StandbyID, InstanceID: j.Pin.Instance, ExpectedTerm: j.Term}
+	if j.Planned != nil {
+		// A planned switchover promotes only with the proof of the old leader's clean stop; the callee checks it against what the standby replayed.
+		cp, state, err := r.waitProof(ctx)
+		if err != nil {
+			return false, err
+		}
+		req.Checkpoint, req.ClusterState = cp, state
+	}
+	// The intent is on disk before the call (F5-03): a promotion that ran and is not yet recorded cannot be given up as if it had not happened.
+	if err := r.Journal.PromotionIntent(); err != nil {
+		if errors.Is(err, journal.ErrAbandoned) {
+			return false, failover.Fail(failover.CodeSwitchoverUnproven, false, "the bootstrap of the map group was given up before the promotion; nothing more is done")
+		}
+		return false, err
+	}
+	behindUntil := r.now().Add(dur(r.VerifyWait, 30*time.Second))
 	for try := 0; ; try++ {
+		if try > 0 && !r.Journal.Active() {
+			// The bootstrap was given up while the call was repeated (F6-02): another call would promote a standby whose lease was let go of, behind the back of the journal.
+			return false, failover.Fail(failover.CodeSwitchoverUnproven, false, "the bootstrap of the map group was given up while the promotion was repeated; nothing more is done")
+		}
 		ans, err := r.P.Promote(ctx, r.P.Self(), req)
 		switch {
 		case err == nil:
 			return false, r.Journal.Event(journal.StepPromote, "promoted", map[string]any{"status": ans.Status, "timeline": ans.Timeline, "lsn": ans.Lsn})
+		case failover.IsCode(err, "standby_behind") && r.now().Before(behindUntil):
+			// The standby has not replayed the shutdown checkpoint yet (replication lag, a loaded machine): the ordinary groups wait for it for VerifyWait and so does
+			// this bootstrap; a proof that can never be made (unprovable) is refused at once (F5-04).
+		case failover.IsCode(err, "unprovable"), failover.IsCode(err, "standby_behind"):
+			// Nothing was promoted, and the old leader is stopped: this server cannot start it again (that is the leader's call). It asks for a decision.
+			if j.Planned == nil {
+				return false, &failover.PauseError{Reason: "the standby of the map group cannot prove what it must (" + err.Error() + "); nothing was promoted"}
+			}
+			// The old leader is stopped and nothing was promoted: this server lets go of the fence lease and tells the old leader, whose task rolls back and
+			// starts its primary again (the lease decides who may run: it is free now). The bootstrap is given up.
+			reason := "the standby of the map group cannot prove that it holds everything the old leader wrote (" + err.Error() + ")"
+			r.P.Alert(ctx, "failoverNeedsDecision", "critical", "group:0", "The planned switchover of the map group was refused after the old leader stopped: "+reason+"; the old leader is started again.", true)
+			// The journal is given up whether or not the old leader could be told (F5-09): the lease is let go of already, and a journal that stays active would keep the
+			// gate of this server closed and a later repeat could promote after the old leader's task was rolled back.
+			perr := r.P.PlannedRefused(ctx, j.OldServer, j.Planned.TaskID, reason)
+			_ = r.Journal.Event(journal.StepPromote, "refused", map[string]any{"reason": reason, "toldTheOldLeader": perr == nil})
+			if aerr := r.Journal.AbandonUnpromoted(reason); aerr != nil {
+				return false, aerr
+			}
+			// Only now can the old leader resolve its hold: a bootstrap that names it and is active is what makes it wait (F6-01).
+			if rerr := r.P.ResumeOldLeader(ctx, j.OldServer); rerr != nil {
+				_ = r.Journal.Event(journal.StepPromote, "oldLeaderNotResumed", map[string]any{"error": rerr.Error()})
+			}
+			if perr != nil {
+				return false, failover.Fail(failover.CodeSwitchoverUnproven, false, "%s; the old leader could not be told (%v): its task rolls back by its own wait", reason, perr)
+			}
+			return false, failover.Fail(failover.CodeSwitchoverUnproven, false, "%s", reason)
 		case failover.IsCode(err, "stale_term"):
 			return false, errors.New("another failover changed the catalog term of the cluster; nothing else is done")
 		case failover.IsCode(err, "lease_not_held"), failover.IsCode(err, "unavailable"):
@@ -623,9 +732,31 @@ func (r *Runner) makeLeader(ctx context.Context, j journal.Journal) (bool, error
 	}
 	cur, _ := r.Journal.Current()
 	if !cur.Recorded {
-		id, err := r.P.RecordTask(ctx, cur)
-		if err != nil {
-			return false, fmt.Errorf("recording the task of the failover: %w", err)
+		id := int64(0)
+		if cur.Planned != nil {
+			// The task is the old leader's: its row was replicated to this server before the stop and the engine claims it once the gate is open. Its group 0 row
+			// says promoted, with the new term, so that the steps the engine runs again use the term that now holds.
+			id = cur.Planned.TaskID
+			term, _, terr := r.P.CatalogTerm(ctx)
+			if terr != nil {
+				return false, fmt.Errorf("reading the catalog term: %w", terr)
+			}
+			var timeline int64
+			for _, e := range cur.Events {
+				if e.Kind == "promoted" {
+					if tl, ok := e.Detail["timeline"].(float64); ok {
+						timeline = int64(tl)
+					}
+				}
+			}
+			if err := r.P.RecordPlanned(ctx, id, term, timeline); err != nil {
+				return false, fmt.Errorf("marking the map group of the task promoted: %w", err)
+			}
+		} else {
+			var err error
+			if id, err = r.P.RecordTask(ctx, cur); err != nil {
+				return false, fmt.Errorf("recording the task of the failover: %w", err)
+			}
 		}
 		if err := r.Journal.Recorded(id); err != nil {
 			return false, err
@@ -656,3 +787,33 @@ const AlertAuthority = "certificateAuthorityUnavailable"
 
 // AuthorityMessage is what the alert says: the key is not escrowed, so the operator restores it by hand.
 const AuthorityMessage = "The map group was failed over and this server, the new manager leader, does not hold the key of the certificate authority: no certificate can be issued, renewed or revoked. Restore pki/ca.key and pki/revoked.json of the old leader from its backup into the pki directory of this server and restart kingresd; the certificates of the servers last a year, and their renewal fails until then."
+
+// waitProof waits until the old leader of a planned switchover has delivered the proof of its clean stop (the shutdown checkpoint and the state the
+// cluster was left in): a pause when it does not come, because a standby is promoted on that proof only.
+func (r *Runner) waitProof(ctx context.Context) (checkpoint, state string, err error) {
+	start := r.now()
+	deadline := start.Add(dur(r.ProofWait, 4*time.Minute))
+	for {
+		cur, ok := r.Journal.Current()
+		if ok && cur.Planned != nil && cur.Planned.Checkpoint != "" {
+			return cur.Planned.Checkpoint, cur.Planned.ClusterState, nil
+		}
+		// The old leader's task sends the proof; when it does not (its kingresd ended after the clean stop and is not back), the proof is read from its server:
+		// the primary does not run there, and what pg_controldata says is checked by the standby against what it replayed, as for the proof that is sent.
+		if ok && r.now().Sub(start) >= dur(r.ProofPullAfter, 20*time.Second) {
+			if cp, st, perr := r.P.PullProof(ctx, cur.OldServer); perr == nil && st == "shut down" && cp != "" {
+				if serr := r.Journal.SetProof(cp, st); serr == nil {
+					_ = r.Journal.Event(journal.StepPromote, "proofRead", map[string]any{"from": cur.OldServer, "checkpoint": cp})
+					return cp, st, nil
+				}
+			}
+		}
+		if !r.now().Before(deadline) {
+			return "", "", &failover.PauseError{Reason: "the old leader of the map group did not deliver the proof of its clean stop; nothing was promoted. " +
+				"Start the old leader's server again, or repeat the request"}
+		}
+		if err := r.sleep(ctx, dur(r.LeasePoll, time.Second)); err != nil {
+			return "", "", err
+		}
+	}
+}

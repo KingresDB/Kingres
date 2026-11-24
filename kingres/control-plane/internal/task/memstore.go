@@ -54,6 +54,18 @@ func cp(t *Task) Task {
 	return c
 }
 
+// ActiveFor implements ActiveStore.
+func (m *MemStore) ActiveFor(_ context.Context, kind, subjType, subjID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, t := range m.tasks {
+		if t.Kind == kind && t.SubjectType == subjType && t.SubjectID == subjID && t.State.Active() {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // Create implements Store.
 func (m *MemStore) Create(_ context.Context, t Task) (Task, error) {
 	m.mu.Lock()
@@ -298,7 +310,16 @@ var failoverClass = map[string]bool{"server.failover": true, "replication.restor
 
 // databaseOps are the kinds that change which databases and tables have a catalog (migration 0016): a failover is
 // excluded by them and excludes them.
-var databaseOps = map[string]bool{"database.create": true, "database.drop": true, "table.distribute": true}
+var databaseOps = map[string]bool{"database.create": true, "database.drop": true, "table.distribute": true,
+	// migration 0041: the tasks of the distributed schemas exclude a failover too
+	"schema.distribute": true, "schema.move": true, "schema.undistribute": true}
+
+// schemaMoves are the schema tasks that move a bucket (a schema is one bucket of a colocation group of its own; make local may
+// move it first): a rebalance and they exclude each other (migration 0041, KX001 and KX002).
+var schemaMoves = map[string]bool{"schema.move": true, "schema.undistribute": true}
+
+// membershipOps change which servers hold shards: a schema task that moves a bucket and they exclude each other (migration 0041, KX006 and KX007).
+var membershipOps = map[string]bool{"server.add": true, "server.remove": true, "server.leave": true}
 
 // excludedLocked is the rule of the database trigger for a task of kind about to be created.
 func (m *MemStore) excludedLocked(kind string) error {
@@ -314,6 +335,15 @@ func (m *MemStore) excludedLocked(kind string) error {
 		case failoverClass[kind] && databaseOps[o.Kind] && o.State.Active():
 			return &ExcludedError{Kind: kind, Other: o.Kind}
 		case databaseOps[kind] && failoverClass[o.Kind] && o.State.Active():
+			return &ExcludedError{Kind: kind, Other: o.Kind}
+		// Migration 0041: a rebalance and a schema task that moves a bucket exclude each other.
+		case kind == "rebalance" && schemaMoves[o.Kind] && o.State.Active():
+			return &ExcludedError{Kind: kind, Other: o.Kind}
+		case schemaMoves[kind] && o.Kind == "rebalance" && (o.State == Pending || o.State == Running):
+			return &ExcludedError{Kind: kind, Other: "rebalance"}
+		case schemaMoves[kind] && membershipOps[o.Kind] && o.State.Active():
+			return &ExcludedError{Kind: kind, Other: o.Kind}
+		case membershipOps[kind] && schemaMoves[o.Kind] && o.State.Active():
 			return &ExcludedError{Kind: kind, Other: o.Kind}
 		}
 	}

@@ -76,6 +76,17 @@ type Journal struct {
 	TaskID   int64 `json:"taskId,omitempty"`
 	// Abandoned is when the bootstrap was given up before the promotion (F4-06): its gate is open and a new one may begin.
 	Abandoned time.Time `json:"abandoned,omitempty"`
+	// Planned is set when the bootstrap serves a planned switchover of the map group (the old leader is alive and stops cleanly; the task row is its task's).
+	Planned *Planned `json:"planned,omitempty"`
+}
+
+// Planned is what the old leader's task tells the candidate: the id of its task (the bootstrap records none of its own), the standby it chose and has the
+// mark replayed on, and, once the old leader stopped cleanly, the proof of the stop (the shutdown checkpoint and the state the cluster was left in).
+type Planned struct {
+	TaskID       int64  `json:"taskId"`
+	StandbyID    int64  `json:"standbyId"`
+	Checkpoint   string `json:"checkpoint,omitempty"`
+	ClusterState string `json:"clusterState,omitempty"`
 }
 
 // ErrNewerTerm is returned by Begin when the journal on disk belongs to a bootstrap of a higher term than the one asked for.
@@ -160,6 +171,10 @@ func (s *Store) copyLocked() Journal {
 	if s.j.Pin != nil {
 		p := *s.j.Pin
 		c.Pin = &p
+	}
+	if s.j.Planned != nil {
+		p := *s.j.Planned
+		c.Planned = &p
 	}
 	return c
 }
@@ -279,18 +294,27 @@ func (s *Store) Undo(steps ...string) error {
 	return s.saveLocked()
 }
 
+// ErrAbandoned is returned by PromotionIntent for a bootstrap that was given up: nothing may be promoted for it any more (F6-02).
+var ErrAbandoned = errors.New("journal: the bootstrap was given up; nothing is promoted for it")
+
 // ErrPromoted is returned by Abandon for a bootstrap that promoted the standby: it can only go on.
 var ErrPromoted = errors.New("journal: the standby was promoted; the bootstrap cannot be given up")
 
 // Abandon gives up a bootstrap that did not reach the promotion (F4-06): the gate of the engine opens, the monitor looks again, and a new
 // bootstrap may begin. After the promotion (B5) it is refused: the promoted instance holds the lease and the bootstrap must end.
-func (s *Store) Abandon(reason string) error {
+func (s *Store) Abandon(reason string) error { return s.abandon(reason, false) }
+
+// AbandonUnpromoted is Abandon for a caller that knows that nothing was promoted although the promoting call began: the callee refused before it changed
+// anything, or the instance was asked and is still in recovery (F5-03). Only a recorded promotion refuses it.
+func (s *Store) AbandonUnpromoted(reason string) error { return s.abandon(reason, true) }
+
+func (s *Store) abandon(reason string, unpromoted bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.j == nil || s.finishedLocked() || !s.j.Abandoned.IsZero() {
 		return nil
 	}
-	if !s.j.Done[StepPromote].IsZero() {
+	if !s.j.Done[StepPromote].IsZero() || (!unpromoted && s.promotionStartedLocked()) {
 		return ErrPromoted
 	}
 	s.j.Abandoned = s.now().UTC()
@@ -311,4 +335,81 @@ func Stuck(j Journal, catalogTerm int64, now time.Time, maxAge time.Duration) (b
 		return true, fmt.Sprintf("the bootstrap began %s ago and did not reach the promotion", now.Sub(j.StartedAt).Round(time.Second))
 	}
 	return false, ""
+}
+
+// SetPlanned marks the bootstrap in progress as the one of a planned switchover. It is refused when a standby is pinned already (the pin is
+// the end of what the old leader may still decide) and idempotent for the same task and standby.
+func (s *Store) SetPlanned(p Planned) (Journal, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.j == nil {
+		return Journal{}, errors.New("journal: no bootstrap is in progress")
+	}
+	if s.j.Planned != nil {
+		if s.j.Planned.TaskID == p.TaskID && s.j.Planned.StandbyID == p.StandbyID {
+			return s.copyLocked(), nil
+		}
+		return Journal{}, errors.New("journal: the bootstrap serves another planned switchover")
+	}
+	if s.j.Pin != nil {
+		return Journal{}, errors.New("journal: a standby is pinned already")
+	}
+	s.j.Planned = &Planned{TaskID: p.TaskID, StandbyID: p.StandbyID}
+	return s.copyLocked(), s.saveLocked()
+}
+
+// SetProof records the proof of the clean stop of the old leader. It is refused for a bootstrap that is not planned, and a proof that differs
+// from the one recorded is refused (the first stays).
+func (s *Store) SetProof(checkpoint, clusterState string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.j == nil || s.j.Planned == nil {
+		return errors.New("journal: no planned switchover is in progress")
+	}
+	if s.j.Planned.Checkpoint != "" {
+		if s.j.Planned.Checkpoint == checkpoint && s.j.Planned.ClusterState == clusterState {
+			return nil
+		}
+		return errors.New("journal: another proof is recorded")
+	}
+	s.j.Planned.Checkpoint, s.j.Planned.ClusterState = checkpoint, clusterState
+	return s.saveLocked()
+}
+
+// promotionStartedLocked says that the call that promotes was begun: the intent is recorded before the call, because the answer is recorded after it and a
+// promotion that ran and was not recorded (kingresd ended, or the answer is still on its way) must not be given up as if it had not happened (F5-03).
+func (s *Store) promotionStartedLocked() bool {
+	if s.j == nil {
+		return false
+	}
+	for _, e := range s.j.Events {
+		if e.Step == StepPromote && e.Kind == "promoting" {
+			return true
+		}
+	}
+	return false
+}
+
+// PromotionIntent records, once, that the call that promotes is about to be made.
+func (s *Store) PromotionIntent() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.j == nil {
+		return errors.New("journal: no bootstrap is in progress")
+	}
+	if !s.j.Abandoned.IsZero() {
+		return ErrAbandoned
+	}
+	if s.promotionStartedLocked() {
+		return nil
+	}
+	s.j.Events = append(s.j.Events, Event{At: s.now().UTC(), Step: StepPromote, Kind: "promoting"})
+	return s.saveLocked()
+}
+
+// PromotionStarted says that the intent is recorded.
+func (s *Store) PromotionStarted() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.promotionStartedLocked()
 }

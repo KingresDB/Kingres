@@ -321,3 +321,121 @@ func TestRelinquishKeepsCheckingAndHoldsTheInstanceBack(t *testing.T) {
 
 // AnyFencedFile is the test's own look at the lease directory of a rig.
 func AnyFencedFile(rigDir string) bool { return AnyFenced(filepath.Join(rigDir, "lease")) }
+
+// The clean stop of a planned switchover holds the primary back but goes on renewing the lease until the stop is over: a shutdown that takes
+// longer than the lease has left (a slow walsender, a slow checkpoint: here, three lease durations of the fake clock) is not fenced in the middle,
+// which would make it an unclean one. When the stop ends cleanly the lease is released; when it does not, Relinquish ends the renewal and the
+// lease lapses and fences as before.
+func TestHoldBackKeepsRenewingThroughASlowStop(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t, []string{"a", "b", "c"}, true)
+	r.m.Renew(ctx)
+	if err := r.m.HoldBack(1); err != nil {
+		t.Fatal(err)
+	}
+	if err := Gate(filepath.Join(r.dir, "lease"), testPrimary)(1); err == nil {
+		t.Fatal("the primary of a group that is held back must not be started")
+	}
+	if r.m.Relinquished(1) {
+		t.Fatal("HoldBack stopped the renewal")
+	}
+	for elapsed := time.Duration(0); elapsed < 3*dur; elapsed += 2 * time.Second {
+		r.clk.Advance(2 * time.Second)
+		r.m.Renew(ctx)
+		r.settle(t)
+		r.m.Check(ctx)
+		if up, stops, _ := r.inst.state(); !up || stops != 0 {
+			t.Fatalf("the slow stop was fenced after %v: running=%v stops=%d", elapsed+2*time.Second, up, stops)
+		}
+		if !r.m.Holds(1) {
+			t.Fatalf("the lease was lost after %v", elapsed+2*time.Second)
+		}
+	}
+	// The stop did not end cleanly: the renewal ends, the lease lapses and the fence stops what still runs.
+	if err := r.m.Relinquish(1); err != nil {
+		t.Fatal(err)
+	}
+	r.clk.Advance(dur - margin + time.Millisecond)
+	r.m.Renew(ctx)
+	r.m.Check(ctx)
+	if up, stops, _ := r.inst.state(); up || stops != 1 {
+		t.Fatalf("a stop that did not end cleanly was not fenced when the lease lapsed: running=%v stops=%d", up, stops)
+	}
+}
+
+// The state of a group that a release or a demotion dropped between a round and the write of the watchdog file is not dereferenced (a cluster test of the
+// rollback of a map group switchover crashed kingresd on it).
+func TestTheWatchdogFileOfAGroupWhoseStateWasDroppedIsNotWritten(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t, []string{"a", "b", "c"}, true)
+	wf := filepath.Join(r.dir, "instance", "lease.json")
+	if err := os.MkdirAll(filepath.Dir(wf), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	r.m.c.WatchdogFile = wf
+	r.m.Renew(ctx)
+	r.m.mu.Lock()
+	delete(r.m.groups, 1)
+	r.m.mu.Unlock()
+	r.m.writeWatchdogFile(1) // must not panic
+}
+
+// F6-05. The three writers of the watchdog file (a round, the idle refresh, the Off file of a demotion) write under one lock, from the reading of the state to the end
+// of the write: a round that took its sequence number before a demotion cannot write after the demotion's Off file and arm the watchdog of a standby.
+func TestTheWritersOfTheWatchdogFileExcludeEachOther(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t, []string{"a", "b", "c"}, true)
+	wf := filepath.Join(r.dir, "instance", "lease.json")
+	if err := os.MkdirAll(filepath.Dir(wf), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	r.m.c.WatchdogFile = wf
+	r.m.Renew(ctx)
+	for name, write := range map[string]func(){
+		"a round":      func() { r.m.writeWatchdogFile(1) },
+		"the idle one": func() { r.m.writeWatchdogIdle(wf) },
+		"the Off file": func() { r.m.writeWatchdogOff(wf) },
+	} {
+		r.m.wmu.Lock() // another writer is in the middle of its write
+		done := make(chan struct{})
+		go func() { write(); close(done) }()
+		select {
+		case <-done:
+			r.m.wmu.Unlock()
+			t.Fatalf("%s wrote while another writer held the lock of the file", name)
+		case <-time.After(150 * time.Millisecond):
+		}
+		r.m.wmu.Unlock()
+		<-done
+	}
+}
+
+// F7-01. The server that a group is handed to is recorded on disk (a restart of kingresd keeps it) and goes with the hold: Unrelinquish and BecameStandby remove it.
+func TestTheCandidateOfAHandOverIsRecordedAndGoesWithTheHold(t *testing.T) {
+	r := newRig(t, []string{"a", "b", "c"}, true)
+	if got := r.m.Candidate(1); got != "" {
+		t.Fatalf("a candidate before any record: %q", got)
+	}
+	if err := r.m.RecordCandidate(1, "b"); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.m.Candidate(1); got != "b" {
+		t.Fatalf("the record: %q", got)
+	}
+	if got := r.m.Candidate(2); got != "" {
+		t.Fatalf("the record of another group: %q", got)
+	}
+	if err := r.m.Unrelinquish(1); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.m.Candidate(1); got != "" {
+		t.Fatalf("the record outlived the hold: %q", got)
+	}
+	_ = r.m.RecordCandidate(1, "b")
+	if err := r.m.BecameStandby(1, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.m.Candidate(1); got != "" {
+		t.Fatalf("the record outlived the instance being a primary: %q", got)
+	}
+}

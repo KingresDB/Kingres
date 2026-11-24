@@ -430,6 +430,9 @@ func (e *env) monitorEvents(r *result, p *pubInputs, meta *monitorMetaFile, poll
 		ec := w.EpochClosed[k]
 		r.notes = appendNew(r.notes, []string{"finding: " + epochClosedText(memberKey{ec.Chain, ec.Epoch}, ec) + ". The closed log stays frozen at that size; the log of the next epoch is a different log and no consistency exists between them, so a state you keep for one is not a state of the other"})
 	}
+	for _, n := range restoreNotes(w) {
+		r.notes = appendNew(r.notes, []string{n})
+	}
 	if poll == 1 || len(digests) > 0 {
 		r.ok(fmt.Sprintf("poll %d events", poll), fmt.Sprintf("%d event(s) read, none differs from what you saw, %d chain(s) retired by a verified event", w.Count, len(w.Retired)))
 	}

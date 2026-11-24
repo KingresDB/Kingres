@@ -258,7 +258,14 @@ kc_vacuum_compact_small(Relation rel)
 	 * horizon of the free list in the metapage (a format change): left for the next format version.
 	 */
 	if (TransactionIdIsValid(GetTopTransactionIdIfAny()))
+	{
+		/* e.g. the reconcile deleted catalog rows of files that no longer exist (C14-10) */
+		ereport(DEBUG1,
+				(errmsg("the merge of the small stripes of \"%s\" was skipped: this VACUUM already has a transaction id",
+						RelationGetRelationName(rel)),
+				 errdetail("The next VACUUM merges them.")));
 		return;
+	}
 	if (MyProc->statusFlags & PROC_IN_VACUUM)
 	{
 		LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
@@ -524,6 +531,8 @@ kc_index_vacuum(Relation rel, bool skip, double live_rows, BufferAccessStrategy 
 	Assert(CheckRelationLockedByMe(rel, ShareUpdateExclusiveLock, true));
 	/* no give-back of a reservation tail while the ranges below are in use (C14-01) */
 	(void) kc_vacuum_lock(rel, ExclusiveLock, true);
+	/* the lock is held before the ranges are read, not after: t/070 stops here (C14-08) */
+	kc_reserve_gate(KC_RES_VAC_LOCKED);
 	kc_reserve_lock(rel, ExclusiveLock);
 	kc_meta_read(rel, &meta);
 	st.r = kc_catalog_live_ranges(rel, GetOldestNonRemovableTransactionId(rel),

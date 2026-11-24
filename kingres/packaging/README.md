@@ -16,6 +16,7 @@ package, and tests each of them.
 | Debian package | `deb/` | `kingres_<version>+pg18-<revision>_amd64.deb` or `kingres_<version>+pg19-<revision>_amd64.deb` with the `kingres.service` unit |
 | Artifact tests | `test/` | Image, compose and package tests (the package test runs systemd in a container); each is run once per major |
 | Where the checks run | developer machines | Every check of this directory runs on a developer's machine (see [Tests of the artifacts](#tests-of-the-artifacts)); no CI workflow of this project exists, runs or is published on GitHub, by decision of the project owner |
+| Release script | `release/release.sh` | Checks the two product branches, requires the record of the final checks, builds the package and the image per major, writes `SHA256SUMS` and the release notes and prepares (never pushes) the two tags; see [../docs/dev/releases.md](../docs/dev/releases.md), "The release script" |
 
 ## One release per PostgreSQL major
 
@@ -65,11 +66,12 @@ Target: Ubuntu 24.04, amd64. Everything below was run on Windows 11 with WSL2
   `kingres_ledger` 0.1, `kingres_timepart` 0.1 and `kingres_columnar` 0.1).
   `kingres_columnar` needs `shared_preload_libraries = 'kingres_columnar'` to
   write (it registers a WAL resource manager). **What the product preloads
-  today, and what it should preload, is described in
+  is described in
   [The preload of `kingres_columnar`](#the-preload-of-kingres_columnar).** In
-  short: `kingresd` preloads `kingres_shard,kingres_ledger` and not
-  `kingres_columnar`; without the preload `CREATE EXTENSION` works, a columnar
-  table can be read, and creating one, a write, and the conversion of a
+  short: since phase 12 `kingresd` preloads `kingres_shard,kingres_ledger,kingres_columnar`
+  (`instance.PreloadLibraries`; an instance made by an earlier package gets the new list when
+  `kingresd` starts and the instance is restarted); without the preload `CREATE EXTENSION` works,
+  a columnar table can be read, and creating one, a write, and the conversion of a
   partition to columnar storage by `kingres_timepart` are refused with a message
   that names `shared_preload_libraries`. The other four extensions need no
   preload except `kingres_shard` and `kingres_ledger`.
@@ -541,6 +543,7 @@ test/test-compose.sh --rev kingres-19 [--port-base 58700]  # three nodes joined 
 test/test-deb.sh --deb FILE --other-deb FILE --work WORK   # install ... purge under systemd
 test/test-verifier-package.sh [--work DIR]                 # the verifier in the package, no Docker
 test/test-modes.sh [--rev REV]                              # the scripts are committed (and archived) as executable, no Docker
+test/test-release.sh [--work DIR]                          # the release script, no Docker, no build
 ```
 
 Each test is run once per major, on the source of that major. The image and
@@ -686,13 +689,13 @@ Verified by the tests against the commit built:
 
 ## The preload of `kingres_columnar`
 
-**What the product does today.** `kingresd` writes
-`shared_preload_libraries = 'kingres_shard,kingres_ledger'` for every instance
-(`RenderManaged`, `kingres/control-plane/internal/instance/render.go`), and the tests of
-this directory assert exactly that. The parameter is managed: the settings API refuses a
-change of it (`config_parameter_managed`) and `kingresd` offers no other way.
-So **an operator has no supported way to turn the preload on** today. On such an
-instance (the default of every package, image and compose node):
+**What the product does now (phase 12, control plane).** `kingresd` writes
+`shared_preload_libraries = 'kingres_shard,kingres_ledger,kingres_columnar'` for every instance
+(`instance.PreloadLibraries`; `EnsureConfig` brings an older `kingres-managed.conf` up to date at the start of
+`kingresd` and reloads a running instance, and the list takes effect at a restart). The library is left out only when
+the installation has no file for it. The parameter is managed: the settings API refuses a change of it
+(`config_parameter_managed`). **Until an instance has been restarted with the new list** (an instance made by an
+earlier package, or any instance of a cluster that was not restarted):
 
 - `CREATE EXTENSION kingres_columnar` works, and a columnar table that already exists is
   read;
@@ -700,7 +703,8 @@ instance (the default of every package, image and compose node):
   `kingres_timepart` (`convert_partition`, `convert_old_partitions`, the policy's
   `columnar_after`) are refused with `kingres_columnar must be listed in
   shared_preload_libraries to write columnar tables`; the partition stays a heap table with
-  all its rows (the flow test checks it).
+  all its rows. The control plane refuses a conversion with `extension_missing` until every instance of every
+  server has loaded the library, and says which one to restart (standbys of a group before its primary).
 
 **Recommendation: preload it (the design's choice,
 [analytics-phase12-storage.md](../docs/design/analytics-phase12-storage.md), question 6 and
@@ -733,6 +737,9 @@ dead weight in the package without it. What it costs every backend, from reading
   recovery, base backups, `pg_rewind`) and on **every standby** of it, or the server may fail
   to start or to replay. So the preload is a property of the whole cluster, and it must
   never be taken away from an instance that holds columnar data.
+
+**Done (phase 12 control plane):** `RenderManaged` has the new list (`instance.PreloadLibraries`), `EnsureConfig` re-renders
+`kingres-managed.conf` when its list differs, the tests and `managed.go` follow, and the flow test of this directory expects the new list. The text below is the analysis that led to it.
 
 **Upgrade of an existing cluster.** `kingres-managed.conf` is written when an instance is
 created and rewritten only by `WriteManaged` (a settings change); `EnsureConfig` at the start

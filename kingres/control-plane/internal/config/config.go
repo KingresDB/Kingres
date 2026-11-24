@@ -111,6 +111,8 @@ type Config struct {
 	// before it tries a bucket move that failed again (default 30s).
 	RebalanceRetryBackoff time.Duration
 	GatherTimeout         time.Duration
+	// PartitionSchedulerInterval is how often the manager leader asks which time-partitioning policies are due (default 1m).
+	PartitionSchedulerInterval time.Duration
 	// LedgerKeysDir is the directory of the private signing keys of the ledger (design ledger-phase7.md, 3.2.2); empty
 	// means <DataDir>/ledger/keys. LedgerKeyPassphraseFile names the file with the passphrase that seals the key
 	// files; empty keeps them in clear text, like ca.key. The passphrase is read from the file, never from the
@@ -122,6 +124,14 @@ type Config struct {
 	LedgerPublicationListen  string
 	LedgerPublicationTLSCert string
 	LedgerPublicationTLSKey  string
+	// TransferDir is the directory of the staged files of the data transfer (design data-export-import.md); empty means
+	// <DataDir>/transfer. TransferKeyFile is the file with the master key that seals them; empty means <DataDir>/transfer.key
+	// (never inside TransferDir). TransferMaxDuration bounds one transfer task (the statement_timeout of the COPY is the time
+	// left of it). MaxAtomicBytes is the largest decompressed CSV that a table import accepts (the import is one transaction).
+	TransferDir         string
+	TransferKeyFile     string
+	TransferMaxDuration time.Duration
+	MaxAtomicBytes      int64
 	// HA are the settings of high availability (see ha.go).
 	HA HAConfig
 }
@@ -238,6 +248,14 @@ var settings = []setting{
 		apply: str(func(c *Config) *string { return &c.LedgerPublicationTLSCert })},
 	{key: "ledger-publication-tls-key", env: "KINGRES_LEDGER_PUBLICATION_TLS_KEY", usage: "TLS private key file of the publication listener",
 		apply: str(func(c *Config) *string { return &c.LedgerPublicationTLSKey })},
+	{key: "transfer-dir", env: "KINGRES_TRANSFER_DIR", usage: "directory of the staged files of the data transfer (default <data-dir>/transfer; put it on a volume with room, not on the one of the database); kingresd refuses a directory that is not empty and not its own, or that is or holds a data directory",
+		apply: str(func(c *Config) *string { return &c.TransferDir })},
+	{key: "transfer-key-file", env: "KINGRES_TRANSFER_KEY_FILE", usage: "file (mode 0600) with the master key that encrypts the staged files of the data transfer (default <data-dir>/transfer.key; created at first use; part of file-level backups of the data directory)",
+		apply: str(func(c *Config) *string { return &c.TransferKeyFile })},
+	{key: "transfer-max-duration", env: "KINGRES_TRANSFER_MAX_DURATION", usage: "longest time of one data transfer task (default 24h); a COPY carries the time left as its statement_timeout",
+		apply: dur(func(c *Config) *time.Duration { return &c.TransferMaxDuration })},
+	{key: "max-atomic-bytes", env: "KINGRES_MAX_ATOMIC_BYTES", usage: "largest decompressed CSV file that a table import accepts, in bytes (default 2 GiB); the import is one transaction, a larger file is split by the user",
+		apply: integer(func(c *Config) *int64 { return &c.MaxAtomicBytes }, 1)},
 	{key: "pg-port", env: "KINGRES_PG_PORT", usage: "TCP port of the managed instance",
 		apply: func(c *Config, v string) error {
 			n := int64(0)
@@ -302,6 +320,8 @@ var settings = []setting{
 		apply: dur(func(c *Config) *time.Duration { return &c.VersionCheckInterval })},
 	{key: "gather-timeout", env: "KINGRES_GATHER_TIMEOUT", usage: "time one server gets to answer its part of a cluster-wide read of logs, alerts or metrics (default 3s)",
 		apply: dur(func(c *Config) *time.Duration { return &c.GatherTimeout })},
+	{key: "partition-scheduler-interval", env: "KINGRES_PARTITION_SCHEDULER_INTERVAL", usage: "how often the manager leader asks which time-partitioning policies are due (default 1m)",
+		apply: dur(func(c *Config) *time.Duration { return &c.PartitionSchedulerInterval })},
 }
 
 // Defaults returns the built-in configuration.
@@ -327,7 +347,8 @@ func Defaults() Config {
 		PGListen:            "127.0.0.1",
 		CertificateLifetime: 365 * 24 * time.Hour, CertificateRenewFraction: 1.0 / 3.0,
 		CertificateCheckInterval: time.Hour, CertificateRetryInterval: time.Minute,
-		MonitorInterval: 10 * time.Second, LedgerPendingMaxAge: 5 * time.Minute, VersionCheckInterval: time.Minute, RebalanceRetryBackoff: 30 * time.Second, GatherTimeout: 3 * time.Second,
+		MonitorInterval: 10 * time.Second, LedgerPendingMaxAge: 5 * time.Minute, VersionCheckInterval: time.Minute, RebalanceRetryBackoff: 30 * time.Second, GatherTimeout: 3 * time.Second, PartitionSchedulerInterval: time.Minute,
+		TransferMaxDuration: 24 * time.Hour, MaxAtomicBytes: 2 << 30,
 		HA: DefaultHA(),
 	}
 }
@@ -459,6 +480,15 @@ func (c *Config) Validate() error {
 	}
 	if c.AuditFile == "" {
 		c.AuditFile = filepath.Join(c.DataDir, "audit.jsonl")
+	}
+	if c.TransferDir == "" {
+		c.TransferDir = filepath.Join(c.DataDir, "transfer")
+	}
+	if c.TransferKeyFile == "" {
+		c.TransferKeyFile = filepath.Join(c.DataDir, "transfer.key")
+	}
+	if rel, err := filepath.Rel(filepath.Clean(c.TransferDir), filepath.Clean(c.TransferKeyFile)); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
+		errs = append(errs, errors.New("transfer-key-file must not be inside transfer-dir"))
 	}
 	if err := c.HA.validate(); err != nil {
 		errs = append(errs, err)

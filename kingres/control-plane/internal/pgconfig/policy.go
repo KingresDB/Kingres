@@ -122,6 +122,10 @@ var refusedReason = map[string]instance.Reason{
 
 // refusedByPolicy are parameters refused although PostgreSQL does not hide them.
 var refusedByPolicy = map[string]instance.Reason{
+	"archive_mode":                  {Code: instance.ReasonUnsafe, Text: "archiving needs an archive command, which cannot be set here, and without one every WAL segment is kept until the disk is full; set it on the server."},
+	"restart_after_crash":           {Code: instance.ReasonUnsafe, Text: "with it off a crash leaves the instance down until someone starts it."},
+	"recovery_min_apply_delay":      {Code: instance.ReasonUnsafe, Text: "it delays a standby, and with it a failover and a synchronous commit."},
+	"max_slot_wal_keep_size":        {Code: instance.ReasonUnsafe, Text: "a small value invalidates the replication slot of a standby that lags; set it on the server."},
 	"fsync":                         {Code: instance.ReasonUnsafe, Text: "with it off a crash can corrupt a server that the cluster believes holds acknowledged commits."},
 	"full_page_writes":              {Code: instance.ReasonUnsafe, Text: "with it off a crash can corrupt a server that the cluster believes holds acknowledged commits."},
 	"kingres_shard.fault_injection": {Code: instance.ReasonDeveloper, Text: "a test hook of the sharding extension."},
@@ -129,17 +133,96 @@ var refusedByPolicy = map[string]instance.Reason{
 	"kingres_shard.forward_token":   {Code: instance.ReasonSessionInternal, Text: "set by the router on forwarded sessions."},
 }
 
+// controlPlaneSettings are the parameters that change how every session of kingresd itself behaves
+// (its service connections, also those to kingres_system, take the cluster's defaults): a read-only
+// default makes every write of the task engine fail, a timeout ends its long statements, a changed
+// search_path or replication role changes what its statements mean (P13R-01). They are refused at
+// every level; the console has no way to make them safe, so an operator sets them for one role on
+// the server by hand.
+var controlPlaneSettings = map[string]bool{
+	"default_transaction_read_only":       true,
+	"transaction_read_only":               true,
+	"default_transaction_isolation":       true,
+	"transaction_isolation":               true,
+	"session_replication_role":            true,
+	"statement_timeout":                   true,
+	"lock_timeout":                        true,
+	"idle_in_transaction_session_timeout": true,
+	"idle_session_timeout":                true,
+	"transaction_timeout":                 true,
+	"search_path":                         true,
+	"row_security":                        true,
+	"default_table_access_method":         true,
+	"default_tablespace":                  true,
+	"temp_tablespaces":                    true,
+	"check_function_bodies":               true,
+	"client_encoding":                     true,
+}
+
+var controlPlaneReason = instance.Reason{Code: instance.ReasonControlPlane, Text: "it changes how kingresd's own sessions behave (a read-only default or a timeout stops the task engine, a changed search path changes what its statements mean); set it for a role on the server."}
+
+// startRisk are parameters that PostgreSQL accepts in a file and then fails to start with when the
+// host cannot honour them (P13R-02). A restart that stops the server is the worst thing a
+// configuration page can cause, so these are refused.
+var startRisk = map[string]bool{
+	"huge_pages": true, "huge_page_size": true, "shared_memory_type": true, "dynamic_shared_memory_type": true,
+	"min_dynamic_shared_memory": true, "bonjour": true, "bonjour_name": true, "event_source": true,
+}
+
+var startRiskReason = instance.Reason{Code: instance.ReasonStartRisk, Text: "a value the host cannot honour stops the server from starting; set it on the server."}
+
+var tlsReason = instance.Reason{Code: instance.ReasonTLS, Text: "it changes how the cluster's own connections negotiate TLS, and a bad value or a missing file stops the server from starting; set it on the server."}
+
+// alwaysHidden are managed parameters whose value can carry a secret (a connection string with a
+// password): their value is never returned, whatever PostgreSQL says to the role that reads them (P13R-04).
+var alwaysHidden = map[string]bool{"primary_conninfo": true, "kingres_shard.node_conninfo": true}
+
+// Dropped reports whether a stored value of the name can never be written to the override file, by
+// the name alone (managed, refused or unsafe). A stored row of such a name is skipped, with a
+// warning, instead of failing every apply (P13R-05). The classes that depend on what PostgreSQL
+// reports (superuser-only, developer options) are decided on the server.
+func Dropped(name string) bool {
+	name = strings.ToLower(name)
+	if _, ok := instance.IsManaged(name); ok {
+		return true
+	}
+	if controlPlaneSettings[name] || startRisk[name] || strings.HasPrefix(name, "ssl") {
+		return true
+	}
+	if _, ok := refusedByPolicy[name]; ok {
+		return true
+	}
+	if _, ok := refusedReason[name]; ok {
+		return true
+	}
+	_, ok := codeNameReason(name)
+	return ok
+}
+
 // Classify decides what may be done with a parameter. hidden is true when PostgreSQL hides it from a
 // role without pg_read_all_settings (found at run time, see Agent.Hidden).
 func Classify(s Setting, hidden bool) Class {
 	name := strings.ToLower(s.Name)
-	c := Class{Hidden: hidden, ClusterOnly: clusterOnly[name]}
+	c := Class{Hidden: hidden || alwaysHidden[name], ClusterOnly: clusterOnly[name]}
 	if r, ok := instance.IsManaged(name); ok {
 		c.Kind, c.Reason = KindManaged, r
 		return c
 	}
 	if s.Context == "internal" {
 		c.Kind, c.Reason = KindRefused, instance.Reason{Code: instance.ReasonInternal, Text: "PostgreSQL does not let anyone change it."}
+		return c
+	}
+	if controlPlaneSettings[name] {
+		c.Kind, c.Reason = KindRefused, controlPlaneReason
+		return c
+	}
+	if startRisk[name] {
+		c.Kind, c.Reason = KindRefused, startRiskReason
+		return c
+	}
+	if strings.HasPrefix(name, "ssl") {
+		// every TLS setting: a bad value or a missing file stops the postmaster, or cuts kingresd off.
+		c.Kind, c.Reason = KindRefused, tlsReason
 		return c
 	}
 	if r, ok := refusedByPolicy[name]; ok {
@@ -200,6 +283,8 @@ func CheckLevel(s Setting, c Class, level string) (code, msg string) {
 // parameter (a count). replicas is the cluster's replica count.
 func Floor(name string, replicas int) (min int64, reason string, ok bool) {
 	switch strings.ToLower(name) {
+	case "max_worker_processes":
+		return 8, "the launchers and workers of kingres_shard and kingres_ledger (a block worker for each ledger database, the recovery and learn workers) and the launcher of logical replication need slots; below 8 they are silently not started", true
 	case "max_prepared_transactions":
 		return 1, "the sharding extension needs two-phase commit (at least 1)", true
 	case "max_wal_senders":

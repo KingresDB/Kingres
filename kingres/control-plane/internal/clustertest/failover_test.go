@@ -368,10 +368,11 @@ func TestFailoverRefusals(t *testing.T) {
 	leader := c.Leader()
 	_, old, _ := foVictim(t, c)
 
-	// The planned switchover of the map group is not supported yet (the other groups are: failover_switchover_test.go).
-	st, p := leader.Do("POST", "/servers/"+leader.Host+"/failover", map[string]any{"mode": "graceful"}, nil)
-	if st != 422 || p["code"] != "unsupported_operation" {
-		t.Errorf("graceful for the map group: %d %v", st, p)
+	// The planned switchover of the map group is built (TestSwitchoverOfTheMapGroup): its plan names the map group, which moves the manager. A hard failover of a
+	// server whose map group primary answers is not, and is refused.
+	st, p := leader.Do("POST", "/servers/"+leader.Host+"/failover", map[string]any{"mode": "graceful", "dryRun": true}, nil)
+	if gs, _ := p["groups"].([]any); st != 200 || len(gs) != 1 || gs[0].(map[string]any)["isMapGroup"] != true || gs[0].(map[string]any)["movesTheManager"] != true {
+		t.Errorf("the plan of a planned switchover of the map group: %d %v", st, p)
 	}
 	st, p = leader.Do("POST", "/servers/"+leader.Host+"/failover", map[string]any{"mode": "hard"}, nil)
 	if st != 422 {

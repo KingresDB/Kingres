@@ -5,6 +5,7 @@ package clustertest_test
 import (
 	"crypto/x509"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -246,4 +247,340 @@ func swWait(t *testing.T, e swEnv, id any, d time.Duration) map[string]any {
 		t.Fatalf("the task ended %v: %v", body["state"], body["error"])
 	}
 	return body
+}
+
+// A1 of round 2. The leader's kingresd ends right after the writes were stopped (the step is recorded, the old primary holds the hold rules),
+// and is started again: the hold is on disk and stays while kingresd is away (the state call of the old primary says so), the task goes
+// on after the restart and ends with the switchover done, and nothing acknowledged is lost.
+func TestSwitchoverSurvivesTheLeaderEndingWhileTheWritesAreStopped(t *testing.T) {
+	e := swCluster(t)
+	c, port, pool, leader, g, old, nw, w := e.c, e.port, e.pool, e.leader, e.g, e.old, e.nw, e.w
+	// Step indexes: 0 check, 1 freeze, 2 choose, 3 stop the writes, 4 let distributed transactions end, 5 stop the old primary cleanly.
+	leader.SetFaults(fault.Spec{TaskExitPoint: "step_recorded", TaskExitStep: 3})
+	id := swRequest(t, leader, old, nw, g)
+	until(t, 5*time.Minute, "the leader's kingresd to end after the writes were stopped", func() bool {
+		st, _ := leader.Do("GET", "/healthz", nil, nil)
+		return st != 200
+	})
+	leader.Kill() // reaps the process
+	// The hold is on the old primary's disk: the state call answers quiesced for as long as kingresd of the leader is away, and the old
+	// primary is still the primary (nothing was stopped).
+	for i := 0; i < 5; i++ {
+		var state map[string]any
+		code, err := leader.InternalCall(old, "GET", fmt.Sprintf("/failover/state?group=%d", g), nil, &state)
+		if err != nil || code != 200 || state["quiesced"] != true {
+			t.Fatalf("the hold of the writes while the leader is away: %d %v %v", code, err, state)
+		}
+		time.Sleep(time.Second)
+	}
+	leader.Heal()
+	leader.Start()
+	until(t, 3*time.Minute, "the restarted leader accepts a sign-in", func() bool { return leader.Login(clustertest.AdminUser, clustertest.AdminPass) })
+	swWait(t, e, id, 8*time.Minute)
+	if host := swPrimaryHost(t, leader, g); host != nw.Host {
+		t.Fatalf("the primary of group %d is on %s, want %s", g, host, nw.Host)
+	}
+	before := w.count()
+	until(t, 2*time.Minute, "writes after the switchover", func() bool { return w.count() > before+30 })
+	acked := w.Stop()
+	for _, n := range c.Nodes {
+		if n == old {
+			continue
+		}
+		have := foReadIDs(t, n, port, pool)
+		for rid := range acked {
+			if !have[rid] {
+				t.Errorf("acknowledged row %d is missing when read through %s", rid, n.Host)
+				break
+			}
+		}
+	}
+}
+
+// The clean stop takes longer than the lease the old primary has left (the fault holds the stop for 20 s, the lease is 12 s with a margin of 3 s): this
+// is what a walsender of a bucket move that has to send what is pending, or a slow shutdown checkpoint, does, without depending on the load of the
+// machine. The lease is renewed until the stop is over, so the stop is not fenced in the middle and the switchover ends done.
+func TestSwitchoverSurvivesACleanStopThatOutlastsTheLease(t *testing.T) {
+	e := swCluster(t)
+	c, port, pool, leader, g, old, nw, w := e.c, e.port, e.pool, e.leader, e.g, e.old, e.nw, e.w
+	old.SetFaults(fault.Spec{FailoverPoint: "demote:slowstop", FailoverMode: "slow"})
+	id := swRequest(t, leader, old, nw, g)
+	swWait(t, e, id, 8*time.Minute)
+	if host := swPrimaryHost(t, leader, g); host != nw.Host {
+		t.Fatalf("the primary of group %d is on %s, want %s", g, host, nw.Host)
+	}
+	before := w.count()
+	until(t, 2*time.Minute, "writes after the switchover", func() bool { return w.count() > before+30 })
+	acked := w.Stop()
+	for _, n := range c.Nodes {
+		if n == old {
+			continue
+		}
+		have := foReadIDs(t, n, port, pool)
+		for rid := range acked {
+			if !have[rid] {
+				t.Errorf("acknowledged row %d is missing when read through %s", rid, n.Host)
+				break
+			}
+		}
+	}
+}
+
+// The planned switchover of the map group (increment 7, round 2, design "the map group with a live old leader"): the leader's own task hands the map
+// group over. The bootstrap of the standby's server starts first and waits for the lease that the clean stop releases and for the proof, the old
+// leader stops cleanly, the new leader (the standby's server) promotes on the proof, and its engine finishes the task that the old leader could
+// not record. Nothing acknowledged is lost, the leader is the standby's server afterwards, and the task ends done.
+func TestSwitchoverOfTheMapGroup(t *testing.T) {
+	c, port, pool := foClusterWith(t, "-lease-duration", "12s", "-lease-renew", "2s", "-lease-margin", "3s")
+	leader := c.Leader()
+	views := topology(t, leader)[0]
+	if len(views) == 0 {
+		t.Fatalf("the map group has no standby: %v", topology(t, leader))
+	}
+	var nw *clustertest.Node
+	for _, n := range c.Nodes {
+		if n.Host == views[0].server {
+			nw = n
+		}
+	}
+	if nw == nil || nw == leader {
+		t.Fatalf("the standby of the map group is on %q", views[0].server)
+	}
+	w := startFoWriters(c.Nodes, port, pool)
+	until(t, time.Minute, "rows acknowledged before the switchover", func() bool { return w.count() > 40 })
+	st, resp := leader.DoThroughRestart("POST", "/servers/"+leader.Host+"/failover", map[string]any{"mode": "graceful", "shardGroupIds": []int{0},
+		"targets": []map[string]any{{"shardGroupId": 0, "serverId": nw.Host}}}, nil)
+	if st != 202 {
+		t.Fatalf("switchover request: %d %v\n%s", st, resp, leader.LogTail(3000))
+	}
+	id := clustertest.TaskID(resp)
+	// The old leader's system database is stopped by the clean stop: the task is read from the new leader.
+	var task map[string]any
+	defer func() {
+		if t.Failed() {
+			st, body := nw.Do("GET", fmt.Sprintf("/tasks/%v", id), nil, nil)
+			t.Logf("task %v on the new leader (%d): %v", id, st, body)
+			t.Logf("failover status: %v", func() any { _, b := nw.Do("GET", "/failover", nil, nil); return b }())
+			t.Logf("new leader log: %s", quietLog(nw.LogTail(120000)))
+			t.Logf("old leader log: %s", quietLog(leader.LogTail(120000)))
+		}
+	}()
+	until(t, 10*time.Minute, "the task to end on the new leader", func() bool {
+		st, body := nw.Do("GET", fmt.Sprintf("/tasks/%v", id), nil, nil)
+		if st != 200 {
+			return false
+		}
+		s, _ := body["state"].(string)
+		if s == "failed" || s == "done" {
+			task = body
+			return true
+		}
+		return false
+	})
+	if task["state"] != "done" {
+		t.Logf("new leader log: %s", nw.LogTail(12000))
+		t.Logf("old leader log: %s", leader.LogTail(8000))
+		t.Fatalf("the task ended %v: %v", task["state"], task["error"])
+	}
+	hosts, _ := primaryOf(t, nw)
+	if hosts[0] != nw.Host {
+		t.Fatalf("the primary of the map group is on %s, want %s", hosts[0], nw.Host)
+	}
+	body := nw.Expect(200, "GET", "/cluster", nil)
+	if ml, _ := body["managerLeader"].(map[string]any); ml == nil || ml["serverId"] != nw.Host {
+		t.Fatalf("the manager leader is %v, want %s", body["managerLeader"], nw.Host)
+	}
+	before := w.count()
+	until(t, 3*time.Minute, "writes after the switchover", func() bool { return w.count() > before+30 })
+	acked := w.Stop()
+	have := foReadIDs(t, nw, port, pool)
+	for rid := range acked {
+		if !have[rid] {
+			t.Errorf("acknowledged row %d is missing when read through %s", rid, nw.Host)
+			break
+		}
+	}
+}
+
+// mapSwitchoverEnv forms the cluster of the map group tests and starts the writers.
+func mapSwitchoverEnv(t *testing.T) (c *clustertest.Cluster, port int, pool *x509.CertPool, leader, nw *clustertest.Node, w *foWriters) {
+	t.Helper()
+	c, port, pool = foClusterWith(t, "-lease-duration", "12s", "-lease-renew", "2s", "-lease-margin", "3s")
+	leader = c.Leader()
+	views := topology(t, leader)[0]
+	if len(views) == 0 {
+		t.Fatalf("the map group has no standby: %v", topology(t, leader))
+	}
+	for _, n := range c.Nodes {
+		if n.Host == views[0].server {
+			nw = n
+		}
+	}
+	if nw == nil || nw == leader {
+		t.Fatalf("the standby of the map group is on %q", views[0].server)
+	}
+	w = startFoWriters(c.Nodes, port, pool)
+	until(t, time.Minute, "rows acknowledged before the switchover", func() bool { return w.count() > 40 })
+	return
+}
+
+func mapSwitchoverRequest(t *testing.T, leader, nw *clustertest.Node) any {
+	t.Helper()
+	st, resp := leader.DoThroughRestart("POST", "/servers/"+leader.Host+"/failover", map[string]any{"mode": "graceful", "shardGroupIds": []int{0},
+		"targets": []map[string]any{{"shardGroupId": 0, "serverId": nw.Host}}}, nil)
+	if st != 202 {
+		t.Fatalf("switchover request: %d %v\n%s", st, resp, leader.LogTail(3000))
+	}
+	return clustertest.TaskID(resp)
+}
+
+// The standby cannot prove the stop after the old leader stopped (the fault makes the proof in the promoting call false): nothing is promoted, the
+// candidate lets go of the lease and tells the old leader, the old leader's task rolls back and its primary is started again by its lease manager, the
+// writes go on, no acknowledged row is lost and the standby never became a primary. The task is read from the old leader once its instance is back.
+func TestSwitchoverOfTheMapGroupWhoseProofIsRefused(t *testing.T) {
+	c, port, pool, leader, nw, w := mapSwitchoverEnv(t)
+	nw.SetFaults(fault.Spec{FailoverPoint: "promote:unproven", FailoverMode: "fail"})
+	id := mapSwitchoverRequest(t, leader, nw)
+	var task map[string]any
+	defer func() {
+		if t.Failed() {
+			t.Logf("task %v: %v", id, task)
+			t.Logf("old leader log: %s", leader.LogTail(12000))
+			t.Logf("candidate log: %s", nw.LogTail(8000))
+		}
+	}()
+	until(t, 10*time.Minute, "the task to end on the old leader once its instance is back", func() bool {
+		st, body := leader.Do("GET", fmt.Sprintf("/tasks/%v", id), nil, nil)
+		if st != 200 {
+			return false
+		}
+		if s, _ := body["state"].(string); s == "failed" || s == "done" {
+			task = body
+			return true
+		}
+		return false
+	})
+	if e, _ := task["error"].(map[string]any); task["state"] != "failed" || e == nil || e["code"] != failover.CodeSwitchoverUnproven {
+		t.Fatalf("the task: %v", task)
+	}
+	nw.Heal()
+	until(t, 5*time.Minute, "the old leader to hold the map group again", func() bool {
+		hosts, _ := primaryOf(t, leader)
+		return hosts[0] == leader.Host
+	})
+	var st failover.State
+	if code, err := leader.InternalCall(nw, "GET", "/failover/state?group=0", nil, &st); err != nil || code != 200 || len(st.OutOfRecovery()) != 0 {
+		t.Errorf("the standby of the map group is a primary: %d %v %+v", code, err, st)
+	}
+	before := w.count()
+	until(t, 5*time.Minute, "writes after the rollback", func() bool { return w.count() > before+30 })
+	acked := w.Stop()
+	for _, n := range c.Nodes {
+		have := foReadIDs(t, n, port, pool)
+		for rid := range acked {
+			if !have[rid] {
+				t.Errorf("acknowledged row %d is missing when read through %s", rid, n.Host)
+				break
+			}
+		}
+	}
+}
+
+// The old leader's kingresd ends right after the clean stop (the leader changes at the stop), before its task could send the proof. The old primary stays
+// stopped (its marker holds it back, its lease was released), the candidate reads the proof from the old leader's server once that is back, promotes on
+// it, becomes the leader and finishes the task; there is never a second primary, and nothing acknowledged is lost.
+func TestSwitchoverOfTheMapGroupWhoseOldLeaderEndsAtTheStop(t *testing.T) {
+	c, port, pool, leader, nw, w := mapSwitchoverEnv(t)
+	leader.SetFaults(fault.Spec{FailoverPoint: "demote:exit", FailoverMode: "exit"})
+	id := mapSwitchoverRequest(t, leader, nw)
+	var task map[string]any
+	defer func() {
+		if t.Failed() {
+			st0, body0 := nw.Do("GET", fmt.Sprintf("/tasks/%v", id), nil, nil)
+			t.Logf("task %v on the new leader (%d): %v", id, st0, body0)
+			_, fs := nw.Do("GET", "/failover", nil, nil)
+			t.Logf("failover status on the new leader: %v", fs)
+			nw.DumpGoroutines()
+			t.Logf("stacks of the new leader: %s", stuckStacks(nw.LogTail(400000)))
+			t.Logf("candidate log: %s", quietLog(nw.LogTail(200000)))
+			t.Logf("old leader log: %s", quietLog(leader.LogTail(30000)))
+		}
+	}()
+	until(t, 5*time.Minute, "the old leader's kingresd to end after the clean stop", func() bool {
+		st, _ := leader.Do("GET", "/healthz", nil, nil)
+		return st != 200
+	})
+	leader.Kill() // reaps the process
+	leader.Heal()
+	time.Sleep(5 * time.Second) // the old leader is away for a while: the candidate waits for the proof
+	leader.Start()
+	until(t, 10*time.Minute, "the task to end on the new leader", func() bool {
+		st, body := nw.Do("GET", fmt.Sprintf("/tasks/%v", id), nil, nil)
+		if st != 200 {
+			return false
+		}
+		if s, _ := body["state"].(string); s == "failed" || s == "done" {
+			task = body
+			return true
+		}
+		return false
+	})
+	if task["state"] != "done" {
+		t.Fatalf("the task ended %v: %v", task["state"], task["error"])
+	}
+	hosts, _ := primaryOf(t, nw)
+	if hosts[0] != nw.Host {
+		t.Fatalf("the primary of the map group is on %s, want %s", hosts[0], nw.Host)
+	}
+	// the old leader's primary was never started again
+	var st failover.State
+	if code, err := nw.InternalCall(leader, "GET", "/failover/state?group=0", nil, &st); err == nil && code == 200 && len(st.OutOfRecovery()) != 0 {
+		t.Errorf("the old leader runs a primary of the map group: %+v", st)
+	}
+	before := w.count()
+	until(t, 3*time.Minute, "writes after the switchover", func() bool { return w.count() > before+30 })
+	acked := w.Stop()
+	have := foReadIDs(t, nw, port, pool)
+	for rid := range acked {
+		if !have[rid] {
+			t.Errorf("acknowledged row %d is missing when read through %s", rid, nw.Host)
+			break
+		}
+	}
+	_ = c
+}
+
+// quietLog drops the lines of a log that only repeat (a lost credential holder, a forward that waits), so that what a failure left is readable.
+func quietLog(s string) string {
+	var keep []string
+	for _, l := range strings.Split(s, "\n") {
+		if strings.Contains(l, "credentials did not answer") || strings.Contains(l, "forwarding to the manager leader failed") || strings.Contains(l, "the repair of switchovers cannot read") ||
+			strings.Contains(l, "internal call failed") || strings.Contains(l, "monitor connection") {
+			continue
+		}
+		keep = append(keep, l)
+	}
+	if len(keep) > 120 {
+		keep = keep[len(keep)-120:]
+	}
+	return strings.Join(keep, "\n")
+}
+
+// stuckStacks keeps, from the goroutine dump that DumpGoroutines made, the stacks that are in the failover or in the task engine.
+func stuckStacks(log string) string {
+	i := strings.Index(log, "SIGQUIT")
+	if i < 0 {
+		return "(no goroutine dump)"
+	}
+	var keep []string
+	for _, st := range strings.Split(log[i:], "\n\n") {
+		if strings.Contains(st, "internal/failover") || strings.Contains(st, "task.(*Engine)") || strings.Contains(st, "peerclient") {
+			keep = append(keep, st)
+		}
+	}
+	out := strings.Join(keep, "\n\n")
+	if len(out) > 9000 {
+		out = out[:9000]
+	}
+	return out
 }

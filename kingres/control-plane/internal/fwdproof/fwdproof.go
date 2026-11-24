@@ -23,7 +23,10 @@
 // any server). A proof is therefore sent to the manager leader only, which holds
 // every verifier and is trusted with everything anyway (a compromised leader is a
 // compromised cluster); the calls that go to every member (gather) carry an
-// assertion signed by the leader instead (assertion.go). A proof is bound to one
+// assertion signed by the leader instead (assertion.go). The one exception is the
+// request of an operator for the failover of the map group (KindMapStart), whose
+// receiver is the candidate that becomes the leader because the leader is gone
+// (ADR 0026): that server may learn the ClientKey of the operator. A proof is bound to one
 // request, one sender, one receiver and a short time window, and a changed
 // password stops it working.
 package fwdproof
@@ -63,6 +66,12 @@ type Kind string
 const (
 	KindForward Kind = "forward"
 	KindGather  Kind = "gather"
+	// KindMapStart is the request of an operator for the failover of the map group that a member sends to the candidate (F4-05).
+	KindMapStart Kind = "mapStart"
+	// KindForwardStream is the proof of the streaming relay (POST /forward-stream, contract 0.19.0): the frame carries the request
+	// headers the two streaming operations use, and the body is not part of the proof (it is raw bytes of any size, on the mutual TLS
+	// connection between two servers of the cluster).
+	KindForwardStream Kind = "forward-stream"
 )
 
 // Proof is what travels with a request.
@@ -92,6 +101,8 @@ type Message struct {
 	SourceAddress string
 	Pin           string
 	Ordinal       int
+	// Headers are the request headers that travel with a streaming call (Range, Upload-Offset, Content-Length, Content-Type).
+	Headers map[string]string
 }
 
 // digest is SHA-256 over the fields, each with a label and a length, so that
@@ -136,6 +147,18 @@ func (m Message) digest() []byte {
 	str("source-address", m.SourceAddress)
 	str("pin", m.Pin)
 	str("ordinal", fmt.Sprint(m.Ordinal))
+	// Only a message that has headers adds to the digest, so that the proofs of the other calls are what they were.
+	if len(m.Headers) > 0 {
+		hk := make([]string, 0, len(m.Headers))
+		for k := range m.Headers {
+			hk = append(hk, k)
+		}
+		sort.Strings(hk)
+		for _, k := range hk {
+			str("header-name", k)
+			str("header-value", m.Headers[k])
+		}
+	}
 	return h.Sum(nil)
 }
 

@@ -62,6 +62,7 @@
 #include "catalog.h"
 #include "pg_compat.h"
 #include "shippable.h"
+#include "repartition.h"
 
 typedef struct ShipCtx
 {
@@ -71,6 +72,7 @@ typedef struct ShipCtx
 	bool		statement;		/* a whole statement, not one clause */
 	Oid			shipped_relid;	/* statement mode: the table being written */
 	Query	   *top;			/* statement mode: the statement itself */
+	bool		merge_ok;		/* the top level may be a MERGE (design 7): its ON clause and actions are walked */
 	int			colocation_id;	/* multi-relation mode (design 5, 11.7): every distributed table of
 								 * this colocation group may be read, at the one source level the
 								 * analysis of pushdown.c found; else 0 */
@@ -710,9 +712,12 @@ query_ok(Query *q, ShipCtx *ctx)
 	ListCell   *lc;
 	int			rtindex = 0;
 
+	/* the sub-select that stands for a relation another node shipped (repartition.h): its shape is fixed and reads no table (false: nothing wrong) */
+	if (q != ctx->top && kingres_shard_repart_shipped_shape(q, NULL))
+		return false;
 	if (q != ctx->top && q->commandType != CMD_SELECT)
 		return fail(ctx, "it has a data-modifying statement inside a subquery or a WITH clause");
-	if (q->commandType == CMD_MERGE || q->commandType == CMD_UTILITY)
+	if (q->commandType == CMD_UTILITY || (q->commandType == CMD_MERGE && !(ctx->merge_ok && q == ctx->top)))
 		return fail(ctx, "it is a MERGE or a utility statement");
 	if (q->rowMarks != NIL)
 		return fail(ctx, "it has a row locking clause");
@@ -1047,6 +1052,22 @@ ship_walker(Node *node, ShipCtx *ctx)
 				break;
 			}
 
+		case T_MergeAction:
+			if (!ctx->statement || !ctx->merge_ok)
+				return fail(ctx, "it has the structure of a whole statement");
+			break;
+
+		case T_MergeSupportFunc:
+			{
+				MergeSupportFunc *mf = (MergeSupportFunc *) node;
+
+				if (!ctx->statement || !ctx->merge_ok)
+					return fail(ctx, "it has the structure of a whole statement");
+				if (!type_ok(mf->msftype) || !collation_ok(mf->msfcollid))
+					return fail(ctx, "it uses a type or collation that is not built in");
+				break;
+			}
+
 		case T_OnConflictExpr:
 			if (!ctx->statement)
 				return fail(ctx, "it has the structure of a whole statement");
@@ -1153,6 +1174,57 @@ kingres_shard_stmt_shippable_colocated(Query *query, Oid target_relid, int coloc
 }
 
 /*
+ * A MERGE of a distributed table (design 7): the statement a group runs, whose relations are the
+ * target, the distributed tables of the colocation group, reference tables and the sub-select of
+ * a shipped source.  Whether the tables are joined so that this is right is the analysis of
+ * merge.c; this walker judges the expressions (the ON clause, the conditions, SET, VALUES, RETURNING).
+ */
+bool
+kingres_shard_stmt_shippable_merge(Query *query, int colocation_id, const char **reason)
+{
+	ShipCtx		ctx;
+	bool		bad;
+
+	Assert(colocation_id != 0);
+	ship_allow_ext = false;
+	ship_used_ext = NIL;
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.statement = true;
+	ctx.merge_ok = true;
+	ctx.shipped_relid = InvalidOid;
+	ctx.colocation_id = colocation_id;
+	ctx.top = query;
+	bad = query_ok(query, &ctx);
+	if (bad && reason != NULL)
+		*reason = ctx.reason ? ctx.reason : "it cannot be shipped";
+	return !bad;
+}
+
+/*
+ * A MERGE into a reference table (design 7.5, M4 and M5): the rule of a write that runs on every node (the target
+ * is the one table written, the other relations are reference tables or the sub-select of a shipped source)
+ * applied to the MERGE node kinds.
+ */
+bool
+kingres_shard_stmt_shippable_merge_ref(Query *query, Oid target_relid, const char **reason)
+{
+	ShipCtx		ctx;
+	bool		bad;
+
+	ship_allow_ext = false;
+	ship_used_ext = NIL;
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.statement = true;
+	ctx.merge_ok = true;
+	ctx.shipped_relid = target_relid;
+	ctx.top = query;
+	bad = query_ok(query, &ctx);
+	if (bad && reason != NULL)
+		*reason = ctx.reason ? ctx.reason : "it cannot be shipped";
+	return !bad;
+}
+
+/*
  * The fragment of a partial aggregation (design 7): the same tests as the colocated mode, except that
  * an aggregate whose result depends on the order or the grouping of the rows (a floating point sum,
  * array_agg, string_agg) is accepted: the partial states are combined in the order the groups
@@ -1224,4 +1296,30 @@ kingres_shard_extension_version(const char *name)
 		version = TextDatumGetCString(d);
 	ReleaseSysCache(etup);
 	return version;
+}
+
+/*
+ * Is the installed extension of this name one that the list of design 5.5 accepts: in the list, allowed by
+ * kingres_shard.shippable_extensions, and at a version the list names?  (count_distinct.c asks it before it rewrites a statement to
+ * use the functions of kingres_sketch.)
+ */
+bool
+kingres_shard_extension_usable(const char *name)
+{
+	const KsShippableExtension *e = NULL;
+	char	   *version;
+	int			i;
+
+	for (i = 0; shippable_extensions[i].name != NULL; i++)
+		if (strcmp(shippable_extensions[i].name, name) == 0)
+			e = &shippable_extensions[i];
+	if (e == NULL || !ext_setting_allows(name))
+		return false;
+	version = kingres_shard_extension_version(name);
+	if (version == NULL)
+		return false;
+	for (i = 0; e->versions[i] != NULL; i++)
+		if (strcmp(e->versions[i], version) == 0)
+			return true;
+	return false;
 }

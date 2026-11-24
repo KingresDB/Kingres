@@ -45,8 +45,11 @@
 #include "utils/guc.h"
 
 #include "catalog.h"
+#include "count_distinct.h"
 #include "dist_scan.h"
 #include "fragment_scan.h"
+#include "merge.h"
+#include "repartition.h"
 #include "fanout.h"
 #include "forward_auth.h"
 #include "bucket_move.h"
@@ -497,6 +500,8 @@ _PG_init(void)
 							PGC_SIGHUP, GUC_UNIT_S,
 							NULL, NULL, NULL);
 
+	kingres_shard_repartition_init();
+	kingres_shard_merge_init();
 	MarkGUCPrefixReserved("kingres_shard");
 
 	/* Two-phase commit needs prepared transactions on every node. */
@@ -514,6 +519,7 @@ _PG_init(void)
 	kingres_shard_fanout_init();
 	kingres_shard_dist_scan_init();
 	kingres_shard_fragment_scan_init();
+	kingres_shard_count_distinct_init();
 	kingres_shard_planner_init();
 	kingres_shard_utility_init();
 	kingres_shard_remote_scan_init();

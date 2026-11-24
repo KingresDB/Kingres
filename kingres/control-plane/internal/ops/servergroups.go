@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
 )
@@ -94,15 +95,15 @@ func ParseServerUpdate(raw map[string]json.RawMessage) (api.ServerUpdateRequest,
 	sort.Strings(keys)
 	for _, k := range keys {
 		switch {
-		case k == "serverGroup" || k == "shouldHaveShards":
+		case k == "serverGroup" || k == "shouldHaveShards" || k == "weight":
 		case serverReadOnly[k]:
-			errs = append(errs, bad("/"+k, "is read-only; only serverGroup and shouldHaveShards can be changed", "read_only"))
+			errs = append(errs, bad("/"+k, "is read-only; only serverGroup, shouldHaveShards and weight can be changed", "read_only"))
 		default:
 			errs = append(errs, bad("/"+k, "is not a property of a server", "unknown_field"))
 		}
 	}
 	if len(raw) == 0 {
-		errs = append(errs, bad("/", "at least one of serverGroup and shouldHaveShards is required", "required"))
+		errs = append(errs, bad("/", "at least one of serverGroup, shouldHaveShards and weight is required", "required"))
 	}
 	if v, ok := raw["serverGroup"]; ok {
 		req.ServerGroupSet = true
@@ -121,6 +122,17 @@ func ParseServerUpdate(raw map[string]json.RawMessage) (api.ServerUpdateRequest,
 			errs = append(errs, bad("/shouldHaveShards", "must be a boolean", "type"))
 		} else {
 			req.ShouldHaveShards = &b
+		}
+	}
+	if v, ok := raw["weight"]; ok {
+		var w float64
+		switch {
+		case json.Unmarshal(v, &w) != nil || string(v) == "null":
+			errs = append(errs, bad("/weight", "must be a number", "type"))
+		case !(w > 0) || w > 1000:
+			errs = append(errs, bad("/weight", "must be above 0 and at most 1000", "out_of_range"))
+		default:
+			req.Weight = &w
 		}
 	}
 	return req, errs
@@ -224,6 +236,8 @@ func notEmpty(name string, members []string) error {
 type ServerPlacement struct {
 	// ShouldHaveShards is the value the catalog shows now.
 	ShouldHaveShards bool
+	// Weight is the weight the catalog shows now, 0 when it has none.
+	Weight float64
 }
 
 // UpdateServer applies a validated update to a server that exists in the shard
@@ -265,7 +279,8 @@ func (o *Ops) UpdateServer(ctx context.Context, serverID string, cur ServerPlace
 			changeGroup = (group == nil) != (req.ServerGroup == nil) || group != nil && *group != *req.ServerGroup
 		}
 		changeShards := req.ShouldHaveShards != nil && *req.ShouldHaveShards != cur.ShouldHaveShards
-		if !changeGroup && !changeShards {
+		changeWeight := req.Weight != nil && *req.Weight != cur.Weight
+		if !changeGroup && !changeShards && !changeWeight {
 			return nil
 		}
 		if status != "active" {
@@ -294,11 +309,38 @@ func (o *Ops) UpdateServer(ctx context.Context, serverID string, cur ServerPlace
 				return err
 			}
 		}
+		if changeShards || changeWeight {
+			// the automatic rebalance waits settleAfterTopologySeconds after such a change (design 8.2)
+			if _, err := tx.Exec(ctx, `INSERT INTO kingres_cp.cluster_setting (key, value) VALUES ('topology.changedAt', to_jsonb(clock_timestamp()))
+				ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`); err != nil {
+				return err
+			}
+		}
 		if changeShards {
-			return o.setShouldHaveShards(ctx, serverID, *req.ShouldHaveShards)
+			if err := o.setShouldHaveShards(ctx, serverID, *req.ShouldHaveShards); err != nil {
+				return err
+			}
+			if *req.ShouldHaveShards {
+				// a server given back to service is a place for standbys again (it was taken out of their ring by a drain)
+				if _, err := tx.Exec(ctx, `UPDATE kingres_cp.cluster_setting SET value = coalesce((SELECT jsonb_agg(x) FROM jsonb_array_elements_text(value) x
+					WHERE x <> $1), '[]'::jsonb), updated_at = now() WHERE key = $2`, serverID, DrainExcludedKey); err != nil {
+					return err
+				}
+			}
+		}
+		if changeWeight {
+			return o.setWeight(ctx, serverID, *req.Weight)
 		}
 		return nil
 	}))
+}
+
+// DrainExcludedKey is the cluster setting that lists the servers a drain has taken out of the ring of the standbys.
+const DrainExcludedKey = "drain.excludedServers"
+
+// SetShouldHaveShards writes the flag of a server to the shard catalog of every database (the drain uses it).
+func (o *Ops) SetShouldHaveShards(ctx context.Context, server string, want bool) error {
+	return wrap(o.setShouldHaveShards(ctx, server, want))
 }
 
 // setShouldHaveShards sets the flag of every node of the server in the shard
@@ -333,9 +375,15 @@ func (o *Ops) setShouldHaveShardsIn(ctx context.Context, db, host string, want b
 		return connectProblem(err)
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-	var have bool
-	if err := c.QueryRow(ctx, `SELECT to_regclass('kingres.node') IS NOT NULL`).Scan(&have); err != nil {
-		return PGProblem(err)
+	// an untrusted schema is an error: a database that is skipped here would keep the old flag and the drain would think it is done
+	have, err := extUsable(ctx, c, extguard.Shard)
+	if err != nil {
+		return err
+	}
+	if have {
+		if err := c.QueryRow(ctx, `SELECT to_regclass('kingres.node') IS NOT NULL`).Scan(&have); err != nil {
+			return PGProblem(err)
+		}
 	}
 	if !have {
 		return nil
@@ -395,6 +443,81 @@ func setNodeProperty(ctx context.Context, c *pgx.Conn, db string, ids []int32, w
 	switch {
 	case errors.Is(err, errNotMapPrimary) || errors.As(err, &pe) && pe.Code == "55000":
 		return problem.New(problem.NodeStateInvalid, "This server does not hold the primary of the map group in database "+db+"; shouldHaveShards can only be changed through it.")
+	}
+	return err
+}
+
+// setWeight writes the weight of a server to every node row of the server, in every database that has a
+// shard catalog (design 4.3: so that a failover to a standby on another server brings that server's weight).
+// It needs the extension of version 0.8 (set_node_property with three arguments).
+func (o *Ops) setWeight(ctx context.Context, host string, w float64) error {
+	c, err := o.Service.ServiceConn(ctx, "postgres")
+	if err != nil {
+		return connectProblem(err)
+	}
+	rows, err := c.Query(ctx, `SELECT datname FROM pg_catalog.pg_database WHERE NOT datistemplate AND datallowconn ORDER BY datname`)
+	var dbs []string
+	if err == nil {
+		dbs, err = pgx.CollectRows(rows, pgx.RowTo[string])
+	}
+	_ = c.Close(context.WithoutCancel(ctx))
+	if err != nil {
+		return connectProblem(err)
+	}
+	for _, db := range dbs {
+		if err := o.setWeightIn(ctx, db, host, w); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (o *Ops) setWeightIn(ctx context.Context, db, host string, w float64) error {
+	c, err := o.Service.ServiceConn(ctx, db)
+	if err != nil {
+		return connectProblem(err)
+	}
+	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	have, err := extUsable(ctx, c, extguard.Shard)
+	if err != nil {
+		return err
+	}
+	if !have {
+		return nil
+	}
+	var hasFn bool
+	if err := c.QueryRow(ctx, `SELECT to_regclass('kingres.node') IS NOT NULL,
+		to_regprocedure('kingres.set_node_property(integer,boolean,double precision)') IS NOT NULL`).Scan(&have, &hasFn); err != nil {
+		return PGProblem(err)
+	}
+	if !have {
+		return nil
+	}
+	if !hasFn {
+		return problem.New(problem.UnsupportedOp, "The sharding extension of database "+db+" has no weights (version 0.8 is needed); update it first.")
+	}
+	rows, err := c.Query(ctx, `SELECT node_id FROM kingres.node WHERE host = $1 AND weight IS DISTINCT FROM $2::float8 ORDER BY node_id`, host, w)
+	if err != nil {
+		return PGProblem(err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[int32])
+	if err != nil {
+		return PGProblem(err)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	err = inTx(ctx, c, func(tx pgx.Tx) error {
+		for _, id := range ids {
+			if _, err := tx.Exec(ctx, `SELECT kingres.set_node_property($1, NULL, $2)`, id, w); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	var pe *pgconn.PgError
+	if errors.As(err, &pe) && pe.Code == "55000" {
+		return problem.New(problem.NodeStateInvalid, "This server does not hold the primary of the map group in database "+db+"; the weight can only be changed through it.")
 	}
 	return err
 }

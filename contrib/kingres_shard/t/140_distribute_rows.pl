@@ -517,10 +517,10 @@ assert_as_before('after the node came back');
 	$n3->safe_psql('postgres', "UPDATE pg_catalog.pg_extension SET extversion = '0.6' WHERE extname = 'kingres_shard'");
 	my ($rc, $out, $err) = run_sql($n1, "SELECT kingres.create_distributed_table('public.ft', 'tenant', bucket_count => 12);");
 	isnt($rc, 0, 'the creation is refused while a node has another version');
-	like($err, qr/node 3 \(\S+:\d+\) has kingres_shard 0\.6, a table operation needs 0\.8 on every node/, 'the error names the node and the versions');
+	like($err, qr/node 3 \(\S+:\d+\) has kingres_shard 0\.6, a table operation needs 0.9 on every node/, 'the error names the node and the versions');
 	($rc, $out, $err) = run_sql($n1, "SELECT kingres.create_reference_table('public.ft')");
 	like($err, qr/node 3 \(\S+:\d+\) has kingres_shard 0\.6/, 'also for a reference table');
-	$n3->safe_psql('postgres', "UPDATE pg_catalog.pg_extension SET extversion = '0.8' WHERE extname = 'kingres_shard'");
+	$n3->safe_psql('postgres', "UPDATE pg_catalog.pg_extension SET extversion = '0.9' WHERE extname = 'kingres_shard'");
 	assert_as_before('after the version handshake refused it');
 }
 

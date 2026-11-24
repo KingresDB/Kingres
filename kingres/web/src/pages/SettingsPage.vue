@@ -19,6 +19,8 @@ import { endpoints } from '@/api/endpoints'
 import { describeProblem } from '@/api/problem'
 import { keys, useClusterSettings } from '@/api/queries'
 import { DURABILITY_LABEL } from '@/lib/status'
+import { fromGib, MAX_ATOMIC_BYTES, toGib } from '@/lib/transfer'
+import { formatBytes } from '@/lib/format'
 import { compact, firstError, integerBetween } from '@/lib/validators'
 import type { ClusterSettingsUpdateRequest, Durability } from '@/api/types'
 
@@ -35,12 +37,20 @@ const form = reactive({
   maxMoves: 4,
   sharding: false,
   ledger: false,
+  nonSuperuserOwners: false,
+  // Data transfer (0.19.0). The sizes are in gibibytes in the form and in bytes on the wire.
+  dtEnabled: false,
+  dtRetention: 24,
+  dtMaxFile: 20,
+  dtQuota: 100,
+  dtConcurrent: 2,
 })
 const saved = ref(false)
 const submitted = ref(false)
 /** True once the person has edited a field; a refresh from the server must not overwrite edits. */
 const dirty = ref(false)
 const confirmingFeatures = ref<string[] | null>(null)
+const confirmingOwners = ref(false)
 
 function load(): void {
   const d = s.value
@@ -54,7 +64,16 @@ function load(): void {
     maxMoves: d.rebalance.maxConcurrentMoves,
     sharding: d.features.sharding,
     ledger: d.features.ledger,
+    nonSuperuserOwners: d.analytics?.allowNonSuperuserOwners ?? false,
   })
+  if (d.dataTransfer)
+    Object.assign(form, {
+      dtEnabled: d.dataTransfer.enabled,
+      dtRetention: d.dataTransfer.retentionHours,
+      dtMaxFile: toGib(d.dataTransfer.maxFileBytes),
+      dtQuota: toGib(d.dataTransfer.stagingQuotaBytes),
+      dtConcurrent: d.dataTransfer.maxConcurrent,
+    })
   dirty.value = false
 }
 watch(
@@ -83,8 +102,36 @@ const errors = computed(() =>
       form.maxMoves,
       integerBetween('Concurrent moves', 1, 64),
     ),
+    ...(s.value?.dataTransfer
+      ? {
+          'dataTransfer.retentionHours': firstError<number | null>(
+            form.dtRetention,
+            integerBetween('The retention time', 1, 168),
+          ),
+          'dataTransfer.maxFileBytes': firstError<number | null>(
+            form.dtMaxFile,
+            minimumGib('The largest file'),
+          ),
+          'dataTransfer.stagingQuotaBytes': firstError<number | null>(
+            form.dtQuota,
+            minimumGib('The staging quota'),
+          ),
+          'dataTransfer.maxConcurrent': firstError<number | null>(
+            form.dtConcurrent,
+            integerBetween('The number of transfers', 1, 16),
+          ),
+        }
+      : {}),
   }),
 )
+
+/** A size in gibibytes that is at least 1 MiB (the contract's minimum), a number with at most three decimals. */
+function minimumGib(label: string): (value: number | null) => string | undefined {
+  return (value) =>
+    typeof value !== 'number' || !Number.isFinite(value) || value < 0.001
+      ? `${label} is at least 0.001 GiB (1 MiB).`
+      : undefined
+}
 
 /**
  * Only what the user changed. A PATCH is a partial update: the contract refuses an empty group
@@ -108,6 +155,20 @@ function changes(): ClusterSettingsUpdateRequest {
   if (form.sharding && !d.features.sharding) features.sharding = true
   if (form.ledger && !d.features.ledger) features.ledger = true
   if (Object.keys(features).length) body.features = features
+  if (form.nonSuperuserOwners !== (d.analytics?.allowNonSuperuserOwners ?? false))
+    body.analytics = { allowNonSuperuserOwners: form.nonSuperuserOwners }
+  const dt = d.dataTransfer
+  if (dt) {
+    const update: NonNullable<ClusterSettingsUpdateRequest['dataTransfer']> = {}
+    if (form.dtEnabled !== dt.enabled) update.enabled = form.dtEnabled
+    if (form.dtRetention !== dt.retentionHours) update.retentionHours = form.dtRetention
+    // A size is sent only when the person changed what the field shows (the field rounds to three decimals).
+    if (form.dtMaxFile !== toGib(dt.maxFileBytes)) update.maxFileBytes = fromGib(form.dtMaxFile)
+    if (form.dtQuota !== toGib(dt.stagingQuotaBytes))
+      update.stagingQuotaBytes = fromGib(form.dtQuota)
+    if (form.dtConcurrent !== dt.maxConcurrent) update.maxConcurrent = form.dtConcurrent
+    if (Object.keys(update).length) body.dataTransfer = update
+  }
   return body
 }
 
@@ -118,6 +179,7 @@ const save = useMutation({
     saved.value = true
     dirty.value = false
     confirmingFeatures.value = null
+    confirmingOwners.value = false
     await Promise.all([
       client.invalidateQueries({ queryKey: keys.clusterSettings }),
       client.invalidateQueries({ queryKey: keys.cluster }),
@@ -143,6 +205,11 @@ function submit(): void {
   const turnedOn = Object.keys(body.features ?? {})
   if (turnedOn.length > 0) {
     confirmingFeatures.value = turnedOn
+    return
+  }
+  // Trusting owners who are not superusers is a decision about whose code runs as the service role: it is confirmed first.
+  if (body.analytics?.allowNonSuperuserOwners === true) {
+    confirmingOwners.value = true
     return
   }
   save.mutate()
@@ -276,6 +343,105 @@ function submit(): void {
         >
         <p class="hint muted">The first time a feature is enabled, every server needs a restart.</p>
       </fieldset>
+      <fieldset data-testid="analytics-settings">
+        <legend>Analytics</legend>
+        <label class="check"
+          ><input
+            v-model="form.nonSuperuserOwners"
+            type="checkbox"
+            data-testid="allow-non-superuser-owners"
+          />
+          Run the code of table owners who are not superusers</label
+        >
+        <p class="hint muted" data-testid="allow-non-superuser-owners-text">
+          Converting a table between rows and columns, and the runs of a time-partitioning policy,
+          run the code of the owner of the table (an index expression, a check, a default) as the
+          service role, which is a superuser. Off (the default), a table whose owner is not a
+          superuser is refused, and so is its policy. Turn it on only if you trust every owner of a
+          table that you convert or partition by policy. It can be turned off again; a policy that
+          is refused then raises one alert.
+        </p>
+      </fieldset>
+      <fieldset v-if="s.dataTransfer" data-testid="data-transfer-settings">
+        <legend>Data transfer</legend>
+        <label class="check"
+          ><input v-model="form.dtEnabled" type="checkbox" /> Allow table export and import (CSV
+          files)</label
+        >
+        <p class="hint muted" data-testid="data-transfer-state">
+          <template v-if="s.dataTransfer.enabled"
+            >On. Administrators can export a table to a CSV file and import a CSV file into a table.
+            Files are kept on the manager leader's disk until their retention time ends.</template
+          >
+          <template v-else
+            >Off. Every transfer operation is refused, and the Export CSV and Import CSV actions are
+            disabled with this reason. Turning it on is recorded in the audit log.</template
+          >
+          A transfer works only over HTTPS. An import is all or nothing and takes at most
+          {{ formatBytes(s.dataTransfer.maxAtomicBytes ?? MAX_ATOMIC_BYTES) }} of data (256 MiB for
+          a reference table); split a larger file.
+        </p>
+        <FormField
+          v-slot="slot"
+          label="Retention (hours)"
+          hint="1 to 168. How long an export file is kept by default. An upload that receives nothing for 48 hours is deleted."
+          :error="err('dataTransfer.retentionHours')"
+        >
+          <input
+            v-bind="slot"
+            v-model.number="form.dtRetention"
+            class="input num"
+            type="number"
+            min="1"
+            max="168"
+          />
+        </FormField>
+        <FormField
+          v-slot="slot"
+          label="Largest file (GiB)"
+          hint="No staged file, upload or export, is larger. At least 0.001 (1 MiB)."
+          :error="err('dataTransfer.maxFileBytes')"
+        >
+          <input
+            v-bind="slot"
+            v-model.number="form.dtMaxFile"
+            class="input num"
+            type="number"
+            min="0.001"
+            step="any"
+          />
+        </FormField>
+        <FormField
+          v-slot="slot"
+          label="Staging quota (GiB)"
+          hint="The room all staged files together may take on the disk. A transfer that does not fit is refused."
+          :error="err('dataTransfer.stagingQuotaBytes')"
+        >
+          <input
+            v-bind="slot"
+            v-model.number="form.dtQuota"
+            class="input num"
+            type="number"
+            min="0.001"
+            step="any"
+          />
+        </FormField>
+        <FormField
+          v-slot="slot"
+          label="Transfers at once"
+          hint="1 to 16. Transfers that run in the cluster at the same time; one per role."
+          :error="err('dataTransfer.maxConcurrent')"
+        >
+          <input
+            v-bind="slot"
+            v-model.number="form.dtConcurrent"
+            class="input num"
+            type="number"
+            min="1"
+            max="16"
+          />
+        </FormField>
+      </fieldset>
       <ProblemNotice v-if="save.error.value" :error="save.error.value" />
       <p v-if="unchanged" class="notice tone-info" role="status">
         <span aria-hidden="true">&#9432;</span> Nothing was changed, so nothing was saved.
@@ -298,6 +464,26 @@ function submit(): void {
   <div style="max-width: 720px; margin-top: var(--s-5)">
     <AnchorSettings />
   </div>
+  <ConfirmDialog
+    v-if="confirmingOwners"
+    title="Run the code of table owners who are not superusers?"
+    confirm-label="Turn on"
+    danger
+    :busy="save.isPending.value"
+    @cancel="confirmingOwners = false"
+    @confirm="save.mutate()"
+  >
+    <p class="notice tone-danger" role="alert" data-testid="owners-confirm-text">
+      <span aria-hidden="true">&#10006;</span>
+      <span>
+        From now on a conversion and the runs of a policy run the code of the owner of a table as
+        the service role, a superuser, and the scheduler repeats a policy without a person watching.
+        What an owner's code leaves behind in that session would later run with the rights of the
+        service role. Turn this on only if you trust every owner of such a table.
+      </span>
+    </p>
+    <ProblemNotice v-if="save.error.value" :error="save.error.value" />
+  </ConfirmDialog>
   <ConfirmDialog
     v-if="confirmingFeatures"
     :title="`Turn on ${confirmingFeatures.join(' and ')} for the whole cluster?`"

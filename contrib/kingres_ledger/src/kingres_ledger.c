@@ -22,9 +22,14 @@
 #include "postgres.h"
 
 #include "access/table.h"
+#include "catalog/dependency.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/objectaddress.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_class.h"
+#include "commands/defrem.h"
+#include "commands/extension.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
@@ -251,12 +256,50 @@ kl_check_owner(Oid relid)
  * have empty shells of it.  A ledger on a shell would cover none of its rows, so ledger_enable refuses a table whose schema another group
  * holds and names the node to run it on.  Nothing is checked when kingres_shard is not installed in this database.
  */
+/*
+ * Whether the tables of kingres_shard that kl_check_distributed_owner reads are the ones of the
+ * extension: kingres_shard is installed in this database, the schema "kingres" belongs to a
+ * superuser and each table is a member of the extension.  The names are the same in every database,
+ * and a database owner can make a schema of that name (kingres_shard does the same check).
+ */
+static bool
+kl_shard_catalog_trusted(void)
+{
+	static const char *const names[] = {"dist_schema", "bucket_map", "local_node", "node", "bucket_move"};
+	Oid			extoid = get_extension_oid("kingres_shard", true);
+	Oid			nspoid = get_namespace_oid(KL_SCHEMA_NAME, true);
+	HeapTuple	tup;
+	bool		owner_ok = false;
+	int			i;
+
+	if (!OidIsValid(extoid) || !OidIsValid(nspoid))
+		return false;
+	tup = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(nspoid));
+	if (HeapTupleIsValid(tup))
+	{
+		owner_ok = superuser_arg(((Form_pg_namespace) GETSTRUCT(tup))->nspowner);
+		ReleaseSysCache(tup);
+	}
+	if (!owner_ok)
+		return false;
+	for (i = 0; i < (int) lengthof(names); i++)
+	{
+		Oid			relid = get_relname_relid(names[i], nspoid);
+
+		if (!OidIsValid(relid) || getExtensionOfObject(RelationRelationId, relid) != extoid)
+			return false;
+	}
+	return true;
+}
+
 static void
 kl_check_distributed_owner(Oid relid)
 {
 	int			ret;
 	bool		ok = false;
 
+	if (!kl_shard_catalog_trusted())
+		return;
 	if (SPI_connect() != SPI_OK_CONNECT)
 		return;
 	ret = SPI_execute("SELECT pg_catalog.to_regclass('kingres.dist_schema') IS NOT NULL "
@@ -324,6 +367,33 @@ kl_check_distributed_owner(Oid relid)
 }
 
 /*
+ * kl_check_storage
+ *		A ledger table is a heap table (design analytics-phase12-storage 9.6, rule L1).  The capture code writes the history
+ *		row through the table access method and reads old tuples as heap tuples, the row hashes are recomputed from heap
+ *		tuples, and nothing of it is tested against another storage, so a table of another access method (columnar) cannot be
+ *		put under the ledger.  The reverse is the event trigger: ALTER TABLE ... SET ACCESS METHOD rewrites the table, and a
+ *		rewrite of a ledger table is rejected.
+ */
+static void
+kl_check_storage(Oid relid)
+{
+	HeapTuple	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	Oid			am;
+
+	if (!HeapTupleIsValid(tp))
+		return;
+	am = ((Form_pg_class) GETSTRUCT(tp))->relam;
+	ReleaseSysCache(tp);
+	if (OidIsValid(am) && am != HEAP_TABLE_AM_OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("table \"%s\" uses the access method \"%s\" and cannot be a ledger table",
+						get_rel_name(relid), get_am_name(am)),
+				 errdetail("The ledger is built and verified for heap tables: its capture trigger and its row hashes read heap tuples."),
+				 errhint("Use a heap table for the ledger.")));
+}
+
+/*
  * kingres.ledger_lock_table(relation regclass) returns void
  *		Lock a table in SHARE ROW EXCLUSIVE mode, by OID, on behalf of the role
  *		that called ledger_enable.  The caller must own the table.  Locking by
@@ -342,6 +412,7 @@ kingres_ledger_lock_table(PG_FUNCTION_ARGS)
 
 	kl_require_own_statement("ledger_enable");
 	kl_check_owner(relid);
+	kl_require_trusted_registry("enable the ledger on a table");
 	kl_check_distributed_owner(relid);
 	/*
 	 * The order of the locks is checked before the wait for the table (L19-04):
@@ -352,6 +423,7 @@ kingres_ledger_lock_table(PG_FUNCTION_ARGS)
 	kl_check_lock_order(KL_REGISTRY_LOCK_SUBID);
 	LockRelationOid(relid, ShareRowExclusiveLock);
 	kl_check_owner(relid);
+	kl_check_storage(relid);
 
 	/*
 	 * The identifier of the table is the next free one of the registry, taken

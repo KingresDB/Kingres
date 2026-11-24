@@ -22,7 +22,7 @@
 #include "fmgr.h"
 
 /* The version of the extension this library belongs to (the SQL objects of every node must match). */
-#define KINGRES_SHARD_EXT_VERSION "0.8"
+#define KINGRES_SHARD_EXT_VERSION "0.9"
 #include "nodes/params.h"
 #include "nodes/parsenodes.h"
 #include "nodes/plannodes.h"
@@ -119,6 +119,12 @@
  * fence a node.  The setting is 0 (no limit) unless the caller sets it.
  */
 #define ERRCODE_KINGRES_CALL_TIMEOUT MAKE_SQLSTATE('K','S','0','1','5')
+
+/*
+ * SQLSTATE of "this table is a ledger table (or the history table of one) of kingres_ledger and cannot be distributed or made a reference
+ * table" (phase 7 step 25, internal_raise_blockers in the SQL of 0.9).  Raised by SQL; the macro documents the code.  Not a retry.
+ */
+#define ERRCODE_KINGRES_LEDGER_TABLE MAKE_SQLSTATE('K','S','0','1','6')
 
 /*
  * The text that starts the statement of every fragment of a distributed scan

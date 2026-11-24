@@ -11,13 +11,17 @@ import PageHeader from '@/components/PageHeader.vue'
 import QueryBoundary from '@/components/QueryBoundary.vue'
 import BucketGrid from '@/components/BucketGrid.vue'
 import NullableValue from '@/components/NullableValue.vue'
+import GateButton from '@/components/GateButton.vue'
+import BucketSplitDialog from '@/components/BucketSplitDialog.vue'
 import {
   useAllBuckets,
   useBucketDistribution,
   useColocationGroups,
   useDatabases,
+  useSchemas,
   useServers,
 } from '@/api/queries'
+import SafeName from '@/components/SafeName.vue'
 import { formatBytes, formatNumber } from '@/lib/format'
 import type { Bucket } from '@/api/types'
 
@@ -33,6 +37,7 @@ const serverFilter = ref<string>(typeof route.query.server === 'string' ? route.
 const stateFilter = ref<'' | 'moving' | 'orphan'>('')
 const lookup = ref('')
 const selected = ref<Bucket | null>(null)
+const splitting = ref<number | null>(null)
 
 // Default to the first sharded database once the list is known.
 watch(
@@ -45,10 +50,14 @@ watch(
 )
 
 const colocations = useColocationGroups(() => dbName.value || null)
+// The Shards page shows the groups of hash-distributed tables; a distributed schema has a group of one bucket of its own.
+const hashGroups = computed(
+  () => colocations.data.value?.items.filter((g) => (g.kind ?? 'hash') === 'hash') ?? [],
+)
 watch(
   () => colocations.data.value,
-  (data) => {
-    const items = data?.items ?? []
+  () => {
+    const items = hashGroups.value
     if (colocationId.value === null || !items.some((g) => g.colocationId === colocationId.value)) {
       colocationId.value = items[0]?.colocationId ?? null
     }
@@ -64,6 +73,36 @@ const distribution = useBucketDistribution(
   () => dbName.value || null,
   () => colocationId.value ?? undefined,
 )
+
+// Distributed schemas per server group (a count and a size), for a database that has any (design shard-phase11.md, 14.2).
+const schemas = useSchemas(() => dbName.value)
+interface GroupSchemas {
+  groupId: number
+  serverId: string | null
+  count: number
+  bytes: number
+  /** Schemas whose size is not known here (null, shown as "n/a", never as 0). */
+  unknown: number
+}
+const schemasPerGroup = computed<GroupSchemas[]>(() => {
+  const byGroup = new Map<number, GroupSchemas>()
+  for (const s of schemas.data.value ?? []) {
+    const d = s.distribution
+    if (!d) continue
+    const row = byGroup.get(d.shardGroupId) ?? {
+      groupId: d.shardGroupId,
+      serverId: d.serverId ?? null,
+      count: 0,
+      bytes: 0,
+      unknown: 0,
+    }
+    row.count += 1
+    if (s.sizeBytes === null || s.sizeBytes === undefined) row.unknown += 1
+    else row.bytes += s.sizeBytes
+    byGroup.set(d.shardGroupId, row)
+  }
+  return [...byGroup.values()].sort((a, b) => a.groupId - b.groupId)
+})
 
 watch([dbName, serverFilter], () => {
   void router.replace({
@@ -130,11 +169,7 @@ function findBucket(): void {
         <div class="field">
           <label for="f-col">Colocation group</label>
           <select id="f-col" v-model="colocationId">
-            <option
-              v-for="g in colocations.data.value?.items"
-              :key="g.colocationId"
-              :value="g.colocationId"
-            >
+            <option v-for="g in hashGroups" :key="g.colocationId" :value="g.colocationId">
               {{ g.colocationId }} ({{ g.tableCount }} tables, {{ g.distributionColumnType }})
             </option>
           </select>
@@ -205,6 +240,9 @@ function findBucket(): void {
                   (moving to group {{ selected.movingToShardGroupId }})</template
                 ></span
               >
+              <span v-if="selected.modulus"
+                >Hashes: remainder {{ selected.remainder }} modulo {{ selected.modulus }}</span
+              >
               <span
                 >Primary on server {{ selected.primaryServerId ?? '-' }}, replicas on
                 {{
@@ -213,6 +251,18 @@ function findBucket(): void {
                     : 'none'
                 }}, <NullableValue :value="selected.sizeBytes" :format="formatBytes"
               /></span>
+              <div>
+                <GateButton
+                  op="splitBucket"
+                  small
+                  :blocked-reason="
+                    selected.state === 'active' ? '' : 'Only an active bucket can be split.'
+                  "
+                  data-testid="split-bucket"
+                  @click="splitting = selected.bucket"
+                  >Split bucket</GateButton
+                >
+              </div>
             </div>
           </div>
           <p v-else-if="lookup" class="muted">No bucket with that number in this group.</p>
@@ -245,6 +295,44 @@ function findBucket(): void {
           </TableWrap>
         </section>
       </QueryBoundary>
+
+      <section v-if="schemasPerGroup.length" class="card" aria-labelledby="schemas-group-h">
+        <h2 id="schemas-group-h">Distributed schemas per server group</h2>
+        <TableWrap>
+          <table class="table" data-testid="schemas-per-group">
+            <caption class="sr-only">
+              Distributed schemas, their number and size, per server group
+            </caption>
+            <thead>
+              <tr>
+                <th scope="col">Server group</th>
+                <th scope="col">Server</th>
+                <th scope="col" class="num">Schemas</th>
+                <th scope="col" class="num">Size</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="g in schemasPerGroup" :key="g.groupId">
+                <th scope="row">Group {{ g.groupId }}</th>
+                <td>
+                  <SafeName v-if="g.serverId" :value="g.serverId" :max="60" />
+                  <template v-else>-</template>
+                </td>
+                <td class="num">{{ g.count }}</td>
+                <td class="num">
+                  <NullableValue
+                    :value="g.unknown === g.count ? null : g.bytes"
+                    :format="formatBytes"
+                  />
+                  <span v-if="g.unknown > 0 && g.unknown < g.count" class="muted">
+                    (and {{ g.unknown }} not known)</span
+                  >
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </TableWrap>
+      </section>
 
       <section class="card" aria-labelledby="per-server-h">
         <h2 id="per-server-h">Buckets per server</h2>
@@ -294,4 +382,11 @@ function findBucket(): void {
       </section>
     </div>
   </QueryBoundary>
+  <BucketSplitDialog
+    v-if="splitting !== null && colocationId !== null"
+    :database-name="dbName"
+    :colocation-id="colocationId"
+    :bucket="splitting"
+    @close="splitting = null"
+  />
 </template>

@@ -26,6 +26,10 @@ type DatabaseGeneralInput struct {
 type ShardingInput struct {
 	Enabled     bool `json:"enabled"`
 	BucketCount int  `json:"bucketCount,omitempty"`
+	// Mode is row (the default), schema or both (contract 0.15.0).
+	Mode string `json:"mode,omitempty"`
+	// DistributeNewSchemas places every new schema on a shard group; only with mode schema or both.
+	DistributeNewSchemas *bool `json:"distributeNewSchemas,omitempty"`
 }
 
 // ReplicationInput are the replication settings of a new database.
@@ -45,11 +49,16 @@ type DatabaseUpdateRequest struct {
 		Owner           string `json:"owner,omitempty"`
 		ConnectionLimit *int   `json:"connectionLimit,omitempty"`
 	} `json:"general,omitempty"`
-	Sharding *struct {
-		Enabled bool `json:"enabled"`
-	} `json:"sharding,omitempty"`
-	Replication *ReplicationInput `json:"replication,omitempty"`
-	Ledger      *LedgerInput      `json:"ledger,omitempty"`
+	Sharding    *DatabaseShardingUpdate `json:"sharding,omitempty"`
+	Replication *ReplicationInput       `json:"replication,omitempty"`
+	Ledger      *LedgerInput            `json:"ledger,omitempty"`
+}
+
+// DatabaseShardingUpdate is the "sharding" member of updateDatabase: every member is optional, one is needed (contract 0.15.0).
+type DatabaseShardingUpdate struct {
+	Enabled              *bool   `json:"enabled,omitempty"`
+	Mode                 *string `json:"mode,omitempty"`
+	DistributeNewSchemas *bool   `json:"distributeNewSchemas,omitempty"`
 }
 
 // DistributeTableRequest is the body of PUT .../distribution.
@@ -147,6 +156,21 @@ type LedgerVerifyRequest struct {
 	Checks []string `json:"checks,omitempty"`
 }
 
+// RebalanceSettingsUpdate is the "rebalance" member of a settings update; every member is optional but one is
+// needed (contract 0.15.0 added all but the first).
+type RebalanceSettingsUpdate struct {
+	MaxConcurrentMoves  *int     `json:"maxConcurrentMoves,omitempty"`
+	Strategy            *string  `json:"strategy,omitempty"`
+	Threshold           *float64 `json:"threshold,omitempty"`
+	ThresholdSet        bool     `json:"-"`
+	MaxMovesPerServer   *int     `json:"maxMovesPerServer,omitempty"`
+	MaxMoveAttempts     *int     `json:"maxMoveAttempts,omitempty"`
+	MaxDiskUsedFraction *float64 `json:"maxDiskUsedFraction,omitempty"`
+	MaxStandbyLagBytes  *int64   `json:"maxStandbyLagBytes,omitempty"`
+	// Automatic is the automatic mode (contract 0.15.0).
+	Automatic *AutomaticSettingsUpdate `json:"automatic,omitempty"`
+}
+
 // ClusterSettingsUpdateRequest is the body of PATCH /settings/cluster.
 type ClusterSettingsUpdateRequest struct {
 	DefaultReplicaCount *int    `json:"defaultReplicaCount,omitempty"`
@@ -156,10 +180,8 @@ type ClusterSettingsUpdateRequest struct {
 		TimeoutSeconds *int  `json:"timeoutSeconds,omitempty"`
 		MaxCount       *int  `json:"maxCount,omitempty"`
 	} `json:"autoFailover,omitempty"`
-	Rebalance *struct {
-		MaxConcurrentMoves *int `json:"maxConcurrentMoves,omitempty"`
-	} `json:"rebalance,omitempty"`
-	Features *struct {
+	Rebalance *RebalanceSettingsUpdate `json:"rebalance,omitempty"`
+	Features  *struct {
 		Sharding *bool `json:"sharding,omitempty"`
 		Ledger   *bool `json:"ledger,omitempty"`
 	} `json:"features,omitempty"`
@@ -167,6 +189,21 @@ type ClusterSettingsUpdateRequest struct {
 	Clock *struct {
 		MaxDifferenceMs *int `json:"maxDifferenceMs,omitempty"`
 	} `json:"clock,omitempty"`
+	// Analytics is added in contract 0.17.0.
+	Analytics *struct {
+		AllowNonSuperuserOwners *bool `json:"allowNonSuperuserOwners,omitempty"`
+	} `json:"analytics,omitempty"`
+	// DataTransfer is added in contract 0.19.0.
+	DataTransfer *DataTransferSettingsUpdate `json:"dataTransfer,omitempty"`
+}
+
+// DataTransferSettingsUpdate is a partial update of DataTransferSettings (contract 0.19.0).
+type DataTransferSettingsUpdate struct {
+	Enabled           *bool  `json:"enabled,omitempty"`
+	RetentionHours    *int   `json:"retentionHours,omitempty"`
+	MaxFileBytes      *int64 `json:"maxFileBytes,omitempty"`
+	StagingQuotaBytes *int64 `json:"stagingQuotaBytes,omitempty"`
+	MaxConcurrent     *int   `json:"maxConcurrent,omitempty"`
 }
 
 // LedgerClientKey is a registered client key of the ledger (contract 0.11.0).

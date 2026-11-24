@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/instance"
@@ -341,6 +342,7 @@ func (s *Service) connect(ctx context.Context, db string) (*pgx.Conn, error) {
 	}
 	cfg.ConnectTimeout = 5 * time.Second
 	cfg.RuntimeParams["application_name"] = "kingresd-setup"
+	safeServiceSession(cfg)
 	return pgx.ConnectConfig(ctx, cfg)
 }
 
@@ -429,3 +431,29 @@ func (s *Service) SystemDSN() string {
 // PublishSystemDSN gives the sinks of OnDSN the system DSN as it is now: after a promotion of the map group the engine and the store
 // move to the promoted instance.
 func (s *Service) PublishSystemDSN() { s.publishDSN() }
+
+// safeServiceSession fixes the search path of a service connection in its startup parameters, which outrank the settings of a database and of a role. The
+// owner of a database can run ALTER DATABASE ... SET search_path, and a service session that took it would resolve an unqualified operator or function to
+// an object that the owner planted and run it as the service role (a superuser). The service role's own statements name what they use; pg_catalog is the
+// only schema that they search.
+func safeServiceSession(cfg *pgx.ConnConfig) {
+	if cfg.RuntimeParams == nil {
+		cfg.RuntimeParams = map[string]string{}
+	}
+	cfg.RuntimeParams["search_path"] = "pg_catalog"
+}
+
+// SafeSession fixes the search path of a connection that the service role opens, in its startup parameters (see safeServiceSession). Every
+// pgx.ParseConfig and pgxpool.ParseConfig of the service role calls it before the connection is made, for a pool as SafeSession(cfg.ConnConfig): a database
+// owner can run ALTER DATABASE ... SET search_path, and a session that took it would run the function or the operator of the owner as a superuser.
+func SafeSession(cfg *pgx.ConnConfig) { safeServiceSession(cfg) }
+
+// NewSafePool opens a pool of the service role to dsn with SafeSession applied (pgxpool.New does not let a caller change the startup parameters).
+func NewSafePool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	SafeSession(cfg.ConnConfig)
+	return pgxpool.NewWithConfig(ctx, cfg)
+}

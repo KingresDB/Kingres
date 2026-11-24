@@ -143,8 +143,20 @@ func (m *Manager) EnsureConfig(id int) (bool, error) {
 	if err != nil {
 		return changed, err
 	}
-	if strings.Contains(string(cur), "include_if_exists '"+ConfigFileName+"'") {
+	// An instance made by an earlier package preloads fewer libraries: bring the line up to date (it takes effect at the next restart). The list names
+	// kingres_columnar only when the installation has the library: an instance whose preload names a file that is not there cannot start, and the next
+	// restart, even after a crash, would take the server down.
+	m.markColumnarPreload(id, string(cur)) // before the list is chosen: a file that names the library is the proof that the instance had it
+	want := m.preloadListFor(id)
+	if strings.Contains(string(cur), "include_if_exists '"+ConfigFileName+"'") && !preloadDiffers(string(cur), want) {
 		return changed, nil
+	}
+	if preloadDiffers(string(cur), want) {
+		m.log.Warn("shared_preload_libraries of an instance is brought up to date; it takes effect when the instance is restarted (standbys first), and until then a columnar table cannot be written",
+			"instance", id, "now", preloadOf(string(cur)), "next", want)
+		if want != PreloadLibraries {
+			m.log.Warn("the installation has no kingres_columnar library: the instance does not preload it, and columnar storage is not available on this server", "instance", id)
+		}
 	}
 	s, err := m.Settings(id)
 	if err != nil {
@@ -153,7 +165,105 @@ func (m *Manager) EnsureConfig(id int) (bool, error) {
 	if err := m.WriteManaged(id, s); err != nil {
 		return changed, err
 	}
+	// A running instance reads the new line at a reload and then shows the setting as pending a restart (pg_settings.pending_restart), which is what
+	// getConfigSummary and the restart of the console list; without the reload it would not know.
+	if up, _ := m.Running(context.Background(), id); up {
+		if err := m.Reload(context.Background(), id); err != nil {
+			m.log.Warn("reloading an instance after its preload list changed failed", "instance", id, "error", err)
+		}
+	}
 	return true, nil
+}
+
+var preloadLineRE = regexp.MustCompile(`(?m)^shared_preload_libraries = '([^'
+]*)'`)
+
+// preloadOf returns the preload list of kingres-managed.conf, "" when it has none.
+func preloadOf(managed string) string {
+	m := preloadLineRE.FindStringSubmatch(managed)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// preloadOutOfDate says whether kingres-managed.conf carries a preload list other than PreloadLibraries.
+func preloadOutOfDate(managed string) bool { return preloadDiffers(managed, PreloadLibraries) }
+
+// preloadDiffers says whether kingres-managed.conf carries a preload list, and another one than want.
+func preloadDiffers(managed, want string) bool {
+	have := preloadOf(managed)
+	return have != "" && have != want
+}
+
+// columnarLibrary is the library whose absence from the installation makes the manager leave it out of the preload list.
+const columnarLibrary = "kingres_columnar"
+
+// preloadList is the value of shared_preload_libraries for an instance of this installation: PreloadLibraries, without kingres_columnar when the
+// installation has no such library file in its package library directory (a package that was not upgraded with kingresd, an image that mixes versions).
+// The answer is looked up each time: the directory is read through pg_config, which is cheap, and a package that is upgraded while kingresd runs is seen.
+func (m *Manager) preloadList() string {
+	if m.libraryExists(columnarLibrary) {
+		return PreloadLibraries
+	}
+	return strings.TrimSuffix(PreloadLibraries, ","+columnarLibrary)
+}
+
+// columnarMarker is the file in the directory of an instance that says the instance has had kingres_columnar in its preload list.
+const columnarMarker = "columnar-preload"
+
+// markColumnarPreload records that the instance preloads kingres_columnar (the managed file at hand names it), so that the library is never taken out of the
+// list of an instance that may have columnar tables because the file is missing for a moment (a package upgrade removes the old library before it installs the new).
+func (m *Manager) markColumnarPreload(id int, managed string) {
+	if !libraryIn(preloadOf(managed), columnarLibrary) {
+		return
+	}
+	if dir, err := m.Dir(id); err == nil {
+		_ = os.WriteFile(filepath.Join(dir, columnarMarker), []byte("1\n"), 0o600)
+	}
+}
+
+func libraryIn(list, lib string) bool {
+	for _, n := range strings.Split(list, ",") {
+		if strings.TrimSpace(n) == lib {
+			return true
+		}
+	}
+	return false
+}
+
+// preloadListFor is preloadList for an instance: when the installation has no library file but the instance has had it in its list (it may have columnar
+// tables), the library stays in the list and a warning says that the instance will not start until the library is back. A new instance, which never had it, gets
+// the list without it.
+func (m *Manager) preloadListFor(id int) string {
+	if m.libraryExists(columnarLibrary) {
+		return PreloadLibraries
+	}
+	if dir, err := m.Dir(id); err == nil {
+		if _, err := os.Stat(filepath.Join(dir, columnarMarker)); err == nil {
+			m.log.Warn("the installation has no kingres_columnar library file, and this instance has preloaded it before and may have columnar tables: the library stays in its list, "+
+				"and the instance cannot start until the package that has the file is installed", "instance", id)
+			return PreloadLibraries
+		}
+	}
+	return m.preloadList()
+}
+
+// libraryExists tells whether the installation has the library file lib (lib.so, or the extension of the platform), through pg_config --pkglibdir.
+// When pg_config cannot be run the library is assumed to be there, which is what the product did before.
+func (m *Manager) libraryExists(lib string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := m.run(ctx, "pg_config", "--pkglibdir")
+	if err != nil || out == "" {
+		return true
+	}
+	for _, ext := range []string{".so", ".dylib", ".dll"} {
+		if _, err := os.Stat(filepath.Join(out, lib+ext)); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // CheckValue asks PostgreSQL's own parser whether a value is valid for a parameter of PostgreSQL
@@ -171,6 +281,10 @@ func (m *Manager) CheckValue(ctx context.Context, id int, name, value string) er
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	out, err := m.run(ctx, "postgres", "-D", data, "-c", name+"="+value, "-C", name)
+	return postgresCheckError(out, err)
+}
+
+func postgresCheckError(out string, err error) error {
 	if err == nil {
 		return nil
 	}
@@ -180,4 +294,127 @@ func (m *Manager) CheckValue(ctx context.Context, id int, name, value string) er
 		}
 	}
 	return fmt.Errorf("instance: postgres -C: %w", err)
+}
+
+// CheckConfig asks PostgreSQL's own parser whether the files of the instance, the override file
+// included, can be loaded as they are now (postgres -C over the whole configuration). A restart that
+// would fail on a value the parser refuses is found here, before the instance is stopped (P13R-02).
+func (m *Manager) CheckConfig(ctx context.Context, id int) error {
+	data, err := m.DataDir(id)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	out, err := m.run(ctx, "postgres", "-D", data, "-C", "data_directory")
+	return postgresCheckError(out, err)
+}
+
+// MarkConfigGood keeps a copy of the override file as the last one an instance ran with
+// (kingres-config.conf.good): a restart that cannot start the instance puts it back.
+func (m *Manager) MarkConfigGood(id int) error {
+	p, err := m.ConfigPath(id)
+	if err != nil {
+		return err
+	}
+	b, err := os.ReadFile(p) //nolint:gosec // path below the manager root
+	if err != nil {
+		return err
+	}
+	return writeAtomic(p+".good", b)
+}
+
+// EmptyConfigText is the override file without any value.
+const EmptyConfigText = "# Generated by kingresd. Do not edit: changes are overwritten.\n"
+
+// RestoreGoodConfig puts back the last file the instance started with, or the empty override file when none was kept
+// (never the file that WriteConfig replaced, which can be a bad one: two changes made before a restart, P13S-01).
+func (m *Manager) RestoreGoodConfig(id int) error {
+	p, err := m.ConfigPath(id)
+	if err != nil {
+		return err
+	}
+	b, err := os.ReadFile(p + ".good") //nolint:gosec // path below the manager root
+	if errors.Is(err, fs.ErrNotExist) {
+		b = []byte(EmptyConfigText)
+	} else if err != nil {
+		return err
+	}
+	return writeAtomic(p, b)
+}
+
+func firstLineOf(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) > 300 {
+		s = s[:300]
+	}
+	return s
+}
+
+// rolledBackMark is the file that says the last start went back to the last good override file.
+func (m *Manager) rolledBackMark(id int) (string, error) {
+	p, err := m.ConfigPath(id)
+	return p + ".rolledback", err
+}
+
+// fallBackToGoodConfig puts the last good override file back when the file now is another one, and leaves a mark with
+// the reason. It reports whether it changed the file (then a second start is worth trying).
+func (m *Manager) fallBackToGoodConfig(id int, why string) bool {
+	p, err := m.ConfigPath(id)
+	if err != nil {
+		return false
+	}
+	cur, err := os.ReadFile(p) //nolint:gosec // path below the manager root
+	if err != nil {
+		return false
+	}
+	want, err := os.ReadFile(p + ".good") //nolint:gosec // path below the manager root
+	if err != nil {
+		want = []byte(EmptyConfigText)
+	}
+	if string(cur) == string(want) {
+		return false
+	}
+	if err := writeAtomic(p, want); err != nil {
+		return false
+	}
+	if mark, err := m.rolledBackMark(id); err == nil {
+		_ = writeAtomic(mark, []byte(why+"\n"))
+	}
+	m.log.Warn("the instance did not start with its override file; the last good file was put back", "instance", id, "reason", why)
+	return true
+}
+
+// TakeRollbackMark returns, and removes, the reason a start went back to the last good override file ("" and false when
+// it did not). The configuration task asks before and after a restart.
+func (m *Manager) TakeRollbackMark(id int) (string, bool) {
+	mark, err := m.rolledBackMark(id)
+	if err != nil {
+		return "", false
+	}
+	b, err := os.ReadFile(mark) //nolint:gosec // path below the manager root
+	if err != nil {
+		return "", false
+	}
+	_ = os.Remove(mark)
+	return strings.TrimSpace(string(b)), true
+}
+
+// AdoptGoodConfig keeps the override file of a running instance as its last good one when none was kept yet (an
+// instance that started before the console could configure it, and has not been started since). The file a running
+// instance holds at kingresd's start is the one it started with, or one a reload took, so it is the best there is.
+func (m *Manager) AdoptGoodConfig(ctx context.Context, id int) {
+	p, err := m.ConfigPath(id)
+	if err != nil {
+		return
+	}
+	if _, err := os.Stat(p + ".good"); err == nil {
+		return
+	}
+	if up, _ := m.Running(ctx, id); up {
+		_ = m.MarkConfigGood(id)
+	}
 }

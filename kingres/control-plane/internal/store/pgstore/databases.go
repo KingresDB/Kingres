@@ -5,6 +5,7 @@ package pgstore
 import (
 	"context"
 	"encoding/json"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"sort"
 	"strings"
 
@@ -12,6 +13,7 @@ import (
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/transfer"
 )
 
 // databaseRow is a row of pg_database with the size and connection count.
@@ -63,6 +65,10 @@ type dbProbe struct {
 	// bucketCount is the largest colocation bucket count; nil when the
 	// database has no colocation group.
 	bucketCount *int
+	// mode and distributeNew are the sharding mode of the database (extension 0.8); "" for an older one.
+	mode          string
+	distributeNew bool
+	schemaCount   *int
 }
 
 func (s *Store) probeDatabase(ctx context.Context, db string) dbProbe {
@@ -75,18 +81,38 @@ func (s *Store) probeDatabase(ctx context.Context, db string) dbProbe {
 SELECT (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition
           AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'kingres', 'kingres_cp')
-          AND n.nspname !~ '^pg_(toast|temp)'),
-       to_regclass('kingres.bucket_map') IS NOT NULL,
-       to_regclass('kingres.ledger_blocks') IS NOT NULL`).Scan(&probe.tableCount, &probe.hasShard, &probe.hasLedger)
+          AND n.nspname !~ '^pg_(toast|temp)')`).Scan(&probe.tableCount)
 	if err != nil {
 		s.opts.Logger.Debug("cannot probe database", "database", db, "error", err)
 		return dbProbe{}
 	}
 	probe.ok = true
+	// A database whose extension schema cannot be trusted, or cannot be checked, is not readable: it is not shown as a database without sharding or ledger
+	// (extguard; the monitor raises the alert).
+	for _, ext := range []string{extguard.Shard, extguard.Ledger} {
+		if _, err := s.extInfo(ctx, p, ext); err != nil {
+			s.opts.Logger.Debug("cannot probe database: its extension schema is not usable", "database", db, "extension", ext, "error", err)
+			return dbProbe{}
+		}
+	}
+	// The relations count only when the extension is installed and its schema is trusted (extguard); the same for the sharding settings below.
+	probe.hasShard, _ = s.regclassExists(ctx, p, "kingres.bucket_map")
+	probe.hasLedger, _ = s.regclassExists(ctx, p, "kingres.ledger_blocks")
 	if probe.hasShard {
 		var n *int
 		if err := p.QueryRow(ctx, "SELECT max(bucket_count) FROM kingres.colocation").Scan(&n); err == nil {
 			probe.bucketCount = n
+		}
+		var hasMode bool
+		if hasMode, _ = s.regclassExists(ctx, p, "kingres.sharding_settings"); hasMode {
+			_ = p.QueryRow(ctx, "SELECT mode, distribute_new_schemas FROM kingres.sharding_settings").Scan(&probe.mode, &probe.distributeNew)
+			var n int
+			if err := p.QueryRow(ctx, "SELECT count(*) FROM kingres.dist_schema").Scan(&n); err == nil {
+				probe.schemaCount = &n
+			}
+			if probe.mode == "schema" {
+				probe.bucketCount = nil
+			}
 		}
 	}
 	return probe
@@ -149,6 +175,7 @@ func (s *Store) buildDatabases(ctx context.Context, name string) ([]api.Database
 			by, at, mode := st.createdBy, st.createdAt, st.ledgerMode
 			db.CreatedBy, db.CreatedAt = &by, &at
 			db.Ledger.Mode, db.Ledger.DigestIntervalSeconds = &mode, st.digest
+			db.ApproximateAggregates = &api.DatabaseApproximate{Enabled: st.approxEnabled, CountDistinct: st.approxDistinct}
 			if st.sharding && st.bucketCnt != nil && db.Sharding.BucketCount == nil {
 				db.Sharding.BucketCount = st.bucketCnt
 			}
@@ -245,20 +272,27 @@ func (s *Store) ClusterSettings(ctx context.Context) (api.ClusterSettings, error
 	if err := p.QueryRow(ctx, "SELECT current_setting('synchronous_commit')").Scan(&sc); err != nil {
 		return api.ClusterSettings{}, s.wrap("reading synchronous_commit", err)
 	}
-	var shard, ledger bool
-	if err := p.QueryRow(ctx, `SELECT to_regclass('kingres.node') IS NOT NULL,
-		to_regclass('kingres.ledger_blocks') IS NOT NULL`).Scan(&shard, &ledger); err != nil {
-		return api.ClusterSettings{}, s.wrap("checking features", err)
+	shard, err := s.regclassExists(ctx, p, "kingres.node")
+	if err != nil {
+		return api.ClusterSettings{}, err
+	}
+	ledger, err := s.regclassExists(ctx, p, "kingres.ledger_blocks")
+	if err != nil {
+		return api.ClusterSettings{}, err
 	}
 	out := api.ClusterSettings{
 		DefaultReplicaCount: cat.replicaCount(),
 		DefaultDurability:   durabilityOf(sc),
 		AutoFailover:        api.AutoFailoverSettings{Enabled: false, TimeoutSeconds: 120, MaxCount: 1},
-		Rebalance:           api.RebalanceSettings{MaxConcurrentMoves: 4},
-		Features:            api.FeatureFlags{Sharding: shard, Ledger: ledger},
-		Restart:             api.RestartState{ServerIDs: []string{}},
-		Clock:               &api.ClockSettings{MaxDifferenceMs: 1000},
+		Rebalance: api.RebalanceSettings{MaxConcurrentMoves: 4, Strategy: "byBucketCount", MaxMovesPerServer: 2, MaxMoveAttempts: 3,
+			MaxDiskUsedFraction: 0.85, MaxStandbyLagBytes: 64 << 20, Automatic: defaultAutomatic()},
+		Features:  api.FeatureFlags{Sharding: shard, Ledger: ledger},
+		Restart:   api.RestartState{ServerIDs: []string{}},
+		Clock:     &api.ClockSettings{MaxDifferenceMs: 1000},
+		Analytics: &api.AnalyticsSettings{},
 	}
+	dt := transfer.DefaultSettings()
+	out.DataTransfer = dt.API()
 	// Values the administrator set (kingres_cp.cluster_setting) win over the
 	// defaults derived from the catalogs.
 	if ok, _ := s.regclassExists(ctx, p, "kingres_cp.cluster_setting"); ok {
@@ -305,17 +339,63 @@ func (s *Store) ClusterSettings(ctx context.Context) (api.ClusterSettings, error
 				if json.Unmarshal(v, &n) == nil {
 					out.Clock = &api.ClockSettings{MaxDifferenceMs: n}
 				}
+			case "analytics.allowNonSuperuserOwners":
+				if json.Unmarshal(v, &b) == nil {
+					out.Analytics = &api.AnalyticsSettings{AllowNonSuperuserOwners: b}
+				}
 			case "rebalance.maxConcurrentMoves":
 				if json.Unmarshal(v, &n) == nil {
 					out.Rebalance.MaxConcurrentMoves = n
 				}
+			case "rebalance.strategy":
+				if json.Unmarshal(v, &str) == nil {
+					out.Rebalance.Strategy = str
+				}
+			case "rebalance.threshold":
+				var f float64
+				if json.Unmarshal(v, &f) == nil && string(v) != "null" {
+					out.Rebalance.Threshold = &f
+				}
+			case "rebalance.maxMovesPerServer":
+				if json.Unmarshal(v, &n) == nil {
+					out.Rebalance.MaxMovesPerServer = n
+				}
+			case "rebalance.maxMoveAttempts":
+				if json.Unmarshal(v, &n) == nil {
+					out.Rebalance.MaxMoveAttempts = n
+				}
+			case "rebalance.maxDiskUsedFraction":
+				var f float64
+				if json.Unmarshal(v, &f) == nil {
+					out.Rebalance.MaxDiskUsedFraction = f
+				}
+			case "rebalance.automatic.enabled", "rebalance.automatic.strategy", "rebalance.automatic.threshold", "rebalance.automatic.checkIntervalSeconds",
+				"rebalance.automatic.settleSeconds", "rebalance.automatic.settleAfterTopologySeconds", "rebalance.automatic.minIntervalSeconds",
+				"rebalance.automatic.failoverSettleSeconds", "rebalance.automatic.window":
+				applyAutomatic(out.Rebalance.Automatic, strings.TrimPrefix(k, "rebalance.automatic."), v)
+			case "rebalance.maxStandbyLagBytes":
+				var b int64
+				if json.Unmarshal(v, &b) == nil {
+					out.Rebalance.MaxStandbyLagBytes = b
+				}
+			default:
+				dt.Apply(k, v)
 			}
 		}
+		out.DataTransfer = dt.API()
 		if err := rows.Err(); err != nil {
 			return out, s.wrap("reading kingres_cp.cluster_setting", err)
 		}
 	}
 	return out, nil
+}
+
+func modeFlag(p dbProbe) *bool {
+	if p.mode == "" {
+		return nil
+	}
+	b := p.distributeNew
+	return &b
 }
 
 // newDatabase builds the response for one database. Values that no catalog
@@ -329,7 +409,7 @@ func newDatabase(r databaseRow, probe dbProbe, replicas int, durability string) 
 		Name: r.name, Status: "ready",
 		General: api.DatabaseGeneral{Owner: &r.owner, Encoding: &r.encoding, LCCollate: &r.collate,
 			LCCtype: &r.ctype, ConnectionLimit: &r.connLimit},
-		Sharding:    api.ShardingSettings{Enabled: probe.hasShard, BucketCount: probe.bucketCount},
+		Sharding:    api.ShardingSettings{Enabled: probe.hasShard, BucketCount: probe.bucketCount, Mode: probe.mode, DistributeNewSchemas: modeFlag(probe)},
 		Replication: api.ReplicationSettings{Durability: &durability, ReplicaCount: replicas},
 		Stats:       api.DatabaseStats{SizeBytes: &r.sizeBytes, ActiveConnections: &r.connections},
 		Health:      api.DatabaseHealth{UnderReplicatedBuckets: &zero, UnavailableBuckets: &zero},
@@ -337,6 +417,7 @@ func newDatabase(r databaseRow, probe dbProbe, replicas int, durability string) 
 	if probe.ok {
 		tables := probe.tableCount
 		db.Stats.TableCount = &tables
+		db.Stats.DistributedSchemaCount = probe.schemaCount
 	}
 	if !probe.hasLedger {
 		off := "off"
@@ -359,7 +440,8 @@ func (s *Store) DatabaseCreateOptions(ctx context.Context) (api.DatabaseCreateOp
 	}
 	out := api.DatabaseCreateOptions{
 		Encodings: []api.EncodingOption{}, Collations: []api.CollationOption{},
-		BucketCount:                 api.IntegerRange{Default: 128, Minimum: 1, Maximum: 4096},
+		BucketCount:   api.IntegerRange{Default: 128, Minimum: 1, Maximum: 4096},
+		ShardingModes: []string{"row", "schema", "both"}, ShardingModeDefault: "row",
 		LedgerDigestIntervalSeconds: api.IntegerRange{Default: 3600, Minimum: 60, Maximum: 86400},
 	}
 	var defEnc, defCollate string

@@ -1772,3 +1772,43 @@ Each was applied by changing the installed install script of PostgreSQL 18 and r
 | M17 | the undo has no lock timeout | `t/206` E |
 | M18 | the switch keeps the default deadlock timeout | `t/206` D |
 | M19 | the old batch function (held rows counted with a new snapshot) | `t/206` B |
+
+## 22. The control plane of increments 2 to 4 and the split as built (contract 0.15.0): decisions and departures
+
+**Decision: a drain is a task of kind `rebalance`, not of kind `server.drain` (departs from sections 9.1 and 11.3).** `drainServer` submits the task `rebalance` (subject `cluster`/`cluster`) with the
+options `trigger = drain`, `drainOnly`, the drained server, `removeWhenDone` and `acceptFewerReplicas`. Reason: everything the control plane already does for a rebalance is keyed by that kind and subject, and a drain must
+have all of it: the database triggers that exclude server operations and failovers (migrations 0009 to 0016, `KX001`/`KX002`), the in-memory exclusion of the task store, the pause of a rebalance by a failover (`mapgroup.go`),
+`rebalance_in_progress` for `PATCH /servers`, the counting in `facts.go` and the read model, one stop, resume and cancel path, the report with the id of the task, and the alert. A separate kind would need each of
+those places changed and tested again, and the design wants the same exclusion ("the rebalance lock is held for the duration"). The cost: the task list shows `rebalance` for a drain (the status and the report say
+`trigger: drain`), and a drain and a rebalance exclude each other, which they should. The extra steps of a drain are steps of the same task that a plain rebalance skips (`task.Skip`): the flag first, the wait until the
+server owns no bucket (including moves in `cleaning`), and the removal, which is the `server.remove` task started after the drain task has ended (the two exclude each other); a manager that restarts in between leaves the
+server drained and not removed.
+
+**Not built in this round: steps 4 and 5 of section 11.3** (hand-over of the map group, relocation of the standbys hosted on the server). `drainServer` refuses a server that runs the map group primary
+(`server_hosts_map_group`) and a drain that would leave fewer servers than `replicaCount + 1` (`replicas_cannot_be_kept`, `acceptFewerReplicas` overrides); `previewServerDrain` lists the groups whose standby runs on the server.
+
+**Automatic mode (section 8).** The safety rules are the pure function `SafetyBlockers`; an automatic run is paused by `autoGuard` before each move (`stoppedBy: safetyRule`) and resumed by the job when the rules have held for
+`settleSeconds`. The "last topology change" is the newest of `server.joined_at`, the end of a server task and `topology.changedAt`, which `updateServer` writes when it changes the flag or the weight. The disk rule uses the existing
+per-move check (`Disk`); the rules `maxStandbyLagBytes` and the window are settings, the lag rule is not evaluated yet (no lag source in the read model of the leader).
+
+**Split (section 9.3).** The preview cannot find a table without a primary key (the owner's tables are not readable from the map group primary); the extension refuses it when `split_bucket` starts and the task fails with
+`split_unsupported`. The task does not wait for the orphans to be dropped (`cleanup_bucket_splits` is the recovery worker's). The size estimate comes from the extension's plan inputs (`internal_plan_inputs('by_disk_size', ...)`).
+
+**Corrections to section 22 (same round).**
+
+- *`Make the schema distributed` of phase 11 is not marked `NonIdempotent` (departs from shard-phase11.md 13.1).* The design marks the step so that an interrupted run fails with `step_interrupted` instead of calling
+  `distribute_schema` twice. The step reads `kingres.schemas` before it calls the function and does nothing when the schema is distributed already, which is the design's own remedy for a retry ("its result is known by reading
+  `kingres.dist_schema`"). The function is one two-phase transaction, so after an interruption the schema is either distributed or not, and the read says which. With the mark, a crash of the leader between the call and the record of
+  the step would fail a task whose work is done and ask a person to look; without it the task finishes. A call that was cut while still running is refused by the extension as "already distributed" only if the transaction committed, which is the case the read finds first.
+- *Step 5 of the drain (section 11.3, the standbys hosted on the server) is built; step 4 (the map group) is not built yet.* Step 5 is the standby reconcile of phase 5 (`standby.Leader`) with the draining server taken out of its ring
+  (the hook `Excluded`, fed by the cluster setting `drain.excludedServers`, which a return to service clears), then a wait until no `kingres.node` row of role standby is on the server. It has unit tests (`standby/exclusion_test.go`, `rebalance/drain_test.go`)
+  and no cluster test yet. Step 4 (the map group) is the planned switchover of the map group of the failover branch
+  (the old leader hands the bootstrap to a standby of group 0 on another server, `server.failover` graceful for group 0), after which the drain task continues on the new leader. Until step 4 exists `drainServer` refuses a server that
+  runs the map group primary (`server_hosts_map_group`); a server whose standbys the others cannot take fails the relocation step with `replicas_cannot_be_kept` (or ends it with fewer standbys under `acceptFewerReplicas`).
+
+**Cancelling a split, and its limit.** The extension looks at a request to cancel (`cancel_bucket_split(id)`) only during the backfill, before each batch of rows is copied; after the backfill it cannot stop the split, and it refuses the request while the split is switching.
+The step `Split the bucket` is not interruptible by the engine (an interrupted step ends the task as cancelled whatever the extension does). The step itself watches for the request (every second), passes it on and says truthfully what came of it:
+(a) the request reached the backfill: the extension undoes the split (the children and the triggers go, the bucket is `active` again) and the task **fails with the code `cancelled`** and the text "The split was cancelled before its switch and undone: the bucket is unchanged"; the bucket can be split again;
+(b) the request came too late (the extension refused it, or accepted it and the split completed all the same): the task records in its detail "The cancel request came too late: the split had passed its backfill and goes on to its end", **goes on and ends `done`** (the step `Check the new buckets` runs), and the bucket list shows the children. A task is therefore never `cancelled` while the split completes.
+The cancel guard of the kind (`splitCancellable`) accepts a cancel until the split step is done or the "too late" note is recorded; a cancel after that is answered 409 `task_not_cancellable`, which is the truthful answer. A split whose session is lost (a restart of `kingresd`) is not touched by a lost lease or a shutdown: the task is taken over, finds the record and settles it with
+`resume_bucket_splits()`. The cluster test of the split shows both cases (the gate `split_after_triggers` for the undo, `split_after_backfill` for the late cancel, which ends done with the children in the bucket list).

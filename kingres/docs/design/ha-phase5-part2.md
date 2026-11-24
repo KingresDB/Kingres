@@ -876,6 +876,9 @@ differs from a dead OLD:
   stops with it; the task row (replicated to the candidate before the stop, and `switchover_verify` asks the
   same thing for the data) is claimed by the new leader's engine after B8, and its step "hand over" finds the
   work done.
+  **Status (2026-11-21): not built.** A failover, a switchover or a restore that involves the map group while the server of its primary is alive is
+  refused today with 422 `unsupported_operation`, and the bootstrap refuses a live old server (it cannot ask it to demote: those calls are the
+  leader's). The delta that builds it is the last section of this document.
 
 ### 3.6 Choosing the standby
 
@@ -2499,7 +2502,7 @@ The review (`docs/reviews/2026-11-20-kingresd-failover-increments-4-7.md`) found
   *Open:* the decision `allowDataLoss` of an operator is still carried in the body by the member that received the request; a member that is not honest can
   set it (a signed assertion of the operator's session is the remedy and is not built).
 - **F4-06.** A map bootstrap that did not reach the promotion is given up by the candidate monitor when the catalog has a newer term or it is 15 minutes old
-  (`Journal.Abandon`, `journal.Stuck`); a promoted one cannot be given up. *Open:* no operator call to abandon (it would be a contract change).
+  (`Journal.Abandon`, `journal.Stuck`); a promoted one cannot be given up. The operator's call to abandon is `abandonMapGroupBootstrap` (contract 0.18.0, `POST /failover/map/abandon`).
 - **F4-07.** The call that promotes carries the shutdown checkpoint and the state, and the callee makes `switchover_verify` again before it changes anything; a
   refusal (`unprovable`, `standby_behind`) is a rollback.
 - **F4-08.** `task.Step.Interruptible`: a cancel ends a running step of the kind (when the guard allows it) within one poll, not at its end; the steps of a
@@ -2522,4 +2525,200 @@ down: `takeFence` rolls it back through the path of every failure (`quorum_unava
 still holds. A plain failover still pauses.
 
 **Open after the review (listed for later):** F4-05, the decision `allowDataLoss` of an operator that a member carries in the body of `start` (a signed assertion of the
-operator's session is the remedy); F4-06, an operator's call to abandon a stuck map bootstrap (a contract change; the monitor gives up a stale one by itself).
+operator's session is the remedy, built 2026-11-21 as the signed form of `map/start`); F4-06 is closed in 0.18.0 (`abandonMapGroupBootstrap`).
+
+### Increment 7, round 2 (the restore of the preferred primaries, the plan of a switchover, the phases, 2026-11-20)
+
+Contract unchanged (0.13.0): the restore operation, the plan and the status schemas were declared in 0.10.0; the text of the operations says how
+`kingresd` behaves.
+
+- **Restore** (`internal/failover/restore.go`): the task `replication.restorePreferredPrimaries` (subject `replication` / `preferred-primaries`) is the
+  steps of a switchover over other groups. `Input.Olds` says, per group, which server runs the primary now (a restore spans servers) and
+  `Input.Targets` the preferred server, the server of the group's first node by id; every place that took the old server from `Input.ServerID` takes it
+  from `oldOf(group)`. A group whose primary is at home is not listed; a group whose preferred server has no ready, registered standby is skipped
+  (`preferredNotReady`); the map group is skipped (`mapGroup`: the planned switchover of the map group is not built). Skipped groups are rows of the report with
+  state `skipped` and the reason. `failover_run.kind` is `restorePreferredPrimaries` (no migration: the column and its check exist from 0011), a restore pauses and
+  resumes like a failover (the resume keeps the input it was started with), and the rebalance refuses to start while one is unfinished.
+- **A group that fails before its promotion** is rolled back by the step that failed; the wrapper of the step (`restoreContinues`) then records the group
+  `failed` with the code and message, and the remaining steps of that group do nothing; the next group is run and the task ends with the outcome `partial`
+  (5.5, 4). A failure after the promotion, a pause, a lost lease and a stopped context are not turned: they are the task's.
+- **Plan** (`dryRun`): for `graceful` and `restore` the candidates that do not stream are not eligible, the verdict is `none`, the group has `writesPausedSeconds`
+  (an estimate of ten seconds) and `estimatedSeconds` (a minute), the steps are those of a switchover. The plan of a restore has no `serverId`.
+- **Phases and the pause.** `GET /failover` takes the phase of a group of a switchover or restore from the task's steps (the first step of the group that is not done:
+  `checking`, `choosing`, `quiescing`, `waitingForTransactions`, `stopping`, `verifying`, `waitingForLease`, `promoting`, `followingCatalog`, `repointing`,
+  `finishing`) and `writesPausedSince` from the event `quiesced` of the group while no later `writesResumed`, `rolledBack` or `groupFailed` event exists.
+  The phases of a hard failover are the earlier ones (from the state of the group's row).
+- **Not built.** The map group in a restore (and the planned switchover of the map group); the skipped groups are in the report, not in the plan; the adoption
+  `/standby/adopt {clean}` (the old primary is rebuilt, `pg_rewind`, as in round 1).
+- **Tests.** Unit: `internal/failover/restore_test.go` (resolving, skipping, the hand-back, a failed group, skipped rows, the plans, the phases). Cluster
+  (`internal/clustertest/failover_restore_test.go`): T12 `TestSwitchoverAndBack` (plan, switchover, restore, no loss, a second restore refused) and
+  `TestSwitchoverStatusNamesThePhaseAndThePause`.
+
+### Increment 7, round 2: the map group with a live old leader (design delta, 2026-11-21; not built)
+
+What the code does today, read for this delta. (1) A request for the server that runs the primary of the map group is taken by the bootstrap only when that server is not heard
+(`mapFailover.Handles`), and only in mode `hard`. (2) When the old leader answers, the request goes through the leader's task, whose `Preflight` refuses group 0 with
+`unsupported_operation` (422): the failover of a live leader's server, a switchover of the map group and a restore that has to move the map group are all refused. (3) The branch of
+`mapgroup.takeFence` that asks a live old server to demote (design 3.5, last bullet) cannot work as it stands: `POST /failover/demote`, `/failover/lease`, `/failover/state`,
+`/failover/quiesce`, `/failover/mark` and `/failover/verify` are `LeaderOnly`, and the candidate is not the leader, so the callee answers `not_leader` and the bootstrap logs
+the event and goes on to wait for the lease to run out. (4) The old leader's task cannot be recorded once its own instance is stopped, because the system database is that instance.
+
+The shape that fits these facts, for `graceful`, for a `hard` failover of a live leader's server, and for a restore that includes group 0:
+
+1. **The leader's task makes every call to the old server, as it does for any group; the candidate only takes over.** The calls that stop things stay `LeaderOnly` and fenced.
+   The old leader's own task runs them against its own server (a call to itself over the internal API, as today).
+2. **Group 0 is the last group of the task** (a restore and a multi-group failover order the groups so; the other groups are done by the old leader as usual). For group 0 the steps
+   are the steps of a switchover up to `Stop the writes` and `Let distributed transactions end` (the hold rules keep the service role's loopback lines, so the task can still
+   write its own rows while the clients are held), then:
+   - `Start the bootstrap`: the leader calls `POST /failover/map/start` on the chosen standby's server (the choice is the streaming standby of F4) with the term, the requester, the
+     comment, the id of its task and `planned: true`. The candidate runs B1 with a live old server (manual only, as today), B2 (its freeze), and then **waits at B3** until the old
+     server's instance is stopped cleanly; it never calls the old server.
+   - `Stop the old primary cleanly`: the leader marks, waits for the standby's replay, and stops with `fast`, as in round 1. This is the last thing the old leader's engine does.
+   The step cannot be recorded done: the instance that holds the task row is gone. That is intended; see 3.
+3. **The new leader's engine claims the task.** The row replicated to the standby before the stop says `running`, the step `Stop the old primary cleanly` `running`, and the
+   task's lease is expired for the new leader. The engine claims it once its gate is open (B8), and the steps that are not recorded done run again; each of them is idempotent
+   for this case and says so: the stop reads the shutdown checkpoint again with the idempotent `demote fast` call (the old server's kingresd answers a call of the new leader
+   through the held-back rule of the callee), the verify and the hand-over of the lease find the work done, `Promote` answers `already`, `promote_node` answers `already` with
+   `final`. The bootstrap does not insert a task for a `planned` journal (`RecordTask` returns the id of the task named in the journal), so there is one task, the operator's.
+4. **The proof.** The promotion of the candidate carries the shutdown checkpoint (F4-07): the bootstrap reads it from the old server with `demote fast` (the leader's engine
+   made the stop, and the old server's kingresd is up), and `switchover_verify` runs on the candidate before `pg_promote`. A refusal is not a rollback here: the old primary is
+   stopped, so it has to be started again (open point 1) or the bootstrap pauses with `failoverNeedsDecision`.
+5. **Rollback before the stop** is the rollback of round 1 (the leader releases its leases, resumes, lets the writes in) plus `POST /failover/map/abandon`-like cleanup of the
+   candidate's journal (`Journal.Abandon`, F4-06): the candidate gives up a `planned` journal when the old server is still running after the task ended or the task is gone.
+
+Open points to settle before building (each needs the cluster, not a unit test):
+1. After the stop of the old leader the leader role is vacant until B7; a refusal of the proof then leaves a stopped old primary and no leader. Who restarts it: the candidate's
+   monitor, by the same path as a map group whose old primary came back (`Resume` through the lease rounds of the old server: the wait marker, then a won lease). To be shown
+   by a cluster test with the fault `verify:false` on the candidate.
+2. The fence of the re-run steps: the old server's fence cache for the task is in the system database that is stopped; the new run has epoch + 1 and the callee must accept it
+   from the new leader. To be shown by T5-like test with the leader's kingresd ended at the stop step.
+3. `GET /failover/state` is `LeaderOnly`: the bootstrap cannot read the old server's state, so the wait at B3 reads the old server's position through `GET /failover/position`
+   (`AnyPeer`), which says whether the instance answers. That is enough to wait; the checkpoint comes with the call of the engine's re-run.
+4. A restore with the map group first would have its other groups run by the new leader's engine; with the map group last, everything is the old leader's except the final
+   hand-over. The order of the groups in a restore is therefore: ascending, group 0 last.
+
+Work in order: (a) unit tests on fakes of the bootstrap with `planned: true` (wait at B3, no task inserted, the proof carried); (b) `Preflight` and `Resolve` accept group 0 with a live old
+server (the three modes), group order; (c) the two steps and their idempotent re-run; (d) the cluster tests: switchover of the map group, the leader ending at the stop, a refused
+proof, the restore with the map group. Contract: none (the operation texts say that group 0 is allowed); the 422 for group 0 is lifted.
+
+### For the independent review of the whole part (increment 9, 2026-11-21)
+
+What a reviewer who did not write it should read, in the order of the risk, and what to try to break. The earlier reviews are in `docs/reviews/` (F3, and F4-01 to F4-17).
+
+1. **The proof around a promotion** (`internal/failover/steps.go` promote, `cmd/kingresd/failover.go` promote handler, `internal/standby` freeze): the term, the fence of the run, the lease attached to the promoted instance, the checkpoint proof of a switchover. Try: a late call of a superseded run at every step; a promote whose answer is lost; a restart of the leader between the promotion and its record.
+2. **The rollback paths** (`switchover.go`: `rollbackSwitchover`, `failedPastPromotion`, `rollbackFailed`; `repair.go`): a group must never be resumed once the promotion may have happened, and a held group must never stay held. Try: every failure and cancel at every step with the leader's kingresd ended at the same time.
+3. **The leases** (`internal/lease`): the fence lease adoption and its attach, the markers and the start gate, the bounded topology read, the log of a lost lease. Try: a loaded machine (rounds that arrive late), a killed server out of three, a catalog that does not answer, a watchdog that stops a primary whose kingresd was away longer than the lease (the case of the catalog step, where the new primary's lease lived only in the memory of the killed kingresd).
+4. **The map group bootstrap** (`internal/failover/mapgroup`, `journal`, `cmd/kingresd/mapfailover.go`, `mapmonitor.go`): the freeze that is asked for again, the candidate monitor, the abandon of a stuck journal, the engine gate. Try: two candidates; a candidate that is restarted at every boundary; a leader that comes back after the promotion. A live old leader: a planned switchover and a restore move the map group (built, round 2); a hard failover of a live leader's server is refused.
+5. **The old primary** (`internal/standby/oldprimary.go`, `internal/instance/quiesce.go`, `standby.go` `SyncAccess`): the proof that a directory is the former primary of the group, the hold rules and their backup, the rules that are copied to the standbys of a server. Try: a directory that looks like the old primary and is not; a rebuild interrupted at every step; a server whose only instance is a standby.
+6. **What the tests cannot show**: the gate runs of 2026-11-20 and 21 found instances of the shared cluster down, a leader's own lease lost a few seconds after a kill, and a new primary stopped while its server's kingresd was away; the first two are not explained (the logs that would explain them are now written). A review should read the code that stops an instance and ask who restarts it in every case.
+
+**Progress on the delta (2026-11-21).** Built and unit-tested on fakes: the bootstrap side. `journal.Planned` (the task id, the chosen standby, the proof), `mapgroup.Request.Planned`
+(a live old server is accepted only for it; everything else stays refused), B3 waits up to `PlannedWait` (4 min) for the lease the clean stop releases, B4 pins the old leader's
+choice only, B5 waits up to `ProofWait` (4 min) for the proof and promotes with it (a refusal by the callee is a pause with `failoverNeedsDecision`, because this server cannot
+start the old leader again), B7 records no task but names the old leader's. On the callee side `POST /failover/map/start` takes `planned` from the old server only, and
+`POST /failover/map/proof` takes the proof from the old server only. **At that moment not built (it is built, see the progress paragraph that follows):** the leader's side (the `Preflight` and `Resolve` that accept group 0 with a live old server,
+group 0 last in the order of a switchover and a restore, the step that calls `map/start` and the clean stop that sends the proof, the idempotent re-run of the steps on the new
+leader) and every cluster test; the four open points stood (they are settled below).
+
+### The clean stop holds the primary back and keeps its lease (`HoldBack`, 2026-11-21): the safety argument
+
+What changed. `demoteClean` (the callee of the clean stop of a planned switchover) used to call `Relinquish` before the fast shutdown: the marker `relinquished.<group>` was
+written and the renewal of the lease stopped, and the lease then ran out `duration - margin` after the last round, in the middle of a slow shutdown (a shutdown checkpoint on a
+slow disk, a walsender that has to send what is pending, a loaded machine). The lease manager fenced the instance with an immediate stop, the state was `shutting down`, and the
+step refused (`switchover_unproven`), safely but needlessly. Now `HoldBack` writes the same marker and does **not** stop the renewal; the renewal ends with `ReleaseGroup` when the
+stop was clean (the lease is handed back at once) and with `Relinquish` when it was not (not stopped, or a state other than `shut down`), after which the lease runs out and the
+fence stops whatever still runs, as before. The stop is bounded by its own context (120 s), not by the lease.
+
+What must stay true, and why it does.
+
+1. **A primary never acts beyond its lease.** The lease is renewed only by this kingresd's rounds, each of which needs a majority, and a renewal gives at most `duration` from its own
+   start. So the primary's authority ends at the last renewal plus `duration - margin` whatever happens next; `HoldBack` only moves the last renewal later, to the end of the stop.
+   During the held stop the primary does not write for clients: the hold rules of the quiesce (`pg_hba.conf` replaced, the sessions ended) were in force before the stop was asked for, and a
+   postmaster that is shutting down accepts no new connection. What it still does is what a shutdown does (the checkpoint, the walsenders sending the WAL that is pending to the standbys
+   and the subscribers), and the proof (`switchover_verify` against the shutdown checkpoint, state `shut down`) is the only thing a promotion rests on.
+2. **kingresd dies during the held stop.** The renewals stop with the process. The instance (the postmaster is not a child of kingresd) either finishes its shutdown by itself, which is
+   a clean stop whose lease then runs out at the grantors with nobody to renew it, or it hangs, and the watchdog (for an enforced group, which a switchover group always is: it has a
+   standby) stops it immediately when the lease file runs out, `duration - margin` after the last renewal, and writes the `fenced` marker. A restarted kingresd reads the marker
+   (`loadRelinquished`): the group is relinquished again in memory, so the restarted process does **not** renew it, which is the behaviour from before this change; and the primary is not
+   started (point 4). The leader's task, or the next run of it, repeats the stop (`demote fast` is idempotent: it finds the instance stopped, reads the checkpoint, and releases the
+   lease), or finds the state not `shut down` and rolls back or pauses; nothing is promoted without the proof.
+3. **The leader changes during the held stop.** The callee finishes the stop it began (it is local to the old primary's server). If the connection of the superseded run drops, the
+   request context ends: `Stop` is cut short, `Running` cannot be asked, the answer is `stopped: false`, and the callee ends the renewal (`Relinquish`) before it returns, so the lease
+   runs out and the watchdog or the lease manager fences what still runs; the new run, with a higher epoch, is the only one the callee accepts (the fence), reads the state again, and
+   takes the lease through the ordinary wait. The calls of the old run that arrive late are refused by the fence and the term. A second `demote fast` while the first still runs waits on
+   the lifecycle lock of the instance and finds it stopped. The repair loop does not undo the hold while a failover task is unfinished (a task whose lease expired counts as
+   unfinished), so it cannot resume the old primary under the new run.
+4. **The start gate.** The marker is on disk before the stop is asked for (`pki.WriteFile` is an atomic replace), so from the first moment of the held stop no start of the primary of
+   the group is accepted by this server: `lease.Gate` refuses on `relinquished`, `fenced` and `waitlease`, and the lease manager starts a primary only for `fenced` and `waitlease`
+   (`Waiting`), never for `relinquished`. The marker goes away only with `Unrelinquish` (the rollback, `Manager.Resume`, which then writes the wait marker when the instance does not run, so
+   that the rounds start it once the lease is held; with the renewal going on, that is at the next round) or with `BecameStandby` (the old primary rebuilt as a standby, after the role
+   file says standby). A fence that fires while the hold is on adds `fenced`; both markers refuse a start.
+5. **What did not change.** Another server cannot be granted the lease while the old one is renewed, exactly as before; the lease is still handed to the new holder only after the
+   release or the lapse; the old primary is still never promoted back by itself; `Relinquish` is still what ends the renewal of a stop that did not end cleanly; and the lapse of the
+   lease still fences, which is the safety of every other path.
+
+The cost, stated: a hung shutdown now holds the lease for up to the 120 s of the stop context instead of for `duration - margin`. During that time the group has no primary that takes
+clients (it is quiesced, and then shutting down) and no other holder; the task fails after it with the same refusal as before and rolls back, and the group takes writes again when the
+old primary is resumed. A shorter bound can be set by the stop context, not by the lease.
+
+Evidence. Unit: `internal/lease` `TestHoldBackKeepsRenewingThroughASlowStop` (a stop of three lease durations is not fenced; after `Relinquish` the lapse fences). Cluster:
+`TestSwitchoverSurvivesACleanStopThatOutlastsTheLease` (the fault `demote:slowstop` holds the stop for 20 s against a lease of 12 s with a margin of 3 s). The cluster test is to be
+shown failing on the old code (`Relinquish` in place of `HoldBack`) and passing on the new, in the gate that follows.
+
+**Progress on the delta (2026-11-21, later).** The leader's side is built for a planned switchover (`graceful`) and the restore: `Preflight` accepts group 0 for them when the task runs on the old leader's own server (a hard failover of a live leader's server stays 422), `mapLast` puts group 0 last, `stopClean` starts the bootstrap (`MapStart`, planned) before the mark and sends the proof (`MapProof`) after the stop, a rollback gives the bootstrap up (`MapAbandon`), the bootstrap marks the task's group 0 row promoted with the new term (`RecordPlanned`) and `runRowOf` reads that term, and the steps `Stop the old primary cleanly`, `Verify`, `Lease`, `Hand the lease` and `Promote` of group 0 skip on the new leader when the standby is out of recovery. Cluster: `TestSwitchoverOfTheMapGroup` passes on PostgreSQL 18 (the task ends done on the new leader, the leader is the standby's server, nothing acknowledged is lost). Open points 1 (who restarts the old leader after a refused proof) and 2 (the fence of the re-run on a leader change at the stop) have no cluster test yet.
+
+**The two open points of the delta, settled (2026-11-21, last).**
+1. *The standby refuses the proof after the old leader has stopped.* No operator is needed, because nothing was promoted and the lease decides who may run. The candidate's call
+   to promote carries the proof, the callee runs `switchover_verify` first, and a refusal (`unprovable`, `standby_behind`) ends the bootstrap: the candidate **lets go of the fence
+   lease** it holds (so that the old leader can win its own lease: it was released by the clean stop), tells the old leader (`POST /failover/map/refused`, accepted only from the
+   server the old leader's task asked to start the bootstrap), records the event `refused`, gives the journal up and returns `switchover_unproven`. The old leader's task does not
+   end at the proof: `Stop the old primary cleanly` waits for the verdict (the candidate promoted, or refused, or `MapVerdictWait`, 6 min, passed) and on a refusal or silence rolls
+   back through the path of every failure: the lease is released, the old primary is resumed (`Manager.Resume`: the marker comes off and the wait marker is written, so the lease
+   manager starts the primary as soon as it holds the lease), the writes are let in again, the candidate's bootstrap is given up (`map/abandon`) and the task is recorded `failed`
+   once the old leader's database is back. A candidate that says nothing is waited for, and the lease keeps the two apart: the old leader cannot win the lease while the candidate
+   renews it, and the candidate cannot promote without the lease. The alert `failoverNeedsDecision` is raised by the candidate and says that the old leader is started again.
+   Fault: `promote:unproven` (mode `fail`) on the candidate. Cluster test: `TestSwitchoverOfTheMapGroupWhoseProofIsRefused`.
+2. *The leader changes at the stop (the old leader's kingresd ends after the clean stop, before its task sends the proof).* The old primary stays stopped: the relinquished marker is
+   on disk before the stop and keeps the start gate shut, and its lease was released. The candidate does not wait for ever: after `ProofPullAfter` (20 s) without the proof it
+   **reads it from the old leader's server** (`GET /failover/map/checkpoint`: pg_controldata of a primary that does not run, `409 not_stopped` when it does), takes it only when
+   the state is `shut down`, and promotes on it; the standby's `switchover_verify` checks it against what it replayed, exactly as for a proof that is sent. A restarted old leader
+   cannot finish the task (its database is the stopped instance), and the new leader's engine claims it, skips the steps that were done and finishes it; the calls that the finishing
+   steps make to the old primary's server wait 15 s (`OldServerWait`) instead of the minutes that a server that answers "not ready" makes a task step wait. There is no second
+   primary at any time: the old one cannot start (the marker, and the lease is held by the candidate from B3 on), and the candidate promotes only on a proof. Fault: `demote:exit`
+   (mode `exit`) on the old leader. Cluster test: `TestSwitchoverOfTheMapGroupWhoseOldLeaderEndsAtTheStop`.
+
+### A hold that nothing owns (F6-01 to F6-05, 2026-11-22)
+
+The review of the fixes of round 2 found that the old leader of a planned switchover of the map group can stay held back for ever. Its primary is the system database, so while the
+hand-over marker holds it back no task can be read or written, and the loop that repairs the holds of ordinary groups does not cover the map group. What ends a hold now:
+
+- **The old leader itself.** From the start of kingresd, a loop (every ten seconds) looks for the hand-over marker of group 0. When it is there, the server asks every other server
+  `GET /failover/map/bootstrap?old=<this server>` and ends the hold (`Resume` and `Unquiesce`, as the rollback of a switchover does) only when no server reports an active bootstrap that names it, no
+  server reports a promoted standby of the map group, and at least one standby is shown to be in recovery. A server that does not answer neither blocks nor proves. The lease stays the final authority:
+  the primary starts again only when this server wins it, so a mistaken resume cannot make two primaries.
+- **The candidate.** A bootstrap of a planned switchover that is given up (by the operator, by the monitor, or because the proof was refused) asks the old leader's server to do the same
+  (`POST /failover/map/resume`), after the journal is given up, because an active bootstrap is what makes the old leader wait.
+- **The operator.** `abandonMapGroupBootstrap` with no bootstrap in progress anywhere asks every server to do it, and answers with the server that was started again (`resumedServerId`).
+- **The question whether the standby is still one** (`inRecovery`) falls back to `pg_controldata` when the instance cannot be reached: a standby that was stopped says "in archive recovery" or
+  "shut down in recovery", a promoted one "in production" or "shut down". Before, an unreachable standby was read as "may have promoted", the abandon answered a conflict, and the old leader
+  stayed held back.
+
+The abandon takes the lifecycle lock of the standby agent, which the promoting call holds across `pg_promote`: the probe, the mark of the journal and the release of the lease are one step against
+a promotion, so a promotion that is running is waited for and found (409), and one that has not begun finds its lease let go of. The promoting loop of the bootstrap stops when the journal was
+given up. The writers of the watchdog file (a round, the idle refresh, the Off file of a demotion) exclude each other, so that a round that took its sequence number before a demotion cannot
+arm the watchdog of a standby after it. A rollback of the old leader that cannot ask the candidate (an error other than a conflict) goes on, and says so in the log: the lease decides which of the
+two primaries may run.
+
+### The end of a hold needs the word of the candidate (F7-01 to F7-05, 2026-11-22)
+
+The review of the fixes above found that "some standby is in recovery" proves nothing about the standby that was promoted: after a completed switchover whose new primary died, the standby on a third
+server still reads "in recovery", and the old leader would have resumed its stale primary and lost what the new primary acknowledged. The lease decides who runs, not whose history is right; the hold is
+what guards that. So:
+
+- The clean stop of the map group names the server the group is handed to (`candidate` of the demote call); the old leader records it on disk before it stops (`candidate.0` in the lease
+  directory) and removes it with the hold.
+- The old leader resumes only when that server answers and shows its standby in recovery, no bootstrap that names it is active anywhere, and no standby was promoted. A candidate that does not
+  answer, or whose standby cannot be read, blocks: it may be the promoted primary. Without a record, and for the operator's call (`strict`), every server must answer and none may say `unknown`.
+- A bootstrap that was given up whose lease could not be let go of fails the abandon (503) and leaves the repeat to finish the release; the promoting call refuses a journal that was given up.
+- A hold that cannot be resolved is named in the log at warning level once a minute and in the failover status (`paused`, with the reason); the system database is the held-back primary, so an alert
+  cannot be recorded, and the status can only be read where a session can be made.

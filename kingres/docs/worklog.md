@@ -7,6 +7,622 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-22 (staging branch g15): cp-1011, p13-fix and web-15b merged, contract revisions renumbered
+
+The staging branch g15 (from kingres-18) merges cp-1011, p13-fix and web-15b. The contract revisions are renumbered in merge order so that they follow kingres-18's 0.14.0: the control plane of phases 10 and 11 (written as 0.16.0 in cp-1011) is 0.15.0, and the closing of phase 13 (written as 0.17.0 in p13-fix) is 0.16.0. Entries of this log and the review files that were written on those branches still say 0.16.0 and 0.17.0; read them as 0.15.0 and 0.16.0. The failover branch, which carries an older 0.15.0, is renumbered when it merges. Generated files were regenerated; no migration numbers collide (cp-1011 has 0040 and 0041, p13-fix has none).
+
+---
+
+## 2026-11-22 (second entry): the fixes for the review of the fixes of phase 13
+
+### What was done
+
+- The review ([reviews/2026-11-22-config-phase13-fixes.md](reviews/2026-11-22-config-phase13-fixes.md)) found 5 medium and 4 low findings (P13S-01 to P13S-09, no critical or high). All are fixed or answered on `p13-fix`; the report has a "Fixes" section.
+- P13S-01: every successful start keeps the override file as the last good one; the manager retries a failed start with it (the empty file when none, never the previous one), for every start (the restart task, a reboot, a crash, an operator), with a mark the task reads.
+- P13S-02, 03, 06, 09: the sample-rate log parameters and `log_file_mode` are managed; `archive_mode`, `client_encoding`, `restart_after_crash`, `recovery_min_apply_delay`, `max_slot_wal_keep_size` are refused. P13S-04: floor of 8 for `max_worker_processes`.
+- P13S-05: the hash of a server covers every instance, and a copied standby gets the override file of its own server. P13S-07: `expectedRevision` is checked again in the record step, the start of a configuration task is one step under a mutex, the dialog waits for the revision.
+
+### How it was verified
+
+- Mutants: 5 for the rollback and the identity (killed by the new tests), 7 for the lists, the floor, `supersedes` and the standby file, 1 for the dialog; all killed.
+- PostgreSQL 18 and 19.0 (private installs, lane l5): `pgconfig`, `instance`, `httpapi`, `ops`, `standby` packages (318 passing tests each) and the 23 `TestConfig*` cluster tests.
+- Console: typecheck, lint, 1464 unit tests, `api:check`; `check-contract.mjs` holds. The browser tests were not run again (only a text and a disabled state of the dialog changed since the last run).
+
+### Decisions and deviations
+
+- The exclusion of `config.apply` and `config.restart` is a mutex of the leader, not a rule of the engine (see the report).
+
+### Still open
+
+See "What is left" of the report: no state on the server page for a start that went back to the good file at a reboot; no floors for `max_parallel_workers` and `max_locks_per_transaction`.
+
+## 2026-11-22 (third entry): phase 11 leftovers in kingres_shard: the schemas in the rebalance plan and the drain, and the schema checks of check_cluster
+
+Covers branch p11-left (from shard-p12), design [shard-phase11.md](design/shard-phase11.md) sections 9.9 and 9.10.
+
+### What was done
+
+- **The rebalance plan.**  `kingres.plan_rebalance()` and `group_load()` now plan a distributed schema as an item `(colocation_id, 0)` like a bucket (before, the plan counted the schema
+  in the load of its group and never moved it).  A schema that a ledger table pins is not an item and stays as fixed load; the owners are asked for the pins
+  (`internal_pinned_schemas()`, node-local) when the caller is a superuser.  The sizes under `by_disk_size` were already read from the owner (review P10R-09).
+- **The drain.**  A drain is a rebalance with `drain_only`, so its plan holds the schemas of the group with `reason = 'drain'`.  New: `kingres.schemas_on_group(group)` (superuser), the schemas of
+  a group with sizes and blockers (a ledger pin, an unlogged table, a table with neither a key nor a full replica identity), which is what the preview of a drain needs.  `set_node_property(node, false)`
+  already kept new schemas off the group and `remove_node` already refuses a group that owns a bucket; both are now tested for schemas.
+- **`check_cluster`.**  New `internal_check_schemas()`: for every active primary, `schema_missing`, `schema_table_missing`, `schema_structure_differs` (the table fingerprint), `stray_schema_rows` (rows in the
+  empty copy of a table of another group's schema, outside a move that has the group as source or target) and `schema_catalog_differs` (a digest of the schemas, their groups, states, placement epochs and
+  numbers of tables, by names).  The node does the work (`internal_check_schemas_local`) from what the map group primary expects.
+- Tests `t/276` (the plan, the pinned schema, the drain, placement, removal) and `t/277` (every check, a move, a clean cluster); `t/236` section C now says what it always meant (the plan of phase 4 does not move a schema).
+  Each change has a mutant that a test kills.
+- **SQL.**  The changes are in `kingres_shard--0.8--0.9.sql` (0.8 is released and its scripts are as they were): `CREATE OR REPLACE` of `internal_plan_inputs()` and `check_cluster()` and a block of six new functions; `kingres_shard--0.9.sql` is regenerated with `mk-install-script.sh`.  The branch contains `p12-storage` (kingres_shard 0.9, columnar) merged in; the tests of this work are `t/276` and `t/277` (`t/270` to `t/275` are the columnar and count-distinct tests of p12-storage, which `meson.build` now lists too).
+
+### How it was verified
+
+Full run on both majors (kingres_shard TAP: 235 files, 59620 tests on 19 and 59060 on 18, all pass; regress, kingres_ledger and kingres_columnar pass), and in-tree meson (kingres_shard 234 ok, 1 skipped; ledger 39 and columnar 69 ok).  One in-tree failure, `t/188_online_alter` (a warning that the verification of a table operation was not done: 402 rows against 400 after the switch, under 4-process load), passed 3 of 3 reruns alone and in both TAP runs; it is watched as a load-dependent flake.
+
+### Decisions and deviations
+
+- A non-superuser's plan does not know the pins (only a superuser can ask the nodes); the move of a pinned schema is refused when tried.
+- `drain_status()` is unchanged (it counts a schema's bucket among the buckets of its group); the schemas of a group come from `schemas_on_group()`.
+- The message of `remove_node` still says "buckets", not "schemas" (the function is in `node_admin.c`, which the 0.9 work changes).
+
+### Still open
+
+- The step 6 of the drain in the control plane (reading the schemas again) and `previewServerDrain` belong to cp-1011 and can now call `schemas_on_group()`.
+
+## 2026-11-22: failover round 2 (restore, planned switchover, the map group with a live leader), its independent review and the fixes
+
+Covers the branch fo-r2wip, rebased onto kingres-18 at e279c14091 (contract 0.15.0).
+
+### What was done
+
+- **Round 2 of failover:** the restore of the preferred primaries, the plan and phases of a planned switchover, and the map group with a live old leader (a planned switchover
+  and a restore that include group 0): the bootstrap side in `mapgroup`, the leader's side in `failover`, the signed start of an operator's request (ADR 0026), the call that
+  gives up a stuck bootstrap (`abandonMapGroupBootstrap`, contract 0.15.0), `HoldBack` (the lease is renewed until a clean stop is over), and the 15 s bound on calls to the old
+  server.
+- **Independent review**
+  ([reviews/2026-11-21-failover-round-2.md](reviews/2026-11-21-failover-round-2.md)): no critical finding, one high (F5-01), five medium, six low. All twelve are fixed, one commit
+  per finding; the table in the review maps them to commits.
+- **Three defects found by the cluster tests of the fixes** and fixed: the step of the map group ended with the task lease about ten seconds after the clean stop (no rollback ran);
+  a rollback that could not be recorded made the engine run the step again and start a second switchover; and a nil dereference in the lease manager (`writeWatchdogFile`) crashed
+  kingresd in the rollback.
+- **Web:** the generated files and the panel follow contract 0.15.0: audit words, the endpoint, the mock handler, and a button on the failover progress view that gives up the move of
+  the manager (`kingres_admin`).
+- **Test hardening:** the request of the map group failover tests waits out, within two minutes, the 422 of a leader whose view does not yet show the killed server dead.
+- **Second independent review**
+  ([reviews/2026-11-22-failover-round-2-fixes.md](reviews/2026-11-22-failover-round-2-fixes.md)): all F5 fixes hold (22 mutants killed); one high (F6-01: the old leader of a planned
+  switchover of the map group can stay held back with no primary, and nothing repairs it), two medium (F6-02, F6-03), three low (F6-04 to F6-06). All are fixed (the table in the
+  review maps them to commits): the old leader ends a hold that nothing owns by itself, the candidate and the operator ask it to, the abandon works from the control data of a
+  standby it cannot ask and waits for a promotion that is running, and a bootstrap that was given up cannot promote (the lane found the last gap).
+- **Third independent review** ([reviews/2026-11-22-failover-f6-fixes.md](reviews/2026-11-22-failover-f6-fixes.md)): no path to two writable primaries; one high (F7-01: the old
+  leader resumed on the evidence of any standby in recovery, so after a completed switchover whose new primary died it could revive stale data), one medium (F7-02: a failed release of the
+  lease did not fail the abandon), three low. All fixed: the old leader resumes only on the word of the server the group was handed to (recorded at the clean stop), a failed release fails
+  the abandon, an unresolved hold is warned about once a minute and shown in the status.
+- **The report of an old primary** that needed crash recovery carries the divergence in bytes (zero when its WAL ends before the point where the histories parted), measured from its
+  shutdown checkpoint; the cluster test of the old primary accepts a missing number only with the documented message.
+
+### How it was verified
+
+- Unit tests of failover, journal, mapgroup, kingresd, lease, internalapi, httpapi and contract pass; a mutant of every fix (F5-01 to F5-12 except the two documents, and the three
+  later fixes) fails the new test of the fix and is killed. `check-contract.mjs` holds for 0.15.0 (141 operations); `go generate ./internal/contract` changes nothing.
+- Cluster tests in lane l3 on PostgreSQL 18 and 19 with kingres_shard 0.7 (extensions of e279c14091): the switchover, abandon and restore set and the failover, old-primary and
+  map-group set pass on both majors, with the five new tests of the review (a candidate that never promotes, an operator abandon, an abandon while the promoting call is in flight,
+  a standby that is behind, an unreadable `pg_controldata`). `TestMapGroupBootstrapSurvivesKingresdEnding` failed once on PostgreSQL 19 with the 422 described above and then passed
+  three of three reruns; it was hardened as described.
+- F6 and F7: 24 mutants of the F6 fixes and 17 of the F7 fixes (lists in the reviews) are killed. The last full lane l3 run (tip 6170828196, PostgreSQL 18 and 19.0 reinstalled from the
+  reference install, extensions of e279c14091) passed the three new cluster tests on both majors, the switchover and abandon set on PostgreSQL 18, and the failover, old-primary and
+  map-group set on both majors. The switchover and abandon set on PostgreSQL 19.0 failed once, in `TestSwitchoverOfTheMapGroup` (timed out after 10 minutes waiting for the task on the
+  new leader, which answered 503); the other tests of that step passed. Its log was too short to show a cause, and the test passed in 4 of 4 reruns alone (3 on PostgreSQL 19.0, 1 on
+  PostgreSQL 18). The cause is not known; the output of the test on failure was enlarged to show it next time.
+- Web: typecheck, lint, `api:check`, `brand:check` and the full vitest suite pass. The browser and end-to-end suites were not run.
+- Not verified: the review's item 5 (the candidate killed between a refusal and the abandon) has no cluster test of its own; unit tests cover it, and the second case of F6-01
+  (the old leader restarted) is a cluster test now. The tests of `internal/pgconninfo` could not run on the Windows host (the test executable is blocked); they are not related to this work.
+
+### Needs-verification items
+
+None checked in this entry.
+
+### Decisions and deviations
+
+- ADR 0026 (the candidate of a map group failover receives the proof of the operator's session) is accepted as the way to carry an operator's authority to a member that is not the
+  leader; the documents say so.
+- After the clean stop of the map group the step runs on a context that is not cancelled (bounded by the verdict wait of six minutes), because the engine cancels its context when the
+  task lease cannot be renewed.
+
+### Still open
+
+- The map group's hard failover of a live leader's server is still refused (422); only the planned switchover and the restore include group 0.
+- A cluster test for the candidate killed between a refusal and the abandon (unit tests cover it).
+- The old leader's resolution of a hold waits for a standby to be shown in recovery; with every other server gone it does not resume (the lease would protect it, but the proof is
+  missing): an operator starts it by the abandon call once a standby answers.
+
+## 2026-11-22: the search_path of the privileged SQL of kingres_shard (XSP-01 to XSP-03)
+
+Covers the fix of the three findings of the static audit `extaudit/2026-11-22-extension-search-path-static` on branch xsp-fix (kingres_shard 0.8).
+
+### What was done
+
+- **XSP-01** (`claimed_relid_check`, `utility.c`) and **XSP-02** (`kingres_shard_assert_no_move`, `bucket_move.c`): both run SQL as the bootstrap superuser from the ProcessUtility hook, in the session's own `search_path`, and
+  their `phase IN (...)` lists were parsed with an unqualified `=`.  A database owner (`ALTER DATABASE ... SET search_path`) could plant an `=(text, text)` operator in a schema of its own and have its function
+  run as the bootstrap superuser.  Each block now opens a GUC nest level and forces `search_path = pg_catalog, pg_temp` (as `acl_query()` in `node_admin.c` does) until the block ends, and every list is
+  `OPERATOR(pg_catalog.=) ANY (ARRAY[...]::pg_catalog.text[])`.
+- **XSP-03** (hook statements that run as the calling role): `is_user_partitioned`, `user_partition_exists` and the DROP TABLE lookup of `map_partition_statement` in `utility.c` write every comparison as
+  `OPERATOR(pg_catalog.=)`.  They do not force the path: the caller's own path is what resolves the names of the user's statement elsewhere, and the statements name no object but `kingres.*` and `pg_catalog.*`.
+  The text of `schema_ctas` is left as it is: it replays the user's own query, and adds no operator.
+- **The sweep of the rest of the source**: every SPI statement and every raise of privileges in `contrib/kingres_shard/src` was read again.  The other raises (`schema_ddl.c`, `node_admin.c`) already call only
+  `kingres.internal_*` functions or use `OPERATOR(pg_catalog.x)`; the other statements with `IN`, `=` or `LIKE` run inside SQL-callable functions or workers that pin `pg_catalog` first.  Nothing else changed.
+- **`t/252_extension_search_path.pl`**: a database owner without superuser rights plants `=(text, text)` and `=(name, text)` in its own schema (the functions only record the call, in a table the owner owns), sets
+  `ALTER DATABASE ... SET search_path = evil, pg_catalog`, and runs ADD COLUMN, CREATE INDEX, CREATE TABLE IF NOT EXISTS ... PARTITION OF and DROP TABLE IF EXISTS on its distributed tables.  History rows of a finished
+  table operation, move and split are in the catalog, because an operator is called only for a row that the statement reads.  The test asserts that no planted function ran and that the DDL reached both nodes.
+- README, "Security notes": one item on the forced path and the qualified operators.
+
+### How it was verified
+
+- The new test passes on 18.7 and 19.0.  Four mutants, each built with -Werror and each failing test 11 (calls of the planted operator): the sources of `utility.c` and `bucket_move.c` as before the fix (29 calls), `utility.c`
+  alone as before (13), `bucket_move.c` alone as before (16), only the qualification of the XSP-03 statements removed (3).
+- The full `kingres_shard` suite (clean -Werror build, regress, every TAP file) on PostgreSQL 18.7 and 19.0: 219 TAP files, 48074 tests on 18 and 48770 on 19, all passed (one file skipped by design on each major, as always).  `kingres_ledger` built into both installations first.
+
+### Decisions and deviations
+
+- The XSP-03 statements are qualified but not run under a forced path, on purpose (see above).
+- The block of the two privileged checks has no PG_TRY: an error inside it ends the transaction, which restores the GUC and the user id.
+
+### Still open
+
+- Nothing from the three findings.
+
+### Core patches
+
+None.
+
+---
+
+## 2026-11-22 (second entry): phase 12, the sharding part: the repartitioned join and MERGE on distributed tables
+
+Covers branch shard-p12, rebased onto the staging branch m18 (kingres-18 with the 0.8 tree of shard-p1011 merged).  Design:
+[analytics-phase12-queries.md](design/analytics-phase12-queries.md), sections 3 to 7; the sketch extension and the rollup tasks of that note are not part of this entry.
+
+### What was done
+
+- **The base.**  shard-p12 (J1 and J2 step 1, built on shard-p10) was rebased onto m18; one conflict, the settings list of `expected/catalog.out`.  No SQL object is added by any of this work
+  (the design says the upgrade script stays a guard), so there is still one upgrade path and `kingres_shard--0.8.sql` is unchanged; `t/250` passes.  Two scratch scripts that had been
+  committed at the repository root were removed.
+- **The repartitioned join** (`src/repartition.c`, `src/fragment_scan.c`): J1 and J2 step 1 as before, then a partial aggregation above the repartitioned join (the groups aggregate their rows of
+  the join, the origin combines; the partial marker carries `rp=<n>`), the behaviour under bucket moves (fault points `rp_after_ship` and `rp_before_fragment`; a stale map gives `KS001`, never a wrong
+  answer; `t/262`), the equivalence generator `t/267` (seeded, four profiles against the single node), regress `repartition_plans`, the `EXPLAIN` lines of design 4.12 (what moved, or "Repartition: not used:
+  <reason>"), and a broadcast side (a table that has no routable key is sent whole to every group; inner joins and the nullable side of a LEFT JOIN; bounded by `repartition_max_bytes`).
+- **`MERGE` on distributed tables** (`src/merge.c`, `src/planner.c`, `src/fanout.c`): the settings `enable_distributed_merge` and `merge_max_source_bytes`; M1 (a colocated MERGE runs on every group that owns a
+  target bucket), M3 (a routed source: the origin reads the source and sends each row to the owner of its key), M6 (a local target, a ledger table included, with a source fenced by `OFFSET 0`, which
+  works with the real planner on both majors), M4 and M5 (a reference target with constants or reference tables, or a source that the origin reads once and sends to every node); fault points
+  `merge_before_first_group`, `merge_between_groups`, `merge_before_commit`; tests `t/263` to `t/266` and regress `merge_plans`.  Every shape that is not accepted is refused with its own message, as before.
+- The tests and mutants of each piece are in the commits; every mutant that survived is explained there (defence in depth, cost-only, or equivalent).
+
+### How it was verified
+
+- At the tip (clean -Werror builds, regress, every TAP file) on PostgreSQL 18.7 and 19rc2: 226 files, 57203 tests on 18 and 57234 on 19; the one failure was `t/043_reference_paths` (it expected the old
+  refusal of `MERGE` into a reference table, which M4 now runs; the test was changed and passes).  In tree: see the message of the integration.
+- The neighbours of the changed code (t/112 to t/160, t/260 to t/267) were also run by the authors of each piece on PG19.
+
+### Decisions and deviations
+
+- A preserved moved side of a LEFT JOIN, dual repartition, a closed whole-statement fragment above the repartitioned join, and extension objects in the text of a repartitioned join are **not built**: each is
+  refused with its reason and the complete scan answers.  The reasons are in the README ("The repartitioned join").  A preserved moved side is believed provable (NULL keys go once to one group; ON conditions on
+  the preserved table stay in the text; no pruning from the nullable side) but needs a partitioned role for a shipped relation in the group's analysis, which is shared with the closed queries of 2b.
+- The marker of a MERGE fragment is `kingres:merge-fragment place=N rp=K`, in the style of the existing kinds, not `kingres:frag v=2 kind=merge` as the design says.
+- M3 and M5 need the source to be one relation (a join in `USING` goes in a sub-select); M1 accepts a join of colocated tables.  A key restriction in `ON` does not prune the groups of M1 (always correct).
+- A NULL route key is hashed like a NULL in the row router and in tuple routing, which is the design's slot-0 rule without a special case.
+
+### The fixes for the review
+
+The independent review of this branch ([2026-11-22-kingres-shard-phase12-joins-merge.md](reviews/2026-11-22-kingres-shard-phase12-joins-merge.md);
+the repartitioned join held, MERGE had one silent wrong answer) is fixed on branch p12-fix, one commit for each finding, each with a test that fails
+without it (the section "Fixes" of the review lists the commits, the tests and the mutants).  P12M-01: a prepared MERGE that declares a parameter it does not
+use no longer shifts the arrays of a shipped source (the origin sends the parameters that the text uses, then the arrays; `t/268` section A, nine types in
+three positions for M1, M3, M4, M5 and M6).  P12M-02: a MERGE through a view is refused explicitly, and the guards for the target (CHECK OPTION, row-level
+security, view owner, view) run on the statement as written for every shape.  The fixing found a case that the review had not: a security_barrier view over a
+reference table was accepted by M5 after M4 had refused it, and the text of M5 has no filter, so every node changed rows that the view hides; the guards
+now run before M4 and M5 are tried.  P12M-03: a source row of a group that is not a planned target is KS001, not dropped (new fault point
+`merge_before_collect`).  P12M-04: the merge fault points fire for M4 and M5 (`t/266` section E).  P12M-05: two stale README passages.  P12M-06: the refusal for
+a stable default names the column.  P12J-01: `repartition_max_bytes` is capped at 512MB.  P12J-02: the group-side rule for a preserved moved side is pinned
+by forged fragments (`t/261` section G).  Not changed, and open: M5 takes the writer lock of every relation of the statement on every node, so a local source
+that exists on one node only is refused with "reference table ... does not exist on this node" (a refusal, not a wrong answer; the lock names should come from
+the reference tables only).
+
+### Still open
+
+- The four items above that are not built.
+- An independent review of the fixes of the review of this branch.
+- M5 and a local source that does not exist on every node (see the fixes above).
+- Integration with phase 10's scheduler and the control plane of cp-1011 (`MERGE` and the repartitioned join add no REST surface).
+
+## 2026-11-22 (third entry): fixes for the second review of the phase 12 control plane (P12D-01 to P12D-09)
+
+## 2026-11-22: the console of phase 12 follows the settled contract, the owners of tables, and the independent review
+
+Continues the entry below on branch p12-web.
+
+### What was done
+
+- Merged p12-cp twice (`22a40eb52f`, `a8a770e771`; contract still 0.18.0): the `dryRun` preview and typed blockers of a storage change, the table in the alert subject, sentence step names, the enumerated shapes of `partitionEvery`, the bound of `asOf`, a put refused during a run, the cluster setting `analytics.allowNonSuperuserOwners` (a switch on the Settings page with its consequence and a confirmation to turn it on), `tableOwner` and `ownerTrusted` (an owner notice with a link to the setting), the blocker `owner_not_trusted`, and the refusal of a policy put and run for an owner that is not trusted. The mock follows each of them.
+- Fixed the findings P12W1 to P12W10 of the independent review ([the review](reviews/2026-11-22-console-phase12.md), section Fixes): sizes never made up, no Save over a policy that was not read, Run now held and red, a re-enabled drop policy needs preview and name, values the form cannot show are kept, real multi-unit intervals, a mock that finds indexes and triggers only when the task runs, field errors by JSON pointer, the smaller points.
+
+### How it was checked
+
+- typecheck, lint, `api:check`, the full vitest suite and the browser suite: full vitest 95 files, 1727 tests pass; browser suite 4 files, 48 tests pass; typecheck, lint and api:check clean.
+- New mutants, all caught: trusting owners without asking, a policy put accepted for an untrusted owner, the setting not making an owner trusted, the owner notice for a trusted owner, a run for an untrusted owner not refused, Save over an unread policy, Run now not held on a failed plan, a kept value rewritten, a drop policy turned on without preview, a size shown as 0, a 404 of another instance taken for no policy, field errors read by the bare name, a run that sends `asOf`, a plan with invented sizes, an unknown format counted as Row; the earlier survivors M6, M8 and M17 of the review are caught by tests of their own.
+
+### Still open
+
+- The end-to-end run against a real `kingresd`.
+- Not pushed.
+
+---
+
+## 2026-11-22: the analytics console (phase 12, steps W1 and W2) on contract 0.18.0
+
+Branch p12-web, from the contract commit `7d43a79a3f` of p12-cp. The table page of increment 9.7 (branch web-15b, one commit) is not on kingres-18, and the Storage column, the partitions panel and the policy need it, so that commit is taken first (cherry-picked, the same change). The control plane of phase 12 is built on p12-cp by another writer; nothing in `kingres/api` or in Go is changed here.
+
+### What was done
+
+- **Approximate aggregates** (inventory row Q-W1): `ApproximateAggregatesCard` on the database page and `ApproximateAggregatesDialog` (a switch, the mode of count(DISTINCT), the error rate in percent, the consequence in words, the task with its five steps). The three new problem codes of the extension have their own words.
+- **Plan summary** (Q-W1, and the phase 2b item "EXPLAIN path summary in the workbench"): `lib/plan-summary.ts` reads the lines `Pushed:`, `Repartition:`, `Pushdown: not used:`, `Rewritten:` and `Remote groups:` of an EXPLAIN result and shows one line above the monospaced plan (path, why not, rewrite); no line it knows, no summary. The help text with the sketch functions appears when the database has the extension; the note says EXPLAIN ANALYZE and MERGE run the statement.
+- **Storage** (St-W1): `StorageBadge` and the Storage column and filter of the tables list; the Storage row, the format, range, rows and ratio of each partition, a filter by format and a marker with progress on the row of a partition that is being converted, on the table page.
+- **Policy and runs** (St-W1, St-W2): `PartitionPolicyPanel` (policy, health line, next and last run, runs list), `PartitionRunDialog` (a run with its actions, failures in words), `PartitionPolicyDialog` (the form, **Preview** through `planPartitionPolicy`, the field errors from the JSON pointers, the table name typed when a retention is new or shorter, and a preview of the form as it is then), `RunPolicyDialog` (the plan first, then the task), `RemovePolicyDialog`, and the link of the two new alert kinds to the table.
+- **Convert storage** (St-W2): `SetStorageDialog` for a table or one partition (codec, level, stripe and chunk rows, sort order of a partition, what the console already knows that stops it, the reasons of `conversion_refused` listed, cancel until the switch).
+- **Mock** (`src/mocks/analytics.ts`, switch `?analytics=`): all eleven operations as the contract says, including the tasks, the problem codes, the idempotency of configure and put, the dry run that changes nothing, the 404 of a table without a policy, the roles and `unsupported_operation` on an older server. `describeTable` adds `storage` and the new members of `partitioning`; `listTablePartitions` answers the format, range, rows and ratio.
+- README of the web panel: a section for the analytics console and the switch `?analytics=`. The notes on what the contract does not say are in the report of the writer (11 items: the subject of the partition alerts, no preview of a storage change, no way to install kingres_columnar, the step names, the shapes of the intervals, and others).
+- A separate commit formats three files that were unformatted before this work (`api/problem.ts`, `contract-0-4.test.ts`, `kind-labels.test.ts`); `npm run lint` fails without it.
+
+### How it was checked
+
+- `npm run typecheck`, `npm run lint` (eslint and prettier) and `npm run api:check` (the generated files are up to date with the contract at `7d43a79a3f`): clean.
+- `npx vitest run` (two workers): 95 files, 1685 tests passed (after the merge of the settled contract of p12-cp, `22a40eb52f`: dryRun preview, typed blockers, alert subject members, sentence step names, asOf bound, put refused during a run; mutants for these were added and caught). New: `analytics-lib-0-18` (46), `analytics-mock-0-18` (49), `analytics-ui-0-18` (65). One existing test, in `hostile.test.ts`, asked for "the table" of the database page and now names it, because the page has a second table (the servers of the card). `tables-0-14-mock.test.ts` compares `partitioning` with `toMatchObject` now, because 0.18.0 adds members to it. The full run once showed `task-notices.test.ts` timing out under load; it passes alone and in the later full run.
+- `npm run test:browser` (Chrome): 4 files, 48 tests passed. The new file runs the eight states of phase 12 through axe in light and dark at 1366 and 320 px (no violation) and checks that no page scrolls sideways and that each dialog and its buttons stay inside the window at 1366 and 320 px.
+- Mutants, each caught and reverted (the tree was clean after each): a new or shorter retention no longer needs the name typed; a missing ratio shown as `0.0 x`; a repartitioned join read as a colocated one (survived at first because the Repartition line gave the same answer; a test of the Pushed line alone was added, then caught); the mock accepts a columnar_after longer than the retention; the mock does not refuse a conversion for its reasons; the mock plan changes the partitions; a blocked storage change can still start; saving a retention does not ask for the name; saving a retention needs no preview; a preview of an older form is taken for the current one; the error rate of the dialog is not checked; a conversion of a partition does not hold the table page; the Storage filter shows every table; the plan is audited or needs admin (role change); a server without the sketch package is not refused; a hidden character of a server id shown as it is; in the browser: a select without a label (axe), a 900 px wide grid at 320 px (layout), an unnamed button (axe).
+- `git diff --check`, the scan for the project name misspelt with a double s, and the scan for local paths in the changed files: clean.
+
+### Decisions and deviations
+
+- The Storage filter is made in the panel from `Table.storage`; the server's `storage` parameter is implemented in the mock but not sent (the whole list is read anyway).
+- `Convert storage` is not offered for a distributed table or for the partitions of one (the release has heap distributed partitions only; D1b is later).
+- The alert link reads the table from `AlertSubject.tableSchema` and `tableName` (settled in the contract after the first version of this entry, which read it from `aspect`).
+- The mock uses the sentence step names of the settled README for `table.setStorage` and `partition.maintain`, and a disable of approximate aggregates runs the same five steps as an enable.
+
+### Still open
+
+- The contract notes (11 items) for the writer of the control plane.
+- No install action for `kingres_columnar` (no operation for it); no preview for a storage change; the alert subject of the partition alerts; the distributed tables.
+- The end-to-end run against a real `kingresd` once the control plane of phase 12 is built.
+- Not pushed.
+
+### Core patches
+
+none
+
+---
+
+### Core patches
+
+None.
+
+---
+
+## 2026-11-22: the fixes for the first independent review of phase 13 (configuration from the console)
+
+### What was done
+
+- The review ([reviews/2026-11-22-config-phase13.md](reviews/2026-11-22-config-phase13.md)) found 2 high, 5 medium and 8 low findings. All 15 are fixed or answered on
+  branch `p13-fix` (made from `p13-fin`, contract 0.17.0, which is unreleased and was changed in place); the report has a "Fixes" section that maps each finding to its commit and test.
+- High: the parameters that change how the sessions of `kingresd` itself behave (`default_transaction_read_only`, timeouts, `search_path`, ...) are refused at every
+  level; `unix_socket_permissions`, `unix_socket_group`, `huge_pages`, every `ssl*` and others are managed or refused; a restart is checked with `postgres -C` first, and a restart
+  that cannot start puts the last good override file back and starts the instance again.
+- Medium: a server that is down no longer keeps the apply task open (it is recorded as `waiting` and the convergence loop brings it up to date); the hidden set fails closed;
+  a stored value whose name became managed or refused is skipped and can always be removed; the restart goes through the instance lifecycle of the operations code and finds the
+  primary of each group from the leader's record; the time-zone tests use a zone that is not the host's.
+- Low: tests for the executed restart order, leading zeros and the audit; the audit details; the task codes; the reserved-connections warning; `expectedRevision` in the contract; the
+  console sends it. Contract 0.17.0 gained the optional `expectedRevision` of `ConfigChangeRequest` (additive).
+
+### How it was verified
+
+- Every fix has a test that fails without it; each was checked with a mutant (listed in the report): 10 cluster mutants and 13 unit mutants, all killed.
+- PostgreSQL 18 and 19 (private installs, lane l5): the `pgconfig`, `instance`, `httpapi` and `ops` packages, and the whole `TestConfig*` set of the cluster tests (23 tests) on three servers.
+- Console: typecheck, lint, the whole unit suite (90 files, 1462 tests), the browser tests (layout, CSP, axe), `api:check`; `node kingres/api/scripts/check-contract.mjs` holds.
+
+### Decisions and deviations
+
+- The apply task no longer waits for a server that is down (design "Failure cases" changed). Audit details carry `basedOnRevision` and the task id instead of the revision, which is allocated after the audit event.
+- `log_line_prefix` and `log_error_verbosity` stay settable (the console does not parse log lines). The console mock still models a waiting task for a server that is down.
+
+### Still open
+
+See the report: no cluster test with a promoted standby (unit test of the order only), no test that induces a failure of the hidden-set read inside `State`, the derived default of a removed
+override is not known to the preview warning, and the mock of the console still models the old waiting task.
+
+## 2026-11-22 (second entry): fixes for the independent review of the phase 12 control plane (P12C-01 to P12C-16), and the console's contract notes
+
+Branch `p12-cp`. The review is [reviews/2026-11-22-control-plane-phase12.md](reviews/2026-11-22-control-plane-phase12.md); its "Fixes" section lists every finding with the change and the test.
+
+### What was done
+
+- The four high findings: the time of a run is the time of the server (within five minutes, for a request and for the scheduler), a run is always closed with `timepart_finish_run` (begin failure, step failure, the hook of the kind) so that a failing
+  policy does not start a task at every tick, `kingres_columnar` goes into `shared_preload_libraries` only when the installation has the library (a rewrite is logged and reloaded, the conversion needs the library on every server), and the conversion and the runs share
+  one rule for the owners of tables (`trust_table_owners` on, documented).
+- The mediums and lows: columnar options on a columnar table, lock waits with `lock_timeout` and retry, a missing run is an error, alerts of databases that were not read are left alone, a scheduled run does not need the library, reads never install an extension,
+  the limit to the leader's instance is in the contract text and the 404, `put` during a run, `Engine.ActiveFor`, versions as numbers.
+- Contract text and shapes for the console (still 0.18.0): `dryRun` and `TableStoragePreview`, typed `blockers` on `conversion_refused`, `tableSchema` and `tableName` of `AlertSubject`, the shapes of `partitionEvery`, the bound of `asOf`; listed in `p12cp/contract-changes.txt`.
+
+### How it was verified
+
+PostgreSQL 18 and 19.0 (the private installations were refreshed from `~/kw-int/pg`, extensions built from e279c14091), lane l1: the PG-backed tests of `internal/ops`, `internal/store/pgstore`, `internal/instance` and the two cluster tests of three servers
+(`TestApproximateAggregates`, `TestTableStorageAndPartitionPolicies`). Unit tests of `ops`, `partsched`, `task`, `monitor`, `api`, `problem`, `contract`; `check-contract.mjs`; `vue-tsc`. `httpapi` has one test that fails now and then on Windows on the cleanup of its temporary
+directory (`TestSettingsOperations`), not on an assertion. The mutants of the round are in the report.
+
+### Decisions and deviations
+
+- The sound rule for the owners of tables is trust, as the extension offers it: a refusal of non-superuser owners (or a cluster setting) was not built; the contract text says what the setting gives away. It is a question for the project owner.
+- The restart order of the preload change is the operator's: the restart of the console orders standbys and primaries by the rule of the configuration design, which was written for settings that go up; for a list of libraries the safe order (standbys first) is documented, not enforced.
+
+### Still open
+
+- A cluster test that restarts one server with the library missing (the logic is tested with a fake installation).
+- The cluster setting for non-superuser owners, if wanted.
+
+### Core patches
+
+None.
+
+---
+
+## 2026-11-22: the table page and the table dialogs of the console (phase 9, increment 9.7) moved onto the control plane of 9.6
+
+## 2026-11-22: the console of phase 14a, table CSV export and import (increments CN1 to CN5, contract 0.19.0)
+
+Branch `dx-web`, from the contract commit cb4afe3757 of branch `dx-cp`. The control plane is written on `dx-cp` by another writer; this
+entry covers the console only. No Go code and no contract text was changed.
+
+### What was done
+
+- **CN1, API layer and mock.** The ten operations in `endpoints.ts` and `queries.ts`; calls that keep the session in place on a
+  401 (`unwrap(..., { keepSession: true })`) for the uploader; the texts of the twelve new problem codes; the labels of the task
+  kinds `table.export` and `table.import` and of the eight new audit actions (the red tests A0 left); a mock that behaves like
+  the server (offsets, 409 with the right offset, 64 KiB alignment, `Range` and 206, 416, 410, a 401 in the middle of an upload,
+  quota, the setting off, the role, creator-only files) with the fixtures of the design and a real SHA-256, and the `?transfer=` switches.
+- **CN2.** The *Data transfer* group of the settings page; the Transfers panel (export files and the uploads of the tab, Download,
+  Delete) on the databases page and on a database page; the resumable download (`lib/downloader.ts`).
+- **CN3.** *Export CSV* in the tables list: gates, consistency sentence before the confirmation, the spreadsheet text, options,
+  acceptance of code of another role, task progress, result with the SHA-256, the sentence about exporting twice, the download.
+- **CN4.** *Import CSV*: local preview and guess, the limit shown before the upload, options, the uploader (`Blob.slice`, 64 MiB,
+  re-read offset, password on a 401, pause, resume, cancel, `sessionStorage` in `try/catch`), the import task, the whitelisted
+  errors and the wording of `import_outcome_unknown`.
+- **CN5.** Tests, fifteen browser states, mutants (below), README and this entry.
+
+### How it was verified
+
+- Typecheck, lint (eslint with no warning, prettier), `npm run api:check`.
+- The full vitest suite: 97 files, 1580 tests, all passed.
+- The browser tests (`npm run test:browser`, 12 minutes): 3 files, 49 tests, all passed. They include the axe run of fourteen states of the data transfer (the settings group, the panel with files and with the setting off, the export dialog and its refusal, its result and its failure, the import dialog with the preview, the options, the stop for the password, the refused size, a failed import and an unknown outcome) in light at 1366 px and dark at 320 px, and the layout run of the same states at 1366 and 320 px.
+- **Mutants of the console** (a defect put in by hand, the tests that must notice it run, the file restored): 31 of 31 killed.
+  They cover the downloader (a short file called complete, the ETag, the SHA-256, a resume from byte 0, `Content-Range`, more bytes
+  than the record), the uploader (a conflict taken from the client, no re-read after a break, the 2 GiB cap missing or applied to a
+  compressed file, a 401 as a failure, no session check between chunks, another size continued, cancel without delete, an unaligned
+  chunk), the dialogs (the limit as `>=`, a repeat offered after an unknown outcome, the upload dropped after a failure), the
+  options (the null limit, `skipBom`, the spreadsheet guard, the consistency sentence), the gates and the panel, the settings
+  (sizes always sent), and the mock (another role sees a file, the alignment, a range past the end, a value in the failure text).
+
+### The review of the console and its fixes
+
+The independent review ([reviews/2026-11-22-console-data-transfer-14a.md](reviews/2026-11-22-console-data-transfer-14a.md)) found no critical or
+high finding, eight medium (DXW-01 to DXW-08) and nine low ones. All are fixed with tests, with the tip of `dx-cp` (97976b3c44) merged: a conflict
+that does not move the offset waits and stops as busy; a cancel whose delete was refused keeps the upload listed and says so; an import
+repeat after an unknown outcome needs a tick; the cap of a reference table (256 MiB) is known before the upload; a failing file is a
+save error and never hangs the dialog; a download that loses its session asks for the password and goes on from its bytes; the link
+fallback shows the size and the SHA-256 and the commands to check it and is for administrators only; a 400 that carries the offset
+resumes; a stream that fails after the last byte is complete; a download stops when the session of the console ends; uploads are
+kept per person with a fingerprint of the file; a file that cannot be previewed gets no default for its first line. 37 mutants of the
+fixed code were killed. The two contract requests of the review (the spreadsheet option and the effective import cap) were answered in contract 0.19.0
+(`DataExport.spreadsheetSafe`, `DataTransferSettings.maxAtomicBytes`) and the console uses them: the download dialog warns about a file
+written with the guard off, and the cap of one import comes from the server (a reference table stays at 256 MiB). Both are done.
+The transfer actions are also in the header of the table page of phase 9.7 (branch `web-15b` merged).
+
+### Decisions and deviations
+
+- The download is not only the plain link of the design: a fetch with `Range` resumes after a break and reports a short file; the
+  link is the fallback for a large file in a browser that cannot write to a file as it goes.
+- A file kept in memory is checked against the SHA-256 of the export before it is handed over; a mismatch saves nothing.
+- The 2 GiB cap is enforced in the browser before the first byte for an uncompressed file; for a gzip file the server counts after
+  expansion, so only the largest staged file applies.
+- The actions are mounted in the tables list of a database; the table page of phase 9 (branch `web-15b`) is not in this base and
+  takes `TableTransferActions` in its header.
+
+### Still open
+
+- The progress indicators that need `Table.operation`; distribute with related tables.
+- Not pushed.
+
+---
+
+## 2026-11-22: phase 12, the sharding extension: the fixes of the independent review of 0.9 (P12S-01 to P12S-06)
+
+The review is in [reviews/2026-11-22-kingres-shard-0.9-storage.md](reviews/2026-11-22-kingres-shard-0.9-storage.md), with a Fixes section.
+
+### What was done
+
+- **P12S-01** the sketch is looked up only for a rewritable count(DISTINCT) and only when the role has USAGE on its schema and EXECUTE on the aggregate; otherwise the statement is exact with one warning.
+- **P12S-02** both settings drop the cached plans when they change.
+- **P12S-03** the options of columnar_set_options are carried by distribution, rebuilds, undistribute and moves (the bucket partition and the leaves).
+- **P12S-04** the confirmation after PREPARE is skipped only for the node that add_node is adding.
+- **P12S-05** every relation of a bucket is checked, not the first (a second table access method over the heap handler makes it testable).
+- **P12S-06** tests for the oid types and for one shard group.
+
+### How it was verified
+
+- A new or extended test for each, each with a one-line mutant that it kills (t/270, 271, 273, 274, 275).
+- The full suite on both majors is in the Gate section below.
+
+## 2026-11-22: phase 12, the sharding extension: columnar tables in kingres_shard 0.9, the explicit refusal of ledger tables, and approximate count(DISTINCT)
+
+Covers branch p12-storage (from p12f-fix, kingres_shard 0.8 with the review fixes of step 12).  Version 0.9 is new: the other writer of kingres_shard (shard-p12) adds no SQL object and stays at 0.8, so the integrator merges the two and resolves the version.
+
+### What was done
+
+- **Version 0.9.**  `kingres_shard--0.8--0.9.sql`, the generated `kingres_shard--0.9.sql` (the 0.8 install script followed by the upgrade script; `mk-install-script.sh` now writes both scripts and `t/250` checks both), the control file, `Makefile`, `meson.build`, the C version
+  string, the version handshake (`internal_check_node_versions` asks for 0.9) and the `upgrade` regression test (the step from 0.8 on its own, and 0.9 at the end of every chain).
+- **St-S1, the access method is carried** (`t/270`).  `internal_table_ddl` names the access method of the source (`USING columnar`) in the statement that makes the table and its shadow, so `create_distributed_table`, the blocking rebuilds,
+  `undistribute_table` and `add_node` keep it; every bucket partition and leaf that is not heap gets `REPLICA IDENTITY FULL`; a user-partitioned table keeps the access method of each leaf (`internal_partition_layout` has an `am` column); the report
+  gains `access_method_missing`, `columnar_reference_table` (a reference table stays heap, design 9.5) and the note `columnar_storage` (the 0.8 report is kept as `internal_table_change_report_base` and the 0.9 report calls it).  A defect found on the
+  way: `add_node` onto a node that already had `kingres_columnar` or `kingres_ledger` failed after `PREPARE` ("function internal_sync_confirm does not exist": the schema `kingres` exists there and the function does not, which the check accepted only
+  for a missing schema).
+- **St-S2, refusals** (`t/271`).  The online variants of the lifecycle capture changes with a row trigger, which columnar does not support: the report has the blocker `columnar_online`, so the call is refused before an operation is recorded.  The split
+  refusal has the words of the design.  `kingres_ledger` rule L1 (`t/040_columnar_refused` in kingres_ledger): `ledger_enable` refuses a table whose access method is not heap, in C inside `ledger_lock_table`, so kingres_ledger stays at 0.3; `SET ACCESS METHOD`
+  on a ledger table is rejected by the existing rewrite trigger (the test shows it).
+- **Phase 7 step 25** (`t/272`).  A ledger table, or the history table of one, is refused by `create_distributed_table`, `create_reference_table` and their online variants with SQLSTATE `KS016` and a message of its own (the detail lists every blocker with its
+  code); `check_cluster` reports `ledger_distributed_table` for a ledger table that the catalog distributes or makes a reference table.
+- **Q-S5, `count_distinct_mode`** (`t/273`).  `kingres_shard.count_distinct_mode` (`exact` or `approximate`) and `count_distinct_error_rate`; the planner hook rewrites `count(DISTINCT x)` of every level that reads a hash-distributed table into
+  `kingres_sketch.approx_count_distinct(x, p)`; the new file `src/count_distinct.c`, one call in `planner.c`, `kingres_shard_extension_usable` in `shippable.c`.
+- **St-S3, bucket moves of columnar relations** (`t/274`, `t/271`).  The copy is made `USING` the access method of the source, a leaf that is not heap has `REPLICA IDENTITY FULL`, the move works with `kingres_columnar` 0.2 or later and is refused with the words of
+  the design with 0.1; inserts during a move, the move back, and a user-partitioned bucket with a columnar and a heap leaf are tested.
+
+### How it was verified
+
+- Every behaviour has a TAP test that fails without it; each was checked with a one-line mutant (clean build with -Werror against PostgreSQL 19 and the test run):  S1 seven, S2 four, rule L1 one, step 25 five, Q-S5 eleven, S3 four, every one killed except one (and the mutants that did not build or did not apply were redone as others):
+  the check `get_typtype(base) != TYPTYPE_BASE` in `count_distinct.c` is redundant with the check of the extended hash function (a record has none in the type cache), so no test can tell the two apart.
+- The full suites are recorded in the section below ("Gate").
+
+### Gate of the fixes
+
+- `kingres_shard` with the fixes, in a fresh area with PostgreSQL 19.0 and 18 (clean -Werror builds with no warning, regress 23 of 23, every TAP file): 224 files, 48556 tests on 18 and 49050 on 19.  One file failed in that run, `t/273`: a statement of the new assertion read a table the role may not read (a mistake of the test); fixed, and `t/273` passes alone on both majors from a clean build.  Every other file passed.
+- The mutants of the fixes: fifteen, all killed (the first one that survived, the eager lookup, got an assertion).
+
+
+### Decisions and deviations
+
+- **Reference tables are not columnar** (design 9.5 recommends it; the S1 row of the plan says "carry"): `create_reference_table` refuses a columnar table with `columnar_reference_table`.
+- **The online variants are refused for columnar**, not made to work: their capture trigger is a row-level AFTER trigger.  The blocking variants work.
+- **The compaction before the switch (S3) is not done.**  The move would have to call `columnar_compact` inside `move_bucket`, a 450-line function; the stripes of the initial copy are full, only the changes of the move make small stripes.  The README says to run
+  `kingres.columnar_compact` afterwards.  The options of `columnar_set_options` are not carried to the copy either.
+- **The refusal for old kingres_columnar** is made by version (0.2 or later), so the refusal of S2 became the check of S3 rather than a second code path.
+- **L1 is in C**, so the ledger extension needs no new version.  The other half of L1 (`convert_partition` and `columnar_*` refuse a ledger table) belongs to kingres_timepart and kingres_columnar and is not done here.
+- **`EXPLAIN` does not print the line `Rewritten: count(DISTINCT x) -> approximate (p = 14)`** of the design; the aggregate shows as `approx_count_distinct(...)`.
+- The rewrite runs before the shortcut for a cluster of one shard group, so an answer does not depend on the number of groups.
+
+### Still open
+
+- The control plane and console parts of phase 12 (Q-C1, Q-W1, the storage and partitioning operations) are not in this branch.
+- Columnar tables in a distributed schema (phase 11) are not tested: the shells are made with the access method now (`internal_table_ddl` is shared), which needs `kingres_columnar` on every node.
+- Moves of a schema (`move_schema`) were not exercised with a columnar table.
+- Merge: `kingres_shard.h` (the version define), `Makefile` and `meson.build` (data files, objects), `mk-install-script.sh`, the README, `planner.c` (one call), `shippable.c` (one function at the end) and `node_conn.c` (one condition) are the files that the shard-p12 branch may also change.
+
+### Gate
+
+- `kingres_shard` at the tip before the last three fixes (clean -Werror builds with no warning, regress 23 of 23, every TAP file) on PostgreSQL 18 and 19: 223 files, 47924 tests on 18 and 48436 on 19.  Eight files failed in that run, each for a reason that was then fixed and the files run again on the fixed tree on both
+  majors (10 files, all passing): six tests that name the version of the extension in an expected message (t/036, 047, 058, 105, 140, 148 ask for 0.9 now), `t/098` (no file but the lookup names the extended hash function: `count_distinct.c` asks the type cache for the finfo), and `t/272` (a regclass printed with and without its schema).
+  An earlier gate of the S1 commit alone had the same version failures and one failure of `t/085` on 18 that did not repeat (a wait for a WAL segment; it passes alone).
+- `kingres_ledger` (regress and 39 TAP files, 2587 tests) on 18 and 19 with the check of rule L1: all pass.
+
+- E1 (the console against a real `kingresd`), after CP3, CP5 and CN4.
+- A browser test that downloads a file (headless Chrome would open the file picker).
+
+### Core patches
+
+None.
+
+## 2026-11-22 (later): fixes of the independent review of phase 14a
+
+### What was done
+
+- The review (0 critical, 1 high, 4 medium, 7 low) is in `docs/reviews/2026-11-22-data-export-import-14a.md` with a section "Fixes". The high finding (the commit intent
+  was overwritten after COMMIT, so a re-run said "nothing stored" and a retry doubled the rows) is fixed by a marker row that commits with the data; load and commit are one
+  step. The mediums: the staged files are adopted at start (quota), a dangerous role is refused for import and the owner test of the export no longer trusts a superuser, the
+  header cells are guarded, the checks of the export are repeated at step time. The lows: no `lost` mark from a poll, the size cap reads the file, the column types are compared,
+  `skipBom` only for UTF-8, xml guarded, the janitor re-reads before its alarm, one transfer per role without a race, refused requests leave no record.
+- Contract 0.19.0 texts only (steps, the 403 and 400 cases, `import_outcome_unknown` now rare); logged in `contract-changes.txt`.
+
+### How it was verified
+
+- New tests (`review14_e2e_test.go`, `review14_restart_e2e_test.go`, `TestImportCrashAfterCommit`) on PostgreSQL 18 and 19; each was shown to fail with its fix removed (mutants:
+  header guard, owner test, dangerous role, skipBom, types, lock, adoption, setting, record removal, gzip look, marker read, `row_security`, untrusted check).
+
+### Still open
+
+- The xml guard cannot be run here (the test build of PostgreSQL has no libxml); the janitor retry has no test that fails without it (the race needs a hook inside the sweep).
+- A real failover of the leader at every step and a shard group lost exactly at COMMIT, as before.
+
+---
+
+## 2026-11-22: data export and import of tables (phase 14a, control plane): contract 0.19.0, the relay, uploads, downloads, the export and the import
+
+### What was done
+
+- **Contract 0.19.0** (cb4afe3757): ten operations, the vendor extension `x-streams`, the setting `dataTransfer`, twelve problem codes, two task kinds, the
+  checker rules and the generated files; two texts corrected later (validation_failed is 400, insufficient_disk 409).
+- **CP1:** the table `kingres_cp.data_transfer` (migration 0035), the setting, the flags, the check of the role between steps, `transfer.SafeError` with the canary and
+  fuzz tests. **CP2** came from the second writer (`internal/staging`, merged). **S1:** the relay spike (5 GiB each way, heap growth 3 and 13 MiB; it found that the idle
+  body must move the write deadline too). **CP3:** `POST /internal/v1/forward-stream`, the guards (TLS, the setting), uploads, downloads with Range, the janitor.
+  **CP4:** the task `table.export`. **CP5:** the task `table.import` (all or nothing, the commit intent, reference tables through typed arrays, S2 applied).
+- The design note has a section with the spike results and every place where the code differs from the text.
+
+### How it was verified
+
+- Unit tests of the relay, the internal call against a real mutual TLS listener, the guards and the relayed operations, SafeError (canary in every class, fuzz), the scanner
+  (against a reference, fuzz), the options and statements; PostgreSQL 18 and 19: the record and the setting, uploads, exports, downloads, imports of every kind of table, the
+  error classes with a canary, the commit fault points, cancel, demotion; three servers: uploads, import, export and download through followers, a follower that dies
+  in the middle of an upload.
+- Mutants killed: SafeError copying the message; the body limit on the relay call; the proof check of the relay; the TLS guard; the setting guard; the stream limits and
+  the relay in the guard; the chunk timeout; four of the scanner (quote toggle, record limit, the end-marker check; the fourth was not confirmed); the count comparison
+  of the import.
+
+### Still open
+
+- The independent review of the relay and of the import transaction, the leader-change fault tests of a real failover at every step, the console (second writer), the batches (14a+).
+## 2026-11-22 (later): the search path of the service connections (DX16-01, branch sp-fix)
+
+### What was done
+
+- A security review found that a service connection set no search_path: the owner of a database can run `ALTER DATABASE ... SET search_path = <own schema>, pg_catalog`, plant an
+  operator of the same signature in that schema, and the service role (a superuser) resolves an unqualified comparison of the control plane to it and runs its function. The three
+  places that open a service connection (`Service.connect`, `InstanceConn`, `RemoteConn`) now set `search_path=pg_catalog` in the startup parameters, which outrank the settings of a
+  database and of a role, and `asService` repeats it with `SET LOCAL` as the first statement of every transaction. The control plane was audited by running the whole end-to-end
+  suite with the path: no statement relied on another schema.
+
+### How it was verified
+
+- `TestServiceSessionIgnoresTheSearchPathOfTheDatabase` plants the schema, the operator (regclass, regclass) and the database setting, then runs a distribution of a reference table (the
+  check compares two regclass values): without the fix a role `kg_sp_pwned` with SUPERUSER exists afterwards, with it none. PostgreSQL 18 and 19: the whole `cmd/kingresd` suite passes;
+  the first 35 tests of `internal/clustertest` (failover, standbys) passed on 18 before the run was stopped for time.
+
+### Still open
+
+- The connections that the sharding extension opens to other nodes are not audited here.
+
+## 2026-11-22: the table page and the table dialogs of the console (phase 9, increment 9.7) moved onto the control plane of 9.6
+
+Branch web-15b (from m18) carries the one console commit of web-15 for increment 9.7, cherry-picked so that the history stays one commit. web-15 also holds the failover console of contract 0.15.0, which m18 does not have; it is not taken here.
+
+### What was done
+
+- The table page `/databases/<name>/tables/<schema>/<table>`, the dialogs distribute, undistribute, change the distribution, create, attach, detach and drop a partition, the preview panel and the task panel, from web-15.
+- The conflicts (README, browser harness, `mocks/http.ts`, `mocks/state.ts`) all came from the 0.15.0 failover console; only the 0.14.0 table parts were kept. The fixed-shape mock handlers that 9.6 put on m18 for the eight operations were replaced by the mock of 9.7 (`src/mocks/tables.ts`); the generated types, operations and problem codes are those of m18, and no stand-in type is left. A doc comment that had slipped above a new constant in `handlers.ts` was put back.
+- Checked against shard-phase9.md: each of the eight operations of 9.6 has its UI (the preview in every dialog, undistribute, alter, create, attach, detach, drop, the list of partitions). Not done as the design describes: the progress indicator on a row of the tables list and the badge on the Shards page need an `operation` field on `Table`, which contract 0.14.0 does not have; "distribute with related tables" (control plane and dialog) stays open, as the README says. The reviews in kingres/docs/reviews say nothing about the console of 9.7 (the review of increments 4 to 9 lists the console as not in the commits).
+
+### How it was checked
+
+- `npm run typecheck`, `npm run lint` (eslint and prettier) and `npm run api:check`: clean.
+- `npx vitest run`: 92 files, 1513 tests passed.
+- `npm run test:browser` (Chrome): 3 files, 46 tests passed (axe in light and dark at 1366 and 320 px, layout, content security policy), including the table route and the four table states.
+- Mutants, each caught by the tests and reverted: a blocked change no longer holds the start; the partition name limit raised by 100 bytes; "Cancel the task" shown for a task that cannot be cancelled.
+- `go test ./internal/...` on Windows: every package passes except `internal/pgconninfo`, whose test binary Windows refuses to run ("Access is denied", a build failure, repeated). No Go file is changed here. `internalapi` and `ledgersign` failed once under the load of the browser run and passed alone.
+
+### The review of the console (2026-11-22) and its fixes
+
+The independent review (docs/reviews/2026-11-22-console-phase9-7.md, no critical or high finding) had seven findings, all fixed in a second commit on web-15b: type-to-confirm and the danger tone for undistribute and alter (C97R-001); no claim that a cancelled task left the table as it was, the detail of the task shown and read again after a cancel (C97R-002); the mock switches blockme, diffme, pending, undo:<ms> and undo:fail with tests of the paused, verification-failed and pending states (C97R-003); a test that the start waits for the preview (C97R-004); a name on every group of radios (C97R-005); a test of the 57 bytes with two-byte letters (C97R-006); pending tasks hold the buttons and the page reads 200 tasks (C97R-007). The runs and the mutants are in the Fixes section of the review and in the final report of the work.
+
+### Still open
+
+- The progress indicators that need `Table.operation`; distribute with related tables.
+- Not pushed.
+
+---
+
+
 ## 2026-11-22: phase 11 (distributed schemas), the extension: the scale work (step 12), the review fixes and the documentation (step 15)
 
 Covers the work on branch shard-p1011 after the second review of phase 11 (the review fixes of 2026-11-21 are in the entry of that day).
@@ -24,6 +640,7 @@ Covers the work on branch shard-p1011 after the second review of phase 11 (the r
   `kingres_shard--0.8.sql` is checked against `mk-install-script.sh` (`t/250`) and was regenerated after the merge of `ext-partfix` (a fresh 0.8 install had its partition blocker back); the lazy
   lookups take the primary key index from the open table, not an OID kept at load (REINDEX CONCURRENTLY, a renamed or missing index, `t/247`); `add_node` cleans the new node when there is no
   schema left to make and a missing role is an error of the call (`t/251`); sha256 digests; `catalog_incremental` is `PGC_SUSET`.
+- **The review of those fixes (P12F-01 to P12F-03)**, fixed: a catalog table of the extension that lost its primary key is read without an index and a warning is raised once, so that `ALTER TABLE ... ADD PRIMARY KEY` and every other statement still run (`t/247` E); the roles of the distributed schemas are checked on the new node with a query on `pg_roles` before staging and the staging session reads English messages (`t/251` B); `internal_split_switch` sets `extra_float_digits = 3` itself (`t/249`).  Review: `reviews/2026-11-22-kingres-shard-step12-review-fixes.md`.
 - **Steps 13 and 14, the control plane and the panel, are not part of this branch.**  They were built here (contract 0.15.0, five operations, three task kinds, the task engine's `Step.Recover`, migration
   0050, the panel's dialogs) and then taken out again: the branch cp-1011 already carries the control plane and the console of phases 10 and 11 (contract 0.16.0, after failover 0.15.0 and cp-push
   0.14.0), in its fixed merge order.  The work stays on the branch `p11-cp-steps13-14` (8c9488e9aa) for a comparison with cp-1011.
@@ -49,12 +666,126 @@ Covers the work on branch shard-p1011 after the second review of phase 11 (the r
 - The comparison of `p11-cp-steps13-14` with cp-1011.
 - A load that is incremental per colocation group, if 2000 schemas are not enough (the DDL statement still grows from 26 to 52 ms between 200 and 2000 schemas).
 - A flake seen once under the control plane work: the switch of a move under a running writer timed out on a node and the move was undone; not understood.
+## 2026-11-22 (third entry): fixes for the second review of the phase 12 control plane (P12D-01 to P12D-09)
+
+Branch `p12-cp`. The review is [reviews/2026-11-22-control-plane-phase12-fixes.md](reviews/2026-11-22-control-plane-phase12-fixes.md); its "Fixes" section lists every finding with the change and the test.
+
+### What was done
+
+- A scheduled run is compared with the last run of its policy (a clock that stepped is refused, one alert); a failure before any run exists backs off on the policy itself; the library check covers standbys; the preload list keeps the library of an instance that had it.
+- The decision for non-superuser owners: the cluster setting `analytics.allowNonSuperuserOwners` (default off, contract 0.18.0), the refusal codes, one alert instead of a retry, and the corrected trust text. `tableOwner` and `ownerTrusted` on the policy and the storage preview.
+- Lows: reader stall shortened (200 ms) and described, alerts of dropped databases cleared, one alert per refusal, `maintainRunning` fails closed, back-off on the last run.
+- Contract changes for the console are in `p12cp/contract-changes.txt` (items 14 to 17).
+
+### How it was verified
+
+PostgreSQL 18 and 19.0, lane l1: the PG-backed tests of `internal/ops`, `internal/instance`, `internal/store/pgstore` and the two cluster tests. Unit tests of `ops`, `partsched`, `monitor`, `api`, `contract`; `check-contract.mjs`. Mutants are in the report.
+
+### Decisions and deviations
+
+- The setting is a cluster setting read from `kingres_cp.cluster_setting` at each use; a system database without it means off.
+
+### Still open
+
+- A cluster test that restarts one server with the library missing.
+
+## 2026-11-22: phase 12 control plane (contract 0.18.0): approximate aggregates, storage conversion, time-partitioning policies and their scheduler, and the preload of kingres_columnar
+
+Branch `p12-cp` (worktree of its own), from `kingres-18` at e279c14091. Items St-P1 to St-P5 and Q-C1 of the inventory of 2026-11-22; the console parts (W1, W2, Q-W1)
+are on `p12-web`.
+
+### What was done
+
+- **Contract 0.18.0** (own commit): 11 operations (`getApproximateAggregates`, `configureApproximateAggregates`, `setTableStorage`, `setPartitionStorage`, `getPartitionPolicy`,
+  `putPartitionPolicy`, `deletePartitionPolicy`, `runPartitionPolicy`, `listPartitionPolicyRuns`, `getPartitionPolicyRun`, `planPartitionPolicy`), three task kinds, six problem codes, two alert
+  kinds, six audit actions, the optional `storage` and `partitioning` members of `Table`, the query parameter `storage`. `listTablePartitions` (0.14.0) is extended, not duplicated. Numbered 0.18.0
+  because the other branches take 0.15.0 to 0.17.0; the integrator renumbers (and the migrations 0035 and 0036). The generated files, the labels and the mock statuses of the panel follow.
+- **The release blocker**: `instance.PreloadLibraries` is `kingres_shard,kingres_ledger,kingres_columnar`; `EnsureConfig` brings an older `kingres-managed.conf` up to date at the start of `kingresd`;
+  `kingres_timepart` and `kingres_sketch` need no preload (read in their READMEs and tested). The flow test and the text of the packaging README follow.
+- **Q-C1** `database.approximateAggregates` (five steps, one install step per server), migration 0035, the closed `apply` kinds `extension.check`, `extension.install`, `extension.verify`, `database.settings`,
+  and a read of another server through the internal call `exec` (`membership.Manager.Query`).
+- **St-P2** `storage` and `partitioning` in `listTables`/`getTable` (pgstore), the filter, `listTablePartitions` for ordinary partitioned tables, the install of `kingres_columnar` and `kingres_timepart` in every
+  database that is made (and, through the existing copy of the extension list, on every server that is added).
+- **St-P3** `table.setStorage` for a table and for a partition. **St-P4** the policy resources. **St-P5** `internal/partsched`, `partition.maintain`, `runPartitionPolicy`, the runs, the alerts and the
+  counters on `/metrics`; migration 0036.
+- Documentation: `kingres/control-plane/README.md` (section "Analytics"), `kingres/api/README.md` (changelog 0.18.0, task kinds), `internal-api.md`, `kingres/packaging/README.md`.
+
+### How it was verified
+
+See the tests named in the README section. On PostgreSQL 18 and 19, lane l1, private installations built from e279c14091 (`install-extensions.sh` now builds the five extensions):
+`TestApproximateAggregates`, `TestTableStorageAndPartitionPolicies` (cluster tests, three servers), `TestIntegrationSetStorage*`, `TestIntegrationPartitionPolicyResource`, `TestIntegrationMaintain*`,
+`TestIntegrationPartitionScheduler*`, `TestIntegrationTableStorage`, and the tests of `internal/instance`. Unit: `go test ./internal/ops ./internal/partsched ./internal/httpapi ./internal/api ./internal/problem ./internal/store/...`,
+`node scripts/check-contract.mjs`, `npm run api:check`, `vue-tsc`. Mutants: see the list in the report of the round.
+
+### Decisions and deviations
+
+- A database that was made before this version gets `kingres_columnar` and `kingres_timepart` at the first use of a storage or policy operation, where the design answers `extension_missing` for an extension that is not
+  installed (nothing in the contract installs them). `extension_missing` stays for a package without the extension and for a library that is not preloaded.
+- Storage and policy operations work on the instance of this server (where the leader runs). A plain table of another group's instance is not found; distributed tables are D1a and D1b.
+- Step names are sentences (house style) and not the single words of the design table. `itemsDone` and `itemsTotal` of the convert step are not set (the environment of a step has no call for them yet).
+- `createdBy` of a policy is the service role; the audit log has the role that asked.
+- `database.approximateAggregates` is not in the exclusion rules of the task table (a failover does not stop it); the engine's one task per subject covers the second request.
+
+### Still open
+
+- Cluster test with a server whose package has another `kingres_sketch` version (all servers of the tests share one installation).
+- D1a, D1b (policies and conversion on distributed tables), S3 and the console steps.
+- Retention and conversion of the columnar partitions need `kingres_columnar` 0.2 in the packages of every server of a cluster: a mixed cluster is not checked by `partition.maintain`.
 
 ### Core patches
 
 None.
 
 ---
+
+## 2026-11-22: fixes for the review of the schema tasks port on cp-1011
+
+### What was done
+
+- The review of the three port commits (`reviews/2026-11-22-cp-1011-schema-tasks-port.md`, no critical or high finding) was
+  fixed: `Recover` cut off by a shutdown no longer fails the task (SP1); the move step asks the extension to settle a move that no
+  call drives, repeatedly, and has a bound on the fresh path (SP3); only the extension's refusal of a cancel is "too late" (SP4); the
+  late-cancel note survives the clean-up step (SP5); the make steps accept a failed call that took effect (SP6); the web note for a
+  failed move names only the cases where the schema stayed (SP7); partitions are checked for a replica identity (SP8); a make local
+  that moved first says where the schema went (SP9); migration 0041 and the memory store also exclude `schema.move` and
+  `schema.undistribute` against `server.add`, `server.remove` and `server.leave` (SP11).
+- A make local with a move first could never finish within the cleaning delay; it now ends the cleaning of its own move first.
+- Tests: kills inside the call of the extension (distribute, make local), the other direction of the rebalance exclusion at the
+  request, a terminated move backend with and without the leader, unit tests for the engine and the guards.
+
+### How it was verified
+
+Unit tests of task, ops, httpapi, rebalance, sysdb and failover; the web unit tests (1484) and the browser test of the schema
+dialogs; the trigger tests and `TestSchemaTasksOnACluster` and `TestDistributedSchemasThroughTheAPI` on PostgreSQL 18 and 19 (lane
+l1); each new test against a mutant (the table in the review file).
+
+### Still open
+
+- A prepared transaction left by a cut `distribute_schema` cannot be made on demand (no fault point in the call): the test covers the
+  branch of `Recover` and the meeting of the two calls, not the resolution of a real leftover.
+- A make local whose schema has no row on the map group is taken as made, which is also true for a dropped schema.
+
+---
+
+
+## 2026-11-22: the open low finding and notes of the second look at the fixes of C13 (C14-08, C14-09, C14-10)
+
+### What was done
+
+- **kingres_columnar** (branch c14-low). C14-08: a developer gate (point 8 of `kingres_columnar.reserve_gate_at`) between the vacuum lock and the read of the ranges, and `t/070`
+  stops the index vacuum there and checks that a writer's give-back is refused. C14-10: the skipped merge of a `VACUUM` that already has a transaction id says so at `DEBUG1`, with
+  a test through a dropped table's orphan catalog rows. C14-09: the README states the cost of the refused give-back with its rate.
+
+### How it was verified
+
+- `t/070` passes; the mutants "lock after the ranges" (C14-08) and "message at DEBUG5" (C14-10) each fail it. The full suite of the extension runs on PostgreSQL 18 and 19.
+
+### Still open
+
+- Nothing from the second look at C13: C14-04 stays documented only, as the review says.
+
+---
+
 
 ## 2026-11-20: automatic failover, the last steps of phase 2b and their review, the second review of phase 9 and its fixes, and two npm alerts
 

@@ -51,6 +51,21 @@ type Service struct {
 	MaxAttempts int
 	Backoff     time.Duration
 	Poll        time.Duration
+	// ServerStatus tells the status of a server ("dead" refuses a drain); nil skips the check.
+	ServerStatus func(ctx context.Context, id string) string
+	// SetShouldHaveShards writes the flag of a server to the catalog of every database (the drain's second step).
+	SetShouldHaveShards func(ctx context.Context, server string, want bool) error
+	// RemoveServer starts the task server.remove (a drain with removeWhenDone, after the drain task ended).
+	RemoveServer func(ctx context.Context, actor, id string) (task.Task, error)
+	// RelocateStandbys takes the server out of the ring of the standbys, asks for a reconcile and returns how many standbys the server
+	// still hosts. nil: the step is skipped.
+	RelocateStandbys func(ctx context.Context, server string) (int, error)
+	// DrainWait bounds the wait for the server to own no bucket (default 30 minutes).
+	DrainWait time.Duration
+	// DrainPoll is the pause between two looks at a drain (default 3 s).
+	DrainPoll time.Duration
+	// IsLeader tells whether this server is the manager leader; the automatic job does nothing elsewhere. nil: always.
+	IsLeader func(ctx context.Context) bool
 }
 
 func (s *Service) log() *slog.Logger {
@@ -84,12 +99,16 @@ func (s *Service) Definitions() []task.Definition {
 		Kind: Kind,
 		Steps: []task.Step{
 			step(StepCheck, s.stepCheck),
+			step(StepDrainFlag, s.stepDrainFlag),
 			step(StepPlan, s.stepPlan),
 			step(StepMove, s.stepMove),
+			step(StepDrainEmpty, s.stepDrainEmpty),
+			step(StepDrainStandbys, s.stepDrainStandbys),
 			step(StepWrite, s.stepWrite),
+			step(StepDrainEnd, s.stepDrainEnd),
 		},
 		OnFail: s.onFail,
-	}}
+	}, s.splitDefinition()}
 }
 
 func (s *Service) stepCheck(ctx context.Context, env *task.Env, rows *PGRows, o Options) error {
@@ -112,7 +131,7 @@ func (s *Service) stepPlan(ctx context.Context, env *task.Env, rows *PGRows, o O
 	if err != nil {
 		return err
 	}
-	plan, err := s.Backend.Plan(ctx, dbs)
+	plan, err := s.Backend.Plan(ctx, dbs, o)
 	if err != nil {
 		return err
 	}
@@ -129,7 +148,7 @@ func (s *Service) stepPlan(ctx context.Context, env *task.Env, rows *PGRows, o O
 }
 
 func (s *Service) loop(rows Rows) *Loop {
-	return &Loop{Backend: s.Backend, Rows: rows, MaxAttempts: s.MaxAttempts, Backoff: s.Backoff, Poll: s.Poll}
+	return &Loop{Backend: s.Backend, Rows: rows, MaxAttempts: s.MaxAttempts, Backoff: s.Backoff, Poll: s.Poll, Guard: s.autoGuard}
 }
 
 func (s *Service) stepMove(ctx context.Context, _ *task.Env, rows *PGRows, o Options) error {
@@ -277,6 +296,7 @@ func (s *Service) validate(ctx context.Context, o Options) error {
 	if o.MaxConcurrentMoves != 0 && (o.MaxConcurrentMoves < 1 || o.MaxConcurrentMoves > 64) {
 		errs = append(errs, problem.FieldError{Field: "/maxConcurrentMoves", Message: "must be 1 to 64", Code: "out_of_range"})
 	}
+	errs = append(errs, validateNew(o)...)
 	if len(o.Databases) > 0 {
 		all, err := s.Backend.Databases(ctx, Options{})
 		if err != nil {
@@ -300,6 +320,12 @@ func (s *Service) validate(ctx context.Context, o Options) error {
 
 // Start starts a rebalance, or starts a stopped one again.
 func (s *Service) Start(ctx context.Context, actor string, o Options) (task.Task, error) {
+	return s.start(ctx, actor, o, false)
+}
+
+// start is Start; a drain (o.DrainServer set) is allowed to have nothing to move yet: the flag of the
+// server is set by its second step, and the plan is made as if it were already set.
+func (s *Service) start(ctx context.Context, actor string, o Options, drain bool) (task.Task, error) {
 	eng := s.Engine()
 	if eng == nil {
 		s.log().Warn("rebalance: the task engine is not running")
@@ -307,6 +333,10 @@ func (s *Service) Start(ctx context.Context, actor string, o Options) (task.Task
 	}
 	if err := s.validate(ctx, o); err != nil {
 		return task.Task{}, err
+	}
+	o = s.resolve(ctx, o)
+	if o.Trigger != TriggerAutomatic {
+		s.acknowledge(ctx)
 	}
 	a, err := s.active(ctx)
 	if err != nil {
@@ -326,11 +356,11 @@ func (s *Service) Start(ctx context.Context, actor string, o Options) (task.Task
 	}
 	// The plan first: an empty plan is the answer whatever the state of the nodes (a cluster of one
 	// server has no other node to move to, and its check of the nodes has nothing to say).
-	plan, err := s.Backend.Plan(ctx, dbs)
+	plan, err := s.Backend.Plan(ctx, dbs, o)
 	if err != nil {
 		return task.Task{}, asProblem(err)
 	}
-	if a == nil && len(plan) == 0 {
+	if a == nil && len(plan) == 0 && !drain {
 		return task.Task{}, problem.New(problem.NothingToRebalance, "The buckets are placed as the plan would place them; nothing to move.")
 	}
 	if err := s.Backend.Check(ctx, dbs); err != nil {
@@ -508,7 +538,30 @@ func phaseOf(extPhase string) string {
 }
 
 func optionsOf(o Options) *api.RebalanceOptions {
-	return &api.RebalanceOptions{Databases: o.Databases, MaxConcurrentMoves: o.MaxConcurrentMoves}
+	return &api.RebalanceOptions{Databases: o.Databases, MaxConcurrentMoves: o.MaxConcurrentMoves,
+		Strategy: o.Strategy, Threshold: o.Threshold, DrainOnly: o.DrainOnly, MaxMovesPerServer: o.MaxMovesPerServer,
+		AcknowledgeFailures: o.AcknowledgeFailures, CleanupDelaySeconds: o.CleanupDelaySeconds}
+}
+
+// acknowledge records that an operator started a run: failures of the last automatic run no longer suspend
+// the automatic mode (design 8.3, "a manual start acknowledges it").
+func (s *Service) acknowledge(ctx context.Context) {
+	_ = s.sys(ctx, func(c *pgx.Conn) error {
+		_, err := c.Exec(ctx, `INSERT INTO kingres_cp.cluster_setting (key, value) VALUES ('autostate.acknowledgedAt', to_jsonb(clock_timestamp()))
+			ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`)
+		return err
+	})
+}
+
+// resolve fills the options a request left out from the cluster settings; a system database that cannot be read
+// leaves the defaults of the settings.
+func (s *Service) resolve(ctx context.Context, o Options) Options {
+	set := DefaultSettings()
+	if err := s.sys(ctx, func(c *pgx.Conn) (err error) { set, err = ReadSettings(ctx, c); return }); err != nil {
+		s.log().Warn("rebalance: reading the settings; the defaults are used", "error", err)
+		set = DefaultSettings()
+	}
+	return Resolve(o, set)
 }
 
 func strp(s string) *string {
@@ -555,6 +608,7 @@ func (s *Service) Status(ctx context.Context) (api.RebalanceStatus, error) {
 		}
 		st.StartedAt = &started
 		st.Options = optionsOf(run.Options)
+		st.Strategy, st.Threshold, st.Trigger = run.Options.Strategy, run.Options.Threshold, run.Options.Trigger
 		switch {
 		case a.State == task.Paused:
 			st.State = "stopped"
@@ -585,6 +639,7 @@ func (s *Service) Status(ctx context.Context) (api.RebalanceStatus, error) {
 				Phase: phaseOf(ph), Percent: m.Percent, SizeBytes: m.Size})
 		}
 	}
+	st.Automatic = s.AutoStatus(ctx)
 	last, err := s.latest(ctx, exclude)
 	if err != nil {
 		return st, err
@@ -660,6 +715,7 @@ func scanSummary(row pgx.Row) (api.RebalanceReportSummary, error) {
 	}
 	sum := api.RebalanceReportSummary{ID: run.TaskID, Outcome: run.Outcome, StartedAt: run.StartedAt.UTC(), FinishedAt: end.UTC(),
 		Options: optionsOf(run.Options), StoppedBy: strp(run.StoppedBy), Error: strp(run.Error),
+		Trigger: run.Options.Trigger, Strategy: run.Options.Strategy, Threshold: run.Options.Threshold,
 		Totals: api.ReportTotals{MovesTotal: int(max(int64(run.Planned), total)), MovesDone: int(done), MovesFailed: int(failed),
 			MovesSkipped: int(skipped), BytesMoved: bytes, DurationSeconds: int64(end.Sub(run.StartedAt).Seconds())}}
 	return sum, nil
@@ -761,7 +817,7 @@ func reportMoves(moves []MoveRow) []api.ReportMove {
 	for _, m := range moves {
 		rm := api.ReportMove{DatabaseName: m.Move.Database, ColocationID: m.Move.Colocation, Bucket: m.Move.Bucket,
 			FromShardGroupID: m.Move.From, ToShardGroupID: m.Move.To, FromServerID: m.FromServer, ToServerID: m.ToServer,
-			SizeBytes: m.Size, Attempts: m.Attempts, Error: strp(m.Error)}
+			SizeBytes: m.Size, Attempts: m.Attempts, Error: strp(m.Error), Reason: m.Move.Reason}
 		if m.FinishedAt != nil {
 			rm.DurationSeconds = m.FinishedAt.Sub(m.StartedAt).Seconds()
 		}
@@ -784,10 +840,12 @@ func reportMoves(moves []MoveRow) []api.ReportMove {
 
 // Preview is previewRebalancePlan: the moves a start would make now, in order.
 func (s *Service) Preview(ctx context.Context, req api.RebalancePlanRequest) (api.RebalancePlan, error) {
-	o := Options{Databases: req.Databases, MaxConcurrentMoves: req.MaxConcurrentMoves}
+	o := Options{Databases: req.Databases, MaxConcurrentMoves: req.MaxConcurrentMoves, Strategy: req.Strategy, Threshold: req.Threshold,
+		DrainOnly: req.DrainOnly, MaxMovesPerServer: req.MaxMovesPerServer, ExcludeServers: req.ExcludeServerIDs}
 	if err := s.validate(ctx, o); err != nil {
 		return api.RebalancePlan{}, err
 	}
+	o = s.resolve(ctx, o)
 	limit := req.MoveLimit
 	if limit == 0 {
 		limit = 200
@@ -803,7 +861,7 @@ func (s *Service) Preview(ctx context.Context, req api.RebalancePlanRequest) (ap
 	if len(dbs) == 0 {
 		return plan, nil
 	}
-	moves, err := s.Backend.Plan(ctx, dbs)
+	moves, err := s.Backend.Plan(ctx, dbs, o)
 	if err != nil {
 		return plan, asProblem(err)
 	}
@@ -844,12 +902,20 @@ func (s *Service) Preview(ctx context.Context, req api.RebalancePlanRequest) (ap
 			known = false
 		}
 		if i < limit {
-			plan.Moves = append(plan.Moves, api.PlannedMove{DatabaseName: m.Database, ColocationID: m.Colocation, Bucket: m.Bucket,
-				FromShardGroupID: m.From, ToShardGroupID: m.To, FromServerID: from, ToServerID: to, EstimatedSizeBytes: m.Size, Rank: max(0, 1000-i)})
+			pm := api.PlannedMove{DatabaseName: m.Database, ColocationID: m.Colocation, Bucket: m.Bucket,
+				FromShardGroupID: m.From, ToShardGroupID: m.To, FromServerID: from, ToServerID: to, EstimatedSizeBytes: m.Size, Rank: max(0, 1000-i),
+				Reason: m.Reason}
+			if m.Cost > 0 {
+				c := m.Cost
+				pm.Cost = &c
+			}
+			plan.Moves = append(plan.Moves, pm)
 		}
 	}
 	plan.Needed = len(moves) > 0
 	plan.Truncated = len(moves) > limit
+	plan.Strategy, plan.Threshold = o.Strategy, o.Threshold
+	loadBefore, loadAfter, imbalance := s.loadsOf(ctx, dbs, o, moves, of)
 	plan.Totals.MoveCount = len(moves)
 	if known && len(moves) > 0 {
 		plan.Totals.TotalBytes = &total
@@ -860,7 +926,67 @@ func (s *Service) Preview(ctx context.Context, req api.RebalancePlanRequest) (ap
 	}
 	sort.Strings(servers)
 	for _, sv := range servers {
-		plan.ServerImpacts = append(plan.ServerImpacts, api.ServerImpact{ServerID: sv, PrimaryBucketsBefore: before[sv], PrimaryBucketsAfter: after[sv]})
+		im := api.ServerImpact{ServerID: sv, PrimaryBucketsBefore: before[sv], PrimaryBucketsAfter: after[sv]}
+		if lb, ok := loadBefore[sv]; ok {
+			la := loadAfter[sv]
+			im.LoadBefore, im.LoadAfter = &lb, &la
+		}
+		plan.ServerImpacts = append(plan.ServerImpacts, im)
+	}
+	plan.Imbalance = imbalance
+	for _, db := range dbs {
+		for _, w := range s.groupWarnings(ctx, db) {
+			plan.Warnings = append(plan.Warnings, w)
+		}
 	}
 	return plan, nil
+}
+
+// loadsOf is the load of every server by the strategy before and after the plan, and the largest deviation of a
+// receiver from the ideal now; all empty when the extension has no group_load.
+func (s *Service) loadsOf(ctx context.Context, dbs []string, o Options, moves []Move, serverOf func(db string, g int32) string) (before, after map[string]float64, imbalance *float64) {
+	loads, err := s.Backend.Loads(ctx, dbs, o)
+	if err != nil {
+		return nil, nil, nil
+	}
+	before, after = map[string]float64{}, map[string]float64{}
+	worst := 0.0
+	for _, l := range loads {
+		if l.Server == "" {
+			continue
+		}
+		before[l.Server] += l.Load
+		after[l.Server] += l.Load
+		if l.Receiving && l.Deviation > worst {
+			worst = l.Deviation
+		}
+	}
+	for _, m := range moves {
+		c := float64(m.Cost)
+		if c == 0 && m.Size != nil {
+			c = float64(*m.Size)
+		}
+		after[serverOf(m.Database, m.From)] -= c
+		after[serverOf(m.Database, m.To)] += c
+	}
+	return before, after, &worst
+}
+
+// groupWarnings are the groups of a database that have buckets and no active primary (design 4.1): their
+// buckets are not planned.
+func (s *Service) groupWarnings(ctx context.Context, db string) []string {
+	var out []string
+	_ = s.Backend.withShard(ctx, db, func(c *pgx.Conn) error {
+		rows, err := c.Query(ctx, `SELECT DISTINCT m.group_id FROM kingres.bucket_map m WHERE NOT EXISTS (
+			SELECT 1 FROM kingres.node n WHERE n.group_id = m.group_id AND n.role = 'primary' AND n.is_active) ORDER BY 1`)
+		if err != nil {
+			return err
+		}
+		ids, err := pgx.CollectRows(rows, pgx.RowTo[int32])
+		for _, g := range ids {
+			out = append(out, fmt.Sprintf("groupUnavailable: shard group %d of database %s has no active primary; its buckets are not planned.", g, db))
+		}
+		return err
+	})
+	return out
 }

@@ -30,3 +30,6 @@ func pause(cmd *exec.Cmd, stop bool) {
 	}
 	_ = syscall.Kill(cmd.Process.Pid, sig)
 }
+
+// quit makes the Go runtime of the process print every goroutine and end (SIGQUIT), for a test that wants to see where a step is stuck.
+func quit(cmd *exec.Cmd) { _ = syscall.Kill(cmd.Process.Pid, syscall.SIGQUIT) }

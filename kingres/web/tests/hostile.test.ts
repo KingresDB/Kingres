@@ -128,7 +128,12 @@ describe('detail pages and dialogs show hostile names safely', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
     await load('/databases/shop')
     await waitFor(() => expect(document.body.textContent).toMatch(/U\+202E/))
-    expect(within(screen.getByRole('table')).getAllByRole('rowheader').length).toBeGreaterThan(10)
+    // the page has the Schemas table (0.15.0) and the Tables table: the tables of the database are the one with its own caption
+    expect(
+      within(screen.getByRole('table', { name: /tables of the database/i })).getAllByRole(
+        'rowheader',
+      ).length,
+    ).toBeGreaterThan(10)
     expectSafePage()
     expect(warn.mock.calls.flat().join(' ')).not.toMatch(/duplicate keys/i)
     warn.mockRestore()
@@ -194,7 +199,10 @@ describe('detail pages and dialogs show hostile names safely', () => {
         bodies.push(await request.clone().json())
     })
     await user.selectOptions(target, same[1] as HTMLElement)
-    await user.click(within(dialog).getByRole('button', { name: /^distribute table$/i }))
+    // The start button waits for the preview of the change (what the sharding extension says about the table).
+    const start = within(dialog).getByRole('button', { name: /^distribute table$/i })
+    await waitFor(() => expect(start).toBeEnabled())
+    await user.click(start)
     await waitFor(() => expect(bodies).toHaveLength(1))
     expect(bodies[0]).toMatchObject({ colocateWith: { schema: 'x.y', table: 'z' } })
   })

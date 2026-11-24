@@ -27,4 +27,13 @@ is(compare($out, "$dir/kingres_shard--0.8.sql"), 0,
 	'kingres_shard--0.8.sql is what mk-install-script.sh generates (run it in contrib/kingres_shard and commit the result)')
   or diag("diff -u $dir/kingres_shard--0.8.sql $out");
 
+# the install script of 0.9 is the 0.8 install script with the 0.8--0.9 upgrade script appended
+my $out9 = "$tmp/kingres_shard--0.9.sql";
+local $ENV{KS_INSTALL_SCRIPT_OUT_09} = $out9;
+$rc = system('sh', "$dir/mk-install-script.sh");
+is($rc, 0, 'mk-install-script.sh runs again for 0.9');
+is(compare($out9, "$dir/kingres_shard--0.9.sql"), 0,
+	'kingres_shard--0.9.sql is what mk-install-script.sh generates (run it in contrib/kingres_shard and commit the result)')
+  or diag("diff -u $dir/kingres_shard--0.9.sql $out9");
+
 done_testing();

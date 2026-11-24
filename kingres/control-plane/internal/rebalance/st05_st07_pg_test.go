@@ -21,7 +21,7 @@ func extStub(t *testing.T, e *guardEnv) *pgx.Conn {
 	ctx := context.Background()
 	stub := e.in.Connect(t, "postgres")
 	for _, q := range []string{
-		`CREATE SCHEMA kingres`,
+		`CREATE SCHEMA IF NOT EXISTS kingres`,
 		`CREATE TABLE kingres.bucket_move (move_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, colocation_id int, bucket int, phase text, detail text, started_at timestamptz DEFAULT clock_timestamp())`,
 		`CREATE FUNCTION kingres.resume_bucket_moves() RETURNS int LANGUAGE sql AS 'SELECT 0'`,
 		`CREATE FUNCTION kingres.internal_move_alive(id bigint) RETURNS bool LANGUAGE plpgsql AS $$
@@ -34,6 +34,7 @@ func extStub(t *testing.T, e *guardEnv) *pgx.Conn {
 			t.Fatal(err)
 		}
 	}
+	trustStub(t, stub)
 	return stub
 }
 

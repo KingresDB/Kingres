@@ -50,6 +50,8 @@ type RoleConnector interface {
 
 // Ops carries the dependencies of the operations.
 type Ops struct {
+	// failed remembers when a partition.maintain task of a table last failed (the back-off of a failure before any run exists).
+	failed failedTasks
 	// Service opens service connections; Roles opens role connections.
 	Service ServiceConnector
 	Roles   RoleConnector
@@ -103,8 +105,18 @@ type Ops struct {
 	// LedgerAudit is the check "publication" of a verification: the findings of the audit of the stored logs of a database (nil: not supported).
 	LedgerAudit func(ctx context.Context, db string) ([]string, error)
 	BundleDir   string
+	// Transfer configures the data transfer (contract 0.19.0); nil: this server does not offer it.
+	Transfer *TransferConfig
 	// DiskFree, when set, tells the free space of the disk of a server (the table lifecycle checks the destinations before it copies); nil skips the check.
 	DiskFree DiskFree
+	// Remote reads from another server (the extension versions of getApproximateAggregates); nil: the other servers show as unreachable.
+	Remote RemoteQuerier
+	// extBackendOverride replaces the local PostgreSQL side of the extension steps (tests).
+	extBackendOverride extBackend
+	// metrics counts the runs of time-partitioning policies (maintain.go).
+	metrics partitionMetrics
+	// approxRecordOverride replaces the write of the setting into the system database (tests).
+	approxRecordOverride func(context.Context, approxParams) error
 	// tableBackendOverride replaces the database side of the table tasks (tests).
 	tableBackendOverride tableBackend
 	// BG bounds background task runs; Wait waits for them.
@@ -117,6 +129,11 @@ type Ops struct {
 	life       lifecycle
 	// stmts tracks the running workbench statements (cancel.go).
 	stmts statements
+	// xferSt is the staging store and the master key, opened at the first use (transfer.go).
+	xferMu sync.Mutex
+	// startMu orders the check of the limits of the transfers with the start of the task, so that two requests of one role cannot both pass it.
+	startMu sync.Mutex
+	xferSt  *xferState
 }
 
 // SetEngine installs the task engine once the system database exists.
@@ -182,7 +199,13 @@ func (o *Ops) asRole(ctx context.Context, db, role string, f func(tx pgx.Tx) err
 		return connectProblem(err)
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-	return inTx(ctx, c, f)
+	return inTx(ctx, c, func(tx pgx.Tx) error {
+		// The startup parameter fixes the path of the session; this keeps it for the transaction whatever the code before did to the session.
+		if _, err := tx.Exec(ctx, "SET LOCAL search_path = pg_catalog"); err != nil {
+			return err
+		}
+		return f(tx)
+	})
 }
 
 // asService runs f in a transaction on a service connection to db.
@@ -232,6 +255,9 @@ func connectProblem(err error) error {
 // only the SQLSTATE and PostgreSQL's own message for errors the caller can act
 // on (which never contain passwords or verifiers).
 func PGProblem(err error) error {
+	if err == nil {
+		return nil // "return x, PGProblem(rows.Err())" must not turn a success into "the instance is not available"
+	}
 	var p *problem.Problem
 	if errors.As(err, &p) {
 		return p

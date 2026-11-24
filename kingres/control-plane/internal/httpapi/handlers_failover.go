@@ -6,8 +6,11 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
+	"unicode"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
@@ -17,6 +20,7 @@ import (
 // answered by the leader too, because the run's records are in its system database.
 type Failoverer interface {
 	Start(ctx context.Context, actor, server string, req failover.Request) (*task.Task, *failover.Plan, error)
+	StartRestore(ctx context.Context, actor string, req failover.RestoreRequest) (*task.Task, *failover.Plan, error)
 	Status(ctx context.Context) (failover.Status, error)
 	Reports(ctx context.Context, limit int, cursor string) (failover.ReportPage, error)
 	Report(ctx context.Context, id int64) (failover.Report, error)
@@ -24,10 +28,12 @@ type Failoverer interface {
 
 func (s *Server) failoverHandlers() map[string]handlerFunc {
 	return map[string]handlerFunc{
-		"failoverServer":      s.failoverServer,
-		"getFailoverStatus":   s.getFailoverStatus,
-		"listFailoverReports": s.listFailoverReports,
-		"getFailoverReport":   s.getFailoverReport,
+		"failoverServer":            s.failoverServer,
+		"restorePreferredPrimaries": s.restorePreferredPrimaries,
+		"getFailoverStatus":         s.getFailoverStatus,
+		"listFailoverReports":       s.listFailoverReports,
+		"getFailoverReport":         s.getFailoverReport,
+		"abandonMapGroupBootstrap":  s.abandonMapGroupBootstrap,
 	}
 }
 
@@ -71,6 +77,31 @@ func (s *Server) failoverServer(c *call, w http.ResponseWriter, r *http.Request)
 	}
 	c.addDetails(map[string]any{"taskId": t.ID, "serverId": server, "mode": req.Mode, "shardGroupIds": req.ShardGroupIDs,
 		"allowDataLoss": req.AllowDataLoss, "comment": req.Comment})
+	s.accepted(w, r, *t)
+	return nil
+}
+
+// restorePreferredPrimaries starts the restore of the preferred primaries, or answers its plan (the body is optional).
+func (s *Server) restorePreferredPrimaries(c *call, w http.ResponseWriter, r *http.Request) error {
+	fo, err := s.needFailover()
+	if err != nil {
+		return err
+	}
+	var req failover.RestoreRequest
+	if r.ContentLength != 0 {
+		if err := s.body(w, r, &req); err != nil {
+			return err
+		}
+	}
+	t, plan, err := fo.StartRestore(r.Context(), c.session.Username, req)
+	if err != nil {
+		return s.failoverProblem(r, err)
+	}
+	if plan != nil {
+		s.writeJSON(w, r, http.StatusOK, plan)
+		return nil
+	}
+	c.addDetails(map[string]any{"taskId": t.ID, "shardGroupIds": req.ShardGroupIDs})
 	s.accepted(w, r, *t)
 	return nil
 }
@@ -131,10 +162,12 @@ func (s *Server) getFailoverReport(_ *call, w http.ResponseWriter, r *http.Reque
 type MapFailoverer interface {
 	// Handles says that a request for the failover of server is the failover of the map group that cannot go through the leader.
 	Handles(ctx context.Context, server string) bool
-	Start(ctx context.Context, actor, server string, req failover.Request) (task.Task, error)
+	Start(ctx context.Context, actor string, id internalapi.ForwardIdentity, server string, req failover.Request) (task.Task, error)
 	Active() bool
 	TaskZero() (task.Task, bool)
 	Status() (failover.Status, bool)
+	// Abandon gives up the bootstrap of the map group that is in progress on this server or on a standby's server (F4-06): false when none is.
+	Abandon(ctx context.Context, actor, reason string) (failover.MapAbandonResult, error)
 }
 
 // mapFailoverIntercept answers the operations of the bootstrap of the map group on this server. It returns true when it answered.
@@ -156,7 +189,7 @@ func (s *Server) mapFailoverIntercept(c *call, w http.ResponseWriter, r *http.Re
 		if req.DryRun {
 			return true, problem.New(problem.UnsupportedOp, "The plan of the failover of the map group cannot be asked while the manager leader is gone.")
 		}
-		t, err := mf.Start(r.Context(), c.session.Username, server, req)
+		t, err := mf.Start(r.Context(), c.session.Username, identityOf(c.session), server, req)
 		if err != nil {
 			return true, s.failoverProblem(r, err)
 		}
@@ -164,6 +197,8 @@ func (s *Server) mapFailoverIntercept(c *call, w http.ResponseWriter, r *http.Re
 		w.Header().Set("Location", "/api/v1/failover")
 		s.writeJSON(w, r, http.StatusAccepted, taskToAPI(t))
 		return true, nil
+	case "abandonMapGroupBootstrap":
+		return true, s.abandonMapGroupBootstrap(c, w, r)
 	case "getFailoverStatus":
 		if st, ok := mf.Status(); ok {
 			s.writeJSON(w, r, http.StatusOK, st)
@@ -178,4 +213,29 @@ func (s *Server) mapFailoverIntercept(c *call, w http.ResponseWriter, r *http.Re
 		}
 	}
 	return false, nil
+}
+
+// abandonMapGroupBootstrap gives up a stuck bootstrap of the map group (0.18.0). Any server answers it: the leader may be the server that is gone.
+func (s *Server) abandonMapGroupBootstrap(c *call, w http.ResponseWriter, r *http.Request) error {
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	if err := s.bodyClosed(w, r, &req); err != nil {
+		return err
+	}
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" || len(reason) > 500 || strings.ContainsFunc(reason, unicode.IsControl) {
+		return problem.New(problem.ValidationFailed, "The reason must be 1 to 500 characters without control characters.")
+	}
+	mf := s.deps.MapFailover
+	if mf == nil {
+		return problem.New(problem.UnsupportedOp, "This server cannot give up a bootstrap of the map group (no managed instance or no internal API).")
+	}
+	res, err := mf.Abandon(r.Context(), c.session.Username, reason)
+	if err != nil {
+		return s.failoverProblem(r, err)
+	}
+	c.addDetails(map[string]any{"reason": reason, "abandoned": res.Abandoned, "resumedServerId": res.ResumedServer})
+	s.writeJSON(w, r, http.StatusOK, res)
+	return nil
 }

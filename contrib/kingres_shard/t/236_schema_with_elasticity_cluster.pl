@@ -9,7 +9,7 @@
 #   A. the catalog carries both lines: the layout columns of phase 10 and the kind of phase 11, equal on every node after a push, and a
 #      document of an older map group (no new column at all) is accepted
 #   B. a group that holds a distributed schema is never split (internal_split_allowed, split_bucket), a hash group is
-#   C. the plans (plan_rebalance, rebalance_plan) do not move the bucket of a schema; check_cluster has nothing to say about a schema
+#   C. rebalance_plan (phase 4) does not move the bucket of a schema; plan_rebalance (phase 10) plans it as an item (t/270 tests that further); check_cluster has nothing to say about a schema
 #   D. the buckets view has the modulus last and shows a schema table with one bucket; a split of a hash group and a distributed schema live together
 
 use strict;
@@ -84,9 +84,9 @@ like(q1($n1, "SELECT kingres.internal_split_allowed($cs)"), qr/holds a distribut
 # ---------------------------------------------------------------------------
 # C. plans and checks
 # ---------------------------------------------------------------------------
-is(q1($n1, "SELECT count(*) FROM kingres.plan_rebalance() WHERE colocation_id = $cs"), 0, 'plan_rebalance does not move the bucket of a schema');
 is(q1($n1, "SELECT count(*) FROM kingres.rebalance_plan() WHERE colocation_id = $cs"), 0, 'rebalance_plan does not either');
-is(q1($n1, "SELECT count(*) FROM kingres.plan_rebalance('by_disk_size', 0) WHERE colocation_id = $cs"), 0, '... nor by disk size');
+is(q1($n1, "SELECT count(*) FROM kingres.plan_rebalance() p WHERE p.colocation_id = $cs AND (p.bucket <> 0 OR p.source_group <> (SELECT group_id FROM kingres.bucket_map WHERE colocation_id = $cs AND bucket = 0))"), 0, 'plan_rebalance plans the bucket of a schema as bucket 0, from the group that holds it (if at all)');
+is(q1($n1, "SELECT count(*) FROM kingres.plan_rebalance('by_disk_size', 0) p WHERE p.colocation_id = $cs AND p.bucket <> 0"), 0, '... also by disk size');
 is(q1($n1, q{SELECT count(*) FROM kingres.check_cluster()}), 0, 'check_cluster has nothing to say about a cluster with a distributed schema') or diag(q1($n1, q{SELECT * FROM kingres.check_cluster()}));
 is(q1($n1, q{SELECT sum(buckets) FROM kingres.drain_status()}), 5, 'drain_status counts the bucket of the schema among the buckets of its group');
 

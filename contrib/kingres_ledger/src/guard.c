@@ -75,6 +75,8 @@
 #include "access/xact.h"
 #include "catalog/dependency.h"
 #include "catalog/namespace.h"
+#include "catalog/index.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_type.h"
@@ -204,6 +206,128 @@ kl_extension_oid(void)
 	if (!OidIsValid(kl_extoid_cache))
 		kl_extoid_cache = get_extension_oid(KL_EXTENSION_NAME, true);
 	return kl_extoid_cache;
+}
+
+/*
+ * kl_schema_trusted
+ *		Whether the schema "kingres" belongs to a superuser.  The schema is shared with the other
+ *		KingresDB extensions and can be made by the owner of a database before the extension is
+ *		installed; the relations of the ledger are trusted only in a schema that a superuser holds.
+ */
+static bool
+kl_schema_trusted(Oid nspoid)
+{
+	HeapTuple	tup = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(nspoid));
+	bool		result = false;
+
+	if (HeapTupleIsValid(tup))
+	{
+		result = superuser_arg(((Form_pg_namespace) GETSTRUCT(tup))->nspowner);
+		ReleaseSysCache(tup);
+	}
+	return result;
+}
+
+/*
+ * kl_catalog_relid
+ *		The OID of a table of the ledger catalog found by its name, or InvalidOid when the extension
+ *		is not installed in this database, the schema is not a superuser's, or the relation of that
+ *		name is not an ordinary table that is a member of the extension.  A relation that is not
+ *		the extension's is a look-alike (the schema can be made by the owner of the database).
+ */
+Oid
+kl_catalog_relid(const char *relname)
+{
+	Oid			extoid = kl_extension_oid();
+	Oid			nspoid;
+	Oid			relid;
+
+	if (!OidIsValid(extoid))
+		return InvalidOid;
+	nspoid = get_namespace_oid(KL_SCHEMA_NAME, true);
+	if (!OidIsValid(nspoid))
+		return InvalidOid;
+	if (!kl_schema_trusted(nspoid))
+	{
+		static Oid	logged_db = InvalidOid;
+
+		/* the extension is installed, the schema is somebody's else: the registry is not read, and the log says so once */
+		if (logged_db != MyDatabaseId)
+		{
+			logged_db = MyDatabaseId;
+			ereport(LOG,
+					(errmsg("kingres_ledger: the schema \"%s\" of database with OID %u is not owned by a superuser; its registry is not read", KL_SCHEMA_NAME, MyDatabaseId)));
+		}
+		return InvalidOid;
+	}
+	relid = get_relname_relid(relname, nspoid);
+	if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION ||
+		getExtensionOfObject(RelationRelationId, relid) != extoid)
+		return InvalidOid;
+	return relid;
+}
+
+/*
+ * kl_catalog_index_relid
+ *		The same for an index of a table that kl_catalog_relid returned: it must be an index of that table
+ *		(the index of a constraint is not recorded as a member of the extension itself).
+ */
+Oid
+kl_catalog_index_relid(const char *idxname, Oid tableoid)
+{
+	Oid			nspoid;
+	Oid			idxoid;
+
+	if (!OidIsValid(tableoid))
+		return InvalidOid;
+	nspoid = get_namespace_oid(KL_SCHEMA_NAME, true);
+	if (!OidIsValid(nspoid))
+		return InvalidOid;
+	idxoid = get_relname_relid(idxname, nspoid);
+	if (!OidIsValid(idxoid) || IndexGetRelation(idxoid, true) != tableoid)
+		return InvalidOid;
+	return idxoid;
+}
+
+/*
+ * kl_registry_untrusted
+ *		The extension is installed in this database but its schema is not the superuser's: its
+ *		registry cannot be read, so nothing can be said of which tables are ledger tables.  (Not
+ *		installed is not this: that is a clean no-op everywhere.)
+ */
+bool
+kl_registry_untrusted(void)
+{
+	Oid			nspoid;
+
+	if (!OidIsValid(kl_extension_oid()))
+		return false;
+	nspoid = get_namespace_oid(KL_SCHEMA_NAME, true);
+	return !OidIsValid(nspoid) || !kl_schema_trusted(nspoid);
+}
+
+/*
+ * kl_fail_closed
+ *		The guards that look at the registry to see whether there is anything to protect must not
+ *		take "the registry cannot be read" for "nothing is registered": a role that is not a
+ *		superuser is refused whatever would drop or take over the ledger.  A superuser may repair.
+ */
+bool
+kl_fail_closed(void)
+{
+	return kl_registry_untrusted() && !superuser();
+}
+
+/* Raise an error where an operation needs the registry and it cannot be trusted. */
+void
+kl_require_trusted_registry(const char *what)
+{
+	if (kl_registry_untrusted())
+		ereport(ERROR,
+				(errcode(ERRCODE_KL_PROTECTED),
+				 errmsg("cannot %s: the schema \"%s\" is not owned by a superuser, so the registry of the ledger cannot be trusted",
+						what, KL_SCHEMA_NAME),
+				 errhint("A superuser must make the schema its own (ALTER SCHEMA ... OWNER TO) after looking at what is in it.")));
 }
 
 /*

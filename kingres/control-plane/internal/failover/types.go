@@ -29,23 +29,53 @@ import (
 // KindFailover is the kind of the task (contract TaskKind server.failover).
 const KindFailover = "server.failover"
 
+// KindRestore is the kind of the task that restores the preferred primaries (contract TaskKind replication.restorePreferredPrimaries); its
+// subject is "replication" / "preferred-primaries".
+const (
+	KindRestore      = "replication.restorePreferredPrimaries"
+	SubjectRestoreID = "preferred-primaries"
+	SubjectRestore   = "replication"
+)
+
 // Request modes.
 const (
 	ModeHard     = "hard"
 	ModeGraceful = "graceful"
+	// ModeRestore is the restore of the preferred primaries: a switchover per group whose primary is not on its preferred server.
+	ModeRestore = "restore"
 )
 
 // Input is the input of the task: the request as it was resolved when the task
 // was made. It holds no secret. Groups is ascending, the map group (0) first.
 type Input struct {
-	Mode          string           `json:"mode"`
-	ServerID      string           `json:"serverId"`
+	Mode     string `json:"mode"`
+	ServerID string `json:"serverId"`
+	// Olds is the server whose primary is handed over, per group, for a restore (a restore spans servers); empty for the others, where
+	// it is ServerID.
+	Olds map[int32]string `json:"olds,omitempty"`
+	// Skipped are the groups that a restore does not touch, with the reason (preferredNotReady, mapGroup).
+	Skipped       []SkippedGroup   `json:"skipped,omitempty"`
 	Groups        []int32          `json:"groups"`
 	Targets       map[int32]string `json:"targets,omitempty"`
 	AllowDataLoss bool             `json:"allowDataLoss"`
 	Comment       string           `json:"comment,omitempty"`
 	Trigger       string           `json:"trigger"`
 	RequestedBy   string           `json:"requestedBy"`
+}
+
+// SkippedGroup is a group that a restore leaves alone.
+type SkippedGroup struct {
+	Group  int32  `json:"group"`
+	Reason string `json:"reason"`
+	Text   string `json:"text"`
+}
+
+// oldOf is the server whose primary of group g is handed over.
+func (in Input) oldOf(g int32) string {
+	if s := in.Olds[g]; s != "" {
+		return s
+	}
+	return in.ServerID
 }
 
 // Task error codes (README table of the control plane; the contract does not make
@@ -248,6 +278,9 @@ type DemoteRequest struct {
 	// Mode "fast" is the clean stop of a switchover: the lease is released (not transferred) and the answer carries the proof.
 	ExpectedTerm int64  `json:"expectedTerm"`
 	TransferTo   string `json:"transferTo"`
+	// Candidate is the server that a planned switchover of the map group hands the group to (mode fast, group 0): the old leader records it before it stops, and resumes
+	// its primary later only on that server's word (F7-01).
+	Candidate string `json:"candidate,omitempty"`
 }
 
 // DemoteAnswer is the answer of POST /failover/demote.
@@ -401,6 +434,12 @@ type Peers interface {
 	Mark(ctx context.Context, server string, r MarkRequest) (MarkAnswer, error)
 	Verify(ctx context.Context, server string, r VerifyRequest) (VerifyAnswer, error)
 	Resume(ctx context.Context, server string, r ResumeRequest) error
+	// The calls of the planned switchover of the map group (the old leader's task talks to the bootstrap of the candidate).
+	MapStart(ctx context.Context, server string, r MapStartRequest) error
+	MapProof(ctx context.Context, server string, r MapProofRequest) error
+	MapAbandon(ctx context.Context, server, reason string) error
+	// MapRefusal is the refusal of the proof that the candidate reported to this server, the old leader's (local: the task runs here).
+	MapRefusal(ctx context.Context, taskID int64) (string, bool)
 }
 
 // Node is a row of kingres.node.
@@ -641,3 +680,38 @@ const CountAutomaticSQL = `WITH c AS (UPDATE kingres_cp.failover_run SET counted
 	INSERT INTO kingres_cp.cluster_setting (key, value)
 	SELECT 'autoFailover.eventsSinceReset', to_jsonb(coalesce((SELECT (value #>> '{}')::int FROM kingres_cp.cluster_setting WHERE key = 'autoFailover.eventsSinceReset'), 0) + 1) FROM c
 	ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`
+
+// MapPlanned is what the old leader's task tells the candidate that starts the bootstrap of a planned switchover of the map group: the id of its task and
+// the standby it chose (the same field names as journal.Planned).
+type MapPlanned struct {
+	TaskID    int64 `json:"taskId"`
+	StandbyID int64 `json:"standbyId"`
+}
+
+// MapStartRequest is the body of POST /failover/map/start for a planned switchover (cmd/kingresd mapStartBody).
+type MapStartRequest struct {
+	Server        string      `json:"server"`
+	RequestedBy   string      `json:"requestedBy"`
+	AllowDataLoss bool        `json:"allowDataLoss"`
+	Comment       string      `json:"comment"`
+	Planned       *MapPlanned `json:"planned,omitempty"`
+}
+
+// MapProofRequest is the body of POST /failover/map/proof: how the old leader was left by its clean stop.
+type MapProofRequest struct {
+	Checkpoint   string `json:"checkpoint"`
+	ClusterState string `json:"clusterState"`
+}
+
+// MapCheckpoint is the answer of GET /failover/map/checkpoint: how the stopped primary of the map group was left.
+type MapCheckpoint struct {
+	Checkpoint   string `json:"checkpoint"`
+	ClusterState string `json:"clusterState"`
+}
+
+// MapAbandonResult is what giving up a bootstrap of the map group did (contract 0.18.0). ResumedServer names the server whose primary of the map group, held back
+// for a planned switchover, was started again by it; it is empty when there was none to start.
+type MapAbandonResult struct {
+	Abandoned     bool   `json:"abandoned"`
+	ResumedServer string `json:"resumedServerId,omitempty"`
+}

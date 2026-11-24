@@ -89,6 +89,17 @@ const (
 	GroupDegraded       Code = "group_degraded"
 	InsufficientDisk    Code = "insufficient_disk"
 	NoReceivingServer   Code = "no_receiving_server"
+	// ReplicasCannotBeKept: a drain would leave fewer servers than the replica count needs (contract 0.15.0).
+	ReplicasCannotBeKept Code = "replicas_cannot_be_kept"
+	// Distributed schemas (contract 0.15.0).
+	ShardingModeInUse      Code = "sharding_mode_in_use"
+	SchemaNotDistributable Code = "schema_not_distributable"
+	SchemaPinned           Code = "schema_pinned"
+	SchemaMoveInProgress   Code = "schema_move_in_progress"
+	// BucketBusy: the bucket has a move or a split in progress (contract 0.15.0).
+	BucketBusy Code = "bucket_busy"
+	// SplitUnsupported: a table of the colocation group cannot be split (contract 0.15.0).
+	SplitUnsupported Code = "split_unsupported"
 	// Added in contract 0.10.0 (failover).
 	FailoverNeedsDecision Code = "failover_needs_decision"
 	LeaseSettingsDiffer   Code = "lease_settings_differ"
@@ -100,6 +111,26 @@ const (
 	ChainNotDiverged   Code = "chain_not_diverged"
 	// Added in contract 0.14.0 (the table lifecycle): the table cannot take the requested change; Blockers says why.
 	TableNotEligible Code = "table_not_eligible"
+	// Added in contract 0.17.0 (phase 12): the extensions of the analytics, the storage format and the time-partitioning policy.
+	ExtensionUnavailable     Code = "extension_unavailable"
+	ExtensionVersionMismatch Code = "extension_version_mismatch"
+	SketchHashMismatch       Code = "sketch_hash_mismatch"
+	ExtensionMissing         Code = "extension_missing"
+	ConversionRefused        Code = "conversion_refused"
+	PartitionPolicyConflict  Code = "partition_policy_conflict"
+	// Added in contract 0.19.0 (data transfer).
+	DataTransferDisabled   Code = "data_transfer_disabled"
+	InsecureTransport      Code = "insecure_transport"
+	TransferQuotaExceeded  Code = "transfer_quota_exceeded"
+	UploadIncomplete       Code = "upload_incomplete"
+	UploadOffsetMismatch   Code = "upload_offset_mismatch"
+	ChunkTooLarge          Code = "chunk_too_large"
+	UploadChecksumMismatch Code = "upload_checksum_mismatch"
+	ImportHeaderMismatch   Code = "import_header_mismatch"
+	ImportLedgerPolicy     Code = "import_ledger_policy"
+	ImportTooLarge         Code = "import_too_large"
+	ImportEndMarker        Code = "import_end_marker"
+	ExportUntrustedCode    Code = "export_untrusted_code"
 )
 
 // FieldError is one entry of the "errors" extension (schema ValidationIssue).
@@ -142,6 +173,8 @@ type Problem struct {
 	Plan any `json:"plan,omitempty"`
 	// Blockers are the lines of the report of the sharding extension that make a table not eligible (table_not_eligible; contract 0.14.0).
 	Blockers any `json:"blockers,omitempty"`
+	// Reasons are further reasons in the shape of Blockers (contract 0.19.0, optional).
+	Reasons any `json:"reasons,omitempty"`
 
 	// retryAfter, when positive, is sent as a Retry-After header (seconds).
 	retryAfter int
@@ -223,6 +256,13 @@ var specs = map[Code]struct {
 	GroupDegraded:                   {409, "Shard group degraded", "group-degraded"},
 	InsufficientDisk:                {409, "Insufficient disk space", "insufficient-disk"},
 	NoReceivingServer:               {409, "No receiving server", "no-receiving-server"},
+	ReplicasCannotBeKept:            {409, "Replicas cannot be kept", "replicas-cannot-be-kept"},
+	ShardingModeInUse:               {409, "Sharding mode in use", "sharding-mode-in-use"},
+	SchemaNotDistributable:          {422, "Schema not distributable", "schema-not-distributable"},
+	SchemaPinned:                    {409, "Schema pinned", "schema-pinned"},
+	SchemaMoveInProgress:            {409, "Schema move in progress", "schema-move-in-progress"},
+	BucketBusy:                      {409, "Bucket busy", "bucket-busy"},
+	SplitUnsupported:                {422, "Split not supported", "split-unsupported"},
 	FailoverNeedsDecision:           {409, "The failover needs a decision", "failover-needs-decision"},
 	LeaseSettingsDiffer:             {409, "Lease settings differ", "lease-settings-differ"},
 	LedgerNotPublished:              {409, "The ledger is not published", "ledger-not-published"},
@@ -231,6 +271,24 @@ var specs = map[Code]struct {
 	LastSigningKey:                  {409, "Last signing key", "last-signing-key"},
 	ChainNotDiverged:                {409, "The chain is not diverged", "chain-not-diverged"},
 	TableNotEligible:                {422, "The table cannot take this change", "table-not-eligible"},
+	ExtensionUnavailable:            {422, "The extension is not available", "extension-unavailable"},
+	ExtensionVersionMismatch:        {409, "The extension versions differ", "extension-version-mismatch"},
+	SketchHashMismatch:              {409, "The sketch hashes differ", "sketch-hash-mismatch"},
+	ExtensionMissing:                {409, "An extension is missing", "extension-missing"},
+	ConversionRefused:               {409, "The storage format cannot be changed", "conversion-refused"},
+	PartitionPolicyConflict:         {409, "The table cannot have this policy", "partition-policy-conflict"},
+	DataTransferDisabled:            {403, "Data transfer is disabled", "data-transfer-disabled"},
+	InsecureTransport:               {403, "Insecure transport", "insecure-transport"},
+	TransferQuotaExceeded:           {409, "Staging quota exceeded", "transfer-quota-exceeded"},
+	UploadIncomplete:                {409, "Upload incomplete", "upload-incomplete"},
+	UploadOffsetMismatch:            {409, "Upload offset mismatch", "upload-offset-mismatch"},
+	ChunkTooLarge:                   {413, "Chunk too large", "chunk-too-large"},
+	UploadChecksumMismatch:          {422, "Upload checksum mismatch", "upload-checksum-mismatch"},
+	ImportHeaderMismatch:            {422, "The header does not match", "import-header-mismatch"},
+	ImportLedgerPolicy:              {422, "The ledger policy refuses unsigned writes", "import-ledger-policy"},
+	ImportTooLarge:                  {422, "The file is too large to import", "import-too-large"},
+	ImportEndMarker:                 {422, "The file has an end-of-data line", "import-end-marker"},
+	ExportUntrustedCode:             {422, "The read would run code of another role", "export-untrusted-code"},
 }
 
 // New returns a Problem for the code with the standard status, title and

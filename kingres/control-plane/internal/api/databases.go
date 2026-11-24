@@ -23,6 +23,10 @@ type ShardingSettings struct {
 	// BucketCount is the number of hash buckets per colocation group; null
 	// when not available.
 	BucketCount *int `json:"bucketCount"`
+	// Mode is row, schema or both (contract 0.15.0, optional); BucketCount is null in mode schema.
+	Mode string `json:"mode,omitempty"`
+	// DistributeNewSchemas tells whether a new schema is placed on a shard group by itself (contract 0.15.0, optional).
+	DistributeNewSchemas *bool `json:"distributeNewSchemas,omitempty"`
 }
 
 // ReplicationSettings are the replication settings of a database.
@@ -45,6 +49,8 @@ type LedgerSettings struct {
 type DatabaseStats struct {
 	// SizeBytes is the size of the database.
 	SizeBytes *int64 `json:"sizeBytes"`
+	// DistributedSchemaCount is the number of distributed schemas (contract 0.15.0, optional).
+	DistributedSchemaCount *int `json:"distributedSchemaCount,omitempty"`
 	// TableCount is the number of user tables.
 	TableCount *int `json:"tableCount"`
 	// ActiveConnections is the number of current connections.
@@ -95,6 +101,8 @@ type Database struct {
 	LedgerSummary DatabaseLedgerSummary `json:"ledgerSummary"`
 	// RebalanceRequired tells whether buckets need rebalancing.
 	RebalanceRequired bool `json:"rebalanceRequired"`
+	// ApproximateAggregates is the approximate-aggregates setting (contract 0.17.0, optional).
+	ApproximateAggregates *DatabaseApproximate `json:"approximateAggregates,omitempty"`
 	// CreatedBy is the role that created the database.
 	CreatedBy *string `json:"createdBy"`
 	// CreatedAt is the creation time.
@@ -147,6 +155,8 @@ type Table struct {
 	SizeBytes *int64 `json:"sizeBytes"`
 	// Partitioning says how the user partitioned a distributed table (contract 0.14.0, optional); null when it is not partitioned.
 	Partitioning *TablePartitioning `json:"partitioning,omitempty"`
+	// Storage is the storage format (contract 0.17.0, optional); null when it is not known.
+	Storage *TableStorage `json:"storage,omitempty"`
 }
 
 // TablePartitioning is the partitioning member of Table.
@@ -154,6 +164,10 @@ type TablePartitioning struct {
 	Method         string `json:"method"`
 	Key            string `json:"key"`
 	PartitionCount int    `json:"partitionCount"`
+	// ColumnType, HasPolicy and DefaultPartition (contract 0.17.0, optional) are set for a table that is range-partitioned on one time column.
+	ColumnType       string `json:"columnType,omitempty"`
+	HasPolicy        *bool  `json:"hasPolicy,omitempty"`
+	DefaultPartition *bool  `json:"defaultPartition,omitempty"`
 }
 
 // TableColumn is a column of a table with its eligibility as distribution
@@ -201,6 +215,15 @@ type ColocationGroup struct {
 	TableCount int `json:"tableCount"`
 	// SizeBytes is the size of the group's data; null when not available.
 	SizeBytes *int64 `json:"sizeBytes"`
+	// BaseBucketCount is the number of buckets the group was made with (contract 0.15.0, optional); BucketCount is the
+	// current number, which a split raises.
+	BaseBucketCount *int `json:"baseBucketCount,omitempty"`
+	// MaxModulus is the greatest modulus of a bucket of the group (contract 0.15.0, optional).
+	MaxModulus *int `json:"maxModulus,omitempty"`
+	// Kind is hash or schema (contract 0.15.0, optional): a schema group has one bucket and holds one distributed schema.
+	Kind string `json:"kind,omitempty"`
+	// SchemaName is the distributed schema of a schema group, null for a hash group (contract 0.15.0, optional).
+	SchemaName *string `json:"schemaName,omitempty"`
 }
 
 // ColocationGroupList is the response of the colocation group list.
@@ -225,6 +248,10 @@ type Bucket struct {
 	SizeBytes *int64 `json:"sizeBytes"`
 	// MovingToShardGroupID is the destination while moving.
 	MovingToShardGroupID *int32 `json:"movingToShardGroupId"`
+	// Modulus and Remainder say which hashes the bucket holds: the remainder of the hash modulo the modulus; the
+	// remainder equals the bucket number (contract 0.15.0, optional).
+	Modulus   *int `json:"modulus,omitempty"`
+	Remainder *int `json:"remainder,omitempty"`
 }
 
 // BucketPage is a page of the bucket map.
@@ -299,6 +326,9 @@ type DatabaseCreateOptions struct {
 	ReplicaCount int `json:"replicaCount"`
 	// DefaultDurability is the default durability level.
 	DefaultDurability string `json:"defaultDurability"`
+	// ShardingModes are the values of the sharding mode and ShardingModeDefault the default (contract 0.15.0, optional).
+	ShardingModes       []string `json:"shardingModes,omitempty"`
+	ShardingModeDefault string   `json:"shardingModeDefault,omitempty"`
 	// LedgerDigestIntervalSeconds is the ledger digest interval range.
 	LedgerDigestIntervalSeconds IntegerRange `json:"ledgerDigestIntervalSeconds"`
 }

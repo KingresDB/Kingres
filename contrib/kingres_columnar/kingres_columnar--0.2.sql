@@ -5,6 +5,36 @@
 
 \echo Use "CREATE EXTENSION kingres_columnar" to load this file. \quit
 
+-- The schema is the extension's own: when it exists already (a role may have made it in advance, and "schema = ..." in the control file uses an existing
+-- schema) it must be owned by a superuser and give CREATE to no role that is not a superuser.  Otherwise that role would own what the service role, a
+-- superuser, reads and runs (the same check as extguard in the control plane, which refuses such a schema at run time too).
+DO $kgchk$
+DECLARE
+    v_schema pg_catalog.text := '@extschema@';
+    v_owner  pg_catalog.name;
+BEGIN
+    SELECT r.rolname INTO v_owner
+      FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner
+     WHERE n.nspname OPERATOR(pg_catalog.=) v_schema AND NOT r.rolsuper;
+    IF v_owner IS NOT NULL THEN
+        RAISE EXCEPTION 'the schema % already exists and is owned by %, which is not a superuser', v_schema, v_owner
+            USING ERRCODE = 'insufficient_privilege',
+                  HINT = 'Drop the schema, or make a superuser its owner, before CREATE EXTENSION.';
+    END IF;
+    IF EXISTS (SELECT 1
+                 FROM pg_catalog.pg_namespace n,
+                      LATERAL pg_catalog.aclexplode(COALESCE(n.nspacl, pg_catalog.acldefault('n', n.nspowner))) a
+                WHERE n.nspname OPERATOR(pg_catalog.=) v_schema
+                  AND a.privilege_type OPERATOR(pg_catalog.=) 'CREATE'
+                  AND (a.grantee OPERATOR(pg_catalog.=) 0
+                       OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles g WHERE g.oid OPERATOR(pg_catalog.=) a.grantee AND g.rolsuper))) THEN
+        RAISE EXCEPTION 'the schema % grants CREATE to a role that is not a superuser (or to PUBLIC)', v_schema
+            USING ERRCODE = 'insufficient_privilege',
+                  HINT = 'Revoke CREATE on the schema before CREATE EXTENSION.';
+    END IF;
+END
+$kgchk$;
+
 -- The stripe catalog: one row per stripe, keyed by the identity of the
 -- stored content (an id in the metapage of the relation file, which a copy of
 -- the file keeps and a rewrite or TRUNCATE replaces).  Ordinary heap rows: a stripe is visible

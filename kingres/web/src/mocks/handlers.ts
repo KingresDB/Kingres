@@ -5,7 +5,11 @@
 // response bodies are typed with the generated schema types.
 import { evaluateAccess } from '@/lib/network-rules'
 import { applyPending, configHandlers } from './config'
+import { DEFAULT_AUTOMATIC } from './state'
 import { ledgerHandlers } from './ledger'
+import { decorateStatus, distributedSchemaCount, elasticityHandlers } from './elasticity'
+import { analyticsHandlers, describePartitions, describeTable, explainPlan } from './analytics'
+import { transferHandlers } from './transfer'
 import { AGGREGATE_SIZE, anchoringOf, digestAnchorsOf, l7, publicationOf } from './ledger-view'
 import type { HttpHandler } from 'msw'
 import type { components } from '@/api/schema'
@@ -38,7 +42,6 @@ import {
   instancesOfServer,
   ledgerBlock,
   ledgerStatusOf,
-  makeBuckets,
   MOCK_PASSWORD,
   MOCK_SETUP_TOKEN,
   mockConfig,
@@ -64,6 +67,14 @@ import {
   restorePlan,
   startFailoverRun,
 } from './failover'
+import {
+  columnDefsOf,
+  previewChange,
+  startAlter,
+  startDistribute,
+  startPartition,
+  startUndistribute,
+} from './tables'
 
 type S = components['schemas']
 
@@ -398,6 +409,26 @@ function markRebalance(s: MockState, reason: S['RebalanceReason']): void {
 /** 0.12.0: the refusal of a request that needs a decision carries the plan (`?failover=noplan`: a server that does not yet). */
 function decisionExtra(plan: S['FailoverPlan']): Partial<Problem> {
   return mockConfig.failoverNoPlan ? {} : { plan }
+}
+
+const CHANGE_KINDS: S['TableChangeRequest']['kind'][] = [
+  'distribute',
+  'undistribute',
+  'alter',
+  'createPartition',
+  'attachPartition',
+  'detachPartition',
+  'dropPartition',
+]
+
+/** The database, the table and the state of the request of a table operation; 404 when either does not exist. */
+function tableOf(c: { s: MockState; params: Record<string, string | undefined> }) {
+  const rec = db(c.s, c.params.databaseName ?? '')
+  const t = rec.tables.find(
+    (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
+  )
+  if (!t) throw problem('not_found', 'Table does not exist.')
+  return { s: c.s, rec, t }
 }
 
 /** 0.12.0: a database is not created, dropped or distributed while a failover or a restore runs (409 `failover_in_progress`). */
@@ -843,7 +874,9 @@ function newDatabase(s: MockState, b: S['DatabaseCreateRequest']): Database {
     },
     sharding: {
       enabled: b.sharding?.enabled ?? false,
-      bucketCount: b.sharding?.bucketCount ?? 128,
+      bucketCount: b.sharding?.mode === 'schema' ? null : (b.sharding?.bucketCount ?? 128),
+      mode: b.sharding?.enabled ? (b.sharding?.mode ?? 'row') : 'row',
+      distributeNewSchemas: b.sharding?.distributeNewSchemas ?? false,
     },
     replication: {
       durability: b.replication?.durability ?? s.settings.defaultDurability,
@@ -890,31 +923,9 @@ function databaseView(s: MockState, name: string): Database {
 
 // --- roles and grants ----------------------------------------------------------------------------------
 
-const COLUMN_DEFS: Record<string, { name: string; type: string; key?: boolean }[]> = {
-  notes: [
-    { name: 'note_id', type: 'bigint', key: true },
-    { name: 'body', type: 'text' },
-    { name: 'tags', type: 'jsonb' },
-    { name: 'created_at', type: 'timestamptz' },
-  ],
-  monthly_totals: [
-    { name: 'month', type: 'date', key: true },
-    { name: 'total', type: 'numeric' },
-    { name: 'region', type: 'text' },
-  ],
-  exports: [
-    { name: 'export_id', type: 'bigint', key: true },
-    { name: 'payload', type: 'bytea' },
-    { name: 'created_at', type: 'timestamptz' },
-  ],
-}
-
 /** Columns of a table with the reason a column cannot be the distribution column (or null). */
 function columnsFor(rec: ReturnType<typeof db>, t: Table): S['TableColumn'][] {
-  const defs = COLUMN_DEFS[t.name] ?? [
-    { name: 'id', type: 'bigint', key: true },
-    { name: 'created_at', type: 'timestamptz' },
-  ]
+  const defs = columnDefsOf(t)
   return defs.map((d) => {
     let reason: S['DistributionBlockedReason'] | null = null
     if (!rec.info.sharding.enabled) reason = 'shardingDisabled'
@@ -1034,6 +1045,15 @@ function metricValue(metric: S['MetricName'], serverId: number, t: number): numb
       return 1800 + serverId * 120 + wave(500, 5) * 900
     case 'bucketsUnderReplicated':
       return 0
+    // The data transfer (0.19.0): only the manager leader holds staged files.
+    case 'transferStagingUsedBytes':
+      return (2 + wave(1800, 6) * 3) * 1024 * MiB
+    case 'transferStagingFreeBytes':
+      return (80 - wave(1800, 6) * 3) * 1024 * MiB
+    case 'transfersRunning':
+      return Math.round(wave(300, 7) * 2)
+    case 'transfersStaged':
+      return 3
     default:
       return clientMetricValue(metric, serverId, t)
   }
@@ -1116,6 +1136,10 @@ const METRIC_UNIT: Record<S['MetricName'], S['MetricQueryResult']['unit']> = {
   transactionsPerSecond: 'countPerSecond',
   queriesPerSecond: 'countPerSecond',
   bucketsUnderReplicated: 'count',
+  transferStagingUsedBytes: 'bytes',
+  transferStagingFreeBytes: 'bytes',
+  transfersRunning: 'count',
+  transfersStaged: 'count',
   clientConnectionsAccepted: 'count',
   clientConnectionsActive: 'count',
   clientConnectionsRefused: 'count',
@@ -1219,6 +1243,13 @@ function runQuery(ctx: Ctx): S['QueryResult'] {
     throw problem('unprocessable', 'A value of column "doc" is larger than 1 MiB.')
   if (/\bbusyrole\b/i.test(sql))
     throw problem('workbench_busy', 'This role already runs two statements on this server.')
+  const plan = explainPlan(ctx.s, b.database, sql)
+  if (plan)
+    return done(
+      [{ name: 'QUERY PLAN', type: 'text' }],
+      plan.map((line) => [line]),
+      'EXPLAIN',
+    )
   let m = /^select\s+1(\s+as\s+(\w+))?$/i.exec(sql)
   if (m) return done([{ name: m[2] ?? '?column?', type: 'int4' }], [[1]])
   if (/^select\s+version\(\)$/i.test(sql))
@@ -1325,6 +1356,11 @@ export function createHandlers(): HttpHandler[] {
   const h: Partial<Record<OperationId, Handler>> = {
     ...configHandlers(),
     ...ledgerHandlers(),
+    ...elasticityHandlers(),
+    ...analyticsHandlers(),
+    ...transferHandlers((rec, t) =>
+      (rec.extraColumns?.[t.name] ?? columnsFor(rec, t)).map((col) => col.name),
+    ),
     getHealth: () => ok({ status: 'ok' }),
     getReadiness: (c) =>
       ok({
@@ -1687,7 +1723,7 @@ export function createHandlers(): HttpHandler[] {
       const s = c.s
       const rec = server(s, c.params.serverId ?? '')
       const b = body<S['ServerUpdateRequest']>(c)
-      const known = ['serverGroup', 'shouldHaveShards']
+      const known = ['serverGroup', 'shouldHaveShards', 'weight']
       const keys = Object.keys(b)
       if (keys.length === 0)
         throw validationFailed([{ field: '', message: 'Give serverGroup or shouldHaveShards.' }])
@@ -1714,6 +1750,13 @@ export function createHandlers(): HttpHandler[] {
         markRebalance(s, 'serverGroupChanged')
       }
       if (placementChanges) rec.shouldHaveShards = b.shouldHaveShards as boolean
+      if (b.weight !== undefined) {
+        if (typeof b.weight !== 'number' || !(b.weight > 0) || b.weight > 1000)
+          throw validationFailed([
+            { field: '/weight', message: 'Must be above 0 and at most 1000.' },
+          ])
+        rec.weight = b.weight
+      }
       return ok(serverView(s, rec))
     },
     removeServer: (c) => {
@@ -1944,6 +1987,13 @@ export function createHandlers(): HttpHandler[] {
       if (errors.length) throw validationFailed(errors)
       if (b.ledger?.mode === 'off' && info.ledger.mode !== 'off')
         throw problem('immutable_field', 'The ledger cannot be turned off once it is on.')
+      if (b.sharding?.mode !== undefined && !info.sharding.enabled && !b.sharding.enabled)
+        throw problem('conflict', 'Sharding is not enabled in this database; enable it first.')
+      if (b.sharding?.mode === 'row' && distributedSchemaCount(rec) > 0)
+        throw problem(
+          'sharding_mode_in_use',
+          'This database has distributed schemas, so it cannot be set to Rows only.',
+        )
       const needsTask =
         (b.sharding?.enabled === true && !info.sharding.enabled) ||
         (b.ledger?.mode && b.ledger.mode !== 'off' && info.ledger.mode === 'off')
@@ -1958,6 +2008,9 @@ export function createHandlers(): HttpHandler[] {
         if (b.ledger?.digestIntervalSeconds !== undefined)
           info.ledger.digestIntervalSeconds = b.ledger.digestIntervalSeconds
         if (b.sharding?.enabled) info.sharding.enabled = true
+        if (b.sharding?.mode) info.sharding.mode = b.sharding.mode
+        if (b.sharding?.distributeNewSchemas !== undefined)
+          info.sharding.distributeNewSchemas = b.sharding.distributeNewSchemas
       }
       if (!needsTask) {
         applyNow()
@@ -1996,144 +2049,106 @@ export function createHandlers(): HttpHandler[] {
       const rec = db(c.s, c.params.databaseName ?? '')
       const schema = c.url.searchParams.get('schema')
       const cls = c.url.searchParams.get('class')
+      const storage = c.url.searchParams.get('storage')
+      if (storage !== null && storage !== 'heap' && storage !== 'columnar')
+        throw validationFailed([{ field: 'storage', message: 'Use heap or columnar.' }])
       return ok(
         paginate(
-          rec.tables.filter(
-            (t) =>
-              (!schema || t.schema === schema) &&
-              (!cls || t.classes.includes(cls as Table['classes'][number])),
-          ),
+          rec.tables
+            .filter(
+              (t) =>
+                (!schema || t.schema === schema) &&
+                (!cls || t.classes.includes(cls as Table['classes'][number])),
+            )
+            .map((t) => describeTable(c.s, rec, t))
+            // A partitioned table matches columnar when any of its partitions is columnar (contract 0.18.0).
+            .filter((t) => {
+              if (storage === null) return true
+              const pf = t.storage?.partitionFormats
+              if (pf) return storage === 'columnar' ? pf.columnar > 0 : pf.heap > 0
+              return (t.storage?.accessMethod ?? 'heap') === storage
+            }),
           c.url,
         ),
       )
     },
-    // The table lifecycle of contract 0.14.0: the mock answers with the shape of the contract and changes little (increment 9.7 gives the panel its dialogs).
+    // The table lifecycle of contract 0.14.0 (increment 9.7): src/mocks/tables.ts.
     previewTableChange: (c) => {
-      db(c.s, c.params.databaseName ?? '')
-      return ok({
-        blockers: [],
-        warnings: [],
-        notes: [],
-        affectedTables: [],
-        estimate: {
-          rows: null,
-          bytes: null,
-          modeRecommended: 'blocking',
-          onlineAvailable: false,
-          onlineUnavailableReason: 'The mock has no online copy.',
-          writersBlocked: 'wholeCopy',
-        },
-      } satisfies S['TableChangePreview'])
+      const { s, rec, t } = tableOf(c)
+      const b = body<S['TableChangeRequest']>(c)
+      if (!CHANGE_KINDS.includes(b.kind))
+        throw validationFailed([
+          { field: 'kind', message: 'Use one of: ' + CHANGE_KINDS.join(', ') + '.' },
+        ])
+      return ok(previewChange(s, rec, t, b))
     },
-    listTablePartitions: () =>
-      ok({ items: [], nextCursor: null } satisfies S['TablePartitionPage']),
+    listTablePartitions: (c) => {
+      const { s, rec, t } = tableOf(c)
+      return ok(paginate(describePartitions(s, rec, t), c.url))
+    },
     undistributeTable: (c) => {
       refuseDuringFailover(c.s)
-      const rec = db(c.s, c.params.databaseName ?? '')
-      const t = rec.tables.find(
-        (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
-      )
-      if (!t) throw problem('not_found', 'Table does not exist.')
+      const { s, rec, t } = tableOf(c)
+      const q = c.url.searchParams
+      const mode = q.get('mode')
+      const views = q.get('dependentViews')
+      const target = q.get('targetGroupId')
+      const errors: { field: string; message: string }[] = []
+      if (mode !== null && !['auto', 'online', 'blocking'].includes(mode))
+        errors.push({ field: 'mode', message: 'Use auto, online or blocking.' })
+      if (views !== null && !['refuse', 'recreate'].includes(views))
+        errors.push({ field: 'dependentViews', message: 'Use refuse or recreate.' })
+      if (target !== null && !/^\d+$/.test(target))
+        errors.push({ field: 'targetGroupId', message: 'Use a shard group number, 0 or more.' })
+      if (errors.length > 0) throw validationFailed(errors)
       return accepted(
-        createTask(c.s, {
-          kind: 'table.undistribute',
-          subject: { type: 'table', id: `${rec.info.name}.${t.schema}.${t.name}` },
-          steps: ['Check the table', 'Copy rows', 'Switch'],
-          apply: () => {
-            t.classes = ['plain']
-            t.distribution = null
-          },
+        startUndistribute(s, rec, t, {
+          ...(q.get('cascadeViaForeignKeys') === 'true' ? { cascadeViaForeignKeys: true } : {}),
+          ...(target !== null ? { targetGroupId: Number(target) } : {}),
+          ...(mode ? { mode: mode as S['TableChangeMode'] } : {}),
+          ...(views ? { dependentViews: views as S['DependentViews'] } : {}),
         }),
       )
     },
     alterTableDistribution: (c) => {
       refuseDuringFailover(c.s)
-      const rec = db(c.s, c.params.databaseName ?? '')
-      const t = rec.tables.find(
-        (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
-      )
-      if (!t) throw problem('not_found', 'Table does not exist.')
-      return accepted(
-        createTask(c.s, {
-          kind: 'table.alter',
-          subject: { type: 'table', id: `${rec.info.name}.${t.schema}.${t.name}` },
-          steps: ['Check the table', 'Copy rows', 'Switch'],
-          apply: () => {
-            void t
-          },
-        }),
-      )
+      const { s, rec, t } = tableOf(c)
+      return accepted(startAlter(s, rec, t, body<S['AlterTableDistributionRequest']>(c)))
     },
     createTablePartition: (c) => {
       refuseDuringFailover(c.s)
-      const rec = db(c.s, c.params.databaseName ?? '')
-      const t = rec.tables.find(
-        (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
-      )
-      if (!t) throw problem('not_found', 'Table does not exist.')
+      const { s, rec, t } = tableOf(c)
       return accepted(
-        createTask(c.s, {
-          kind: 'table.partition',
-          subject: { type: 'table', id: `${rec.info.name}.${t.schema}.${t.name}` },
-          steps: ['Check the request', 'Change the partitions on every server'],
-          apply: () => {
-            void t
-          },
+        startPartition(s, rec, t, {
+          kind: 'create',
+          body: body<S['CreateTablePartitionRequest']>(c),
         }),
       )
     },
     attachTablePartition: (c) => {
       refuseDuringFailover(c.s)
-      const rec = db(c.s, c.params.databaseName ?? '')
-      const t = rec.tables.find(
-        (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
-      )
-      if (!t) throw problem('not_found', 'Table does not exist.')
-      return accepted(
-        createTask(c.s, {
-          kind: 'table.partition',
-          subject: { type: 'table', id: `${rec.info.name}.${t.schema}.${t.name}` },
-          steps: ['Check the request', 'Change the partitions on every server'],
-          apply: () => {
-            void t
-          },
-        }),
-      )
+      const { s, rec, t } = tableOf(c)
+      const b = body<S['AttachTablePartitionRequest']>(c)
+      if (!b.table || typeof b.bound !== 'string' || b.bound.trim() === '')
+        throw validationFailed([
+          { field: b.table ? 'bound' : 'table', message: 'Give the table and the bound.' },
+        ])
+      if (!rec.tables.some((x) => x.schema === b.table.schema && x.name === b.table.table))
+        throw problem('not_found', 'The table to attach does not exist.')
+      return accepted(startPartition(s, rec, t, { kind: 'attach', body: b }))
     },
     detachTablePartition: (c) => {
       refuseDuringFailover(c.s)
-      const rec = db(c.s, c.params.databaseName ?? '')
-      const t = rec.tables.find(
-        (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
-      )
-      if (!t) throw problem('not_found', 'Table does not exist.')
+      const { s, rec, t } = tableOf(c)
       return accepted(
-        createTask(c.s, {
-          kind: 'table.partition',
-          subject: { type: 'table', id: `${rec.info.name}.${t.schema}.${t.name}` },
-          steps: ['Check the request', 'Change the partitions on every server'],
-          apply: () => {
-            void t
-          },
-        }),
+        startPartition(s, rec, t, { kind: 'detach', partition: c.params.partitionName ?? '' }),
       )
     },
     dropTablePartition: (c) => {
       refuseDuringFailover(c.s)
-      const rec = db(c.s, c.params.databaseName ?? '')
-      const t = rec.tables.find(
-        (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
-      )
-      if (!t) throw problem('not_found', 'Table does not exist.')
+      const { s, rec, t } = tableOf(c)
       return accepted(
-        createTask(c.s, {
-          kind: 'table.partition',
-          subject: { type: 'table', id: `${rec.info.name}.${t.schema}.${t.name}` },
-          steps: ['Check the request', 'Change the partitions on every server'],
-          apply: () => {
-            void t
-          },
-        }),
+        startPartition(s, rec, t, { kind: 'drop', partition: c.params.partitionName ?? '' }),
       )
     },
     getTable: (c) => {
@@ -2143,7 +2158,7 @@ export function createHandlers(): HttpHandler[] {
       )
       if (!t) throw problem('not_found', 'Table does not exist.')
       return ok({
-        ...t,
+        ...describeTable(c.s, rec, t),
         columns: rec.extraColumns?.[t.name] ?? columnsFor(rec, t),
       } satisfies S['TableDetail'])
     },
@@ -2186,62 +2201,7 @@ export function createHandlers(): HttpHandler[] {
         : undefined
       if (b.colocateWith && !target?.distribution)
         throw problem('unprocessable', 'The table to colocate with is not distributed.')
-      return accepted(
-        createTask(s, {
-          kind: 'table.distribute',
-          subject: { type: 'table', id: `${rec.info.name}.${t.schema}.${t.name}` },
-          steps: ['Create shards', 'Copy rows', 'Switch over', 'Clean up'],
-          apply: () => {
-            const bucketCount = rec.info.sharding.bucketCount ?? 128
-            if (b.method === 'reference') {
-              t.classes = ['reference']
-              t.distribution = {
-                method: 'reference',
-                column: null,
-                colocationId: 3,
-                bucketCount: 1,
-              }
-            } else {
-              const colocationId =
-                target?.distribution?.colocationId ??
-                Math.max(
-                  0,
-                  ...rec.tables.map((x) => x.distribution?.colocationId ?? 0),
-                  ...rec.colocations.map((x) => x.colocationId),
-                ) + 1
-              t.classes = t.ledger ? ['distributed', 'ledger'] : ['distributed']
-              t.distribution = {
-                method: 'hash',
-                column: b.distributionColumn ?? null,
-                colocationId,
-                bucketCount,
-              }
-              const existing = rec.colocations.find((x) => x.colocationId === colocationId)
-              const group = existing ?? {
-                colocationId,
-                bucketCount,
-                distributionColumnType: 'bigint',
-                tableCount: 0,
-                sizeBytes: 0,
-              }
-              if (!existing) {
-                rec.colocations.push(group)
-                rec.buckets.set(
-                  colocationId,
-                  makeBuckets(
-                    colocationId,
-                    bucketCount,
-                    dataGroups(s).map((g) => g.id),
-                    colocationId * 7,
-                  ),
-                )
-              }
-              group.tableCount += 1
-            }
-            t.homeShardGroupId = null
-          },
-        }),
-      )
+      return accepted(startDistribute(s, rec, t, b))
     },
     enableTableLedger: (c) => {
       const s = c.s
@@ -2347,14 +2307,19 @@ export function createHandlers(): HttpHandler[] {
         }),
       )
     },
-    getRebalanceStatus: (c) => ok(rebalanceStatusView(c.s)),
+    getRebalanceStatus: (c) => ok(decorateStatus(c.s, rebalanceStatusView(c.s))),
     previewRebalancePlan: (c) => {
       const b = body<S['RebalancePlanRequest']>(c)
       const plan = planView(c.s, b.moveLimit ?? 200, b.databases)
       const named = {
         ...plan,
+        strategy: b.strategy ?? c.s.settings.rebalance.strategy ?? 'byBucketCount',
+        threshold: b.threshold ?? (b.strategy === 'byDiskSize' ? 0.1 : 0),
+        imbalance: plan.needed ? 0.34 : 0,
         moves: plan.moves.map((m) => ({
           ...m,
+          reason: 'balance',
+          cost: b.strategy === 'byDiskSize' ? (m.estimatedSizeBytes ?? 1048576) : 1,
           fromServerId: serverOfGroup(c.s, m.fromShardGroupId),
           toServerId: serverOfGroup(c.s, m.toShardGroupId),
         })),
@@ -2501,6 +2466,19 @@ export function createHandlers(): HttpHandler[] {
       resetAutoFailoverCounter(c.s)
       return ok(c.s.settings)
     },
+    // The bootstrap of the map group that a leader's loss forces is run by the candidate, not by a task. The mock has the phase only: a run in it has
+    // promoted the standby already (a bootstrap that did not is not shown), which cannot be given up.
+    abandonMapGroupBootstrap: (c) => {
+      const b = body<S['AbandonMapGroupBootstrapRequest']>(c)
+      if (typeof b.reason !== 'string' || b.reason.length === 0)
+        throw problem('unprocessable', 'A reason is needed.')
+      if (failoverStatusView(c.s).phase === 'bootstrap')
+        throw problem(
+          'conflict',
+          'The standby of the map group was promoted already; the bootstrap goes on to its end.',
+        )
+      return ok({ abandoned: false } satisfies S['AbandonMapGroupBootstrapResult'])
+    },
 
     // --- tasks
     listTasks: (c) => {
@@ -2545,7 +2523,33 @@ export function createHandlers(): HttpHandler[] {
       }
       // A failover stops before the promotion: its freezes are lifted and its report says cancelled (running or paused).
       if (rec.task.kind === 'server.failover') return ok(cancelFailover(c.s, rec))
-      if (rec.task.state !== 'running') throw problem('task_not_cancellable')
+      const tableTask = rec.task.kind.startsWith('table.') || rec.task.kind === 'partition.maintain'
+      if (rec.task.state !== 'running' && !(tableTask && rec.task.state === 'paused'))
+        throw problem('task_not_cancellable')
+      if (tableTask) {
+        // A change of a table stops at the next step and leaves the table as it was (the result is never applied).
+        rec.task.state = 'failed'
+        rec.task.cancellable = false
+        rec.task.error = {
+          code: 'cancelled',
+          message: 'The task was canceled.',
+          step: rec.task.progress.currentStep,
+          retryable: false,
+        }
+        rec.task.progress.steps = rec.task.progress.steps.map((st) =>
+          st.state === 'done'
+            ? st
+            : { ...st, state: st.state === 'running' ? 'failed' : 'skipped' },
+        )
+        // The control plane records the task as cancelled first and undoes the change after that: the detail says so until it has.
+        rec.task.detail = 'Undoing the change on every server.'
+        rec.settleAt = Date.now() + mockConfig.tableUndoMs
+        rec.settleDetail = mockConfig.tableUndoFails
+          ? 'The change could not be undone on server 10.0.0.13, which did not answer. It is cleaned up when that server returns.'
+          : 'The change was undone on every server.'
+        rec.task.updatedAt = nowIso()
+        return ok(rec.task)
+      }
       rec.task.state = 'paused'
       rec.task.cancellable = false
       if (rec.task.kind === 'rebalance') r.state = 'stopped'
@@ -2799,7 +2803,13 @@ export function createHandlers(): HttpHandler[] {
       const errors: { field: string; message: string }[] = []
       if (Object.keys(b).length === 0)
         throw validationFailed([{ field: '/', message: 'at least one property is required' }])
-      for (const group of ['autoFailover', 'rebalance', 'features', 'clock'] as const) {
+      for (const group of [
+        'autoFailover',
+        'rebalance',
+        'features',
+        'clock',
+        'analytics',
+      ] as const) {
         const g = b[group]
         if (g !== undefined && Object.keys(g).length === 0)
           errors.push({ field: `/${group}`, message: 'at least one property is required' })
@@ -2837,6 +2847,31 @@ export function createHandlers(): HttpHandler[] {
           field: 'clock.maxDifferenceMs',
           message: 'Between 10 and 600000 milliseconds.',
         })
+      if (b.analytics !== undefined && typeof b.analytics.allowNonSuperuserOwners !== 'boolean')
+        errors.push({
+          field: 'analytics.allowNonSuperuserOwners',
+          message: 'Say true or false.',
+        })
+      const dt = b.dataTransfer
+      if (dt !== undefined) {
+        if (Object.keys(dt).length === 0)
+          errors.push({ field: '/dataTransfer', message: 'at least one property is required' })
+        if (
+          dt.retentionHours !== undefined &&
+          (!Number.isInteger(dt.retentionHours) || dt.retentionHours < 1 || dt.retentionHours > 168)
+        )
+          errors.push({ field: 'dataTransfer.retentionHours', message: 'Between 1 and 168 hours.' })
+        for (const f of ['maxFileBytes', 'stagingQuotaBytes'] as const) {
+          const v = dt[f]
+          if (v !== undefined && (!Number.isInteger(v) || v < 1048576))
+            errors.push({ field: `dataTransfer.${f}`, message: 'At least 1 MiB.' })
+        }
+        if (
+          dt.maxConcurrent !== undefined &&
+          (!Number.isInteger(dt.maxConcurrent) || dt.maxConcurrent < 1 || dt.maxConcurrent > 16)
+        )
+          errors.push({ field: 'dataTransfer.maxConcurrent', message: 'Between 1 and 16.' })
+      }
       if (errors.length) throw validationFailed(errors)
       if (
         (b.features?.sharding === false && s.settings.features.sharding) ||
@@ -2857,7 +2892,26 @@ export function createHandlers(): HttpHandler[] {
           ...cur.autoFailover,
           ...Object.fromEntries(Object.entries(b.autoFailover).filter(([, v]) => v !== undefined)),
         }
-      if (b.rebalance) cur.rebalance = { ...cur.rebalance, ...b.rebalance }
+      if (b.rebalance) {
+        const { automatic, threshold, ...rest } = b.rebalance
+        cur.rebalance = { ...cur.rebalance, ...rest }
+        if (threshold !== undefined) cur.rebalance.threshold = threshold
+        if (automatic) {
+          const { window, ...flat } = automatic
+          cur.rebalance.automatic = {
+            ...(cur.rebalance.automatic ?? DEFAULT_AUTOMATIC),
+            ...Object.fromEntries(Object.entries(flat).filter(([, v]) => v !== undefined)),
+          } as typeof DEFAULT_AUTOMATIC
+          if (window !== undefined) cur.rebalance.automatic.window = window
+        }
+      }
+      if (b.analytics)
+        cur.analytics = { allowNonSuperuserOwners: b.analytics.allowNonSuperuserOwners === true }
+      if (b.dataTransfer && cur.dataTransfer)
+        cur.dataTransfer = {
+          ...cur.dataTransfer,
+          ...Object.fromEntries(Object.entries(b.dataTransfer).filter(([, v]) => v !== undefined)),
+        }
       if (b.clock?.maxDifferenceMs !== undefined)
         cur.clock = { maxDifferenceMs: b.clock.maxDifferenceMs }
       if (b.features?.sharding && !cur.features.sharding) {

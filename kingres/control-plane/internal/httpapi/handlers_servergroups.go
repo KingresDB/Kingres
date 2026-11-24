@@ -138,7 +138,7 @@ func (s *Server) updateServer(c *call, w http.ResponseWriter, r *http.Request) e
 	if err != nil {
 		return s.storeProblem(r, err, "Server "+quoted(id)+" does not exist.")
 	}
-	if err := o.UpdateServer(r.Context(), id, ops.ServerPlacement{ShouldHaveShards: cur.ShouldHaveShards}, req); err != nil {
+	if err := o.UpdateServer(r.Context(), id, ops.ServerPlacement{ShouldHaveShards: cur.ShouldHaveShards, Weight: weightOf(cur.Weight)}, req); err != nil {
 		return err
 	}
 	det := map[string]any{}
@@ -148,6 +148,9 @@ func (s *Server) updateServer(c *call, w http.ResponseWriter, r *http.Request) e
 	if req.ShouldHaveShards != nil {
 		det["shouldHaveShards"] = *req.ShouldHaveShards
 	}
+	if req.Weight != nil {
+		det["weight"] = *req.Weight
+	}
 	c.addDetails(det)
 	out, err := s.deps.Store.Server(r.Context(), id)
 	if err != nil {
@@ -156,6 +159,13 @@ func (s *Server) updateServer(c *call, w http.ResponseWriter, r *http.Request) e
 	s.completeServers(c, r, []*api.Server{&out.Server})
 	s.writeJSON(w, r, http.StatusOK, out.Server)
 	return nil
+}
+
+func weightOf(w *float64) float64 {
+	if w == nil {
+		return 0
+	}
+	return *w
 }
 
 // forwardedReads are reads that a server asks the leader for, as part of its

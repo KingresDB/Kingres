@@ -125,6 +125,7 @@ func failoverPosition(ctx context.Context, d *haDeps, group int32) (any, error) 
 	}
 	c, err := d.Svc.InstanceConn(ctx, li.ID, "postgres")
 	if err != nil {
+		d.Log.Warn("failover: the position cannot be read: the instance cannot be reached", "group", group, "instance", li.ID, "error", err)
 		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The instance cannot be reached."}
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()

@@ -154,6 +154,9 @@ tests += {
       't/067_vacuum_compacts.pl',
       't/068_vacuum_giveback.pl',
       't/069_vacuum_merge_safe.pl',
+      't/070_vacuum_order_and_skip.pl',
+      't/071_schema_spoof.pl',
+      't/072_catalog_trust.pl',
     ],
   },
 }

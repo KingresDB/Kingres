@@ -6,6 +6,7 @@ import (
 	"context"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store"
@@ -45,7 +46,7 @@ func classPredicate(class string, hasShard, hasLedger bool) string {
 // tableQuery builds the table listing query for the catalog objects that
 // exist in the database; $1 and $2 filter the schema and the name, $3 and $4 are
 // the position to continue after (NULL: from the start), $5 the number of rows.
-func tableQuery(hasShard, hasLedger, hasUpdatable bool, class string) string {
+func tableQuery(hasShard, hasLedger, hasUpdatable bool, class, storage string) string {
 	dist := "NULL::text, NULL::text, NULL::int, NULL::int"
 	distJoin := ""
 	if hasShard {
@@ -87,13 +88,14 @@ WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition
   AND ($1 = '' OR n.nspname = $1) AND ($2 = '' OR c.relname = $2)
   AND ($3::text IS NULL OR (n.nspname, c.relname) > ($3, $4))
   AND ` + classPredicate(class, hasShard, hasLedger) + `
+  AND ` + storagePredicate(storage) + `
 ORDER BY n.nspname, c.relname
 LIMIT $5::int`
 }
 
 // readTables reads the tables of a database; schema and name filter when
 // non-empty.
-func (s *Store) readTables(ctx context.Context, h *dbHandle, schema, name, class string, after []string, limit int) ([]api.Table, error) {
+func (s *Store) readTables(ctx context.Context, h *dbHandle, schema, name, class, storage string, after []string, limit int) ([]api.Table, error) {
 	cat, err := s.loadCatalog(ctx)
 	if err != nil {
 		return nil, err
@@ -126,7 +128,7 @@ func (s *Store) readTables(ctx context.Context, h *dbHandle, schema, name, class
 	if after != nil {
 		as, an = after[0], after[1]
 	}
-	rows, err := h.pool.Query(ctx, tableQuery(hasShard, hasLedger, hasUpdatable, class), schema, name, as, an, limit)
+	rows, err := h.pool.Query(ctx, tableQuery(hasShard, hasLedger, hasUpdatable, class, storage), schema, name, as, an, limit)
 	if err != nil {
 		return nil, s.wrap("listing tables", err)
 	}
@@ -178,10 +180,13 @@ func (s *Store) readTables(ctx context.Context, h *dbHandle, schema, name, class
 		}
 		return t, nil
 	})
-	if err != nil || !hasShard {
+	if err != nil {
 		return out, err
 	}
-	s.addPartitioning(ctx, h, out)
+	if hasShard {
+		s.addPartitioning(ctx, h, out)
+	}
+	s.addStorage(ctx, h, out)
 	return out, nil
 }
 
@@ -189,6 +194,9 @@ func (s *Store) readTables(ctx context.Context, h *dbHandle, schema, name, class
 // nothing is added.
 func (s *Store) addPartitioning(ctx context.Context, h *dbHandle, ts []api.Table) {
 	if len(ts) == 0 {
+		return
+	}
+	if ok, err := s.regclassExists(ctx, h.pool, "kingres.dist_table"); err != nil || !ok {
 		return
 	}
 	var has bool
@@ -248,7 +256,7 @@ func (s *Store) Tables(ctx context.Context, db string, f store.TableFilter, p st
 	}
 	// Keyset paging in SQL on (schema, name): the database builds one more row than
 	// the page, never the whole list of tables.
-	all, err := s.readTables(ctx, h, f.Schema, "", f.Class, after, p.Limit+1)
+	all, err := s.readTables(ctx, h, f.Schema, "", f.Class, f.Storage, after, p.Limit+1)
 	if err != nil {
 		return api.TablePage{}, err
 	}
@@ -265,7 +273,7 @@ func (s *Store) Table(ctx context.Context, db, schema, name string) (api.TableDe
 	if err != nil {
 		return api.TableDetail{}, err
 	}
-	all, err := s.readTables(ctx, h, schema, name, "", nil, 1)
+	all, err := s.readTables(ctx, h, schema, name, "", "", nil, 1)
 	if err != nil {
 		return api.TableDetail{}, err
 	}
@@ -308,20 +316,43 @@ func (s *Store) ColocationGroups(ctx context.Context, db string) ([]api.Colocati
 		return nil, err
 	}
 	multiGroup := len(cat.groups) > 1
-	rows, err := h.pool.Query(ctx, `SELECT co.colocation_id, co.bucket_count, co.dist_column_type::text,
-		`+count+`::int, `+size+`::bigint FROM kingres.colocation co ORDER BY co.colocation_id`)
+	// version 0.8 of the extension: the number of buckets is the number of rows of the map, the base count and the
+	// greatest modulus are columns, and a group has a kind (hash or schema)
+	layout, err := s.columnExists(ctx, h.pool, "kingres.colocation", "max_modulus")
+	if err != nil {
+		return nil, err
+	}
+	bucketCount, extra := "co.bucket_count", "NULL::int, NULL::int, 'hash'::text, NULL::text"
+	if layout {
+		bucketCount = "(SELECT count(*) FROM kingres.bucket_map bm WHERE bm.colocation_id = co.colocation_id)::int"
+		extra = `co.bucket_count, co.max_modulus, co.kind::text,
+			(SELECT ds.nsp::text FROM kingres.dist_schema ds WHERE ds.colocation_id = co.colocation_id)`
+	}
+	rows, err := h.pool.Query(ctx, `SELECT co.colocation_id, `+bucketCount+`, co.dist_column_type::text,
+		`+count+`::int, `+size+`::bigint, `+extra+` FROM kingres.colocation co ORDER BY co.colocation_id`)
 	if err != nil {
 		return nil, s.wrap("reading kingres.colocation", err)
 	}
 	out, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (api.ColocationGroup, error) {
 		var g api.ColocationGroup
-		err := r.Scan(&g.ColocationID, &g.BucketCount, &g.DistributionColumnType, &g.TableCount, &g.SizeBytes)
+		var distType *string
+		err := r.Scan(&g.ColocationID, &g.BucketCount, &distType, &g.TableCount, &g.SizeBytes, &g.BaseBucketCount, &g.MaxModulus, &g.Kind, &g.SchemaName)
+		if distType != nil {
+			g.DistributionColumnType = *distType
+		}
 		if multiGroup {
 			g.SizeBytes = nil // this node sees only its own partitions
 		}
 		return g, err
 	})
 	return out, s.wrap("reading kingres.colocation", err)
+}
+
+// columnExists tells whether a table has a column (the extension of an older version lacks the newer ones).
+func (s *Store) columnExists(ctx context.Context, p *pgxpool.Pool, rel, col string) (bool, error) {
+	var ok bool
+	err := p.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass($1) AND attname = $2 AND NOT attisdropped)`, rel, col).Scan(&ok)
+	return ok, s.wrap("looking for a column of "+rel, err)
 }
 
 // serversByGroup resolves, for every catalog group, the server of its active
@@ -376,7 +407,15 @@ func (s *Store) Buckets(ctx context.Context, db string, colocationID int32, f st
 		return api.BucketPage{}, err
 	}
 	primary, replicas := serversByGroup(cat)
-	rows, err := h.pool.Query(ctx, `SELECT bucket, group_id, state FROM kingres.bucket_map
+	hasModulus, err := s.columnExists(ctx, h.pool, "kingres.bucket_map", "modulus")
+	if err != nil {
+		return api.BucketPage{}, err
+	}
+	modulus := "NULL::int"
+	if hasModulus {
+		modulus = "modulus"
+	}
+	rows, err := h.pool.Query(ctx, `SELECT bucket, group_id, state, `+modulus+` FROM kingres.bucket_map
 		WHERE colocation_id = $1 ORDER BY bucket`, colocationID)
 	if err != nil {
 		return api.BucketPage{}, s.wrap("reading kingres.bucket_map", err)
@@ -384,8 +423,12 @@ func (s *Store) Buckets(ctx context.Context, db string, colocationID int32, f st
 	all, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (api.Bucket, error) {
 		var b api.Bucket
 		var g int32
-		if err := r.Scan(&b.Bucket, &g, &b.State); err != nil {
+		if err := r.Scan(&b.Bucket, &g, &b.State, &b.Modulus); err != nil {
 			return b, err
+		}
+		if b.Modulus != nil {
+			rem := b.Bucket
+			b.Remainder = &rem
 		}
 		b.ShardGroupID = g
 		b.PrimaryServerID = primary[g]

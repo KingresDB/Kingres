@@ -15,7 +15,15 @@ import { safeText } from '@/lib/safe-text'
 import TaskActionDialog from '@/components/TaskActionDialog.vue'
 import EditDatabaseDialog from '@/components/EditDatabaseDialog.vue'
 import DistributeTableDialog from '@/components/DistributeTableDialog.vue'
+import SchemasSection from '@/components/SchemasSection.vue'
 import EnableLedgerDialog from '@/components/EnableLedgerDialog.vue'
+import ApproximateAggregatesCard from '@/components/ApproximateAggregatesCard.vue'
+import StorageBadge from '@/components/tables/StorageBadge.vue'
+import SetStorageDialog from '@/components/tables/SetStorageDialog.vue'
+import PartitionPolicyDialog from '@/components/tables/PartitionPolicyDialog.vue'
+import { matchesStorage, type StorageFilter } from '@/lib/analytics'
+import TransfersPanel from '@/components/transfers/TransfersPanel.vue'
+import TableTransferActions from '@/components/transfers/TableTransferActions.vue'
 import { endpoints } from '@/api/endpoints'
 import { keys, useDatabase, useTables } from '@/api/queries'
 import { DATABASE_STATUS, DURABILITY_LABEL, LEDGER_MODE_LABEL, LEDGER_STATE } from '@/lib/status'
@@ -28,10 +36,17 @@ const database = useDatabase(() => props.name)
 const tables = useTables(() => props.name)
 const db = computed(() => database.data.value)
 const tableRows = computed(() => tables.data.value?.items ?? [])
+/** The Storage filter of the list (contract 0.18.0): a partitioned table matches columnar when any partition is. */
+const storageFilter = ref<StorageFilter>('all')
+const shownRows = computed(() =>
+  tableRows.value.filter((t) => matchesStorage(t, storageFilter.value)),
+)
 
 const dialog = ref<'edit' | 'drop' | null>(null)
 const distributing = ref<Table | null>(null)
 const ledgerFor = ref<Table | null>(null)
+const converting = ref<Table | null>(null)
+const policyFor = ref<Table | null>(null)
 // The page is reused when the address changes to another database. A dialog opened for the
 // previous one must not stay open and act on the new one.
 watch(
@@ -40,6 +55,9 @@ watch(
     dialog.value = null
     distributing.value = null
     ledgerFor.value = null
+    converting.value = null
+    policyFor.value = null
+    storageFilter.value = 'all'
   },
 )
 
@@ -63,6 +81,13 @@ const createdText = computed(() => {
     : `Created by ${by} on ${formatDateTime(d.createdAt)}`
 })
 const shardingOn = computed(() => db.value?.sharding.enabled === true)
+/** Why a table cannot be converted from this list (the dialog says the rest); empty when it can. */
+function storageBlocked(t: Table): string {
+  if (t.classes.includes('distributed') || t.classes.includes('reference'))
+    return 'Converting a distributed table is not available in this version.'
+  if (t.partitioning) return 'Convert one partition at a time, on the page of the table.'
+  return ''
+}
 </script>
 
 <template>
@@ -175,16 +200,33 @@ const shardingOn = computed(() => db.value?.sharding.enabled === true)
             >Open ledger</RouterLink
           >
         </div>
+        <ApproximateAggregatesCard :database-name="name" />
       </section>
 
+      <SchemasSection :database-name="name" :mode="db.sharding.mode" />
+
       <section aria-labelledby="tables-h" class="stack">
-        <h2 id="tables-h">Tables</h2>
+        <div class="row-between">
+          <h2 id="tables-h">Tables</h2>
+          <div v-if="tableRows.length > 0" class="field">
+            <label for="storage-filter">Storage</label>
+            <select id="storage-filter" v-model="storageFilter" data-testid="storage-filter">
+              <option value="all">All formats</option>
+              <option value="heap">Row</option>
+              <option value="columnar">Columnar</option>
+            </select>
+          </div>
+        </div>
         <QueryBoundary
           :loading="tables.isPending.value"
           :error="tables.error.value"
-          :empty="tableRows.length === 0"
-          empty-title="No tables"
-          empty-hint="Create tables with SQL in the query workbench."
+          :empty="shownRows.length === 0"
+          :empty-title="tableRows.length === 0 ? 'No tables' : 'No table in this format'"
+          :empty-hint="
+            tableRows.length === 0
+              ? 'Create tables with SQL in the query workbench.'
+              : 'Choose another format.'
+          "
           @retry="tables.refetch()"
         >
           <TableWrap>
@@ -196,6 +238,7 @@ const shardingOn = computed(() => db.value?.sharding.enabled === true)
                 <tr>
                   <th scope="col">Table</th>
                   <th scope="col">Class</th>
+                  <th scope="col">Storage</th>
                   <th scope="col">Distribution column</th>
                   <th scope="col" class="num">Rows (estimate)</th>
                   <th scope="col" class="num">Size</th>
@@ -203,9 +246,13 @@ const shardingOn = computed(() => db.value?.sharding.enabled === true)
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="t in tableRows" :key="JSON.stringify([t.schema, t.name])">
+                <tr v-for="t in shownRows" :key="JSON.stringify([t.schema, t.name])">
                   <th scope="row" class="mono">
-                    <SafeName :value="`${t.schema}.${t.name}`" :max="120" />
+                    <RouterLink
+                      :to="{ name: 'table', params: { name, schema: t.schema, table: t.name } }"
+                    >
+                      <SafeName :value="`${t.schema}.${t.name}`" :max="120" />
+                    </RouterLink>
                   </th>
                   <td>
                     <span class="row" style="gap: var(--s-1)">
@@ -214,6 +261,7 @@ const shardingOn = computed(() => db.value?.sharding.enabled === true)
                       }}</span>
                     </span>
                   </td>
+                  <td><StorageBadge :table="t" /></td>
                   <td>
                     <template v-if="t.distribution?.column">
                       <code><SafeName :value="t.distribution.column" :max="60" /></code>
@@ -248,6 +296,24 @@ const shardingOn = computed(() => db.value?.sharding.enabled === true)
                       >
                         Enable ledger
                       </GateButton>
+                      <GateButton
+                        op="setTableStorage"
+                        small
+                        :data-testid="`convert-${t.name}`"
+                        :blocked-reason="storageBlocked(t)"
+                        @click="converting = t"
+                      >
+                        Convert storage...
+                      </GateButton>
+                      <GateButton
+                        op="putPartitionPolicy"
+                        small
+                        :data-testid="`policy-${t.name}`"
+                        @click="policyFor = t"
+                      >
+                        Time partitioning...
+                      </GateButton>
+                      <TableTransferActions :database-name="name" :table="t" />
                     </div>
                   </td>
                 </tr>
@@ -263,6 +329,7 @@ const shardingOn = computed(() => db.value?.sharding.enabled === true)
           </p>
         </QueryBoundary>
       </section>
+      <TransfersPanel :database="db.name" />
     </div>
   </QueryBoundary>
 
@@ -303,6 +370,18 @@ const shardingOn = computed(() => db.value?.sharding.enabled === true)
     :database-name="name"
     :table="ledgerFor"
     @close="ledgerFor = null"
+  />
+  <SetStorageDialog
+    v-if="converting"
+    :database-name="name"
+    :table="converting"
+    @close="converting = null"
+  />
+  <PartitionPolicyDialog
+    v-if="policyFor"
+    :database-name="name"
+    :table="policyFor"
+    @close="policyFor = null"
   />
   <DistributeTableDialog
     v-if="distributing"

@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -48,6 +49,8 @@ type internalDeps struct {
 	// forwarded operation (only ever called on the leader).
 	leaders *leader.Resolver
 	forward func(ctx context.Context, peer string, req internalapi.ForwardRequest) (internalapi.ForwardResponse, error)
+	// forwardStream runs a relayed streaming operation of the data transfer (only ever called on the leader).
+	forwardStream func(ctx context.Context, peer string, req internalapi.ForwardRequest, body io.Reader, w http.ResponseWriter) error
 	// gather answers a cluster-wide read for a server of the cluster.
 	gather func(ctx context.Context, peer string, req internalapi.ForwardRequest) (internalapi.ForwardResponse, error)
 	// keys gives the verifier of a role, against which the identity of a forwarded
@@ -113,10 +116,11 @@ func serveInternal(ctx context.Context, d internalDeps) {
 		Authorize: func(_ context.Context, peer string, req internalapi.ForwardRequest) (fwdproof.Assertion, error) {
 			return d.signer.Sign(req.ProofMessage(fwdproof.KindGather, peer, me))
 		},
-		Member:  member,
-		Fault:   d.fault,
-		Fence:   d.fence,
-		Forward: forwardGate(instanceDown, member, d.forward),
+		Member:        member,
+		Fault:         d.fault,
+		Fence:         d.fence,
+		Forward:       forwardGate(instanceDown, member, d.forward),
+		ForwardStream: forwardStreamGate(instanceDown, member, d.forwardStream),
 		State: func(ctx context.Context) internalapi.State {
 			st := internalapi.State{ServerID: me, NodeState: string(d.node.State()), Version: d.version,
 				InternalVersion: internalapi.Version, UptimeSeconds: int64(time.Since(d.started).Seconds())}
@@ -366,7 +370,7 @@ func assertionChecker(certs fwdproof.PeerVerifier, leader func() string, self st
 // must never sign a gather assertion for a proof it could not check.
 func skipWhile(skip func() bool, check func(context.Context, fwdproof.Kind, string, internalapi.ForwardRequest) error) func(context.Context, fwdproof.Kind, string, internalapi.ForwardRequest) error {
 	return func(ctx context.Context, kind fwdproof.Kind, peer string, req internalapi.ForwardRequest) error {
-		if kind == fwdproof.KindForward && skip() {
+		if (kind == fwdproof.KindForward || kind == fwdproof.KindForwardStream) && skip() {
 			return nil
 		}
 		return check(ctx, kind, peer, req)
@@ -391,6 +395,28 @@ func forwardGate(instanceDown func() bool, member func(context.Context, string) 
 			}
 		}
 		return next(ctx, peer, req)
+	}
+}
+
+// forwardStreamGate is forwardGate for the streaming relay: the calling server must be a member of the cluster, except while the local
+// instance is stopped (the pipeline then answers system_database_stopped and runs nothing).
+func forwardStreamGate(instanceDown func() bool, member func(context.Context, string) (bool, error),
+	next func(context.Context, string, internalapi.ForwardRequest, io.Reader, http.ResponseWriter) error,
+) func(context.Context, string, internalapi.ForwardRequest, io.Reader, http.ResponseWriter) error {
+	if next == nil {
+		return nil
+	}
+	return func(ctx context.Context, peer string, req internalapi.ForwardRequest, body io.Reader, w http.ResponseWriter) error {
+		if !instanceDown() {
+			ok, err := member(ctx, peer)
+			if err != nil {
+				return fmt.Errorf("checking whether %q is a member: %w", peer, err)
+			}
+			if !ok {
+				return fmt.Errorf("%q is not a member of the cluster", peer)
+			}
+		}
+		return next(ctx, peer, req, body, w)
 	}
 }
 

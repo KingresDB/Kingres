@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
 	"sync"
 	"time"
 
@@ -90,7 +91,10 @@ func (p *Postgres) SetDSN(dsn string) error {
 func (p *Postgres) config() *pgx.ConnConfig {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.base.Copy()
+	// The search path is fixed in the startup parameters (cluster.SafeSession): a database setting cannot change what the statements below resolve to.
+	cfg := p.base.Copy()
+	cluster.SafeSession(cfg)
+	return cfg
 }
 
 // Authenticate implements Authenticator.
@@ -128,6 +132,11 @@ func classifyConnectError(err error) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		if len(pgErr.Code) >= 2 && pgErr.Code[:2] == "28" {
+			return ErrInvalidCredentials
+		}
+		// 42501: the password was right and the role has no CONNECT on the system database, which only the cluster roles have (cluster.HardenSystemDatabase):
+		// it cannot use the console, and the answer is the one for a wrong password.
+		if pgErr.Code == "42501" {
 			return ErrInvalidCredentials
 		}
 		// Too many connections for the role, database missing, and so on.

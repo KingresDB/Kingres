@@ -278,6 +278,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		}
 		ring = monitor.NewRing(1440, 2000)
 		opsSvc = &ops.Ops{Service: svc, Roles: proxy, Instances: svc.Manager(), WritableIDs: svc.WritableIDs, ServerHost: serverHost, PGPort: cfg.PGPort, Log: log, DiskFree: diskFreeOf(serverHost, cfg.DataDir)}
+		opsSvc.Transfer = transferConfig(cfg, checkedAuthn, auditFn(sink, log))
 	}
 	deps := httpapi.Deps{
 		Logger: log, Store: pg, Setup: node, Sessions: sessions, Authenticator: checkedAuthn, Audit: sink,
@@ -289,6 +290,9 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	}
 	if proxy != nil {
 		deps.Proxy = proxy
+	}
+	if opsSvc != nil {
+		deps.ExtraMetrics = partitionMetrics(opsSvc)
 	}
 	if svc.Enabled() {
 		deps.LocalSettings, err = localsettings.New(localsettings.Options{
@@ -335,6 +339,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		receiver = &membership.Receiver{M: members, Authn: joinAuthn, VerifyToken: svc.VerifyToken}
 		members.OnCertificateInstalled = func() { pc.ForgetAll(); members.Client.ForgetAll(); certHooks.run() }
 		opsSvc.Fanout, opsSvc.Local, opsSvc.InstanceOwner = members, svc, members.InstanceBelongsTo
+		opsSvc.Remote = members
 		stby, err = newStandbyParts(cfg, svc, serverHost, log, members.Audit, members, opsSvc, haReg)
 		if err != nil {
 			return fmt.Errorf("preparing the standbys: %w", err)
@@ -352,6 +357,12 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	if opsSvc != nil && svc.Enabled() {
 		rbs = newRebalance(svc, opsSvc, pg, haReg, log, auditFn(sink, log))
 		rbs.Backoff = cfg.RebalanceRetryBackoff
+		if members != nil {
+			rbs.RemoveServer = members.RemoveServer
+		}
+		if stby != nil && stby.leader != nil {
+			wireStandbyRelocation(rbs, stby.leader, opsSvc, svc)
+		}
 		deps.Rebalance = rbs
 	}
 	foDeps := &failoverDeps{}
@@ -413,7 +424,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		var err error
 		engineOnce.Do(func() {
 			var pool *pgxpool.Pool
-			if pool, err = pgxpool.New(bgCtx, dsn); err != nil {
+			if pool, err = cluster.NewSafePool(bgCtx, dsn); err != nil {
 				return
 			}
 			engSwap = newSwapDB(pool, dsn)
@@ -447,8 +458,8 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			opsSvc.SetEngine(eng)
 			run := &monitor.Runner{Src: monSource{svc}, Ring: ring, Host: serverHost, Leases: func() []ha.LeaseInfo { return haReg.Leases().Info() }, DataDir: filepath.Join(cfg.DataDir, "instances"), Log: log, System: "kingres_system",
 				Interval: cfg.MonitorInterval, LedgerPendingMaxAge: cfg.LedgerPendingMaxAge, RenewFraction: cfg.CertificateRenewFraction,
-				Probes: probesOf(stby),
-				Cert:   svc.ServerCertificate, CA: func() *x509.Certificate {
+				Probes: append(probesOf(stby), transferProbe(opsSvc, serverHost)), Extra: transferMetrics(opsSvc),
+				Cert: svc.ServerCertificate, CA: func() *x509.Certificate {
 					if ca, err := svc.CA(); err == nil {
 						return ca.Cert()
 					}
@@ -465,6 +476,12 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			if lgs != nil {
 				wg.Add(1)
 				go func() { defer wg.Done(); lgs.run(bgCtx) }()
+			}
+			if rbs != nil {
+				// the automatic rebalance (off unless the cluster setting is on); it does nothing on a server that is not the leader
+				rbs.IsLeader = func(ctx context.Context) bool { id, err := leaders.Get(ctx); return err == nil && id == serverHost }
+				wg.Add(1)
+				go func() { defer wg.Done(); rbs.RunAuto(bgCtx) }()
 			}
 			if fos != nil && foDeps.mf != nil {
 				auto := newAutoFailover(foDeps.mf, fos, rbs, leaders, serverHost, cfg.HA.FailureTimeout, log)
@@ -534,6 +551,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	}
 	foDeps.d = hd
 	hd.MapFailover = foDeps.mf
+	hd.IdentityCheck = newIdentityChecker(authn, serverHost)
 	if cfgp != nil {
 		cfgp.start(hd, haCalls)
 	}
@@ -544,6 +562,8 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	}
 	if hd.MapFailover != nil {
 		hd.MapFailover.ResumeOnStart()
+		wg.Add(1)
+		go func() { defer wg.Done(); hd.MapFailover.WatchHeldBack(bgCtx) }()
 	}
 
 	if cfg.InternalListen != "" && svc.Enabled() {
@@ -558,6 +578,11 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 						return internalapi.ForwardResponse{}, fmt.Errorf("%q is not a server of this cluster", peer)
 					}
 					return api.ServeForwarded(ctx, peer, fr)
+				}, forwardStream: func(ctx context.Context, peer string, fr internalapi.ForwardRequest, body io.Reader, w http.ResponseWriter) error {
+					if _, ok := peerDir.Get(peer); !ok {
+						return fmt.Errorf("%q is not a server of this cluster", peer)
+					}
+					return api.ServeForwardedStream(ctx, peer, fr, body, w)
 				}, gather: func(ctx context.Context, peer string, fr internalapi.ForwardRequest) (internalapi.ForwardResponse, error) {
 					// Every server of the cluster may ask; it must be a member (CP-07).
 					if _, ok := peerDir.Get(peer); !ok {

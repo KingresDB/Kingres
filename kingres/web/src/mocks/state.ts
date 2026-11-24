@@ -39,6 +39,12 @@ import type {
 } from '@/api/types'
 import { createConfigState, type ConfigState } from './config-data'
 import { createLedger7State, type Ledger7State } from './ledger-data'
+import type { AnalyticsState } from './analytics'
+import {
+  createTransferState,
+  defaultDataTransferSettings,
+  type TransferState,
+} from './transfer-data'
 
 type S = components['schemas']
 
@@ -134,6 +140,23 @@ export const mockConfig = {
   failoverSwitchoverBehind: false,
   /** 0.12.0: a finished failover ends `completedWithWarnings` (the check of the cluster reported something). */
   failoverWarnings: false,
+  /** 0.14.0 (increment 9.7): a change of a table fails at its start (`space`: not enough free space) or in the copy (`copy`). */
+  tableFail: null as null | 'space' | 'copy',
+  /** The tasks of a table take a minute, so that their progress and Cancel can be tried. */
+  tableSlow: false,
+  /** A bucket move or another operation holds the colocation groups: a change of a distributed table is refused. */
+  tableBusy: false,
+  /** The next change of a table waits at its switch for a transaction that holds the table (paused, with the blockers in the detail). */
+  tableBlocked: false,
+  /** The next change of a table ends with `verification_failed` after its switch (the old copy is kept). */
+  tableVerifyFails: false,
+  /** The next change of a table is accepted and stays `pending`. */
+  tablePending: false,
+  /** How long the undo of a cancelled table task takes to be reported (ms), and whether it fails on one server. */
+  tableUndoMs: 1500,
+  tableUndoFails: false,
+  /** Tables that have foreign keys to an ordinary table (the report of the extension lists them). */
+  tableForeignKeys: [] as string[],
   /** 0.12.0: a refusal `failover_needs_decision` carries no plan (a server of 0.11.0): the console asks with a dry run. */
   failoverNoPlan: false,
   failoverReadiness: {} as Record<number, FailoverReadinessState>,
@@ -184,6 +207,8 @@ interface ServerRec {
   status: ServerStatus
   serverGroup: string | null
   shouldHaveShards: boolean
+  /** The capacity of the server relative to the others (contract 0.15.0); absent means 1. */
+  weight?: number
   version: string
   joinedAt: string
   startedAt: number
@@ -296,6 +321,9 @@ export interface TaskRec {
   onPause?: () => void
   /** 0.9.0: the step that skips itself on purpose; the task records it as `skipped` (the reason is the task detail). */
   skippedStep?: string
+  /** A cancelled table task is recorded as failed first and its undo is reported later: at this time the detail becomes `settleDetail`. */
+  settleAt?: number
+  settleDetail?: string
   applied: boolean
   /** True for tasks created before the node was initialized (readable with the setup token). */
   setup: boolean
@@ -320,6 +348,10 @@ export interface MockState {
   groups: GroupRec[]
   serverGroups: { name: string; description: string }[]
   databases: DbRec[]
+  /** The user partitions of the partitioned tables, by `database/schema.table` (0.14.0, increment 9.7). */
+  partitions?: Record<string, components['schemas']['TablePartition'][]>
+  /** Phase 12 (0.18.0): approximate aggregates, storage, policies and runs; see mocks/analytics.ts. */
+  analytics?: AnalyticsState
   tasks: TaskRec[]
   nextTaskId: number
   roles: Role[]
@@ -330,6 +362,8 @@ export interface MockState {
   nextAuditId: number
   alerts: Alert[]
   settings: ClusterSettings
+  /** The server a drain is emptying, null otherwise (the status says trigger drain meanwhile). */
+  drain: string | null
   rebalance: {
     needed: boolean
     reasons: S['RebalanceReason'][]
@@ -372,6 +406,8 @@ export interface MockState {
   config: ConfigState
   /** 0.11.0: the ledger of phase 7 (the settings, the signing keys, the anchor targets, the divergence of chains). */
   ledger7: Ledger7State
+  /** 0.19.0: the staged uploads and exports of the data transfer. */
+  transfer: TransferState
   /** Result sets the workbench can select from, by table name (hostile-data tests). */
   extraQueryTables?: Record<string, { columns: S['QueryColumn'][]; rows: unknown[][] }>
 }
@@ -379,6 +415,19 @@ export interface MockState {
 // --- helpers ----------------------------------------------------------------------------------
 
 export const nowIso = (): string => new Date().toISOString()
+
+/** The automatic rebalance as a cluster that never changed it has it (contract 0.15.0): off. */
+export const DEFAULT_AUTOMATIC: NonNullable<S['RebalanceSettings']['automatic']> = {
+  enabled: false,
+  strategy: 'byBucketCount',
+  threshold: 0.15,
+  checkIntervalSeconds: 60,
+  settleSeconds: 300,
+  settleAfterTopologySeconds: 600,
+  minIntervalSeconds: 3600,
+  failoverSettleSeconds: 600,
+  window: null,
+}
 const ago = (seconds: number): string => new Date(Date.now() - seconds * 1000).toISOString()
 const ahead = (seconds: number): string => new Date(Date.now() + seconds * 1000).toISOString()
 
@@ -451,7 +500,7 @@ function seedDatabases(): DbRec[] {
       lcCtype: 'en_US.UTF-8',
       connectionLimit: -1,
     },
-    sharding: { enabled: false, bucketCount: 128 },
+    sharding: { enabled: false, bucketCount: 128, mode: 'row', distributeNewSchemas: false },
     replication: { durability: 'sync', replicaCount: 1 },
     ledger: { mode: 'off', digestIntervalSeconds: 3600 },
     stats: { sizeBytes: 0, tableCount: 0, activeConnections: 0, transactionsPerSecond: 0 },
@@ -473,7 +522,7 @@ function seedDatabases(): DbRec[] {
   })
   const shop: DbRec = {
     info: base('shop', {
-      sharding: { enabled: true, bucketCount: 128 },
+      sharding: { enabled: true, bucketCount: 128, mode: 'both', distributeNewSchemas: false },
       ledger: { mode: 'appendOnly', digestIntervalSeconds: 3600 },
       ledgerSummary: { verificationState: 'passed', lastVerifiedBlockHeight: 1790 },
     }),
@@ -512,6 +561,19 @@ function seedDatabases(): DbRec[] {
         sizeBytes: 64 * 1024,
       }),
       table({ name: 'notes', classes: ['plain'], estimatedRows: 1_203, sizeBytes: 2 * MiB }),
+      // Fixtures of the data transfer (contract 0.19.0): what each name makes the export or the import do is in
+      // mocks/transfer-data.ts.
+      table({ name: 'failme', classes: ['plain'], estimatedRows: 40, sizeBytes: MiB }),
+      table({ name: 'blockme', classes: ['plain'], estimatedRows: 40, sizeBytes: MiB }),
+      table({
+        name: 'skewme',
+        classes: ['distributed'],
+        distribution: { method: 'hash', column: 'session_id', colocationId: 2, bucketCount: 128 },
+        homeShardGroupId: null,
+        estimatedRows: 120,
+        sizeBytes: 4 * MiB,
+      }),
+      table({ name: 'othercode', classes: ['plain'], estimatedRows: 40, sizeBytes: MiB }),
     ],
     colocations: [
       {
@@ -881,12 +943,24 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
       defaultReplicaCount: 1,
       defaultDurability: 'sync',
       autoFailover: { enabled: true, timeoutSeconds: 120, maxCount: 1, eventsSinceReset: 0 },
-      rebalance: { maxConcurrentMoves: 4 },
+      rebalance: {
+        maxConcurrentMoves: 4,
+        strategy: 'byBucketCount',
+        threshold: null,
+        maxMovesPerServer: 2,
+        maxMoveAttempts: 3,
+        maxDiskUsedFraction: 0.85,
+        maxStandbyLagBytes: 67108864,
+        automatic: { ...DEFAULT_AUTOMATIC },
+      },
       features: { sharding: true, ledger: true },
+      analytics: { allowNonSuperuserOwners: false },
       clock: { maxDifferenceMs: 1000 },
       restart: { required: false, serverIds: [] },
+      dataTransfer: defaultDataTransferSettings(),
     },
     failover: { reports: [], runs: [] },
+    drain: null,
     rebalance: {
       needed: false,
       reasons: [],
@@ -1080,6 +1154,7 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
     session: null,
     config: createConfigState(servers.map((x) => ({ id: x.id, serverGroup: x.serverGroup }))),
     ledger7: createLedger7State(),
+    transfer: createTransferState(),
   }
 }
 
@@ -1467,6 +1542,7 @@ export function serverView(s: MockState, rec: ServerRec): Server {
     status: effectiveStatus(rec),
     serverGroup: rec.serverGroup,
     shouldHaveShards: rec.shouldHaveShards,
+    weight: rec.weight ?? 1,
     isManagerLeader: rec.id === '10.0.0.11',
     certificateExpiresAt: rec.certificateExpiresAt ?? null,
     certificateRevokedAt: rec.certificateRevokedAt ?? null,
@@ -1915,6 +1991,11 @@ export function tickTasks(s: MockState): void {
   const now = Date.now()
   for (const rec of s.tasks) {
     const t = rec.task
+    if (rec.settleAt !== undefined && now >= rec.settleAt && t.state === 'failed') {
+      t.detail = rec.settleDetail ?? null
+      t.updatedAt = nowIso()
+      rec.settleAt = undefined
+    }
     if (t.state !== 'running') continue
     let fraction = rec.durationMs <= 0 ? 1 : Math.min(1, (now - rec.startedAt) / rec.durationMs)
     // A step that waits for a server holds the whole task, which never gives up (`config.apply`).

@@ -19,8 +19,12 @@ func (d *Document) OperationsGo() ([]byte, error) {
 	b.WriteString("// operations is the operation table of the contract.\n")
 	b.WriteString("var operations = []Operation{\n")
 	for _, op := range d.Operations {
-		fmt.Fprintf(&b, "\t{ID: %q, Method: %q, Path: %q, Tag: %q, Role: %q, Security: %s, PathParams: %s, QueryParams: %s},\n",
-			op.ID, op.Method, op.Path, op.Tag, op.Role, goStrings(op.Security), goStrings(op.PathParams), goStrings(op.QueryParams))
+		streams := ""
+		if op.Streams != "" {
+			streams = fmt.Sprintf(", Streams: %q", op.Streams)
+		}
+		fmt.Fprintf(&b, "\t{ID: %q, Method: %q, Path: %q, Tag: %q, Role: %q, Security: %s, PathParams: %s, QueryParams: %s%s},\n",
+			op.ID, op.Method, op.Path, op.Tag, op.Role, goStrings(op.Security), goStrings(op.PathParams), goStrings(op.QueryParams), streams)
 	}
 	b.WriteString("}\n\n")
 	b.WriteString("// auditActions is the enum of schema AuditAction.\n")

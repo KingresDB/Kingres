@@ -54,9 +54,28 @@
 //   ?anchors=all|disabled|testfail|testwarn|refuse:<code>   0.11.0 (console part B): see the README
 //   ?anchors=<a>,<b>,...          0.11.0: none (alert ledgerNotAnchored) | required (the same, a warning) | ok | behind | failed
 //                                 (a WORM target "archive-worm" exists, with the newest aggregate anchored in time, late or not)
+//   ?analytics=<a>,<b>,...        0.18.0 (phase 12; combinable with a comma): on (approximate aggregates are on in shop) | timeseries (in shop: the table
+//                                 clicks that can be converted, and metrics, partitioned by day, with a policy, its runs and columnar partitions)
+//                                 | ahead-low (the same, with one day ahead and the alert partitionsAheadLow) | sketch:missing|mismatch|hash
+//                                 | columnar:missing | timepart:missing | convert:fail | run:lock|name|fail | publication
+//                                 | old (the 11 new operations answer 422 unsupported_operation)
+//   ?transfer=<a>,<b>,...         0.19.0 (the data transfer; combinable with a comma):
+//                                 off          the cluster setting is off: every transfer operation answers 403 data_transfer_disabled
+//                                 insecure     every transfer operation answers 403 insecure_transport
+//                                 full         the staging area has no room: 409 transfer_quota_exceeded
+//                                 small        the chunk size the server accepts is 128 KiB (a long upload in a short time)
+//                                 session      the next chunk of an upload is answered 401 (the session ended in the middle)
+//                                 cut          the next chunk is cut after 100 KiB; the next download breaks after 1 KiB
+//                                 busy         the next two chunks are answered 409 with the offset unchanged (another request still writes)
+//                                 cut400       the next chunk is cut and answered 400 with Upload-Offset
+//                                 short        the next download ends early, without an error
+//                                 exports      three exports exist: ready, building and expired
 //   ?clock=off:<server>:<ms>      the clock of that server is that many milliseconds ahead (negative: behind).
 //   ?clock=unreachable:<server>   the clock of that server cannot be read.
+import { seedPartitioned } from './tables'
+import { applyAnalyticsSwitch } from './analytics'
 import type { MockState } from './state'
+import { applyTransferSwitch } from './transfer-switches'
 import { loseLease, mockConfig, silenceServer, stallStandby } from './state'
 import { FAIL_STEPS, raiseAutoFailoverLimit, seedAutomaticFailover } from './failover'
 import {
@@ -76,6 +95,29 @@ import {
 } from './config'
 
 /** One value of `?failover=` (several: comma). Unknown values are ignored. */
+/**
+ * `?tables=` (0.14.0, increment 9.7): `partitions` adds a distributed table that the user partitioned by range (with three partitions) and a
+ * table that can be attached to it; `fail:space` and `fail:copy` make the next changes of a table fail; `slow` makes them take a minute;
+ * `busy` says that another operation holds the colocation groups; `blockme` makes the next change wait (paused) at its switch for a
+ * transaction that holds the table, `diffme` makes it end with `verification_failed`, `pending` leaves it `pending`, and `undo:<ms>` or
+ * `undo:fail` set how long the undo of a cancelled task takes to be reported and whether one server could not be reached; `fk:<table>` gives a table a foreign key to an ordinary table.
+ */
+function applyTablesSwitch(entry: string, s: MockState): void {
+  if (entry === 'partitions') seedPartitioned(s)
+  if (entry === 'fail:space') mockConfig.tableFail = 'space'
+  if (entry === 'fail:copy') mockConfig.tableFail = 'copy'
+  if (entry === 'slow') mockConfig.tableSlow = true
+  if (entry === 'busy') mockConfig.tableBusy = true
+  if (entry === 'blockme') mockConfig.tableBlocked = true
+  if (entry === 'diffme') mockConfig.tableVerifyFails = true
+  if (entry === 'pending') mockConfig.tablePending = true
+  if (entry === 'undo:fail') mockConfig.tableUndoFails = true
+  const undo = /^undo:(d{1,6})$/.exec(entry)
+  if (undo) mockConfig.tableUndoMs = Number(undo[1])
+  const fk = /^fk:(.+)$/.exec(entry)
+  if (fk) mockConfig.tableForeignKeys.push(fk[1] as string)
+}
+
 function applyFailoverSwitch(entry: string, s: MockState): void {
   if (entry === 'dataloss') mockConfig.failoverDataLoss = true
   if (entry === 'needs-decision') mockConfig.failoverNeedsDecision = true
@@ -226,6 +268,8 @@ export function applySwitches(params: URLSearchParams, s: MockState): void {
     if (entry === 'slow') mockConfig.rebalanceSlow = true
   }
   for (const entry of (params.get('failover') ?? '').split(',')) applyFailoverSwitch(entry, s)
+  for (const entry of (params.get('tables') ?? '').split(',')) applyTablesSwitch(entry, s)
+  for (const entry of (params.get('analytics') ?? '').split(',')) applyAnalyticsSwitch(entry, s)
   if (params.get('phase7') === 'today') answerAsTheServerDoesToday(s)
   for (const entry of (params.get('signing') ?? '').split(',')) applySigningSwitch(entry, s)
   for (const entry of (params.get('publication') ?? '').split(',')) {
@@ -276,6 +320,7 @@ export function applySwitches(params: URLSearchParams, s: MockState): void {
     const refuse = /^refuse:([a-z_]+)$/.exec(entry)
     if (refuse) mockConfig.opsRefuse = refuse[1] as string
   }
+  for (const entry of (params.get('transfer') ?? '').split(',')) applyTransferSwitch(entry, s)
   for (const entry of (params.get('clock') ?? '').split(',')) {
     const off = /^off:([^:]+):(-?\d+(?:\.\d+)?)$/.exec(entry)
     if (off) setClockOffset(s, off[1] as string, Number(off[2]))

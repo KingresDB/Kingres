@@ -17,6 +17,8 @@
 #     the test, never a real one) it is the very same bytes as the release file of
 #     the same version, and `release verify` of the packaged copy accepts that
 #     release and rejects a changed binary and a note of another key
+#   - release.sh refuses a signed release from a tree that is not clean or whose HEAD is
+#     not the tag of the version, unless --dry-run (checked in a throwaway git repository)
 #
 # The checks that need a running node (systemd shows LimitCORE=0 and the process
 # runs with a zero core limit) are in test-deb.sh, which needs Docker.
@@ -118,8 +120,8 @@ rel="${run}/release"
 ( cd "${ver}" && go run -trimpath ./cmd/kingres-release-tool keygen --out "${keyfile}" ) >"${run}/keygen.txt"
 pubkey="$(sed -n 's/^public key:  //p' "${run}/keygen.txt")"
 check "a key was made for the test" test -n "${pubkey}"
-check "release.sh makes a signed release" bash "${ver}/scripts/release.sh" --version "${version}" --out "${rel}" \
-    --key-file "${keyfile}" --targets "linux/amd64 windows/amd64"
+check "release.sh makes a signed release (a dry run: this tree is not a tagged clean checkout)" bash "${ver}/scripts/release.sh" --version "${version}" --out "${rel}" \
+    --key-file "${keyfile}" --dry-run --targets "linux/amd64 windows/amd64"
 check "the release has the note" test -f "${rel}/SHA256SUMS.note"
 check "the packaged binary is the release file of the same version, byte for byte" \
     cmp "${root}${prefix}/bin/kingres-verify" "${rel}/kingres-verify-linux-amd64"
@@ -137,4 +139,66 @@ status=0
     --key "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" >/dev/null 2>&1 || status=$?
 check_eq "another key is status 1" 1 "${status}"
 
+
+note "release.sh makes a signed release only from the tagged commit of a clean checkout (P7R-07)"
+if command -v git >/dev/null; then
+    g="${run}/gitsrc"
+    mkdir -p "${g}/kingres/verifier"
+    ( cd "${ver}" && tar -cf - --exclude='testdata' . ) | ( cd "${g}/kingres/verifier" && tar -xf - )
+    # the repository of the test is a throwaway one; no tag of the project is made or touched
+    gitq() { git -C "${g}" -c user.name=release-test -c user.email=release-test@example.invalid -c commit.gpgsign=false -c core.hooksPath=/dev/null "$@"; }
+    gitq init -q
+    gitq add -A
+    gitq commit -q -m "the tree of the test"
+    head="$(gitq rev-parse HEAD)"
+    gs="${g}/kingres/verifier/scripts/release.sh"
+    rstatus=0
+    rtry() { # rtry OUTDIR LOGFILE ARGS...: release.sh for linux/amd64, the exit status in ${rstatus}
+        local o="$1" l="$2"
+        shift 2
+        rstatus=0
+        bash "${gs}" --version 9.9.9 --out "${o}" --key-file "${keyfile}" --targets "linux/amd64" "$@" >"${l}" 2>&1 || rstatus=$?
+    }
+    rtry "${run}/r-notag" "${run}/r-notag.log"
+    check_eq "a signed release without a tag is refused" 1 "${rstatus}"
+    check "and it names the missing tag" grep -q 'the tag v9.9.9 does not exist' "${run}/r-notag.log"
+    check "and it made no file" sh -c "! ls '${run}/r-notag'/* >/dev/null 2>&1"
+    rtry "${run}/r-dry" "${run}/r-dry.log" --dry-run
+    check_eq "a dry run without a tag makes the files" 0 "${rstatus}"
+    check "and says in capitals that it is not a release" grep -q 'DRY RUN: .* NOT a release' "${run}/r-dry.log"
+    check "its RELEASE file records no commit" grep -qx 'commit: unknown' "${run}/r-dry/RELEASE"
+    # release verify of that set is not a plain pass: status 5 and the words NOT A RELEASE, unless --accept-dry-run asks for status 0
+    dstatus=0
+    "${packaged}" release verify --sums "${run}/r-dry/SHA256SUMS" --note "${run}/r-dry/SHA256SUMS.note" --key "${pubkey}" \
+        --binary "${run}/r-dry/RELEASE" >"${run}/r-dry-verify.log" 2>&1 || dstatus=$?
+    check_eq "release verify of a dry-run set ends with status 5" 5 "${dstatus}"
+    check "and says NOT A RELEASE" grep -q '^VERIFIED (NOT A RELEASE):' "${run}/r-dry-verify.log"
+    dstatus=0
+    "${packaged}" release verify --accept-dry-run --sums "${run}/r-dry/SHA256SUMS" --note "${run}/r-dry/SHA256SUMS.note" --key "${pubkey}" \
+        --binary "${run}/r-dry/RELEASE" >/dev/null 2>&1 || dstatus=$?
+    check_eq "and with --accept-dry-run ends with status 0" 0 "${dstatus}"
+    # an empty array under set -u is an unbound variable on bash before 4.4: release.sh expands it in the form that those accept (P7H-05)
+    portable='${accept[@]+"${accept[@]}"}'
+    bare='"${accept[@]}"'
+    check "release.sh expands its empty array in the portable form" grep -qF -- "${portable}" "${ver}/scripts/release.sh"
+    check "and nowhere bare" sh -c "! grep -F -- '${bare}' '${ver}/scripts/release.sh' | grep -vF -- '${portable}' | grep -q ."
+    gitq tag v9.9.9
+    rtry "${run}/r-ok" "${run}/r-ok.log"
+    check_eq "a signed release from the tagged clean commit is made" 0 "${rstatus}"
+    check "its RELEASE file names the version and the commit" sh -c "grep -qx 'version: 9.9.9' '${run}/r-ok/RELEASE' && grep -qx 'commit: ${head}' '${run}/r-ok/RELEASE'"
+    check "RELEASE is in the signed sums" grep -q '  RELEASE$' "${run}/r-ok/SHA256SUMS"
+    pub2="$(cd "${ver}" && go run -trimpath ./cmd/kingres-release-tool pub --key-file "${keyfile}" | sed -n 's/^public key:  //p')"
+    check "release verify shows the signed version and commit" sh -c "'${root}${prefix}/bin/kingres-verify' release verify --sums '${run}/r-ok/SHA256SUMS' --note '${run}/r-ok/SHA256SUMS.note' --key '${pub2}' --binary '${run}/r-ok/RELEASE' | grep -q 'version 9.9.9, commit ${head}'"
+    echo "a change that is not committed" >"${g}/kingres/verifier/scripts/untracked.txt"
+    rtry "${run}/r-dirty" "${run}/r-dirty.log"
+    check_eq "a signed release from a dirty tree is refused" 1 "${rstatus}"
+    check "and it says the tree is not clean" grep -q 'the working tree is not clean' "${run}/r-dirty.log"
+    rm -f "${g}/kingres/verifier/scripts/untracked.txt"
+    gitq commit -q --allow-empty -m "after the tag"
+    rtry "${run}/r-moved" "${run}/r-moved.log"
+    check_eq "a signed release from a commit that is not the tag is refused" 1 "${rstatus}"
+    check "and it says HEAD is not the tag" grep -q 'HEAD is not the commit of the tag' "${run}/r-moved.log"
+else
+    echo "git is not on the PATH: the release.sh checks of the tree and the tag were not run"
+fi
 summary

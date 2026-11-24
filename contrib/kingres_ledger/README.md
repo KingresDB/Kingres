@@ -186,6 +186,7 @@ Tests: nineteen pg_regress tests and thirty-four TAP tests under `t/`.
 | `037_attest_savepoints` | L21-05: every placement of one entry and its attestation over two nested subtransactions and every way of closing them, as savepoints and as `EXCEPTION` blocks, against a model written in the test (the reviewer's mutant that does not pass the attestation to the parent at a subtransaction commit dies here) |
 | `038_public_key_check` | L21-01: the eight small-order points, their other encodings, values that are not on the curve (`22023` at registration), a good key accepted with one identifier, and `ledger_attest` refusing a small-order key that a row holds already (`KL012`), on every call of the session (two transactions, three savepoints, the identity key and the all-zero key; L22-03); L22-02: twelve keys in rotation in one session are judged twelve times (the server writes a `DEBUG1` message per judgment, the test counts them), a refused key on every call, and a revoked key is refused by the table though the cache has judged it |
 | `039_signature_paths` | `COPY` into a `required` table (`KL010` unattested, committed attested), partitioned tables (a ledger table cannot be one), and logical replication apply into a `required` table (the subscriber cannot hold it: `KL010`, no row, no entry) next to one with the policy optional that is fed |
+| `040_columnar_refused` | rule L1: `ledger_enable` refuses a columnar table (both modes) and leaves it alone, a heap table is a ledger table as before, `SET ACCESS METHOD columnar` on a ledger table is rejected and the ledger still verifies; skipped when `kingres_columnar` is not installed |
 
 The regress tests need `shared_preload_libraries = 'kingres_ledger'` (the
 in-tree `check` target and `kingres/dev/ext.sh` set it).
@@ -2922,6 +2923,11 @@ it has been looked at, not by how likely it is to be wrong.
 - Tables must be ordinary permanent tables in a user schema without generated
   columns; partitioned tables, tables that take part in inheritance, tables with
   rules, temporary and unlogged tables are rejected.
+- A ledger table is a heap table (rule L1 of the storage part of phase 12): `ledger_enable` refuses a table whose access method is not
+  heap (`columnar`), with SQLSTATE `0A000` and the message `table "t" uses the access method "columnar" and cannot be a ledger table`,
+  and `ALTER TABLE ... SET ACCESS METHOD` on a ledger table is a rewrite, which the event trigger rejects.  The capture code and the row
+  hashes read heap tuples, and nothing of them is tested against another storage.  The check is in C (`ledger_lock_table`), so the
+  version of the extension stays 0.3.
 - The extension owner must be a superuser, and `ledger_enable` needs READ
   COMMITTED and a server that is not in recovery.
 - The row hash depends on the database encoding only through the UTF-8

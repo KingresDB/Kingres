@@ -51,12 +51,27 @@ type Agent struct {
 	// Now is the wall clock (default time.Now); the fault hook of the tests steps it.
 	Now func() time.Time
 
+	// Lifecycle, when set, brackets the restart of an instance with the instance lifecycle of the operations
+	// code (nil in tests that have no operations code).
+	Lifecycle Lifecycle
+
+	// backWait is how long a restart waits for the instance to accept connections again (default two minutes; tests).
+	backWait time.Duration
+
 	// needed replaces the question "does this instance have to be restarted now" (tests).
 	needed func(ctx context.Context, id int) bool
 
 	mu    sync.Mutex // one apply or restart at a time
 	zmu   sync.Mutex
 	zones zoneCache
+}
+
+// Lifecycle is what the agent needs from the operations code to restart an instance as that code
+// would (internal/ops: BeginConfigRestart).
+type Lifecycle interface {
+	// BeginRestart checks that the instance may be restarted now and enters the state "restarting". The
+	// returned function ends it with the outcome of the restart.
+	BeginRestart(ctx context.Context, id int) (end func(ctx context.Context, err error), err error)
 }
 
 type zoneCache struct {
@@ -290,6 +305,11 @@ func hidden(ctx context.Context, c *pgx.Conn, all []Setting) ([]string, error) {
 			out = append(out, s.Name)
 		}
 	}
+	if len(out) == 0 {
+		// Every supported PostgreSQL hides some parameters from this role. An empty set means the
+		// answer cannot be trusted, and the classification must fail closed (P13R-04).
+		return nil, errors.New("PostgreSQL hides no parameter from an ordinary role: the answer cannot be trusted")
+	}
 	return out, nil
 }
 
@@ -339,7 +359,10 @@ func (a *Agent) State(ctx context.Context, req StateRequest) (StateResponse, err
 						if req.Meta {
 							h, herr := hidden(ctx, c, set)
 							if herr != nil {
-								a.log().Warn("reading the hidden parameters failed", "error", herr)
+								// Fail closed: without the hidden set the leader would classify every superuser-only
+								// parameter as settable and return the values of hidden ones (P13R-04).
+								_ = c.Close(context.WithoutCancel(ctx))
+								return StateResponse{}, fmt.Errorf("reading the hidden parameters: %w", herr)
 							}
 							resp.Hidden = h
 						}
@@ -350,10 +373,7 @@ func (a *Agent) State(ctx context.Context, req StateRequest) (StateResponse, err
 		}
 		resp.Instances = append(resp.Instances, info)
 	}
-	if t, err := a.mgr().ReadConfig(cluster.NodeID); err == nil {
-		resp.Revision = instance.ConfigRevision(t)
-		resp.ConfigHash = HashOf(t)
-	}
+	resp.Revision, resp.ConfigHash = a.configIdentity()
 	return resp, nil
 }
 
@@ -417,7 +437,33 @@ func (a *Agent) Apply(ctx context.Context, req ApplyRequest) (ApplyResponse, err
 			}
 		}
 	}
+	// A stored value whose name has become managed or refused since it was set (an upgrade added the name to a
+	// list) is not written and does not stop the apply: it is reported and the operator removes it (P13R-05).
+	vals := map[string]string{}
+	for n, v := range req.Values {
+		if Dropped(n) {
+			a.log().Warn("a stored configuration value is no longer settable and is not written", "parameter", n)
+			worse(n, StateApplied, "", "", "not written: the parameter can no longer be set from the console; remove the stored value")
+			continue
+		}
+		vals[n] = v
+	}
+	req.Values = vals
+	dbs := map[string]map[string]string{}
+	for db, m := range req.Databases {
+		dbs[db] = map[string]string{}
+		for n, v := range m {
+			if Dropped(n) {
+				a.log().Warn("a stored database value is no longer settable and is not written", "database", db, "parameter", n)
+				worse(n, StateApplied, "", "", "not written: the parameter can no longer be set from the console; remove the stored value")
+				continue
+			}
+			dbs[db][n] = v
+		}
+	}
+	req.Databases = dbs
 	waiting := ""
+	stopped := false // an instance refused the file: the others are left alone
 	var firstMeta map[string]Setting
 	var hiddenSet map[string]bool
 	for _, id := range a.instanceIDs() {
@@ -437,8 +483,22 @@ func (a *Agent) Apply(ctx context.Context, req ApplyRequest) (ApplyResponse, err
 		}
 		up, _ := a.mgr().Running(ctx, id)
 		if !up {
-			if err := a.mgr().WriteConfig(id, text); err != nil {
-				return resp, err
+			// The instance cannot say what it thinks of the file, so PostgreSQL's parser is asked: a value it
+			// refuses would stop the instance from starting (P13R-13).
+			if text != oldText {
+				if err := a.mgr().WriteConfig(id, text); err != nil {
+					return resp, err
+				}
+				if cerr := a.mgr().CheckConfig(ctx, id); cerr != nil {
+					if rerr := a.mgr().RestoreConfig(id); rerr != nil {
+						a.log().Error("restoring the override file failed", "instance", id, "error", rerr)
+					}
+					for n := range req.Values {
+						worse(n, StateFailed, "", "", "PostgreSQL does not accept the file: "+firstLine(cerr.Error()))
+					}
+					stopped = true
+					break
+				}
 			}
 			waiting = fmt.Sprintf("instance %d is not running; it reads the file when it starts", id)
 			continue
@@ -468,8 +528,12 @@ func (a *Agent) Apply(ctx context.Context, req ApplyRequest) (ApplyResponse, err
 				meta[strings.ToLower(s.Name)] = s
 			}
 			if firstMeta == nil {
+				h, herr := hidden(ctx, c, set)
+				if herr != nil {
+					// Fail closed (P13R-04): without the hidden set a superuser-only parameter would pass.
+					return fmt.Errorf("reading the hidden parameters: %w", herr)
+				}
 				firstMeta = meta
-				h, _ := hidden(ctx, c, set)
 				hiddenSet = map[string]bool{}
 				for _, n := range h {
 					hiddenSet[strings.ToLower(n)] = true
@@ -485,7 +549,12 @@ func (a *Agent) Apply(ctx context.Context, req ApplyRequest) (ApplyResponse, err
 					continue
 				}
 				if cl := Classify(s, hiddenSet[name]); cl.Kind != KindSettable {
-					return fmt.Errorf("%s cannot be set from the console", name)
+					// Not written, and the apply goes on (P13R-05): the stored value is reported, and the
+					// operator removes it. The file is rendered again without it.
+					a.log().Warn("a stored configuration value is not settable on this server and is not written", "parameter", name)
+					worse(name, StateApplied, "", "", "not written: "+cl.Reason.Text)
+					delete(req.Values, name)
+					continue
 				}
 				if _, err := Check(s, v); err != nil {
 					worse(name, StateFailed, "", "", err.Error())
@@ -503,6 +572,12 @@ func (a *Agent) Apply(ctx context.Context, req ApplyRequest) (ApplyResponse, err
 					return nil // nothing is written when a value is invalid here
 				}
 			}
+			// Names this instance does not allow were taken out of the values above: the file is rendered again.
+			t2, rerr := instance.RenderConfig(req.Revision, req.Values)
+			if rerr != nil {
+				return rerr
+			}
+			text = t2
 			// A file that is already the wanted one still needs a reload when the instance runs something else
 			// (an earlier apply wrote it but could not reload, for example a standby that was starting).
 			drift := false
@@ -572,7 +647,10 @@ func (a *Agent) Apply(ctx context.Context, req ApplyRequest) (ApplyResponse, err
 		}
 	}
 	// Database-level values live in the catalog of each primary instance (standbys replay them, V10).
-	dbErrs := a.applyDatabases(ctx, req, firstMeta)
+	var dbErrs map[string]string
+	if !stopped {
+		dbErrs = a.applyDatabases(ctx, req, firstMeta, hiddenSet)
+	}
 	for n, e := range dbErrs {
 		worse(n, StateFailed, "", "", e)
 	}
@@ -642,7 +720,7 @@ func waitReload(ctx context.Context, c *pgx.Conn, before time.Time) error {
 
 // applyDatabases sets and resets the database-level values on the primary instance. It returns the
 // parameters that failed with PostgreSQL's text. A database that does not exist here is skipped.
-func (a *Agent) applyDatabases(ctx context.Context, req ApplyRequest, meta map[string]Setting) map[string]string {
+func (a *Agent) applyDatabases(ctx context.Context, req ApplyRequest, meta map[string]Setting, hiddenSet map[string]bool) map[string]string {
 	errs := map[string]string{}
 	if len(req.Databases) == 0 && len(req.Removed) == 0 {
 		return errs
@@ -682,11 +760,16 @@ func (a *Agent) applyDatabases(ctx context.Context, req ApplyRequest, meta map[s
 				errs[name] = "the name cannot be set"
 				continue
 			}
-			if s, ok := meta[name]; ok {
-				if cl := Classify(s, false); !cl.Allows(LevelDatabase) {
-					errs[name] = "cannot be set for a database"
-					continue
-				}
+			// Fail closed (P13R-13): a name this server does not know, or one that is hidden, managed or refused
+			// here, is never set, so a compromised leader cannot set what the console refuses.
+			s, ok := meta[name]
+			if !ok {
+				errs[name] = "PostgreSQL on this server has no parameter " + name
+				continue
+			}
+			if cl := Classify(s, hiddenSet[name]); cl.Kind != KindSettable || !cl.Allows(LevelDatabase) {
+				errs[name] = "cannot be set for a database"
+				continue
 			}
 			if err := run(`'ALTER DATABASE %I SET %I TO %L'`, db, name, v); err != nil {
 				errs[name] = pgText(err)
@@ -795,10 +878,54 @@ func (a *Agent) RestartInstance(ctx context.Context, id int, ifPending bool) err
 	if ifPending && !a.restartNeeded(ctx, id) {
 		return nil // it was restarted already (by an earlier try of this call): nothing waits for a restart
 	}
-	if err := a.mgr().Restart(ctx, id); err != nil {
-		return err
+	// PostgreSQL's parser looks at the whole configuration first: a file it refuses would stop the instance
+	// from starting, and the instance has not been stopped yet (P13R-02).
+	if up, _ := a.mgr().Running(ctx, id); up {
+		if err := a.mgr().CheckConfig(ctx, id); err != nil {
+			return fmt.Errorf("instance %d was not restarted, PostgreSQL does not accept its configuration: %w", id, err)
+		}
 	}
-	deadline := time.Now().Add(2 * time.Minute)
+	// The restart goes through the instance lifecycle of the operations code (the state "restarting", the
+	// refusal of a start or stop meanwhile, the wait for the system database) and, inside the manager, through
+	// the lease gate (P13R-06).
+	end := func(context.Context, error) {}
+	if a.Lifecycle != nil {
+		e, err := a.Lifecycle.BeginRestart(ctx, id)
+		if err != nil {
+			return err
+		}
+		end = e
+	}
+	err := a.restartAndWait(ctx, id)
+	end(context.WithoutCancel(ctx), err)
+	return err
+}
+
+// restartAndWait restarts the instance. When the instance cannot start with the file it has now, the last file it
+// ran with is put back and the instance is started again, so that a value that passed every check but the host
+// cannot honour (a memory size, for instance) does not leave the server down (P13R-02).
+func (a *Agent) restartAndWait(ctx context.Context, id int) error {
+	_, _ = a.mgr().TakeRollbackMark(id) // a mark of an earlier start is not this restart's
+	if err := a.mgr().Restart(ctx, id); err != nil {
+		return fmt.Errorf("instance %d did not start (the last good override file was tried as well): %w", id, err)
+	}
+	// The manager starts an instance that cannot start with its override file again with the last good one (it does so for
+	// every start, also after a reboot); the mark says that it did (P13S-01).
+	why, rolledBack := a.mgr().TakeRollbackMark(id)
+	if rolledBack {
+		_ = a.waitBack(ctx, id)
+		return fmt.Errorf("instance %d did not start with the new configuration (%s); the previous file was put back and the instance runs again; remove the value that caused it", id, why)
+	}
+	return a.waitBack(ctx, id)
+}
+
+// waitBack waits until the instance accepts connections (and a standby streams).
+func (a *Agent) waitBack(ctx context.Context, id int) error {
+	wait := a.backWait
+	if wait == 0 {
+		wait = 2 * time.Minute
+	}
+	deadline := time.Now().Add(wait)
 	for {
 		c, err := a.conn(ctx, id)
 		if err == nil {
@@ -919,4 +1046,39 @@ func (a *Agent) restartNeeded(ctx context.Context, id int) bool {
 		return true
 	}
 	return n > 0
+}
+
+// configIdentity returns the revision and the hash of the override files of this server: when every instance that
+// has a data directory holds the same file, its hash and revision; else the lowest revision and a hash that no
+// rendered file has, so that the leader's loop brings the server up to date (a standby that was copied from
+// another server holds that server's file, P13S-05).
+func (a *Agent) configIdentity() (int64, string) {
+	var rev int64 = -1
+	hashes := map[string]bool{}
+	var one string
+	for _, id := range a.instanceIDs() {
+		data, err := a.mgr().DataDir(id)
+		if err != nil {
+			continue
+		}
+		if st, serr := os.Stat(data); serr != nil || !st.IsDir() {
+			continue // a standby that is still being created has no data directory yet
+		}
+		t, err := a.mgr().ReadConfig(id)
+		if err != nil {
+			continue
+		}
+		if r := instance.ConfigRevision(t); rev < 0 || r < rev {
+			rev = r
+		}
+		one = HashOf(t)
+		hashes[one] = true
+	}
+	switch {
+	case len(hashes) == 0:
+		return 0, ""
+	case len(hashes) == 1:
+		return rev, one
+	}
+	return rev, "mixed:" + strings.Join(sortedKeys(hashes), ",")
 }

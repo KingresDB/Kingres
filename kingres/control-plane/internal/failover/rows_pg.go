@@ -71,8 +71,8 @@ func (r *PGRows) Begin(ctx context.Context, in Input, term int64, groups []Group
 	opts, _ := json.Marshal(in)
 	return r.leased(ctx, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `INSERT INTO kingres_cp.failover_run (task_id, kind, trigger, mode, server_id, requested_by, options, expected_term)
-			VALUES ($1, 'failover', $2, $3, $4, $5, $6, $7) ON CONFLICT (task_id) DO NOTHING`,
-			r.TaskID, orStr(in.Trigger, "manual"), in.Mode, in.ServerID, in.RequestedBy, opts, term); err != nil {
+			VALUES ($1, $8, $2, $3, nullif($4, ''), $5, $6, $7) ON CONFLICT (task_id) DO NOTHING`,
+			r.TaskID, orStr(in.Trigger, "manual"), in.Mode, in.ServerID, in.RequestedBy, opts, term, runKind(in)); err != nil {
 			return err
 		}
 		for _, g := range groups {
@@ -83,6 +83,14 @@ func (r *PGRows) Begin(ctx context.Context, in Input, term int64, groups []Group
 		}
 		return nil
 	})
+}
+
+// runKind is the kind of the run record: a restore is not a failover.
+func runKind(in Input) string {
+	if in.Mode == ModeRestore {
+		return "restorePreferredPrimaries"
+	}
+	return "failover"
 }
 
 func orStr(s, d string) string {

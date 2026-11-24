@@ -40,7 +40,7 @@ func TestABrokenObservationSessionDoesNotCancelARecordedMove(t *testing.T) {
 	ctx := context.Background()
 	stub := e.in.Connect(t, "postgres")
 	for _, q := range []string{
-		`CREATE SCHEMA kingres`,
+		`CREATE SCHEMA IF NOT EXISTS kingres`,
 		`CREATE TABLE kingres.bucket_move (move_id bigserial PRIMARY KEY, colocation_id int, bucket int, phase text, detail text, started_at timestamptz DEFAULT now())`,
 		`CREATE TABLE kingres.call_ended (n int)`,
 		`CREATE FUNCTION kingres.move_bucket(int, int, int) RETURNS bigint LANGUAGE plpgsql AS $$
@@ -50,6 +50,7 @@ func TestABrokenObservationSessionDoesNotCancelARecordedMove(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	trustStub(t, stub)
 	conns := &recordingConns{guardEnv: e}
 	b := &PG{Conns: conns, GuardHold: 1500 * time.Millisecond}
 	b.afterGuard = func(context.Context) {

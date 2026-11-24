@@ -12,6 +12,7 @@ OBJS = \
 	src/bucket_move.o \
 	src/catalog.o \
 	src/copy_routed.o \
+	src/count_distinct.o \
 	src/dist_scan.o \
 	src/dist_table.o \
 	src/fanout.o \
@@ -22,6 +23,7 @@ OBJS = \
 	src/ha.o \
 	src/hashing.o \
 	src/kingres_shard.o \
+	src/merge.o \
 	src/node_admin.o \
 	src/node_conn.o \
 	src/placement_check.o \
@@ -31,6 +33,7 @@ OBJS = \
 	src/rebuild.o \
 	src/recovery.o \
 	src/remote_scan.o \
+	src/repartition.o \
 	src/row_router.o \
 	src/schema_ddl.o \
 	src/shippable.o \
@@ -49,10 +52,11 @@ DATA = kingres_shard--0.1.sql kingres_shard--0.2.sql kingres_shard--0.3.sql \
 	kingres_shard--0.3--0.4.sql kingres_shard--0.5.sql kingres_shard--0.4--0.5.sql \
 	kingres_shard--0.6.sql kingres_shard--0.5--0.6.sql \
 	kingres_shard--0.6--0.7.sql kingres_shard--0.7.sql \
-	kingres_shard--0.7--0.8.sql kingres_shard--0.8.sql
+	kingres_shard--0.7--0.8.sql kingres_shard--0.8.sql \
+	kingres_shard--0.8--0.9.sql kingres_shard--0.9.sql
 
 REGRESS = version catalog bucket_for bucket_lookup bucket_layout distribute distribute_rows sequence_options online_refusals routing_single security \
-	utility_guard routing_decisions reference ddl_single rebalance_plan plan_strategies bulk_plans pushdown_shippable pushdown_plans schema_catalog upgrade pg_facts
+	utility_guard routing_decisions reference ddl_single rebalance_plan plan_strategies bulk_plans pushdown_shippable pushdown_plans repartition_plans merge_plans schema_catalog upgrade pg_facts
 # The tests need the extension preloaded (see kingres_shard.conf).
 REGRESS_OPTS = --temp-config $(srcdir)/kingres_shard.conf
 TAP_TESTS = 1

@@ -52,6 +52,14 @@ func newRebalance(svc *cluster.Service, o *ops.Ops, st store.Store, reg *ha.Regi
 	}
 	return &rebalance.Service{
 		Conns: svc, Backend: pgb, Engine: o.Engine, Log: log, Audit: auditFn,
+		SetShouldHaveShards: o.SetShouldHaveShards,
+		ServerStatus: func(ctx context.Context, id string) string {
+			d, err := st.Server(ctx, id)
+			if err != nil {
+				return ""
+			}
+			return d.Status
+		},
 		Background: func(f func()) { o.Go(f) },
 		BGFn:       o.Background,
 		Summary: func(ctx context.Context) (bool, []string, error) {

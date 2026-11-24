@@ -58,6 +58,9 @@ func (s *Server) opsHandlers() map[string]handlerFunc {
 	for id, h := range s.tableLifecycleHandlers() {
 		m[id] = h
 	}
+	for id, h := range s.transferHandlers() {
+		m[id] = h
+	}
 	return m
 }
 
@@ -388,6 +391,10 @@ func (s *Server) updateDatabase(c *call, w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		return s.storeProblem(r, err, "Database \""+name+"\" does not exist.")
 	}
+	if sh := req.Sharding; sh != nil && sh.Enabled != nil && *sh.Enabled && !db.Sharding.Enabled {
+		// the update was applied but the database does not show it: never answer 200 for a change that is not visible
+		return problem.New(problem.InternalError, "Sharding was requested but the database does not report it as enabled.")
+	}
 	s.writeJSON(w, r, http.StatusOK, db)
 	return nil
 }
@@ -539,6 +546,7 @@ func (s *Server) cancelTask(_ *call, w http.ResponseWriter, r *http.Request) err
 	if err != nil {
 		return s.storeProblem(r, err, "No such task.")
 	}
+	t = withCancelGuard(t)
 	s.writeJSON(w, r, http.StatusOK, t)
 	return nil
 }
@@ -664,9 +672,23 @@ func (s *Server) updateClusterSettings(c *call, w http.ResponseWriter, r *http.R
 	if err := s.body(w, r, &req); err != nil {
 		return err
 	}
+	// The audit event of a change of the data transfer setting names the old and the new values (never data).
+	var oldDT *api.DataTransferSettings
+	if req.DataTransfer != nil {
+		if cur, err := s.deps.Store.ClusterSettings(r.Context()); err == nil {
+			oldDT = cur.DataTransfer
+		}
+	}
 	started, err := o.UpdateClusterSettings(r.Context(), c.session.Username, req)
 	if err != nil {
 		return err
+	}
+	if req.DataTransfer != nil {
+		d := map[string]any{"old": oldDT}
+		if cur, err := s.deps.Store.ClusterSettings(r.Context()); err == nil {
+			d["new"] = cur.DataTransfer
+		}
+		c.addDetails(map[string]any{"dataTransfer": d})
 	}
 	// An update that started a task (a new replica count starts standby.reconcile) answers 202
 	// with the Task and a Location, as every operation that starts a task does, to a client that
@@ -682,8 +704,18 @@ func (s *Server) updateClusterSettings(c *call, w http.ResponseWriter, r *http.R
 	if err != nil {
 		return s.storeProblem(r, err, "")
 	}
+	s.showMaxAtomic(&out)
 	s.writeJSON(w, r, http.StatusOK, out)
 	return nil
+}
+
+// showMaxAtomic adds the cap of one import of this server to the data transfer settings (read only, not stored).
+func (s *Server) showMaxAtomic(v *api.ClusterSettings) {
+	if v.DataTransfer != nil && s.deps.Ops != nil {
+		dt := *v.DataTransfer
+		dt.MaxAtomicBytes = s.deps.Ops.MaxAtomicBytes()
+		v.DataTransfer = &dt
+	}
 }
 
 // cancelStatement ends the caller's own running workbench statement (contract

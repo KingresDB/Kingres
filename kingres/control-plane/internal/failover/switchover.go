@@ -5,6 +5,7 @@ package failover
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -36,8 +37,8 @@ func switchoverStepNames() []string {
 	return append(out, StepWriteReport)
 }
 
-// graceful tells whether the input is a planned switchover.
-func (in Input) graceful() bool { return in.Mode == ModeGraceful }
+// graceful tells whether the input is a planned switchover (a restore is a switchover per group).
+func (in Input) graceful() bool { return in.Mode == ModeGraceful || in.Mode == ModeRestore }
 
 // addGraceful appends the steps of one group of a switchover.
 func (r *Runner) addGraceful(out *[]task.Step, g int32) {
@@ -133,33 +134,67 @@ func (r *Runner) chooseGraceful(ctx context.Context, env *task.Env, sc *stepCtx)
 // rollbackSwitchover undoes what a switchover did to the old primary, as far as the promotion has not happened (design 5.3). Every part
 // is idempotent and best effort: the leases of the run are released, the writes are let in again and the old primary, when it was
 // stopped, is started again by its lease manager (the wait marker). It never runs for a group that was promoted.
-func (r *Runner) rollbackSwitchover(ctx context.Context, taskID int64, in Input, g int32, newServer string, term int64) {
+func (r *Runner) rollbackSwitchover(ctx context.Context, taskID int64, in Input, g int32, newServer string, term int64) (handedOver bool) {
 	ctx = context.WithoutCancel(ctx)
+	if g == 0 && newServer != "" {
+		// The bootstrap of the candidate that this task started is asked FIRST (F5-03): it is given up (and lets go of its lease), or it answers that it promoted or
+		// may have, in which case nothing is rolled back: the old leader stays held back and the candidate goes on. Only then are the leases released and the old
+		// leader resumed.
+		if err := r.Peers.MapAbandon(ctx, newServer, "the planned switchover of the map group was rolled back"); err != nil {
+			if IsCode(err, "conflict") {
+				r.log().Warn("failover: the candidate of the map group promoted; the old leader stays held back and nothing is rolled back", "server", newServer)
+				return true
+			}
+			// An answer other than a conflict (the candidate cannot be reached) does not say that nothing was promoted, and the rows that would say so are in the
+			// stopped system database (F6-04). The rollback goes on all the same, and that is safe against two primaries only because of the lease: the candidate's
+			// own kingresd renews its lease and attaches a promoted instance to it, so this server's primary, started again, cannot win the lease from a promoted
+			// candidate and waits for it (the wait marker). The risk is therefore named in the log and never taken silently.
+			r.log().Warn("failover: the bootstrap of the map group could not be given up and it is not known whether the candidate promoted; the old leader is started again and the lease decides which of the two runs",
+				"server", newServer, "error", err)
+		}
+	}
 	_, _ = r.Peers.Lease(ctx, r.Plan.Self(), LeaseRequest{Group: g, Role: LeaseRelease})
 	if newServer != "" && newServer != r.Plan.Self() {
 		_, _ = r.Peers.Lease(ctx, newServer, LeaseRequest{Group: g, Role: LeaseRelease})
 	}
 	// An error is logged, never swallowed: a server that cannot be reached keeps its hold and its marker, and the loop of Repair undoes them when
-	// the server answers again (F4-02), whatever became of this task.
-	if err := r.Peers.Resume(ctx, in.ServerID, ResumeRequest{Group: g, ExpectedTerm: term}); err != nil {
-		r.log().Warn("failover: the old primary could not be resumed; the repair of switchovers will try again", "group", g, "server", in.ServerID, "error", err)
+	// the server answers again (F4-02), whatever became of this task. The map group is not in that loop: its old leader resolves a hold that nothing owns
+	// by itself (F6-01, resolveHeldBack of kingresd).
+	if err := r.Peers.Resume(ctx, in.oldOf(g), ResumeRequest{Group: g, ExpectedTerm: term}); err != nil {
+		r.log().Warn("failover: the old primary could not be resumed; the repair of switchovers will try again", "group", g, "server", in.oldOf(g), "error", err)
 	}
-	if err := r.Peers.Unquiesce(ctx, in.ServerID, QuiesceRequest{Group: g, ExpectedTerm: term}); err != nil {
-		r.log().Warn("failover: the writes could not be let in again; the repair of switchovers will try again", "group", g, "server", in.ServerID, "error", err)
+	if err := r.Peers.Unquiesce(ctx, in.oldOf(g), QuiesceRequest{Group: g, ExpectedTerm: term}); err != nil {
+		r.log().Warn("failover: the writes could not be let in again; the repair of switchovers will try again", "group", g, "server", in.oldOf(g), "error", err)
 	}
 	r.mu.Lock()
 	delete(r.paused, pauseKey(taskID, g))
 	r.mu.Unlock()
+	return false
 }
 
 // rollbackFailed rolls back and returns the failure of the step.
 func (sc *stepCtx) rollbackFailed(ctx context.Context, code string, retry bool, format string, a ...any) error {
-	gr, _ := sc.row(ctx)
+	// The group row is not readable after the clean stop of the map group (the system database is the stopped instance), so the server of the new primary comes
+	// from the step when it knows it (F5-01); a term that cannot be read is -1 on purpose: the calls of the rollback then do not judge by it.
+	newServer := sc.newServer
+	gr, gerr := sc.row(ctx)
+	if newServer == "" {
+		newServer = gr.NewServer
+	}
+	if gerr == nil && (gr.State == "promoted" || gr.State == "done") {
+		// A group that was promoted is never rolled back (F5-06); the step fails with its own error.
+		sc.r.log().Warn("failover: a rollback was asked for a group that was promoted; nothing was undone", "group", sc.group, "code", code)
+		return fail(code, retry, format, a...)
+	}
 	term := int64(-1)
 	if run, err := sc.runRow(ctx); err == nil {
 		term = run.ExpectedTerm
 	}
-	sc.r.rollbackSwitchover(ctx, sc.env.Task.ID, sc.in, sc.group, gr.NewServer, term)
+	if sc.r.rollbackSwitchover(ctx, sc.env.Task.ID, sc.in, sc.group, newServer, term) {
+		// The candidate answered that it promoted (or may have): the group is handed over, not rolled back, and the step ends as the hand-over it is (F5-03).
+		sc.event(ctx, "handedOver", map[string]any{"code": code})
+		return nil
+	}
 	sc.event(ctx, "rolledBack", map[string]any{"code": code})
 	return fail(code, retry, format, a...)
 }
@@ -250,6 +285,25 @@ func (r *Runner) stopClean(ctx context.Context, env *task.Env, sc *stepCtx) erro
 	if err != nil {
 		return err
 	}
+	sc.newServer = nw.Server
+	if handed, herr := sc.mapHandedOver(ctx, nw); herr != nil {
+		return herr
+	} else if handed {
+		return task.Skip("the map group was handed over already")
+	}
+	if sc.group == 0 {
+		// The bootstrap of the candidate starts first: it waits for the lease that the clean stop releases and for the proof that this step sends once the old
+		// leader is stopped. A request that was made before (a repeated run) finds the journal in progress.
+		if err := r.Peers.MapStart(ctx, nw.Server, MapStartRequest{Server: sc.old(), RequestedBy: sc.in.RequestedBy, Comment: sc.in.Comment,
+			Planned: &MapPlanned{TaskID: env.Task.ID, StandbyID: nw.ID}}); err != nil {
+			if IsCode(err, "conflict") {
+				// The candidate gave this very switchover up: it was rolled back while the system database was stopped, so the engine could not record it and runs
+				// the step again. It ends as the rollback it was, with the code of a switchover that could not be proven.
+				return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the planned switchover of the map group was given up and rolled back before; the old leader was started again (%v)", err)
+			}
+			return sc.rollbackFailed(ctx, CodeTargetUnavailable, true, "the bootstrap of the map group could not be started on %s: %v", nw.Server, err)
+		}
+	}
 	// A repeat after the stop finds no primary to mark; the stop below is idempotent and reads the proof again.
 	mk, merr := r.Peers.Mark(ctx, sc.old(), MarkRequest{Group: sc.group, ExpectedTerm: run.ExpectedTerm})
 	if merr == nil {
@@ -272,7 +326,7 @@ func (r *Runner) stopClean(ctx context.Context, env *task.Env, sc *stepCtx) erro
 	} else if st, serr := r.Peers.State(ctx, sc.old(), sc.group); !IsCode(merr, "not_primary") && !(serr == nil && len(st.OutOfRecovery()) == 0) {
 		return sc.rollbackFailed(ctx, CodeStandbyBehind, true, "the position of the old primary of shard group %d could not be marked: %v", sc.group, merr)
 	}
-	ans, err := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "fast", ExpectedTerm: run.ExpectedTerm})
+	ans, err := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "fast", ExpectedTerm: run.ExpectedTerm, Candidate: sc.candidateOf(nw)})
 	if err != nil {
 		if IsCode(err, "stale_term") {
 			return sc.rollbackFailed(ctx, CodeSuperseded, false, "another failover changed the catalog term of the cluster")
@@ -283,6 +337,48 @@ func (r *Runner) stopClean(ctx context.Context, env *task.Env, sc *stepCtx) erro
 		return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the stop of the old primary of shard group %d was not clean (state %q, released %v)", sc.group, ans.ClusterState, ans.Released)
 	}
 	sc.event(ctx, "stoppedClean", map[string]any{"checkpoint": ans.Checkpoint, "clusterState": ans.ClusterState})
+	if sc.group == 0 {
+		// The old leader is stopped: nothing can be recorded by this task until the new leader's engine claims it. The proof goes to the candidate, which
+		// promotes on it after the standby has checked it against what it replayed.
+		// The lease of the task is in the stopped system database and cannot be renewed, so the engine cancels the context of the step ten seconds later. What
+		// follows must not end with it (found by the cluster tests of the review of round 2): the old primary is held back, the candidate may be given up or may
+		// never promote, and only this step can say that the switchover is rolled back. It runs on a context that is not cancelled, bounded by the verdict wait.
+		ctx = context.WithoutCancel(ctx)
+		var perr error
+		for i := 0; i < 5; i++ {
+			if perr = r.Peers.MapProof(ctx, nw.Server, MapProofRequest{Checkpoint: ans.Checkpoint, ClusterState: ans.ClusterState}); perr == nil {
+				break
+			}
+			if err := r.sleep(ctx, time.Second); err != nil {
+				return err
+			}
+		}
+		if perr != nil {
+			// The candidate cannot take the proof (it was given up, or it cannot be reached): the rollback asks it first and starts the old leader again.
+			return sc.rollbackFailed(ctx, CodeTargetUnavailable, true, "the proof of the clean stop could not be sent to %s: %v", nw.Server, perr)
+		}
+		// The verdict: the candidate promotes on the proof (the standby is out of recovery), or it refuses (the standby cannot prove the stop) and tells this server.
+		// A refusal rolls this task back: the old leader's primary is started again by its lease manager, which wins the lease because the candidate let go
+		// of it; a candidate that says nothing is waited for, and the lease decides who may run.
+		deadline := r.now().Add(orDur(r.MapVerdictWait, 6*time.Minute))
+		for {
+			if reason, refused := r.Peers.MapRefusal(ctx, env.Task.ID); refused {
+				return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the standby of the map group could not prove the clean stop of the old leader (%s); the old leader is started again", reason)
+			}
+			if st, serr := r.Peers.State(ctx, nw.Server, sc.group); serr == nil && len(st.OutOfRecovery()) > 0 {
+				return nil
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if !r.now().Before(deadline) {
+				return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the candidate of the map group did not promote after the clean stop of the old leader; the old leader is started again")
+			}
+			if err := r.sleep(ctx, time.Second); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -298,8 +394,13 @@ func (r *Runner) verify(ctx context.Context, env *task.Env, sc *stepCtx) error {
 	if err != nil {
 		return err
 	}
+	if handed, herr := sc.mapHandedOver(ctx, nw); herr != nil {
+		return herr
+	} else if handed {
+		return task.Skip("the map group was handed over already")
+	}
 	// Read the shutdown checkpoint again (the stop is idempotent): it is what the proof is made of.
-	ans, err := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "fast", ExpectedTerm: run.ExpectedTerm})
+	ans, err := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "fast", ExpectedTerm: run.ExpectedTerm, Candidate: sc.candidateOf(nw)})
 	if err != nil || !ans.Stopped || ans.ClusterState != "shut down" || ans.Checkpoint == "" {
 		return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the shutdown checkpoint of the old primary of shard group %d cannot be read (%v)", sc.group, err)
 	}
@@ -344,20 +445,21 @@ func (r *Runner) writesResumed(ctx context.Context, sc *stepCtx) {
 func (r *Runner) preflightGraceful(ctx context.Context, in Input) *Refusal {
 	for _, g := range in.Groups {
 		g := g
-		if g == 0 {
+		if g == 0 && in.oldOf(0) != r.Plan.Self() {
 			return &Refusal{Code: "unsupported_operation", Status: 422, Group: &g,
-				Message: "The planned switchover of the map group is not supported yet; name the other groups in shardGroupIds, or use the failover."}
+				Message: "The map group is handed over by the task that runs on the server of its primary (the manager leader); ask the leader."}
 		}
-	}
-	if r.Plan.Live(ctx, in.ServerID) != "live" {
-		return &Refusal{Code: "node_state_invalid", Status: 422, Message: "Server " + in.ServerID + " is not live; a planned switchover needs a live server (use mode hard)."}
 	}
 	for _, g := range in.Groups {
 		g := g
-		st, err := r.Peers.State(ctx, in.ServerID, g)
+		old := in.oldOf(g)
+		if r.Plan.Live(ctx, old) != "live" {
+			return &Refusal{Code: "node_state_invalid", Status: 422, Group: &g, Message: "Server " + old + " is not live; a planned switchover needs a live server (use mode hard)."}
+		}
+		st, err := r.Peers.State(ctx, old, g)
 		if err != nil || len(st.OutOfRecovery()) == 0 || !st.Holds {
 			return &Refusal{Code: "node_state_invalid", Status: 422, Group: &g,
-				Message: fmt.Sprintf("The primary of shard group %d does not run under its lease on %s; a planned switchover needs a running primary.", g, in.ServerID)}
+				Message: fmt.Sprintf("The primary of shard group %d does not run under its lease on %s; a planned switchover needs a running primary.", g, old)}
 		}
 		recs, err := r.Plan.Standbys(ctx, g)
 		if err != nil {
@@ -406,7 +508,7 @@ func (r *Runner) rollbackUnpromoted(ctx context.Context, t task.Task, in Input) 
 		if run, rerr := runRowOf(ctx, rows, in, g); rerr == nil {
 			term = run.ExpectedTerm
 		}
-		r.rollbackSwitchover(ctx, t.ID, in, g, gr.NewServer, term)
+		_ = r.rollbackSwitchover(ctx, t.ID, in, g, gr.NewServer, term)
 	}
 }
 
@@ -431,4 +533,95 @@ func failedPastPromotion(step string, g int32) bool {
 		return false
 	}
 	return pastPromotion(strings.TrimPrefix(step, prefix))
+}
+
+// restoreContinues turns the failure of a step of one group of a restore into a skip, when the group was not promoted: the group is
+// rolled back, recorded failed with the reason, and the run goes on with the next group (design 5.5, 4). A failure after the promotion,
+// a pause, a lost lease and a stop of the context are not turned: they are the task's.
+func (sc *stepCtx) restoreContinues(ctx context.Context, err error) error {
+	var fe *Error
+	if !errors.As(err, &fe) || ctx.Err() != nil || errors.Is(err, ErrLeaseLost) {
+		return nil
+	}
+	if pastPromotion(sc.key) {
+		return nil // from the promotion on a failure is the task's (F4-03)
+	}
+	gr, ok, gerr := sc.rows.Group(ctx, sc.group)
+	if gerr != nil || !ok {
+		return nil
+	}
+	switch gr.State {
+	case "pending", "frozen", "fenced", "pinned":
+	default:
+		return nil
+	}
+	term := int64(-1)
+	if run, rerr := sc.runRow(ctx); rerr == nil {
+		term = run.ExpectedTerm
+	}
+	_ = sc.r.rollbackSwitchover(ctx, sc.env.Task.ID, sc.in, sc.group, gr.NewServer, term)
+	_ = sc.r.Peers.Unfreeze(ctx, sc.old(), sc.group)
+	text := fe.Code + ": " + fe.Message
+	if serr := sc.rows.Set(ctx, sc.group, GroupSet{State: ptr("failed"), Error: &text, Finished: true}); serr != nil {
+		return nil
+	}
+	sc.event(ctx, "groupFailed", map[string]any{"code": fe.Code, "message": fe.Message})
+	sc.r.Plan.Audit(ctx, "failoverGroupFailed", sc.group, map[string]any{"error": text})
+	return task.Skip("the group failed and was rolled back: " + text)
+}
+
+// mapHandedOver says that the map group of this task was handed over already: the standby the old leader's task chose is out of recovery (the
+// bootstrap of the candidate promoted it). The steps of the map group that the old leader's task could not record (its instance is the system
+// database, and it was stopped) run again on the new leader's engine, and each of them that would act on the old leader or on the promotion
+// skips when this is true.
+func (sc *stepCtx) mapHandedOver(ctx context.Context, nw StandbyRec) (bool, error) {
+	if sc.group != 0 {
+		return false, nil
+	}
+	// A state that cannot be read is not "not handed over" (F5-06): the steps that are right only when the group was not handed over (the start of a bootstrap,
+	// the clean stop) must not run on a failed read, so the read is repeated and then the step fails and is retried.
+	var err error
+	for i := 0; i < 3; i++ {
+		var st State
+		if st, err = sc.r.Peers.State(ctx, nw.Server, sc.group); err == nil {
+			return len(st.OutOfRecovery()) > 0, nil
+		}
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		if serr := sc.r.sleep(ctx, time.Second); serr != nil {
+			return false, serr
+		}
+	}
+	return false, err
+}
+
+// mapLast is the order of the groups of a planned switchover: the map group is the last. Its hand-over ends the old leader's task (its system
+// database is stopped), and the new leader's engine finishes what is left, so nothing after it may depend on the old leader. A hard failover keeps
+// the order of the groups as they are.
+func mapLast(in Input) []int32 {
+	if !in.graceful() {
+		return in.Groups
+	}
+	out := make([]int32, 0, len(in.Groups))
+	map0 := false
+	for _, g := range in.Groups {
+		if g == 0 {
+			map0 = true
+			continue
+		}
+		out = append(out, g)
+	}
+	if map0 {
+		out = append(out, 0)
+	}
+	return out
+}
+
+// candidateOf is the server that the old leader records as the one the map group is handed to; the other groups record none.
+func (sc *stepCtx) candidateOf(nw StandbyRec) string {
+	if sc.group != 0 {
+		return ""
+	}
+	return nw.Server
 }

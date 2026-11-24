@@ -68,6 +68,7 @@
 #include "fanout.h"
 #include "forward_auth.h"
 #include "kingres_shard.h"
+#include "merge.h"
 #include "node_conn.h"
 #include "placement_check.h"
 #include "remote_scan.h"
@@ -80,12 +81,28 @@
 #define FO_PRIV_PLACEMENT	4	/* String: its placement when the statement was planned */
 #define FO_PRIV_KIND		5	/* Integer: FO_KIND_* */
 #define FO_PRIV_RELS		6	/* String: "relid:colocation," per relation of a colocated INSERT ... SELECT */
-#define FO_PRIV_NLOCKS		7
-/* then the lock names, then (host, port, local) per target */
+#define FO_PRIV_MERGEINFO	7	/* List (a MERGE, FO_KIND_MERGE*) or Integer 0: see make_merge_info below */
+#define FO_PRIV_NLOCKS		8
+/* then the lock names, then (host, port, local, group) per target */
 
 /* What the statement is (FO_PRIV_KIND). */
 #define FO_KIND_WRITE			0	/* a write to a reference table, an UPDATE or DELETE of a distributed table */
 #define FO_KIND_INSERT_SELECT	1	/* a colocated INSERT ... SELECT, shipped whole (design 11.7) */
+#define FO_KIND_MERGE			2	/* a colocated MERGE, shipped whole (phase 12, design 7.3) */
+#define FO_KIND_MERGE_ROUTED	3	/* a MERGE whose source the origin reads and routes (design 7.4) */
+#define FO_KIND_MERGE_REF		4	/* a MERGE into a reference table (M4, M5): the same statement on every node (design 7.5) */
+
+/* A write to a distributed table that every group runs, and whose relations are checked again when it starts. */
+#define FO_IS_DIST_WRITE(k) ((k) == FO_KIND_INSERT_SELECT || (k) == FO_KIND_MERGE || (k) == FO_KIND_MERGE_ROUTED)
+#define FO_IS_MERGE(k) ((k) == FO_KIND_MERGE || (k) == FO_KIND_MERGE_ROUTED)
+/* the points merge_before_first_group, merge_between_groups and merge_before_commit fire for every MERGE that goes to several nodes */
+#define FO_FIRES_MERGE_POINTS(k) (FO_IS_MERGE(k) || (k) == FO_KIND_MERGE_REF)
+
+/* The list of FO_PRIV_MERGEINFO: the SELECT that reads the source, the shipped columns, the first array parameter, whether a group is never skipped. */
+#define FO_MI_SOURCE_SQL	0
+#define FO_MI_NCOLS			1
+#define FO_MI_FIRST_PARAM	2
+#define FO_MI_NO_SKIP		3
 
 /*
  * The mark of the local part that is about to run through SPI (design 4.4, review P2B-01).
@@ -123,7 +140,8 @@ typedef struct KsFanoutState
 	int			colocation_id;	/* of the table, 0 for a reference table */
 	int64		plan_placement;	/* its placement when the targets were chosen */
 	int			kind;			/* FO_KIND_* */
-	char	   *rels;			/* FO_KIND_INSERT_SELECT: the relations and what they were when planned */
+	char	   *rels;			/* FO_IS_DIST_WRITE: the relations and what they were when planned */
+	List	   *mergeinfo;		/* FO_KIND_MERGE_ROUTED: FO_MI_* */
 	List	   *targets;		/* of KsFanTarget * */
 	List	   *locknames;		/* reference tables to lock on every node first */
 	bool		done;
@@ -485,19 +503,40 @@ relations_signature(List *relids)
 		const KsDistTable *dt = kingres_shard_lookup_dist_table(lfirst_oid(lc));
 
 		appendStringInfo(&buf, "%u:%d,", lfirst_oid(lc),
-						 (dt == NULL || dt->is_reference) ? 0 : dt->colocation_id);
+						 (dt == NULL) ? -1 : (dt->is_reference ? 0 : dt->colocation_id));
 	}
 	return buf.data;
 }
 
 static PlannedStmt *make_fanout_plan(Query *parse, char *sql, List *targets, bool all_rows,
-									 List *relids, List *locknames, int kind, int64 place);
+									 List *relids, List *locknames, int kind, int64 place,
+									 List *mergeinfo);
 
 PlannedStmt *
 kingres_shard_make_fanout_plan(Query *parse, char *sql, List *targets,
 								bool all_rows, List *relids, List *locknames)
 {
-	return make_fanout_plan(parse, sql, targets, all_rows, relids, locknames, FO_KIND_WRITE, 0);
+	return make_fanout_plan(parse, sql, targets, all_rows, relids, locknames, FO_KIND_WRITE, 0, NIL);
+}
+
+PlannedStmt *
+kingres_shard_make_fanout_plan_shipped(Query *parse, char *sql, List *targets, List *relids, List *locknames,
+									   List *mergeinfo)
+{
+	return make_fanout_plan(parse, sql, targets, false, relids, locknames, FO_KIND_MERGE_REF, 0, mergeinfo);
+}
+
+/*
+ * The plan of a MERGE that every group runs (design 7): colocated when mergeinfo is NIL, else the
+ * source is read here and routed (mergeinfo: the SELECT that reads it, the number of shipped
+ * columns, the number of the first array parameter, whether no group may be skipped).
+ */
+PlannedStmt *
+kingres_shard_make_merge_plan(Query *parse, char *sql, List *targets, int64 place, List *relids,
+							  List *mergeinfo)
+{
+	return make_fanout_plan(parse, sql, targets, true, relids, NIL,
+							mergeinfo == NIL ? FO_KIND_MERGE : FO_KIND_MERGE_ROUTED, place, mergeinfo);
 }
 
 /*
@@ -509,12 +548,12 @@ PlannedStmt *
 kingres_shard_make_insert_select_plan(Query *parse, char *sql, List *targets, int64 place,
 									  List *relids)
 {
-	return make_fanout_plan(parse, sql, targets, true, relids, NIL, FO_KIND_INSERT_SELECT, place);
+	return make_fanout_plan(parse, sql, targets, true, relids, NIL, FO_KIND_INSERT_SELECT, place, NIL);
 }
 
 static PlannedStmt *
 make_fanout_plan(Query *parse, char *sql, List *targets, bool all_rows, List *relids,
-				 List *locknames, int kind, int64 place)
+				 List *locknames, int kind, int64 place, List *mergeinfo)
 {
 	bool		returns_rows = (parse->returningList != NIL);
 	List	   *private;
@@ -541,7 +580,8 @@ make_fanout_plan(Query *parse, char *sql, List *targets, bool all_rows, List *re
 												   place != 0 ? place :
 												   kingres_shard_placement_hash(kingres_shard_lookup_colocation(colocation_id)))));
 	private = lappend(private, makeInteger(kind));
-	private = lappend(private, makeString(kind == FO_KIND_INSERT_SELECT ? relations_signature(relids) : ""));
+	private = lappend(private, makeString(FO_IS_DIST_WRITE(kind) ? relations_signature(relids) : ""));
+	private = lappend(private, mergeinfo != NIL ? (Node *) mergeinfo : (Node *) makeInteger(0));
 	private = lappend(private, makeInteger(list_length(locknames)));
 	foreach(lc, locknames)
 		private = lappend(private, makeString(pstrdup((char *) lfirst(lc))));
@@ -552,6 +592,7 @@ make_fanout_plan(Query *parse, char *sql, List *targets, bool all_rows, List *re
 		private = lappend(private, makeString(pstrdup(t->host)));
 		private = lappend(private, makeInteger(t->port));
 		private = lappend(private, makeInteger(t->is_local ? 1 : 0));
+		private = lappend(private, makeInteger(t->group_id));
 	}
 	cscan = kingres_shard_build_scan(parse, private, returns_rows);
 	cscan->methods = &fo_scan_methods;
@@ -577,16 +618,19 @@ fo_create_scan_state(CustomScan *cscan)
 	s->plan_placement = pg_strtoint64(strVal(list_nth(p, FO_PRIV_PLACEMENT)));
 	s->kind = intVal(list_nth(p, FO_PRIV_KIND));
 	s->rels = pstrdup(strVal(list_nth(p, FO_PRIV_RELS)));
+	if (IsA(list_nth(p, FO_PRIV_MERGEINFO), List))
+		s->mergeinfo = (List *) list_nth(p, FO_PRIV_MERGEINFO);
 	nlocks = intVal(list_nth(p, FO_PRIV_NLOCKS));
 	for (i = 0; i < nlocks; i++)
 		s->locknames = lappend(s->locknames, pstrdup(strVal(list_nth(p, FO_PRIV_NLOCKS + 1 + i))));
-	for (i = FO_PRIV_NLOCKS + 1 + nlocks; i + 2 < list_length(p); i += 3)
+	for (i = FO_PRIV_NLOCKS + 1 + nlocks; i + 3 < list_length(p); i += 4)
 	{
-		KsFanTarget *t = palloc(sizeof(KsFanTarget));
+		KsFanTarget *t = palloc0(sizeof(KsFanTarget));
 
 		t->host = pstrdup(strVal(list_nth(p, i)));
 		t->port = intVal(list_nth(p, i + 1));
 		t->is_local = intVal(list_nth(p, i + 2)) != 0;
+		t->group_id = intVal(list_nth(p, i + 3));
 		s->targets = lappend(s->targets, t);
 	}
 	return (Node *) s;
@@ -652,10 +696,11 @@ fo_begin_scan(CustomScanState *node, EState *estate, int eflags)
 				 errmsg("cannot execute a write statement in a read-only transaction")));
 	kingres_shard_refuse_replica_role(s->colocation_id == 0 ?
 									  "a reference table" : "a distributed table on several shard groups");
-	if (s->kind == FO_KIND_INSERT_SELECT)
+	if (FO_IS_DIST_WRITE(s->kind))
 	{
 		/* the window of the defence against a plan whose relations changed (P2D-02) */
-		kingres_shard_fault_point("insel_before_rels_check");
+		if (!FO_IS_MERGE(s->kind))
+			kingres_shard_fault_point("insel_before_rels_check");
 		check_relations_unchanged(s);
 	}
 
@@ -730,17 +775,38 @@ store_remote_rows(KsFanoutState *s, PGresult *res)
  * statement is already the local part of a fanned-out one.  The rows are kept
  * when keep_rows; the number of rows affected is returned.
  */
+/*
+ * nkeep >= 0: a shipped MERGE source numbers its arrays after the last parameter the text uses, so only that
+ * many parameters go along (review P12M-01: a declared but unused parameter must not shift the arrays).
+ */
 static uint64
-run_local(KsFanoutState *s, ParamListInfo params, bool keep_rows)
+run_local(KsFanoutState *s, ParamListInfo params, bool keep_rows, int nextra, const char **extra, int nkeep)
 {
-	int			n = params ? params->numParams : 0;
-	Oid		   *argtypes = palloc(sizeof(Oid) * Max(n, 1));
-	Datum	   *values = palloc(sizeof(Datum) * Max(n, 1));
-	char	   *nulls = palloc(Max(n, 1));
+	int			n = (params && params->numParams > nkeep && nkeep >= 0) ? nkeep : (params ? params->numParams : 0);
+	Oid		   *argtypes = palloc(sizeof(Oid) * Max(n + nextra, 1));
+	Datum	   *values = palloc(sizeof(Datum) * Max(n + nextra, 1));
+	char	   *nulls = palloc(Max(n + nextra, 1));
 	int			i;
 	int			ret;
 	int			nest;
 	uint64		processed;
+
+	/* the arrays of a routed source (text[] in text form) follow the parameters of the statement */
+	if (nextra > 0)
+	{
+		FmgrInfo	finfo;
+		Oid			infunc;
+		Oid			ioparam;
+
+		getTypeInputInfo(TEXTARRAYOID, &infunc, &ioparam);
+		fmgr_info(infunc, &finfo);
+		for (i = 0; i < nextra; i++)
+		{
+			argtypes[n + i] = TEXTARRAYOID;
+			values[n + i] = InputFunctionCall(&finfo, unconstify(char *, extra[i]), ioparam, -1);
+			nulls[n + i] = ' ';
+		}
+	}
 
 	for (i = 0; i < n; i++)
 	{
@@ -764,7 +830,7 @@ run_local(KsFanoutState *s, ParamListInfo params, bool keep_rows)
 	PG_TRY();
 	{
 		local_part_arm(s->sql);
-		ret = SPI_execute_with_args(s->sql, n, argtypes, values, nulls, false, 0);
+		ret = SPI_execute_with_args(s->sql, n + nextra, argtypes, values, nulls, false, 0);
 	}
 	PG_FINALLY();
 	{
@@ -1075,6 +1141,13 @@ run_all(KsFanoutState *s)
 	bool		have_local = false;
 	uint64		total = 0;
 	int64		origin_placement = 0;
+	bool	   *ran = NULL;		/* the targets the statement ran on */
+	KsMergeShares *shares = NULL;
+	int			nran = 0;
+	int			nkeep = -1;		/* a shipped source: how many parameters of the statement the text uses */
+
+	if (s->mergeinfo != NIL)
+		nkeep = intVal(list_nth(s->mergeinfo, FO_MI_FIRST_PARAM)) - 1;
 
 	if (IsInParallelMode())
 		ereport(ERROR,
@@ -1118,18 +1191,58 @@ run_all(KsFanoutState *s)
 		check_node_set(s);
 	}
 
+	/*
+	 * A MERGE whose source is routed (design 7.4): the source is read here, once, and kept by the
+	 * group that owns the bucket of each row's key, before the first group runs anything (the
+	 * bound of merge_max_source_bytes is met, or not, before any group has changed a row).
+	 */
+	ran = palloc0(sizeof(bool) * Max(list_length(s->targets), 1));
+	if (s->mergeinfo != NIL)
+	{
+		List	   *gids = NIL;
+
+		/* the window between the check of the placement at the start and the read of the source (review P12M-03) */
+		kingres_shard_fault_point("merge_before_collect");
+		foreach(lc, s->targets)
+			gids = lappend_int(gids, ((KsFanTarget *) lfirst(lc))->group_id);
+		shares = kingres_shard_merge_collect(strVal(list_nth(s->mergeinfo, FO_MI_SOURCE_SQL)), params,
+											 intVal(list_nth(s->mergeinfo, FO_MI_NCOLS)),
+											 s->colocation_id, gids, estate->es_query_cxt);
+	}
+
 	foreach(lc, s->targets)
 	{
 		KsFanTarget *t = (KsFanTarget *) lfirst(lc);
 		uint64		count;
+		int			nextra = 0;
+		const char **extra = NULL;
+		int			tidx = foreach_current_index(lc);
+
+		if (shares != NULL)
+		{
+			int			c;
+
+			nextra = intVal(list_nth(s->mergeinfo, FO_MI_NCOLS));
+			/* a group with no row of the source acts on nothing, unless an action reaches target rows that have no source row */
+			if (intVal(list_nth(s->mergeinfo, FO_MI_NO_SKIP)) == 0 &&
+				kingres_shard_merge_share_rows(shares, t->group_id) == 0)
+				continue;
+			extra = palloc(sizeof(char *) * Max(nextra, 1));
+			for (c = 0; c < nextra; c++)
+				extra[c] = kingres_shard_merge_share_array(shares, t->group_id, c);
+		}
+		ran[tidx] = true;
 
 		/* a point per group: kill:n or wait stops the statement between two groups */
 		if (s->kind == FO_KIND_INSERT_SELECT)
 			kingres_shard_fault_point("insel_before_group");
+		if (FO_FIRES_MERGE_POINTS(s->kind))
+			kingres_shard_fault_point(nran == 0 ? "merge_before_first_group" : "merge_between_groups");
+		nran++;
 
 		if (t->is_local)
 		{
-			count = run_local(s, params, true);
+			count = run_local(s, params, true, nextra, extra, nkeep);
 			local_count = count;
 			have_local = true;
 		}
@@ -1143,13 +1256,35 @@ run_all(KsFanoutState *s)
 
 			kingres_shard_begin_write_xact(kc);
 			values = kingres_shard_params_to_text(params, &types, &nparams);
-			if (s->kind == FO_KIND_INSERT_SELECT)
+			if (nkeep >= 0 && nparams > nkeep)
+				nparams = nkeep;	/* P12M-01: the arrays follow the last parameter the text uses */
+			if (nextra > 0)
+			{
+				const char **values2 = palloc(sizeof(char *) * (nparams + nextra));
+				Oid		   *types2 = palloc(sizeof(Oid) * (nparams + nextra));
+				int			c;
+
+				if (nparams > 0)
+				{
+					memcpy(values2, values, sizeof(char *) * nparams);
+					memcpy(types2, types, sizeof(Oid) * nparams);
+				}
+				for (c = 0; c < nextra; c++)
+				{
+					values2[nparams + c] = extra[c];
+					types2[nparams + c] = TEXTARRAYOID;
+				}
+				values = values2;
+				types = types2;
+				nparams += nextra;
+			}
+			if (FO_IS_DIST_WRITE(s->kind))
 			{
 				/* the error of a group is turned into what it means (KS001 on a change of primary, 4.6) */
 				res = kingres_shard_exec_params(kc, s->sql, nparams, types, values, false);
 				if (res == NULL || (PQresultStatus(res) != PGRES_COMMAND_OK &&
 									PQresultStatus(res) != PGRES_TUPLES_OK))
-					kingres_shard_fragment_error(kc, res, "colocated INSERT ... SELECT");
+					kingres_shard_fragment_error(kc, res, FO_IS_MERGE(s->kind) ? "MERGE" : "colocated INSERT ... SELECT");
 			}
 			else
 				res = kingres_shard_exec_params(kc, s->sql, nparams, types, values, true);
@@ -1181,6 +1316,9 @@ run_all(KsFanoutState *s)
 	kingres_shard_fault_point("fanout_after_run");
 	if (s->kind == FO_KIND_INSERT_SELECT)
 		kingres_shard_fault_point("insel_before_recheck");
+	/* the groups have all run; the transaction commits (two-phase when several groups wrote) after this */
+	if (FO_FIRES_MERGE_POINTS(s->kind))
+		kingres_shard_fault_point("merge_before_commit");
 
 	/*
 	 * The map version rule (design/shard-phase4.md): a write to a distributed
@@ -1199,6 +1337,9 @@ run_all(KsFanoutState *s)
 			KsFanTarget *t = (KsFanTarget *) lfirst(lc);
 			int64		theirs;
 
+			/* a group that the statement skipped (a routed source with no row for it) changed nothing */
+			if (!ran[foreach_current_index(lc)])
+				continue;
 			if (t->is_local)
 				theirs = kingres_shard_placement_hash_now(s->colocation_id);
 			else
@@ -1267,21 +1408,16 @@ fo_rescan(CustomScanState *node)
 {
 }
 
-static void
-fo_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
+/* The text of a statement on one line (white space runs become one blank), for EXPLAIN. */
+static char *
+flatten_sql(const char *sql)
 {
-	KsFanoutState *s = (KsFanoutState *) node;
 	StringInfoData flat;
 	const char *p;
 	bool		pending_space = false;
 
-	if (s->kind == FO_KIND_INSERT_SELECT)
-		ExplainPropertyText("Pushed", "colocated INSERT ... SELECT (every group reads and writes its own buckets)", es);
-	ExplainPropertyInteger("Nodes", NULL, list_length(s->targets), es);
-	ExplainPropertyText("Result", s->all_rows ? "sum over the nodes" : "reference table: copies must agree", es);
-
 	initStringInfo(&flat);
-	for (p = s->sql; *p; p++)
+	for (p = sql; *p; p++)
 	{
 		if (*p == '\n' || *p == '\r' || *p == '\t' || *p == ' ')
 		{
@@ -1293,5 +1429,24 @@ fo_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 		pending_space = false;
 		appendStringInfoChar(&flat, *p);
 	}
-	ExplainPropertyText("Remote SQL", flat.data, es);
+	return flat.data;
+}
+
+static void
+fo_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
+{
+	KsFanoutState *s = (KsFanoutState *) node;
+
+	if (s->kind == FO_KIND_INSERT_SELECT)
+		ExplainPropertyText("Pushed", "colocated INSERT ... SELECT (every group reads and writes its own buckets)", es);
+	else if (s->kind == FO_KIND_MERGE)
+		ExplainPropertyText("Pushed", "colocated MERGE (every group owning a bucket of the target runs it over its own buckets)", es);
+	else if (s->kind == FO_KIND_MERGE_ROUTED)
+	{
+		ExplainPropertyText("Pushed", "MERGE with a routed source (this node reads the source and sends each row to the group of its key)", es);
+		ExplainPropertyText("Source SQL", flatten_sql(strVal(list_nth(s->mergeinfo, FO_MI_SOURCE_SQL))), es);
+	}
+	ExplainPropertyInteger("Nodes", NULL, list_length(s->targets), es);
+	ExplainPropertyText("Result", s->all_rows ? "sum over the nodes" : "reference table: copies must agree", es);
+	ExplainPropertyText("Remote SQL", flatten_sql(s->sql), es);
 }

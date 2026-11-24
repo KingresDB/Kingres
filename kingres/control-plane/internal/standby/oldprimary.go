@@ -220,10 +220,12 @@ func (a *Agent) rebuildFormerLocked(ctx context.Context, id int, e Entry, term i
 		// Measure what is about to be discarded, while the directory is still the old primary's.
 		info = a.measureDivergence(ctx, id, rewindConninfo)
 		_ = mgr.SetCopyStep(id, instance.CopyRewinding)
-		lastCheckpoint := ""
+		lastCheckpoint, shutDown := "", false
 		if info.OldEndLsn == "" {
 			if cd, cerr := mgr.ControlData(ctx, id); cerr == nil {
-				lastCheckpoint = cd["Latest checkpoint location"]
+				// A directory whose state is "shut down" has finished its crash recovery (the dry run does it before it refuses): its shutdown checkpoint is the end of
+				// the old primary's WAL and not only a checkpoint that it had before.
+				lastCheckpoint, shutDown = endOfOldWal(cd)
 			}
 		}
 		rerr := error(nil)
@@ -239,7 +241,7 @@ func (a *Agent) rebuildFormerLocked(ctx context.Context, id int, e Entry, term i
 			method = "baseBackup"
 		} else {
 			_ = mgr.SetCopyStep(id, instance.CopyRewound)
-			completeFromRewind(&info, rout, lastCheckpoint)
+			completeFromRewind(&info, rout, lastCheckpoint, shutDown)
 		}
 	}
 	settings, err := a.standbySettings(id, conninfo, slot)
@@ -360,9 +362,12 @@ func (a *Agent) slotOnPrimary(ctx context.Context, e Entry, slot string) error {
 
 // completeFromRewind fills what the dry run could not tell (a primary that was fenced has to finish its crash recovery
 // first, and pg_rewind --dry-run then refuses) from what the rewind itself printed: where the histories parted and the
-// megabytes it copied. The end of the old WAL is then only the last checkpoint that the directory had before, so the
-// bytes written after the divergence are a lower bound, and the message says so.
-func completeFromRewind(info *OldPrimaryInfo, out, lastCheckpoint string) {
+// megabytes it copied. The end of the old WAL is the last checkpoint of the directory: when the directory is shut down
+// (shutDown: the crash recovery was finished before the rewind) that is the end itself, so the bytes written after the
+// divergence are measured, and zero when the old WAL ends before the point where the histories parted (the new primary had
+// everything the old one had, and more); when it is not, the bytes are a lower bound and, when the checkpoint is before the
+// divergence, not known at all, and the message says so.
+func completeFromRewind(info *OldPrimaryInfo, out, lastCheckpoint string, shutDown bool) {
 	if info.DivergenceLsn != "" {
 		return
 	}
@@ -376,11 +381,27 @@ func completeFromRewind(info *OldPrimaryInfo, out, lastCheckpoint string) {
 		info.RewindBytes = &b
 	}
 	info.Message = "The histories parted at " + lsn + "; the dry run could not measure the old WAL (the instance needed crash recovery), so what follows is the divergence the rewind itself reported."
-	if lastCheckpoint != "" {
-		info.OldEndLsn = lastCheckpoint
-		if d, ok := lsnDiff(lsn, lastCheckpoint); ok {
-			info.DivergenceBytes = &d
-			info.Message += " The bytes written after the divergence are at least the distance to the last checkpoint."
-		}
+	if lastCheckpoint == "" {
+		return
 	}
+	info.OldEndLsn = lastCheckpoint
+	d, ok := lsnDiff(lsn, lastCheckpoint)
+	switch {
+	case ok && shutDown:
+		info.DivergenceBytes = &d
+		info.Message += " The bytes written after the divergence are at least the distance to the shutdown checkpoint of the old primary (the record itself is not counted)."
+	case ok:
+		info.DivergenceBytes = &d
+		info.Message += " The bytes written after the divergence are at least the distance to the last checkpoint."
+	case shutDown:
+		zero := int64(0)
+		info.DivergenceBytes = &zero
+		info.Message += " The old primary's WAL ends before that point: it wrote nothing after the divergence but its shutdown checkpoint."
+	}
+}
+
+// endOfOldWal reads the last checkpoint of a directory and whether it is the end of the old primary's WAL: only a directory whose state is "shut down" has finished
+// its crash recovery, so only then is the checkpoint the end and not just one that the directory had before.
+func endOfOldWal(controlData map[string]string) (checkpoint string, shutDown bool) {
+	return controlData["Latest checkpoint location"], controlData["Database cluster state"] == "shut down"
 }

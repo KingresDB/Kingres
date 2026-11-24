@@ -65,22 +65,38 @@ type world struct {
 	stopStates         []string
 	stopN              int
 	promoteReqs        []PromoteRequest
-	oldPreparedUnknown bool    // the old primary does not report a count of prepared transactions
+	oldPreparedUnknown bool // the old primary does not report a count of prepared transactions
+	mapGroup           bool // the group of the world is the map group (0), not 1
+	mapStarts          []MapStartRequest
+	mapProofs          []MapProofRequest
+	noPromoteOnProof   bool
+	mapProofErr        error
+	stateDown          map[string]bool // the calls to this server fail (a transient error on the state read)
+	mapAbandonErr      error           // the candidate answers the abandon with this (a 409 conflict: it promoted)
+	mapRefusal         string
+	mapStartErr        error
 	markErr            error   // the answer of the mark call
 	undoTerms          []int64 // the terms of the quiesce, unquiesce and resume calls
 	stopErr            error   // the answer of the clean stop call
+	dbDownAfterStop    bool    // the rows cannot be read after the clean stop (the map group: its system database is the stopped instance)
+	afterStop          func()  // called when the clean stop is done (a test cancels the context of the step, as the engine does when the task lease cannot be renewed)
 	notReleased        bool    // the clean stop does not release the lease
 	markTerms          []int64
 	stopTerms          []int64
-	promoteRefuse      error  // the answer of a promote call that carries a proof (the callee refuses it)
-	verifyAnswers      []bool // the answers of the proof, in order (the last one repeats)
+	stopCandidates     []string // the Candidate of every clean stop request
+	promoteRefuse      error    // the answer of a promote call that carries a proof (the callee refuses it)
+	verifyAnswers      []bool   // the answers of the proof, in order (the last one repeats)
 	verifyErr          error
 	verifyN            int
 	quiesced           bool
+	oldSrv             string // the server whose primary is handed over (default s1)
+	self               string // the leader's server (default s2)
 }
 
 func newWorld() *world {
 	w := &world{
+		oldSrv:   "s1",
+		self:     "s2",
 		oldAlive: false,
 		term:     5,
 		nodes: []Node{
@@ -147,7 +163,10 @@ func (w *world) count(prefix string) int {
 type fpeers struct{ w *world }
 
 func (p fpeers) unreach(server string) error {
-	if server == "s1" && !p.w.oldAlive {
+	if p.w.stateDown[server] {
+		return ErrUnreachable
+	}
+	if server == p.w.oldSrv && !p.w.oldAlive {
 		return ErrUnreachable
 	}
 	return nil
@@ -171,7 +190,7 @@ func (p fpeers) State(_ context.Context, server string, g int32) (State, error) 
 	}
 	p.w.rec("state %s", server)
 	st := State{Server: server, Group: g, Holds: p.w.lease[server], Frozen: p.w.frozen}
-	if server == "s1" {
+	if server == p.w.oldSrv {
 		f := false
 		st.Instances = []StateInstance{{ID: 1, Group: g, Running: p.w.oldWritable, InRecovery: &f, Role: "primary"}}
 		if !p.w.oldWritable {
@@ -246,6 +265,7 @@ func (p fpeers) Demote(_ context.Context, server string, r DemoteRequest) (Demot
 	if r.Mode == "fast" {
 		p.w.mu.Lock()
 		p.w.stopTerms = append(p.w.stopTerms, r.ExpectedTerm)
+		p.w.stopCandidates = append(p.w.stopCandidates, r.Candidate)
 		p.w.mu.Unlock()
 		if p.w.stopErr != nil {
 			return DemoteAnswer{}, p.w.stopErr
@@ -265,6 +285,14 @@ func (p fpeers) Demote(_ context.Context, server string, r DemoteRequest) (Demot
 		}
 		p.w.stopN++
 		p.w.mu.Unlock()
+		if p.w.dbDownAfterStop && p.w.rows != nil {
+			p.w.rows.mu.Lock()
+			p.w.rows.down = true
+			p.w.rows.mu.Unlock()
+		}
+		if p.w.afterStop != nil {
+			p.w.afterStop()
+		}
 		return DemoteAnswer{Stopped: true, ClusterState: state, Checkpoint: "0/6000028", Released: !p.w.notReleased}, nil
 	}
 	p.w.rec("demote %s to=%s", server, r.TransferTo)
@@ -399,7 +427,7 @@ func (c fcat) PromoteNode(_ context.Context, db string, id int32) (PromoteResult
 		nodes := *c.list(db)
 		var oldID int32
 		for k := range nodes {
-			if nodes[k].Group == 1 && nodes[k].Role == "primary" {
+			if nodes[k].Group == c.w.group() && nodes[k].Role == "primary" {
 				oldID = nodes[k].ID
 			}
 		}
@@ -422,7 +450,7 @@ func (c fcat) PromoteNode(_ context.Context, db string, id int32) (PromoteResult
 
 type fplan struct{ w *world }
 
-func (p fplan) Self() string { return "s2" }
+func (p fplan) Self() string { return p.w.self }
 func (p fplan) Members(context.Context) ([]string, error) {
 	return []string{"s1", "s2", "s3"}, nil
 }
@@ -486,11 +514,15 @@ type memRows struct {
 	events  []string
 	outcome string
 	lost    bool
+	down    bool // the system database is the stopped instance: nothing can be read or written (the map group after its clean stop)
 }
 
 func newMemRows() *memRows { return &memRows{groups: map[int32]*GroupRow{}} }
 
 func (m *memRows) check() error {
+	if m.down {
+		return errors.New("the system database is stopped")
+	}
 	if m.lost {
 		return ErrLeaseLost
 	}
@@ -517,11 +549,17 @@ func (m *memRows) Begin(_ context.Context, in Input, term int64, groups []GroupR
 func (m *memRows) Run(context.Context) (RunRow, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.down {
+		return RunRow{}, false, errors.New("the system database is stopped")
+	}
 	return m.run, m.have, nil
 }
 func (m *memRows) Group(_ context.Context, g int32) (GroupRow, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.down {
+		return GroupRow{}, false, errors.New("the system database is stopped")
+	}
 	r, ok := m.groups[g]
 	if !ok {
 		return GroupRow{}, false, nil
@@ -564,6 +602,9 @@ func (m *memRows) Set(_ context.Context, g int32, u GroupSet) error {
 	}
 	if u.DataLoss != nil {
 		r.DataLoss = u.DataLoss
+	}
+	if u.Error != nil {
+		r.Error = *u.Error
 	}
 	return nil
 }
@@ -754,4 +795,47 @@ func (p fpeers) Resume(_ context.Context, server string, r ResumeRequest) error 
 	p.w.oldWritable = true
 	p.w.mu.Unlock()
 	return nil
+}
+
+// The calls of the planned switchover of the map group (the fake keeps what it was asked).
+func (p fpeers) MapStart(_ context.Context, server string, r MapStartRequest) error {
+	p.w.mu.Lock()
+	p.w.mapStarts = append(p.w.mapStarts, r)
+	p.w.mu.Unlock()
+	if err := p.unreach(server); err != nil {
+		return err
+	}
+	p.w.rec("map-start %s", server)
+	return p.w.mapStartErr
+}
+
+func (p fpeers) MapProof(_ context.Context, server string, r MapProofRequest) error {
+	p.w.mu.Lock()
+	p.w.mapProofs = append(p.w.mapProofs, r)
+	if p.w.mapRefusal == "" && !p.w.noPromoteOnProof {
+		// the candidate promotes on the proof, and holds the lease
+		p.w.promoted[server], p.w.lease[server] = true, true
+	}
+	p.w.mu.Unlock()
+	p.w.rec("map-proof %s", server)
+	return p.w.mapProofErr
+}
+
+func (p fpeers) MapAbandon(_ context.Context, server, reason string) error {
+	p.w.rec("map-abandon %s", server)
+	return p.w.mapAbandonErr
+}
+
+// group is the group that the world's fake catalog moves: 1, or 0 for a world of the map group.
+func (w *world) group() int32 {
+	if w.mapGroup {
+		return 0
+	}
+	return 1
+}
+
+func (p fpeers) MapRefusal(_ context.Context, _ int64) (string, bool) {
+	p.w.mu.Lock()
+	defer p.w.mu.Unlock()
+	return p.w.mapRefusal, p.w.mapRefusal != ""
 }

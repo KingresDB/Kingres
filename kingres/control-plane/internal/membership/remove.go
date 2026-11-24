@@ -11,6 +11,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/audit"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extgate"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peerclient"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
@@ -121,6 +123,14 @@ func (m *Manager) unregisterNode(ctx context.Context, db, host string) error {
 		return err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	return m.unregisterNodeOn(ctx, c, db, host)
+}
+
+// unregisterNodeOn is unregisterNode on the session c of the service role, which is open to database db (see registerNodeOn).
+func (m *Manager) unregisterNodeOn(ctx context.Context, c *pgx.Conn, db, host string) error {
+	if err := extgate.Require(ctx, c, extguard.Shard, db); err != nil {
+		return err
+	}
 	rows, err := c.Query(ctx, `SELECT node_id FROM kingres.node WHERE host = $1 ORDER BY node_id DESC`, host)
 	if err != nil {
 		return err

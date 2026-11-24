@@ -176,7 +176,7 @@ func (f *fakeCluster) Check(context.Context, []string) error {
 	defer f.mu.Unlock()
 	return f.checkErr
 }
-func (f *fakeCluster) Plan(context.Context, []string) ([]Move, error) {
+func (f *fakeCluster) Plan(_ context.Context, _ []string, _ Options) ([]Move, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []Move

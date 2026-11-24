@@ -20,4 +20,7 @@ type ServerUpdateRequest struct {
 	ServerGroup    *string
 	// ShouldHaveShards is the new value when the body contained it.
 	ShouldHaveShards *bool
+	// Weight is the new capacity weight of the server when the body contained it
+	// (contract 0.15.0): above 0, at most 1000.
+	Weight *float64
 }

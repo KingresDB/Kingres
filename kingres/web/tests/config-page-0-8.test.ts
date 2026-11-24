@@ -181,12 +181,12 @@ describe('the filters live in the address', () => {
 
   it('lists only what can be set by default, and managed and refused ones with the toggle', async () => {
     const user = userEvent.setup()
-    const { router } = await renderApp('/configuration?q=ssl_')
-    await screen.findByTestId('param-ssl_prefer_server_ciphers')
-    expect(screen.queryByTestId('param-ssl_cert_file')).toBeNull()
+    const { router } = await renderApp('/configuration?q=archive_')
+    await screen.findByTestId('param-archive_timeout')
+    expect(screen.queryByTestId('param-archive_command')).toBeNull()
     await user.click(screen.getByLabelText('Show managed and refused'))
     expect(router.currentRoute.value.query.all).toBe('1')
-    expect(await screen.findByTestId('param-ssl_cert_file')).toBeInTheDocument()
+    expect(await screen.findByTestId('param-archive_command')).toBeInTheDocument()
   })
 
   it('puts a search in the address when the typing pauses, and finds by name or description', async () => {

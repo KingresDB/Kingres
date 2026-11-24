@@ -408,9 +408,12 @@ kl_sync_all_history_acls(Oid extowner)
 	Oid			saved_uid;
 	int			saved_sec;
 
+	if (kl_registry_untrusted())
+		ereport(WARNING,
+				(errmsg("the privileges of the history tables were not synchronized: the schema \"%s\" is not owned by a superuser, so the registry cannot be trusted", KL_SCHEMA_NAME)));
 	if (!OidIsValid(nspoid) || !OidIsValid(extowner))
 		return;
-	tableoid = get_relname_relid("ledger_table", nspoid);
+	tableoid = kl_catalog_relid("ledger_table");
 	if (!OidIsValid(tableoid))
 		return;
 

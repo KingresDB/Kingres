@@ -128,6 +128,10 @@ func (s *Service) MigrateSystem(ctx context.Context) error {
 	if _, err := sysdb.Migrate(ctx, c); err != nil {
 		return fmt.Errorf("upgrading the system database: %w", err)
 	}
+	// Idempotent: a cluster made before the hardening gets it at its next start.
+	if err := HardenSystemDatabase(ctx, c); err != nil {
+		return err
+	}
 	return nil
 }
 

@@ -14,6 +14,7 @@ import ProblemNotice from '@/components/ProblemNotice.vue'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import RebalanceReportDialog from '@/components/RebalanceReportDialog.vue'
 import NullableValue from '@/components/NullableValue.vue'
+import RebalanceAutomaticCard from '@/components/RebalanceAutomaticCard.vue'
 import { endpoints } from '@/api/endpoints'
 import {
   keys,
@@ -47,10 +48,30 @@ const STATE_META: Record<RebalanceStatus['state'], StatusMeta> = tolerant({
 // Options shared by preview and start.
 const selectedDbs = ref<string[]>([])
 const maxMoves = ref<number | null>(null)
+// Contract 0.15.0: the strategy, the threshold, drain-only and the moves per server. Empty means the cluster setting.
+const strategy = ref<'' | 'byBucketCount' | 'byDiskSize'>('')
+const threshold = ref<number | null>(null)
+const drainOnly = ref(false)
+const perServer = ref<number | null>(null)
 const options = computed(() => ({
   ...(selectedDbs.value.length ? { databases: selectedDbs.value } : {}),
   ...(maxMoves.value ? { maxConcurrentMoves: maxMoves.value } : {}),
+  ...(strategy.value ? { strategy: strategy.value } : {}),
+  ...(threshold.value !== null && threshold.value >= 0 ? { threshold: threshold.value } : {}),
+  ...(drainOnly.value ? { drainOnly: true } : {}),
+  ...(perServer.value ? { maxMovesPerServer: perServer.value } : {}),
 }))
+const TRIGGER_LABEL: Record<string, string> = {
+  manual: 'started by a person',
+  automatic: 'started by the automatic mode',
+  drain: 'draining a server',
+}
+const STRATEGY_LABEL: Record<string, string> = {
+  byBucketCount: 'by bucket count',
+  byDiskSize: 'by disk size',
+}
+const loadText = (v: number | undefined | null, by: string | undefined): string =>
+  v === undefined || v === null ? '-' : by === 'byDiskSize' ? formatBytes(v) : formatNumber(v)
 
 const plan = ref<RebalancePlan | null>(null)
 const previewMutation = useMutation({
@@ -164,6 +185,13 @@ const stoppedByText = computed(() =>
           <h2 id="status-h">Status</h2>
           <StatusBadge :meta="STATE_META[st.state]" />
         </div>
+        <p v-if="st.trigger || st.strategy" class="muted" data-testid="run-kind">
+          <template v-if="st.state !== 'idle'"
+            >This run is {{ TRIGGER_LABEL[st.trigger ?? 'manual'] ?? st.trigger }}, planned
+            {{ STRATEGY_LABEL[st.strategy ?? ''] ?? st.strategy }}, threshold
+            {{ Math.round((st.threshold ?? 0) * 100) }} percent.</template
+          >
+        </p>
         <p v-if="st.needed && !running">
           A rebalance is needed:
           {{ st.reasons.map((r) => REBALANCE_REASON_LABEL[r]).join('; ') || 'buckets are uneven' }}.
@@ -261,7 +289,15 @@ const stoppedByText = computed(() =>
                 :key="`${m.databaseName}-${m.colocationId}-${m.bucket}`"
               >
                 <td><SafeName :value="m.databaseName" :max="60" /></td>
-                <td class="num">{{ m.bucket }}</td>
+                <td class="num" :data-kind="m.kind ?? 'move'">
+                  <template v-if="m.kind === 'schema'"
+                    >Schema <SafeName :value="m.schemaName ?? ''" :max="60"
+                  /></template>
+                  <template v-else
+                    >{{ m.bucket
+                    }}<span v-if="m.kind === 'split'" class="muted"> (splitting)</span></template
+                  >
+                </td>
                 <td>
                   <SafeName v-if="m.fromServerId" :value="m.fromServerId" :max="80" />
                   <template v-else>group {{ m.fromShardGroupId }}</template>
@@ -302,6 +338,55 @@ const stoppedByText = computed(() =>
           </label>
         </fieldset>
         <div class="field" style="max-width: 20em">
+          <label for="rb-strategy">Strategy</label>
+          <select id="rb-strategy" v-model="strategy" :disabled="running">
+            <option value="">
+              The cluster setting ({{ settings.data.value?.rebalance.strategy ?? 'byBucketCount' }})
+            </option>
+            <option value="byBucketCount">By bucket count</option>
+            <option value="byDiskSize">By disk size</option>
+          </select>
+          <span class="hint"
+            >By disk size a bucket counts its bytes, so a few large buckets do not pile up on one
+            server.</span
+          >
+        </div>
+        <div class="field" style="max-width: 20em">
+          <label for="rb-threshold">Threshold</label>
+          <input
+            id="rb-threshold"
+            v-model.number="threshold"
+            class="input num"
+            type="number"
+            min="0"
+            max="1"
+            step="0.01"
+            placeholder="the strategy's default"
+            :disabled="running"
+          />
+          <span class="hint"
+            >The deviation from the ideal load that is accepted: 0.1 is 10 percent. Nothing moves
+            while every server is inside it.</span
+          >
+        </div>
+        <label class="check"
+          ><input v-model="drainOnly" type="checkbox" :disabled="running" /> Only move buckets off
+          servers that should not hold shards</label
+        >
+        <div class="field" style="max-width: 20em">
+          <label for="rb-per">Moves per server</label>
+          <input
+            id="rb-per"
+            v-model.number="perServer"
+            class="input num"
+            type="number"
+            min="1"
+            max="16"
+            :placeholder="String(settings.data.value?.rebalance.maxMovesPerServer ?? 2)"
+            :disabled="running"
+          />
+        </div>
+        <div class="field" style="max-width: 20em">
           <label for="rb-max">Concurrent moves (one at a time in this version)</label>
           <input
             id="rb-max"
@@ -321,6 +406,15 @@ const stoppedByText = computed(() =>
 
       <section v-if="plan" class="card stack" aria-labelledby="plan-h" data-testid="plan">
         <h2 id="plan-h">Plan preview</h2>
+        <p v-if="plan.strategy" class="muted" data-testid="plan-strategy">
+          Planned {{ STRATEGY_LABEL[plan.strategy] ?? plan.strategy
+          }}<template v-if="plan.threshold !== undefined"
+            >, threshold {{ Math.round(plan.threshold * 100) }} percent</template
+          ><template v-if="plan.imbalance !== undefined"
+            >; the servers are now up to {{ Math.round(plan.imbalance * 100) }} percent from the
+            ideal</template
+          >.
+        </p>
         <p v-if="!plan.needed" class="muted">Nothing to move: the buckets are already even.</p>
         <template v-else>
           <p>
@@ -350,6 +444,13 @@ const stoppedByText = computed(() =>
                   <th scope="col">Server</th>
                   <th scope="col" class="num">Before</th>
                   <th scope="col" class="num">After</th>
+                  <th
+                    v-if="plan.serverImpacts.some((i) => i.loadBefore !== undefined)"
+                    scope="col"
+                    class="num"
+                  >
+                    Load before / after
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -357,6 +458,10 @@ const stoppedByText = computed(() =>
                   <th scope="row">Server {{ i.serverId }}</th>
                   <td class="num">{{ i.primaryBucketsBefore }}</td>
                   <td class="num">{{ i.primaryBucketsAfter }}</td>
+                  <td v-if="i.loadBefore !== undefined" class="num">
+                    {{ loadText(i.loadBefore, plan.strategy) }} /
+                    {{ loadText(i.loadAfter, plan.strategy) }}
+                  </td>
                 </tr>
               </tbody>
             </table>
@@ -375,6 +480,7 @@ const stoppedByText = computed(() =>
                     <th scope="col">From</th>
                     <th scope="col">To</th>
                     <th scope="col" class="num">Size</th>
+                    <th scope="col">Why</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -383,7 +489,17 @@ const stoppedByText = computed(() =>
                     :key="`${m.databaseName}-${m.colocationId}-${m.bucket}`"
                   >
                     <td><SafeName :value="m.databaseName" :max="60" /></td>
-                    <td class="num">{{ m.bucket }}</td>
+                    <td class="num" :data-kind="m.kind ?? 'move'">
+                      <template v-if="m.kind === 'schema'"
+                        >Schema <SafeName :value="m.schemaName ?? ''" :max="60"
+                      /></template>
+                      <template v-else
+                        >{{ m.bucket
+                        }}<span v-if="m.kind === 'split'" class="muted">
+                          (splitting)</span
+                        ></template
+                      >
+                    </td>
                     <td>
                       <SafeName v-if="m.fromServerId" :value="m.fromServerId" :max="80" />
                       <template v-else>group {{ m.fromShardGroupId }}</template>
@@ -395,6 +511,15 @@ const stoppedByText = computed(() =>
                     <td class="num">
                       <NullableValue :value="m.estimatedSizeBytes" :format="formatBytes" />
                     </td>
+                    <td>
+                      {{
+                        m.reason === 'drain'
+                          ? 'Drain'
+                          : m.reason === 'balance'
+                            ? 'Balance'
+                            : (m.reason ?? '-')
+                      }}
+                    </td>
                   </tr>
                 </tbody>
               </table>
@@ -402,6 +527,8 @@ const stoppedByText = computed(() =>
           </details>
         </template>
       </section>
+
+      <RebalanceAutomaticCard :automatic="st.automatic" />
 
       <section class="card stack" aria-labelledby="rep-h">
         <h2 id="rep-h">Past reports</h2>
@@ -423,6 +550,7 @@ const stoppedByText = computed(() =>
                   <th scope="col">Report</th>
                   <th scope="col">Outcome</th>
                   <th scope="col">Started</th>
+                  <th scope="col">Run</th>
                   <th scope="col" class="num">Moves</th>
                   <th scope="col" class="num">Data moved</th>
                   <th scope="col" class="num">Duration</th>
@@ -447,6 +575,12 @@ const stoppedByText = computed(() =>
                     />
                   </td>
                   <td>{{ formatDateTime(r.startedAt) }}</td>
+                  <td>
+                    {{ TRIGGER_LABEL[r.trigger ?? 'manual'] ?? r.trigger
+                    }}<template v-if="r.strategy"
+                      >, {{ STRATEGY_LABEL[r.strategy] ?? r.strategy }}</template
+                    >
+                  </td>
                   <td class="num">{{ r.totals.movesDone }} / {{ r.totals.movesTotal }}</td>
                   <td class="num">{{ formatBytes(r.totals.bytesMoved) }}</td>
                   <td class="num">{{ formatDuration(r.totals.durationSeconds) }}</td>

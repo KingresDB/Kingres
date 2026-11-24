@@ -40,6 +40,11 @@ type Operation struct {
 	QueryParams []string
 	// Responses are the declared response status codes, sorted.
 	Responses []string
+	// Streams is the value of the vendor extension x-streams ("upload" or
+	// "download"): the operation moves a body that is not held in memory and
+	// leaves the request timeout and the body limit of the other operations.
+	// Empty for every other operation.
+	Streams string
 }
 
 // Document is a parsed OpenAPI document.
@@ -187,6 +192,7 @@ func (d *Document) extractOperations() error {
 				return fmt.Errorf("operation %s: invalid or missing x-required-role %q", id, role)
 			}
 			o := Operation{ID: id, Method: strings.ToUpper(m), Path: p, Role: role}
+			o.Streams, _ = op["x-streams"].(string)
 			if tags := asSlice(op["tags"]); len(tags) > 0 {
 				o.Tag, _ = tags[0].(string)
 			}

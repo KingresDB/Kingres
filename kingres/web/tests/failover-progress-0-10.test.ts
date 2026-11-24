@@ -143,6 +143,14 @@ describe('a run in progress', () => {
     expect(screen.getByTestId('no-task-yet')).toBeInTheDocument()
     // There is no task to cancel yet, and the button says so.
     expect(screen.getByTestId('cancel-failover')).toHaveAttribute('aria-disabled', 'true')
+    // The bootstrap can be given up from here (kingres_admin); the mock's bootstrap has promoted the standby already, which the server refuses.
+    await user.click(screen.getByTestId('abandon-bootstrap'))
+    const confirm = await screen.findByRole('dialog', { name: /give up the move of the manager/i })
+    await user.click(within(confirm).getByRole('button', { name: /^give up the move$/i }))
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog', { name: /give up the move/i })).toBeNull(),
+    )
+    expect(await screen.findByText(/^conflict$/i)).toBeInTheDocument()
     moveTo(15 / 22)
     await waitFor(() => expect(screen.queryByTestId('manager-moving')).not.toBeInTheDocument(), {
       timeout: 30_000,

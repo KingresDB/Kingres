@@ -263,6 +263,21 @@ type AutoFailoverSettings struct {
 type RebalanceSettings struct {
 	// MaxConcurrentMoves is the default number of concurrent bucket moves.
 	MaxConcurrentMoves int `json:"maxConcurrentMoves"`
+	// The members below are added in contract 0.15.0 (optional in a request, always present in an answer).
+	// Strategy is the default strategy: byBucketCount or byDiskSize.
+	Strategy string `json:"strategy,omitempty"`
+	// Threshold is the default threshold; null takes the strategy's own (0, or 0.1 by disk size).
+	Threshold *float64 `json:"threshold"`
+	// MaxMovesPerServer is the limit of moves that involve one server (default 2).
+	MaxMovesPerServer int `json:"maxMovesPerServer,omitempty"`
+	// MaxMoveAttempts is how often a failed move is tried in one run (default 3).
+	MaxMoveAttempts int `json:"maxMoveAttempts,omitempty"`
+	// MaxDiskUsedFraction is the share of a data volume a move may fill (default 0.85).
+	MaxDiskUsedFraction float64 `json:"maxDiskUsedFraction,omitempty"`
+	// MaxStandbyLagBytes is the lag of a standby above which a group counts as degraded (default 64 MiB).
+	MaxStandbyLagBytes int64 `json:"maxStandbyLagBytes,omitempty"`
+	// Automatic is the automatic mode, off by default (contract 0.15.0).
+	Automatic *AutomaticSettings `json:"automatic,omitempty"`
 }
 
 // RestartState is the pending-restart part of the cluster settings.
@@ -289,6 +304,32 @@ type ClusterSettings struct {
 	Restart RestartState `json:"restart"`
 	// Clock holds the clock settings (contract 0.8.0).
 	Clock *ClockSettings `json:"clock,omitempty"`
+	// Analytics holds the settings of the analytics (contract 0.17.0).
+	Analytics *AnalyticsSettings `json:"analytics,omitempty"`
+	// DataTransfer holds the settings of the table export and import (contract 0.19.0).
+	DataTransfer *DataTransferSettings `json:"dataTransfer,omitempty"`
+}
+
+// AnalyticsSettings are the analytics settings of the cluster.
+type AnalyticsSettings struct {
+	// AllowNonSuperuserOwners allows conversions and policy runs for tables whose owner is not a superuser (default false).
+	AllowNonSuperuserOwners bool `json:"allowNonSuperuserOwners"`
+}
+
+// DataTransferSettings are the cluster settings of the data transfer (contract 0.19.0).
+type DataTransferSettings struct {
+	// Enabled is false until an administrator turns the data transfer on.
+	Enabled bool `json:"enabled"`
+	// RetentionHours is how long an export file is kept by default.
+	RetentionHours int `json:"retentionHours"`
+	// MaxFileBytes is the largest staged file.
+	MaxFileBytes int64 `json:"maxFileBytes"`
+	// StagingQuotaBytes is the sum of the reservations of the staging area.
+	StagingQuotaBytes int64 `json:"stagingQuotaBytes"`
+	// MaxConcurrent is the number of transfers running at once in the cluster.
+	MaxConcurrent int `json:"maxConcurrent"`
+	// MaxAtomicBytes is the largest decompressed file that one import of this server accepts (a flag of the server); read only.
+	MaxAtomicBytes int64 `json:"maxAtomicBytes,omitempty"`
 }
 
 // ClockSettings are the clock settings of the cluster.

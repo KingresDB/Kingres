@@ -11,3 +11,6 @@ func setProc(*exec.Cmd) {}
 func terminate(cmd *exec.Cmd, _ bool) { _ = cmd.Process.Kill() }
 
 func pause(*exec.Cmd, bool) {}
+
+// quit is not available on Windows.
+func quit(*exec.Cmd) {}

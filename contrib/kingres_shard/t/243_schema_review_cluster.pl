@@ -68,6 +68,8 @@ q1($n1, q{SELECT kingres.cleanup_moved_buckets(true)});
 is(q1($n1, q{SET kingres_shard.enable_routing = off; SELECT count(*) FROM cl.t WHERE id = 1001}), 1, 'the cleaning of a group that owns the schema again does not empty it');
 q1($n1, "SELECT kingres.internal_set_schema_group($coloc, 1, 'active')");
 q1($n1, q{SET kingres_shard.enable_routing = off; DELETE FROM cl.t WHERE id = 1001});
+# the defence test above left the old copy on group 0 uncleaned (the cleaning skipped it while group 0 owned the schema): empty it by hand
+q1($n1, q{SET kingres_shard.enable_routing = off; DELETE FROM cl.t});
 
 # ---------------------------------------------------------------------------
 # P11R-02

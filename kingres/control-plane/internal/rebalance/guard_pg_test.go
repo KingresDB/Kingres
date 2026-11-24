@@ -47,6 +47,13 @@ func newGuardEnv(t *testing.T) (*guardEnv, task.Lease) {
 	if _, err := in.Connect(t, "postgres").Exec(ctx, "CREATE DATABASE kingres_system"); err != nil {
 		t.Fatal(err)
 	}
+	// the database the moves go to is a plain one: no call of the extension can succeed there. It does have the schema of the extension, empty, recorded as the extension's
+	// own, so that the gate of the control plane lets the call through and the call fails the way it did before the gate: the function is missing.
+	stub := in.Connect(t, "postgres")
+	if _, err := stub.Exec(ctx, "CREATE SCHEMA kingres"); err != nil {
+		t.Fatal(err)
+	}
+	trustStub(t, stub)
 	e := &guardEnv{in: in, sys: in.Connect(t, sysdb.Database)}
 	if _, err := sysdb.Migrate(ctx, e.sys); err != nil {
 		t.Fatal(err)

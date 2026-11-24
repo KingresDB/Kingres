@@ -151,7 +151,9 @@ like($oerr, qr/ERROR/, 'the stripe size option cannot exceed the reader\'s limit
 		CREATE TABLE kingres.columnar_stripe ($cols13, CONSTRAINT columnar_stripe_pkey PRIMARY KEY (rel_uid, stripe_id));
 		INSERT INTO kingres.columnar_stripe
 		  SELECT rel_uid, stripe_id, first_row, row_count, chunk_groups, natts, first_block, block_count,
-		         blob_len, raw_bytes, footer_offset, cid_points, col_stats FROM kingres.columnar_stripe_14;");
+		         blob_len, raw_bytes, footer_offset, cid_points, col_stats FROM kingres.columnar_stripe_14;
+		-- the catalog of an earlier build is a member of the extension, as this one has to be to be used
+		ALTER EXTENSION kingres_columnar ADD TABLE kingres.columnar_stripe;");
 	my ($out, $err) = script('SELECT count(*) FROM shp');
 	like($err, qr/the stripe catalog has 13 columns, this build uses 14/, 'a catalog of the earlier shape (13 columns) is refused with an error that says so');
 	unlike($out, qr/^\s*\d+\s*$/m, 'and no count is answered');
@@ -159,6 +161,7 @@ like($oerr, qr/ERROR/, 'the stripe size option cannot exceed the reader\'s limit
 	like($err, qr/the stripe catalog has 13 columns/, 'a write into such a table is refused too');
 	$node->safe_psql('postgres', "
 		ALTER EVENT TRIGGER kingres_columnar_on_drop DISABLE;
+		ALTER EXTENSION kingres_columnar DROP TABLE kingres.columnar_stripe;
 		DROP TABLE kingres.columnar_stripe;
 		ALTER TABLE kingres.columnar_stripe_14 RENAME TO columnar_stripe;
 		ALTER TABLE kingres.columnar_stripe RENAME CONSTRAINT columnar_stripe_14_pkey TO columnar_stripe_pkey;

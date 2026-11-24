@@ -40,6 +40,9 @@ func TestCheck(t *testing.T) {
 		{workMem, "3000000000kB", false, "", ""},
 		{workMem, "0x10", false, "", ""},
 		{workMem, "010", false, "", ""},
+		{maxConn, "0100", false, "", ""}, // PostgreSQL reads it as octal 64: the range check does not shadow the leading zero
+		{maxConn, "00", false, "", ""},
+		{maxConn, "007", false, "", ""},
 		{workMem, "1e3", false, "", ""},
 		{workMem, "1.5", false, "", ""}, // fraction without a unit: PostgreSQL would round
 		{workMem, "1.0001kB", false, "", ""},

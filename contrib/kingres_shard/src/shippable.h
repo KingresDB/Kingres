@@ -58,11 +58,15 @@ extern bool kingres_shard_stmt_shippable_colocated(Query *query, Oid target_reli
 													int colocation_id,
 													const char **reason);
 
+extern bool kingres_shard_stmt_shippable_merge(Query *query, int colocation_id, const char **reason);
+extern bool kingres_shard_stmt_shippable_merge_ref(Query *query, Oid target_relid, const char **reason);
+
 extern bool kingres_shard_stmt_shippable_query(Query *query, int colocation_id, const char **reason);
 
 /* The extensions of the compiled-in list (design 5.5) */
 extern PGDLLIMPORT char *kingres_shard_shippable_extensions;
 extern bool kingres_shard_shippable_extension_known(const char *name);
+extern bool kingres_shard_extension_usable(const char *name);
 extern bool kingres_shard_extension_aggregate_ok(Oid aggfnoid);
 extern char *kingres_shard_shippable_ext_used(void);
 extern bool kingres_shard_ext_token_ok(const char *s, size_t len);

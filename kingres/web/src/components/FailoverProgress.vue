@@ -121,6 +121,35 @@ const cancel = useMutation({
     ]),
 })
 
+// Giving up the bootstrap of the map group (contract 0.18.0). The candidate lets go of its lease, and for a planned switchover the old leader rolls back; a
+// bootstrap that promoted the standby cannot be given up (the server answers a conflict), and none in progress answers abandoned: false.
+const abandonAsked = ref(false)
+const abandonNote = ref('')
+const abandonError = ref<unknown>(null)
+const abandon = useMutation({
+  mutationFn: () => endpoints.abandonMapGroupBootstrap('given up from the console'),
+  onSuccess: (r) => {
+    abandonError.value = null
+    const resumed = r.resumedServerId
+      ? ` The primary of the map group on ${r.resumedServerId} is started again.`
+      : ''
+    abandonNote.value = r.abandoned
+      ? `The bootstrap was given up.${resumed}`
+      : `No bootstrap of the map group is in progress.${resumed}`
+  },
+  onError: (e) => {
+    abandonError.value = e
+  },
+  onSettled: () => {
+    abandonAsked.value = false
+    return Promise.all([
+      client.invalidateQueries({ queryKey: keys.failover }),
+      client.invalidateQueries({ queryKey: keys.topology }),
+    ])
+  },
+})
+const abandoning = computed(() => abandon.isPending.value)
+
 const resumeError = ref<unknown>(null)
 const resuming = ref(false)
 async function resume(): Promise<void> {
@@ -215,6 +244,24 @@ watch(
       </span>
     </p>
     <p v-else-if="phase && run.state === 'running'" data-testid="failover-phase">{{ phase }}.</p>
+    <div
+      v-if="mapMoving && run.state === 'running'"
+      class="row"
+      data-testid="manager-moving-actions"
+    >
+      <GateButton
+        op="abandonMapGroupBootstrap"
+        data-testid="abandon-bootstrap"
+        :blocked-reason="abandoning ? 'Giving up ...' : ''"
+        @click="abandonAsked = true"
+      >
+        Give up the move of the manager
+      </GateButton>
+      <span v-if="abandonNote" class="muted" role="status" data-testid="abandon-note">{{
+        abandonNote
+      }}</span>
+    </div>
+    <ProblemNotice v-if="abandonError" :error="abandonError" />
     <p v-if="taskId === null && run.state === 'running'" class="muted" data-testid="no-task-yet">
       The run has no task yet: it is recorded as soon as the system database is writable again.
     </p>
@@ -369,6 +416,21 @@ watch(
       :error="resumeError"
       :context="{ mode: 'hard', includesMapGroup: false }"
     />
+  </ConfirmDialog>
+  <ConfirmDialog
+    v-if="abandonAsked"
+    title="Give up the move of the manager"
+    confirm-label="Give up the move"
+    danger
+    :busy="abandoning"
+    @confirm="abandon.mutate()"
+    @cancel="abandonAsked = false"
+  >
+    <p>
+      The standby that was to become the manager lets go of the lease, and the old manager takes
+      over again. A move that has promoted the standby already cannot be given up: it goes on to its
+      end.
+    </p>
   </ConfirmDialog>
   <FailoverReportDialog
     v-if="reportOpen && taskId !== null"

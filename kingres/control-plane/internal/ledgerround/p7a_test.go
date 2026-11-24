@@ -166,8 +166,8 @@ func TestAnOperatorWhoWritesTheConfirmationAcceptsTheLossAndAnEventSaysSo(t *tes
 			continue
 		}
 		found = true
-		if ev.subject != "generation:1" {
-			t.Errorf("subject %q", ev.subject)
+		if want := restoreSubject(1, ledgerstate.SumOf(old)); ev.subject != want || !strings.HasPrefix(ev.subject, "generation:1:") {
+			t.Errorf("subject %q, want %q", ev.subject, want)
 		}
 		got := map[string]string{}
 		for _, fl := range ev.fields {
@@ -391,5 +391,26 @@ func TestADamagedRecordIsNotReplacedByWhatTheDatabaseHolds(t *testing.T) {
 	}
 	if len(e.logs()) != 0 {
 		t.Errorf("something was written: %d logs", len(e.logs()))
+	}
+}
+
+// P7F-07: two restores that reach the same generation number (the record was lost and made again from the database) have two subjects, so the
+// second is announced; the same restore announced again has the same subject.
+func TestTheSubjectOfARestoreEventTellsTwoCutsOfOneGenerationApart(t *testing.T) {
+	a, b := ledgerstate.SumOf(ledgerstate.State{Events: 4}), ledgerstate.SumOf(ledgerstate.State{Events: 5})
+	if a == b {
+		t.Fatal("the sums are equal")
+	}
+	if restoreSubject(1, a) == restoreSubject(1, b) {
+		t.Fatal("two restores of one generation share a subject: the second event would be suppressed")
+	}
+	if restoreSubject(1, a) != restoreSubject(1, a) {
+		t.Fatal("the same restore has two subjects: it would be announced twice")
+	}
+	if restoreSubject(1, a) == restoreSubject(2, a) {
+		t.Fatal("two generations share a subject")
+	}
+	if got := restoreSubject(3, "abc"); got != "generation:3:abc" {
+		t.Fatalf("%q", got)
 	}
 }

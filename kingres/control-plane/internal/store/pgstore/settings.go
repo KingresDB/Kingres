@@ -20,6 +20,10 @@ type dbSetting struct {
 	digest     *int
 	createdAt  time.Time
 	createdBy  string
+	// approx* are the approximate-aggregates setting (migration 35).
+	approxEnabled  bool
+	approxDistinct string
+	approxRate     *float64
 }
 
 // dbSettings reads the recorded settings by database name. Without the
@@ -35,13 +39,13 @@ func (s *Store) dbSettings(ctx context.Context) (map[string]dbSetting, error) {
 		return out, err
 	}
 	rows, err := p.Query(ctx, `SELECT database_name, sharding_enabled, bucket_count, durability, ledger_mode,
-		ledger_digest_interval, created_at, created_by FROM kingres_cp.database_setting`)
+		ledger_digest_interval, created_at, created_by, approx_enabled, approx_count_distinct, approx_error_rate FROM kingres_cp.database_setting`)
 	if err != nil {
 		return out, s.wrap("reading kingres_cp.database_setting", err)
 	}
 	list, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (dbSetting, error) {
 		var d dbSetting
-		return d, r.Scan(&d.name, &d.sharding, &d.bucketCnt, &d.durability, &d.ledgerMode, &d.digest, &d.createdAt, &d.createdBy)
+		return d, r.Scan(&d.name, &d.sharding, &d.bucketCnt, &d.durability, &d.ledgerMode, &d.digest, &d.createdAt, &d.createdBy, &d.approxEnabled, &d.approxDistinct, &d.approxRate)
 	})
 	if err != nil {
 		return out, s.wrap("reading kingres_cp.database_setting", err)

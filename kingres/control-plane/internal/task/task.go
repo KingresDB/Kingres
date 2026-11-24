@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -235,6 +236,17 @@ func (e *Env) SetDetail(ctx context.Context, detail string) error {
 	return ds.SetDetail(ctx, e.Task.ID, e.lease, detail)
 }
 
+// CancelRequested reports whether a cancel request is recorded for the task now: a step that runs for long asks it between its
+// own waits, because the engine looks at the mark only between steps (a step that is not Interruptible). A task that cannot be
+// read is not cancelled.
+func (e *Env) CancelRequested(ctx context.Context) bool {
+	if e.eng == nil {
+		return false
+	}
+	t, err := e.eng.store.Get(ctx, e.Task.ID)
+	return err == nil && t.CancelRequested
+}
+
 // Fence returns the fencing token of this run (the lease epoch). A step that
 // calls another server for a non-idempotent effect can send it along, so that
 // the other side refuses a call of a run that lost its lease meanwhile.
@@ -275,6 +287,11 @@ type Step struct {
 	// task with CodeStepInterrupted. Steps without the mark are at-least-once:
 	// they run again.
 	NonIdempotent bool
+	// Recover, for a NonIdempotent step, says whether the effect of the step is there when a run finds the step recorded
+	// as running (the run that started it ended before it recorded the end). true: the step is recorded as done and the task
+	// goes on; false: the effect is provably not there, so the step runs again. An error, or no Recover, fails the task with
+	// CodeStepInterrupted as before. A step that cannot tell must not have a Recover.
+	Recover func(ctx context.Context, env *Env) (bool, error)
 	// NeedsSecret names a secret the step needs; when it is missing the task
 	// fails with CodeSecretUnavailable instead of running the step.
 	NeedsSecret string
@@ -609,8 +626,38 @@ func (e *Engine) run(ctx context.Context, t Task, started time.Time, secrets map
 		}
 		st := def.Steps[i]
 		if st.NonIdempotent && i < len(t.Steps) && t.Steps[i].State == StepRunning {
-			return e.fail(ctx, t, i, st, &Error{Code: CodeStepInterrupted, Step: st.Name, Retryable: false,
-				Message: "The step was interrupted after it started and must not run twice, so it is unknown whether it took effect. Check the result and submit the task again if needed."})
+			// The run that started the step ended before it recorded the end. A step that can read its own effect says
+			// whether it is there; any other is not run again.
+			var done bool
+			var rerr error
+			if st.Recover != nil {
+				done, rerr = st.Recover(fence.With(runCtx, fence.Token{Task: t.ID, Epoch: env.lease.Epoch}), env)
+				if rerr != nil && leaseLost(rerr) {
+					return e.standDown(ctx, t, i, st, rerr)
+				}
+				if rerr != nil && runCtx.Err() != nil {
+					// A run that is shut down or has lost its lease did not learn whether the effect is there: it is not a failure of the
+					// step (as on the path of a step that runs); the next holder asks again.
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+					return ErrLeaseLost
+				}
+			}
+			if st.Recover == nil || rerr != nil {
+				return e.fail(ctx, t, i, st, &Error{Code: CodeStepInterrupted, Step: st.Name, Retryable: false,
+					Message: "The step was interrupted after it started and must not run twice, so it is unknown whether it took effect. Check the result and submit the task again if needed."})
+			}
+			if done {
+				cancelReq, err := e.setStep(ctx, t, i, StepDone, percent(i+1, len(def.Steps)))
+				if err != nil {
+					return err
+				}
+				if cancelReq && i+1 < len(def.Steps) && e.honourCancel(ctx, t, def) {
+					return e.cancelTask(ctx, t, def, i+1)
+				}
+				continue
+			}
 		}
 		e.fault(FaultBeforeStep, t.ID, i)
 		if st.NeedsSecret != "" {
@@ -982,6 +1029,29 @@ func (e *Engine) def(kind string) (Definition, bool) {
 	return d, ok
 }
 
+// ActiveStore is the optional part of a Store that answers "does this subject have an unfinished task of this kind" without reading a window of the newest tasks.
+type ActiveStore interface {
+	ActiveFor(ctx context.Context, kind, subjType, subjID string) (bool, error)
+}
+
+// ActiveFor tells whether the subject has an unfinished task (pending, running or paused) of the kind. It asks the store directly when the store can
+// answer; otherwise it reads the newest thousand tasks.
+func (e *Engine) ActiveFor(ctx context.Context, kind, subjType, subjID string) (bool, error) {
+	if s, ok := e.store.(ActiveStore); ok {
+		return s.ActiveFor(ctx, kind, subjType, subjID)
+	}
+	ts, err := e.store.List(ctx, 1000)
+	if err != nil {
+		return false, err
+	}
+	for _, t := range ts {
+		if t.Kind == kind && t.SubjectType == subjType && t.SubjectID == subjID && t.State.Active() {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // List returns the newest tasks.
 func (e *Engine) List(ctx context.Context, limit int) ([]Task, error) {
 	return e.store.List(ctx, limit)
@@ -1021,6 +1091,8 @@ func (e *ExcludedError) Problem() *problem.Problem {
 		return problem.New(problem.RebalanceInProgress, "A rebalance is running; wait until it has finished.")
 	case e.Other == "server.failover" || e.Other == "replication.restorePreferredPrimaries":
 		return problem.New(problem.FailoverInProgress, "A failover is in progress; the buckets stay where they are until it has finished.")
+	case strings.HasPrefix(e.Other, "schema."):
+		return problem.New(problem.OperationInProgress, "A task of a distributed schema ("+e.Other+") is unfinished; wait until it has finished.")
 	default:
 		return problem.New(problem.OperationInProgress, "Another operation changes the servers ("+e.Other+"); wait until it has finished.")
 	}

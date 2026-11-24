@@ -56,6 +56,34 @@ async function startedTask(answer: Promise<Task | S['FailoverPlan']>): Promise<T
   return result
 }
 
+/** A storage change without `dryRun` answers a task; a preview can not come back (the panel never asks for it there). */
+async function storageTask(answer: Promise<unknown>): Promise<Task> {
+  const r = await unwrap(answer as never)
+  if (!('id' in (r as object))) throw new Error('The server answered with a preview, not a task.')
+  return r as Task
+}
+/** A storage change with `dryRun` answers the preview; a task can not come back. */
+async function storagePreview(answer: Promise<unknown>): Promise<S['TableStoragePreview']> {
+  const r = await unwrap(answer as never)
+  if (!('willConvert' in (r as object)))
+    throw new Error('The server answered with a task, not a preview.')
+  return r as S['TableStoragePreview']
+}
+/** What a download answered: the stream, and the headers a resumed download is checked against. */
+export interface ExportStream {
+  status: number
+  body: ReadableStream<Uint8Array> | null
+  contentLength: number | null
+  contentRange: string | null
+  etag: string | null
+}
+
+/** A whole number of bytes from a header, or null when it is absent or is not one. */
+function parseOffset(value: string | null): number | null {
+  if (value === null || !/^\d{1,15}$/.test(value.trim())) return null
+  return Number(value.trim())
+}
+
 export interface Page {
   limit?: number
   cursor?: string
@@ -113,6 +141,10 @@ export const endpoints = {
   addServer: (body: S['AddServerRequest']) => j(api.POST('/servers', { body })),
   updateServer: (serverId: ServerId, body: S['ServerUpdateRequest']) =>
     j(api.PATCH('/servers/{serverId}', { params: { path: { serverId } }, body })),
+  previewServerDrain: (serverId: ServerId) =>
+    j(api.GET('/servers/{serverId}/drain-preview', { params: { path: { serverId } } })),
+  drainServer: (serverId: ServerId, body: S['DrainRequest']) =>
+    j(api.POST('/servers/{serverId}/drain', { params: { path: { serverId } }, body })),
   removeServer: (serverId: ServerId) =>
     j(api.DELETE('/servers/{serverId}', { params: { path: { serverId } } })),
   /**
@@ -193,6 +225,268 @@ export const endpoints = {
         body,
       }),
     ),
+  // --- the table lifecycle of contract 0.14.0 (increment 9.7)
+  /** Turns a distributed or reference table back into a plain table; the options are query parameters. */
+  undistributeTable: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    query: {
+      cascadeViaForeignKeys?: boolean
+      targetGroupId?: number
+      mode?: S['TableChangeMode']
+      dependentViews?: S['DependentViews']
+    } = {},
+  ) =>
+    j(
+      api.DELETE('/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/distribution', {
+        params: { path: { databaseName, schemaName, tableName }, query },
+      }),
+    ),
+  alterTableDistribution: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['AlterTableDistributionRequest'],
+  ) =>
+    j(
+      api.PATCH('/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/distribution', {
+        params: { path: { databaseName, schemaName, tableName } },
+        body,
+      }),
+    ),
+  /** What a change would do, without doing it (blockers, warnings, notes, the tables it touches, an estimate). */
+  previewTableChange: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['TableChangeRequest'],
+  ) =>
+    j(
+      api.POST(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/distribution/preview',
+        { params: { path: { databaseName, schemaName, tableName } }, body },
+      ),
+    ),
+  listTablePartitions: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    q: Page = {},
+  ) =>
+    j(
+      api.GET('/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions', {
+        params: { path: { databaseName, schemaName, tableName }, query: { limit: 200, ...q } },
+      }),
+    ),
+  createTablePartition: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['CreateTablePartitionRequest'],
+  ) =>
+    j(
+      api.POST('/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions', {
+        params: { path: { databaseName, schemaName, tableName } },
+        body,
+      }),
+    ),
+  attachTablePartition: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['AttachTablePartitionRequest'],
+  ) =>
+    j(
+      api.POST(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/attach',
+        { params: { path: { databaseName, schemaName, tableName } }, body },
+      ),
+    ),
+  detachTablePartition: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    partitionName: string,
+  ) =>
+    j(
+      api.POST(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/{partitionName}/detach',
+        { params: { path: { databaseName, schemaName, tableName, partitionName } } },
+      ),
+    ),
+  dropTablePartition: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    partitionName: string,
+  ) =>
+    j(
+      api.DELETE(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/{partitionName}',
+        { params: { path: { databaseName, schemaName, tableName, partitionName } } },
+      ),
+    ),
+  // --- analytics: approximate aggregates, storage format, time partitioning (contract 0.18.0)
+  getApproximateAggregates: (databaseName: string) =>
+    j(
+      api.GET('/databases/{databaseName}/approximate-aggregates', {
+        params: { path: { databaseName } },
+      }),
+    ),
+  configureApproximateAggregates: (databaseName: string, body: S['ApproximateAggregatesRequest']) =>
+    j(
+      api.PUT('/databases/{databaseName}/approximate-aggregates', {
+        params: { path: { databaseName } },
+        body,
+      }),
+    ),
+  setTableStorage: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['TableStorageRequest'],
+  ) =>
+    storageTask(
+      api.PUT('/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/storage', {
+        params: { path: { databaseName, schemaName, tableName } },
+        body,
+      }),
+    ),
+  setPartitionStorage: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    partitionName: string,
+    body: S['PartitionStorageRequest'],
+  ) =>
+    storageTask(
+      api.PUT(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/{partitionName}/storage',
+        { params: { path: { databaseName, schemaName, tableName, partitionName } }, body },
+      ),
+    ),
+  /** What a storage change of a table would do (`dryRun=true`): the blockers and notes, no task. */
+  previewTableStorage: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['TableStorageRequest'],
+  ) =>
+    storagePreview(
+      api.PUT('/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/storage', {
+        params: { path: { databaseName, schemaName, tableName }, query: { dryRun: true } },
+        body,
+      }),
+    ),
+  previewPartitionStorage: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    partitionName: string,
+    body: S['PartitionStorageRequest'],
+  ) =>
+    storagePreview(
+      api.PUT(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partitions/{partitionName}/storage',
+        {
+          params: {
+            path: { databaseName, schemaName, tableName, partitionName },
+            query: { dryRun: true },
+          },
+          body,
+        },
+      ),
+    ),
+  getPartitionPolicy: (databaseName: string, schemaName: string, tableName: string) =>
+    j(
+      api.GET(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy',
+        {
+          params: { path: { databaseName, schemaName, tableName } },
+        },
+      ),
+    ),
+  putPartitionPolicy: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['PartitionPolicyRequest'],
+  ) =>
+    j(
+      api.PUT(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy',
+        {
+          params: { path: { databaseName, schemaName, tableName } },
+          body,
+        },
+      ),
+    ),
+  deletePartitionPolicy: (databaseName: string, schemaName: string, tableName: string) =>
+    j(
+      api.DELETE(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy',
+        { params: { path: { databaseName, schemaName, tableName } } },
+      ),
+    ),
+  /** `asOf` is for tests and dry replays: within five minutes of the time of the instance. The panel never sends it. */
+  runPartitionPolicy: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['RunPartitionPolicyRequest'] = {},
+  ) =>
+    j(
+      api.POST(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy/runs',
+        { params: { path: { databaseName, schemaName, tableName } }, body },
+      ),
+    ),
+  listPartitionPolicyRuns: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    q: Page & { state?: S['PartitionRunState'] } = {},
+  ) =>
+    j(
+      api.GET(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy/runs',
+        {
+          params: {
+            path: { databaseName, schemaName, tableName },
+            query: { limit: 50, ...q },
+          },
+        },
+      ),
+    ),
+  getPartitionPolicyRun: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    runId: number,
+  ) =>
+    j(
+      api.GET(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy/runs/{runId}',
+        { params: { path: { databaseName, schemaName, tableName, runId } } },
+      ),
+    ),
+  /** A dry run: what a run would do now, with the stored policy or with the policy in the request. Nothing changes. */
+  planPartitionPolicy: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    policy?: S['PartitionPolicyRequest'],
+  ) =>
+    j(
+      api.POST(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/partition-policy/plan',
+        {
+          params: { path: { databaseName, schemaName, tableName } },
+          body: policy ? { policy } : {},
+        },
+      ),
+    ),
   listColocationGroups: (databaseName: string) =>
     j(
       api.GET('/databases/{databaseName}/colocation-groups', {
@@ -207,6 +501,75 @@ export const endpoints = {
     j(
       api.GET('/databases/{databaseName}/colocation-groups/{colocationId}/buckets', {
         params: { path: { databaseName, colocationId }, query: { limit: 500, ...q } },
+      }),
+    ),
+  previewBucketSplit: (
+    databaseName: string,
+    colocationId: number,
+    bucket: number,
+    body: S['BucketSplitRequest'],
+  ) =>
+    j(
+      api.POST(
+        '/databases/{databaseName}/colocation-groups/{colocationId}/buckets/{bucket}/split-preview',
+        {
+          params: { path: { databaseName, colocationId, bucket } },
+          body,
+        },
+      ),
+    ),
+  splitBucket: (
+    databaseName: string,
+    colocationId: number,
+    bucket: number,
+    body: S['BucketSplitRequest'],
+  ) =>
+    j(
+      api.POST(
+        '/databases/{databaseName}/colocation-groups/{colocationId}/buckets/{bucket}/split',
+        {
+          params: { path: { databaseName, colocationId, bucket } },
+          body,
+        },
+      ),
+    ),
+  listSchemas: (
+    databaseName: string,
+    q: Page & { distributed?: boolean; shardGroupId?: number; state?: 'active' | 'moving' } = {},
+  ) =>
+    j(
+      api.GET('/databases/{databaseName}/schemas', {
+        params: { path: { databaseName }, query: { limit: 500, ...q } },
+      }),
+    ),
+  getSchema: (databaseName: string, schemaName: string) =>
+    j(
+      api.GET('/databases/{databaseName}/schemas/{schemaName}', {
+        params: { path: { databaseName, schemaName } },
+      }),
+    ),
+  distributeSchema: (
+    databaseName: string,
+    schemaName: string,
+    body: S['DistributeSchemaRequest'],
+  ) =>
+    j(
+      api.PUT('/databases/{databaseName}/schemas/{schemaName}/distribution', {
+        params: { path: { databaseName, schemaName } },
+        body,
+      }),
+    ),
+  undistributeSchema: (databaseName: string, schemaName: string, shardGroupId?: number) =>
+    j(
+      api.DELETE('/databases/{databaseName}/schemas/{schemaName}/distribution', {
+        params: { path: { databaseName, schemaName }, query: { shardGroupId } },
+      }),
+    ),
+  moveSchema: (databaseName: string, schemaName: string, body: S['MoveSchemaRequest']) =>
+    j(
+      api.POST('/databases/{databaseName}/schemas/{schemaName}/moves', {
+        params: { path: { databaseName, schemaName } },
+        body,
       }),
     ),
   getBucketDistribution: (databaseName: string, colocationId?: number) =>
@@ -257,6 +620,8 @@ export const endpoints = {
   getFailoverReport: (reportId: number) =>
     j(api.GET('/failover/reports/{reportId}', { params: { path: { reportId } } })),
   resetAutoFailoverCounter: () => j(api.POST('/settings/cluster/auto-failover/reset')),
+  abandonMapGroupBootstrap: (reason: string) =>
+    j(api.POST('/failover/map/abandon', { body: { reason } })),
 
   // --- tasks
   listTasks: (q: Page & { state?: TaskState; kind?: TaskKind } = {}) =>
@@ -592,6 +957,106 @@ export const endpoints = {
   /** 202 + task `config.restart`. */
   restartPendingInstances: async (body: RestartPendingRequest): Promise<Task> =>
     (await j(api.POST('/config/restarts', { body }))) as Task,
+
+  // --- data transfer (0.19.0): table export and import, resumable uploads, downloads
+  /** 202 + task `table.export`; when it is done its `detail` is `transfer <id>`, the id of the export file. */
+  exportTable: async (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['ExportTableRequest'] = {},
+  ): Promise<Task> =>
+    (await j(
+      api.POST('/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/export', {
+        params: { path: { databaseName, schemaName, tableName } },
+        body,
+      }),
+    )) as Task,
+  /** 202 + task `table.import`. */
+  importTable: async (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    body: S['ImportTableRequest'],
+  ): Promise<Task> =>
+    (await j(
+      api.POST('/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/import', {
+        params: { path: { databaseName, schemaName, tableName } },
+        body,
+      }),
+    )) as Task,
+  // The calls of an upload keep the session in place when the answer is 401: the uploader asks for the password and goes on.
+  createDataUpload: (body: S['CreateDataUploadRequest']) =>
+    j(api.POST('/data-uploads', { body }), { keepSession: true }),
+  getDataUpload: (uploadId: string) =>
+    j(api.GET('/data-uploads/{uploadId}', { params: { path: { uploadId } } }), {
+      keepSession: true,
+    }),
+  /**
+   * Sends one chunk at `offset`. The answer is the offset the server holds afterwards. A 409
+   * `upload_offset_mismatch` is not an error here: it says where the server is (`conflict: true`), and the caller
+   * continues from that offset (also for a 400 that carries `Upload-Offset`). Any other refusal is thrown.
+   */
+  uploadDataChunk: async (
+    uploadId: string,
+    offset: number,
+    chunk: Blob,
+    signal?: AbortSignal,
+  ): Promise<{ offset: number; conflict: boolean }> => {
+    const result = await api.PATCH('/data-uploads/{uploadId}', {
+      params: { path: { uploadId }, header: { 'Upload-Offset': offset } },
+      body: chunk as unknown as string,
+      bodySerializer: (body: unknown) => body as BodyInit,
+      headers: { 'Content-Type': 'application/octet-stream' },
+      signal,
+    })
+    const held = parseOffset(result.response.headers.get('Upload-Offset'))
+    // A 409 says where the server is. So does a 400 that carries the header: the body was cut and the server kept what it
+    // had read (whole segments). Both are answers about the offset, not refusals of the upload.
+    const status = result.response.status
+    if ((status === 409 || status === 400) && held !== null) return { offset: held, conflict: true }
+    await j(Promise.resolve(result), { keepSession: true })
+    if (held === null) throw new Error('The server did not say where the upload is.')
+    return { offset: held, conflict: false }
+  },
+  /** Asks whether the session is alive without sending the person away when it is not (the uploader asks between chunks). */
+  refreshSession: () => j(api.GET('/auth/session'), { keepSession: true }),
+  deleteDataUpload: (uploadId: string) =>
+    j(api.DELETE('/data-uploads/{uploadId}', { params: { path: { uploadId } } }), {
+      keepSession: true,
+    }),
+  listDataExports: (q: Page = {}) => j(api.GET('/data-exports', { params: { query: q } })),
+  getDataExport: (exportId: string) =>
+    j(api.GET('/data-exports/{exportId}', { params: { path: { exportId } } })),
+  deleteDataExport: (exportId: string) =>
+    j(api.DELETE('/data-exports/{exportId}', { params: { path: { exportId } } })),
+  /**
+   * Opens the file from byte `from` (a `Range` request when `from` is above 0). The answer is the stream and what the
+   * server said about it; the caller checks the status (200 or 206), `Content-Range` and `Content-Length`.
+   */
+  downloadDataExport: async (
+    exportId: string,
+    from = 0,
+    signal?: AbortSignal,
+  ): Promise<ExportStream> => {
+    const result = await api.GET('/data-exports/{exportId}/content', {
+      params: {
+        path: { exportId },
+        header: from > 0 ? { Range: `bytes=${from}-` } : {},
+      },
+      parseAs: 'stream',
+      signal,
+    })
+    await j(Promise.resolve(result), { keepSession: true })
+    const { response } = result
+    return {
+      status: response.status,
+      body: response.body,
+      contentLength: parseOffset(response.headers.get('Content-Length')),
+      contentRange: response.headers.get('Content-Range'),
+      etag: response.headers.get('ETag'),
+    }
+  },
 
   // --- workbench, alerts, logs, metrics
   executeQuery: (body: S['QueryRequest'], signal?: AbortSignal) =>

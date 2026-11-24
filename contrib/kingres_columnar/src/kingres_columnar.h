@@ -405,6 +405,7 @@ extern KcAmClass kc_am_class_memo(Oid amoid, KcAmMemo *memo);
 extern bool kc_am_is_columnar(Oid amoid);
 extern void kc_am_failed_reset(void);
 extern void kc_am_cache_init(void);
+extern void kc_catalog_reset(void);
 extern bool kc_rel_is_columnar(Relation rel);
 
 /* the test gates of the check (kingres_columnar.c) */
@@ -467,6 +468,7 @@ extern void kc_reserve_gate(int point);
 /* points of kingres_columnar.reserve_gate_at in the vacuum (testing); 1 to 4 are the writer's, in kc_write.c */
 #define KC_RES_VAC_RANGES	6	/* an index vacuum has its ranges, has not scanned the index (C14-01) */
 #define KC_RES_VAC_MERGED	7	/* the merge of a VACUUM is done, the freeze not yet (C14-06) */
+#define KC_RES_VAC_LOCKED	8	/* an index vacuum holds the vacuum lock, has not read the ranges (C14-08) */
 extern bool kc_scan_dirty_fetch(Relation rel, ItemPointer tid, Snapshot snap, TupleTableSlot *slot);
 extern void kc_index_vacuum(Relation rel, bool skip, double live_rows, BufferAccessStrategy bstrategy);
 

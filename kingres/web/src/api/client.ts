@@ -127,8 +127,15 @@ export function parseRetryAfter(value: string | null): number | null {
  * Awaits an openapi-fetch call and returns its data, or throws an ApiError.
  * Every query, mutation and task poll goes through this, so components never see raw responses,
  * and an answer that says "the session is gone" is noticed in one place whoever asked.
+ *
+ * `keepSession` is for a transfer that must not lose its place: an answer that says the session is gone is
+ * thrown as an error and is not reported, so the page is not sent to the sign-in page. The caller asks for
+ * the password again and goes on (the uploader of a long file does).
  */
-export async function unwrap<T>(call: Promise<Result<T>>): Promise<T> {
+export async function unwrap<T>(
+  call: Promise<Result<T>>,
+  options: { keepSession?: boolean } = {},
+): Promise<T> {
   let result: Result<T>
   try {
     result = await call
@@ -152,7 +159,7 @@ export async function unwrap<T>(call: Promise<Result<T>>): Promise<T> {
         true,
         retryAfter,
       )
-  if (isSessionLost(error)) reportSessionLost()
+  if (isSessionLost(error) && options.keepSession !== true) reportSessionLost()
   if (error.code === 'system_database_stopped') reportSystemDatabaseStopped()
   throw error
 }

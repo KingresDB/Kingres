@@ -95,6 +95,16 @@ const ledgerLinkText = computed(() => {
         ? 'Publication of the ledger'
         : 'Ledger page'
 })
+// 0.18.0: an alert about a time-partitioning policy names its table in the typed members `tableSchema` and `tableName` of the
+// subject and links to the partitions panel of that table. The names are used as they are: a name with a dot is unambiguous.
+const isPolicyAlert = computed(() =>
+  ['partitionsAheadLow', 'partitionPolicyFailed'].includes(props.alert.kind),
+)
+const policyTable = computed(() => {
+  const s = subject.value as { tableSchema?: string | null; tableName?: string | null }
+  return s.tableSchema && s.tableName ? { schema: s.tableSchema, table: s.tableName } : null
+})
+const canTable = computed(() => session.can('getTable'))
 const isPending = computed(() => props.alert.kind === 'replicationPending')
 // 0.8.0: a clock that differs is explained and handled on the Time tab of the Configuration page.
 const canTime = computed(
@@ -163,6 +173,31 @@ const any = computed(
     <li v-if="isLedgerAlert && canLedger" data-testid="alert-ledger">
       <RouterLink :to="ledgerLink">{{ ledgerLinkText }}</RouterLink>
     </li>
+    <li
+      v-if="isPolicyAlert && policyTable && subject.databaseName"
+      data-testid="alert-policy-table"
+    >
+      Table
+      <RouterLink
+        v-if="
+          canTable &&
+          isAddressableSegment(subject.databaseName) &&
+          isAddressableSegment(policyTable.schema) &&
+          isAddressableSegment(policyTable.table)
+        "
+        :to="{
+          name: 'table',
+          params: {
+            name: subject.databaseName,
+            schema: policyTable.schema,
+            table: policyTable.table,
+          },
+        }"
+        ><SafeName :value="`${policyTable.schema}.${policyTable.table}`" :max="120"
+      /></RouterLink>
+      <SafeName v-else :value="`${policyTable.schema}.${policyTable.table}`" :max="120" />
+      (time partitioning)
+    </li>
     <li v-if="canTime" data-testid="alert-clock">
       <RouterLink :to="{ name: 'configuration', query: { tab: 'time' } }"
         >Clocks and what to do</RouterLink
@@ -179,7 +214,7 @@ const any = computed(
       example after a restore from a backup. Nothing is signed until this is resolved, so that no
       checkpoint contradicts what auditors already hold.
     </li>
-    <li v-if="subject.aspect" data-testid="alert-aspect">
+    <li v-if="subject.aspect && !(isPolicyAlert && policyTable)" data-testid="alert-aspect">
       <template v-if="aspectText">{{ aspectText }}</template>
       <template v-else
         >Concerns <SafeName :value="subject.aspect" kind="text" :max="60"

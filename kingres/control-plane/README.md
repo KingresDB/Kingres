@@ -13,7 +13,7 @@ Settings pages; the third lets a second and a third server join (`joinCluster`, 
 server (`removeServer`) and makes the cluster-wide operations run on every server (see
 [Running several servers](#running-several-servers)). At that time rebalance, failover, restoring preferred primaries
 still answered the contract's "not supported yet" problem (rebalance and failover are built since; the table
-under "What is implemented" is current, and only `restorePreferredPrimaries` and eight ledger operations still answer so). The fourth step added server groups, leaving a cluster,
+under "What is implemented" is current, and no operation answers so any more). The fourth step added server groups, leaving a cluster,
 instance start and stop, local settings, inclusion proofs and verification records, security headers and
 crash-injection tests of the task engine. The fifth step (contract 0.5.0) added certificate renewal and revocation,
 the cluster-wide logs, alerts and metrics, the alert kinds that nothing raised, and the corrections listed in
@@ -306,6 +306,11 @@ handlers in `internal/httpapi/handlers_config.go`, wiring in `cmd/kingresd/confi
   PostgreSQL 18 shows `archive_command` and `restore_command` to every database user, so they are refused by name and
   their value is never returned by this API. Cluster-only parameters (`TimeZone`, `lc_*`, `DateStyle`,
   `kingres_shard.default_bucket_count`, ...) cannot be set per server group or server.
+- **Warnings of the preview** (contract 0.16.0, `pgconfig/warnings.go`) never make a request invalid: `config_value_unusual`
+  for a memory value above ten times or below a tenth of the default of the parameter (exactly ten times and a tenth
+  pass; a default of zero never warns), and `config_reserved_connections` when on some server `max_connections` would
+  not exceed `superuser_reserved_connections + reserved_connections`. The sum is computed from the values the change
+  gives and the running ones (a hand-written rule; `postgres -C` does not check it, PostgreSQL checks it at the start).
 - **Validation** is PostgreSQL's: `pg_settings` (type, unit, range, enum), then `set_config` in a rolled-back
   transaction or `postgres -C` for the value, then `pg_file_settings` on the written file before it is reloaded
   (a bad file is replaced by the previous one and never loaded). Nothing is written before every change of a
@@ -330,16 +335,92 @@ handlers in `internal/httpapi/handlers_config.go`, wiring in `cmd/kingresd/confi
   the override file with hostile values, the check before the reload. On three servers
   (`internal/clustertest/config_test.go`): cluster, group and server levels, removal, pending restart and the restart
   task, the order of standbys and primaries, refused and invalid values, a server that is down, a server that fails,
-  database and cluster time zones, the clock difference, history and revert, audit, roles.
+  database and cluster time zones, the clock difference, history and revert, audit, roles. The tests that the check of
+  the phase against its design found missing are in `config_closing_test.go`: `pg_file_settings` clean on every server, a
+  value that PostgreSQL rejects in the file (the file is restored and the text is reported), a database time zone seen
+  on a standby, and the warnings of the preview.
+
+## Data transfer: table CSV export and import (phase 14a, contract 0.19.0)
+
+Design: [../docs/design/data-export-import.md](../docs/design/data-export-import.md) (its last section before "Known limits" says where the code
+differs from the text). Ten operations, tag `Data transfer`: two tasks (`table.export`, `table.import`) and eight operations on staged files.
+
+**Who and what is checked.** Every operation needs `kingres_admin`, the cluster setting `dataTransfer.enabled` (off by default; the leader reads it, a
+follower cannot) and a request that arrived over TLS (the server that received it decides; start `kingresd` with `-tls-cert-file` and `-tls-key-file`).
+The data is bound by the PostgreSQL privileges of the signed-in role: the connection of an export or an import is the role's. A staged file belongs to
+its creator by **name and OID**; another role sees 404 (also another administrator), only a delete is open to every administrator. The role is checked again
+at the start of every step and before the commit (`CurrentRoles`, the OID): a role that signed out, was demoted, expired or was replaced ends the task with
+the code `forbidden` and stores nothing.
+
+**Where files live.** `-transfer-dir` (default `<data-dir>/transfer`, mode 0700, marked by `.kingres-transfer`; refused when it is not empty and unmarked, or is or
+holds the data directory), the master key `-transfer-key-file` (default `<data-dir>/transfer.key`, never inside the staging directory, in file-level
+backups of the data directory), `-transfer-max-duration` (24h; the COPY carries the time left as its `statement_timeout`) and `-max-atomic-bytes` (2 GiB of
+decompressed CSV per import). Files are sealed in 64 KiB segments with AES-256-GCM (package `staging`, increment CP2). Limits and the janitor are
+in the design note; the janitor runs on the leader every 5 minutes and once before the first transfer, expires files, deletes the files of dropped roles and
+stops when the files show an id the system database never issued (a restored database).
+
+**Streaming relay.** `uploadDataChunk` and `downloadDataExport` carry `x-streams`; they leave the 30 s request timeout and the 1 MiB body limit and use idle
+deadlines that move with the bytes (package `relay`, `internal-api.md`, "The streaming relay"). A follower relays them to the leader through
+`POST /internal/v1/forward-stream` without buffering. Spike S1 moved 5 GiB each way with a heap growth of 3 and 13 MiB.
+
+**Export.** One `COPY (SELECT ...) TO STDOUT` of the table in a read-only `READ COMMITTED` transaction of the role, `row_security = off`, fixed session formats
+(`DateStyle`, `IntervalStyle`, `extra_float_digits`, `bytea_output`, `TimeZone`, `lc_monetary`, `client_encoding`), through the compression and the seal; at most
+three attempts for a read that a moved bucket or a lost connection interrupted. The statement is built from names that passed `sqlx` and from checked options;
+`spreadsheetSafe` (default on) prefixes risky text cells with an apostrophe in SQL (a convenience, not a security feature; it loses the padding of `char(n)` and
+the value it changes). The consistency label is `single-snapshot` for a local or reference table and for a distributed table on one group, `per-group` otherwise;
+**there is no global snapshot**. A table with row-level security is exported only by its owner or a role with `BYPASSRLS`, and a read that would run a function
+of another role needs `acknowledgeOtherRolesCode`.
+
+**Import.** All or nothing, in one step (*Load rows*): `BEGIN`, `COPY ... FROM STDIN`, the count of the server compared with the records the scanner counted, an
+insert into `kingres_transfer.import_marker` (a row keyed by a random 128-bit nonce that the task carries, written through the security definer function
+`kingres_transfer.mark(nonce, task, rows, tag)`, which inserts only when `tag` is SHA-256 of a per-database secret and of `nonce:task:rows`; only the control plane can compute it, so no
+role can forge, pre-empt or hold a marker, and the role needs no grant and can still be dropped; the secret and the table are readable by the service role only; markers older than
+30 days are deleted; the schema, tables and function are created and checked by the service role on every use and the import fails closed when the schema exists with another
+owner or holds a trigger, rule, policy, other column or other function, so a database owner cannot plant `kingres_transfer`; an operator removes a planted schema), the commit intent written in the detail of the task under the lease, `COMMIT`. No transaction lives between steps. The marker commits with the rows or not at
+all, so after any interruption the answer to "did it commit" is read from the database: a run that finds the intent asks the marker; a row `committed` finishes the task
+(*Confirm the commit* records the count and the audit event); otherwise the run inserts a tombstone `aborted` for the task (it waits up to 60 seconds for a transaction
+that holds the key) after which no transaction of that task can commit, and fails `copy_interrupted` (retryable) with the proof that nothing was stored. `nothing was
+stored` is never said without that proof. When the question cannot be asked (the lock wait ran out, or the marker is on the server that was the leader before a
+change of leader) the task fails `import_outcome_unknown` and is never retried. A cancel is accepted until the intent is written. The role is refused at the request
+and in the step when it has SUPERUSER, REPLICATION or BYPASSRLS or reaches server files, programs or logs (an import runs the triggers and defaults of the table as that
+role). The setting `dataTransfer.enabled` is read again by the first step of a task: turning it off ends a task that has not begun to move data; a task that is moving
+data is cancelled with `cancelTask`. A transient error of the role check is retryable (`transfer_session_lost`), not a refusal. `done` means the local commit happened; a group whose `COMMIT PREPARED` is still pending
+may show its rows a moment later. A file exported with the spreadsheet guard and a header has an apostrophe in front of a header cell that starts like a formula; import it with `header: skip`
+(`match` compares the names). The marker table is local to the database of the server that loaded (design: a reference table for the batch import of 14c). A reference table is loaded through a temporary table and
+inserts from typed arrays (`unnest($1::int[], ...)`), cap 256 MiB, and refuses array columns. The scanner refuses an unquoted `\.` line (`import_end_marker`;
+on PostgreSQL 18 and 19 it is data in CSV, the refusal is the conservative choice) and a record above 16 MiB; a gzip stream is counted against the limit. **Identity
+columns of a distributed table draw from the sequence of the node the statement runs on** (design F18): rows loaded without the column from different servers can
+repeat values; list the column in the file.
+
+**Errors.** One function, `transfer.SafeError`, builds every error of a transfer from the SQLSTATE, a sentence per state, the names of the schema, table, column and
+constraint (the table is the task's own; a bucket partition name is dropped) and the absolute line number; never the message, detail, hint, context or the row, and
+never the `where` of the router (it holds the socket directory of a node). No problem, task error, task detail, audit event or log line of a transfer has a value
+of the data (tests plant a canary in the failing row of every class).
+
+**Tests.** `internal/relay` (spike S1, `KINGRES_SPIKE_BYTES=5368709120` for the full size), `internal/transfer` (SafeError, scanner, options, record; the record tests
+need PostgreSQL), `internal/staging` (CP2), `internal/httpapi` (guards, relay), `internal/internalapi` (the call against a real mutual TLS listener),
+`cmd/kingresd` (`TestUpload*`, `TestExport*`, `TestImport*`: real kingresd over HTTPS, `-max-atomic-bytes 4194304`), `internal/clustertest`
+(`TestDataTransferThroughAFollower`: three servers, uploads, downloads, import and export through followers, a follower that dies in the middle of an upload).
+Run the PostgreSQL ones with `scripts\run-integration.ps1 -Packages ./cmd/kingresd -Run 'TestUpload|TestExport|TestImport'` on both majors.
+
+**Not built in 14a.** Batches, `skipRows`, `onError` (the router refuses `ON_ERROR`; the console never offers it, nor `LOG_VERBOSITY`), a real failover of the manager leader at every step (the tests restart the leader on its own disk and stop a shard group instead).
+
+**Metrics and alert (added to 0.19.0 before its release).** `transferStagingUsedBytes`, `transferStagingFreeBytes`, `transfersRunning`, `transfersStaged` (server metrics of the
+server that holds the files) and the alert `transferStagingLow` (warning at 90 percent of the staging quota, critical at 98).
+
+**Fault tests added after the first review round.** `TestImportRecordNearTheLimit` (15.5 MiB through PostgreSQL, 16 MiB and 1 byte refused), `TestImportCancelAfterTheIntent` (409,
+the import completes once), `TestImportLeaseLostBeforeTheIntent` (the write of the intent refused: a take-over loads once, no doubled rows), `TestImportCrashAfterCommit` (the lease lost after COMMIT: the marker finishes the task with exactly the rows), `TestImportCommitFaultPoints` (a connection killed after the intent: the marker proves that nothing was stored), the tests of the fixes of the review in `review14_e2e_test.go`, `TestExportUntrustedFunction` (a policy
+of another role: `export_untrusted_code`), `TestStagingMetricsAndAlert`, and on three servers `TestDataTransferLeaderRestartMidTransfer` and
+`TestDataTransferShardGroupLostMidCopy` (rows are all or none; no prepared transaction is left).
 
 ## What is implemented
 
-The server implements revision **0.14.0** of the contract (140 operations, 113
+The server implements revision **0.19.0** of the contract (171 operations, 136
 paths; what is not done is in "Not done in this increment"). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **139 of 140 operations are real; 1 answer "not yet".**
+authenticated operation lists in 0.2.0. **171 of 171 operations are real; 0 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -348,22 +429,24 @@ authenticated operation lists in 0.2.0. **139 of 140 operations are real; 1 answ
 | Auth | `login`, `logout`, `getSession` |  |
 | Cluster | `getCluster`, `getClusterSummary` |  |
 | Roles | `listClusterRoles`, `listRoles`, `createRole`, `getRole`, `deleteRole`, `updateRole`, `setRoleClusterRoles`, `setRoleMemberships` |  |
-| Databases | `getDatabaseCreateOptions`, `listDatabases`, `createDatabase`, `getDatabase`, `dropDatabase`, `updateDatabase` |  |
-| Shards | `getBucketDistribution`, `listColocationGroups`, `listBuckets` |  |
+| Databases | `getDatabaseCreateOptions`, `listDatabases`, `createDatabase`, `getDatabase`, `dropDatabase`, `updateDatabase`, `getApproximateAggregates`, `configureApproximateAggregates` |  |
+| Schemas | `listSchemas`, `getSchema`, `distributeSchema`, `undistributeSchema`, `moveSchema` |  |
+| Shards | `getBucketDistribution`, `listColocationGroups`, `listBuckets`, `previewBucketSplit`, `splitBucket` |  |
 | Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus`, `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification`, `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`, `retireLedgerSigningKey`, `revokeLedgerSigningKey`, `getLedgerTrustFile`, `getLedgerPublication`, `getLedgerAggregate`, `listLedgerAggregates`, `listLedgerAnchorTargets`, `createLedgerAnchorTarget`, `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`, `deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor`, `downloadLedgerAnchor`, `listLedgerClientKeys`, `registerLedgerClientKey`, `revokeLedgerClientKey`, `setTableSignaturePolicy`, `upgradeLedgerExtension`, `createLedgerBundle`, `getLedgerBundle`, `acknowledgeLedgerDivergence` | |
-| Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables`, `previewTableChange`, `undistributeTable`, `alterTableDistribution`, `listTablePartitions`, `createTablePartition`, `attachTablePartition`, `detachTablePartition`, `dropTablePartition` |  |
+| Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables`, `previewTableChange`, `undistributeTable`, `alterTableDistribution`, `listTablePartitions`, `createTablePartition`, `attachTablePartition`, `detachTablePartition`, `dropTablePartition`, `setTableStorage`, `setPartitionStorage`, `getPartitionPolicy`, `putPartitionPolicy`, `deletePartitionPolicy`, `runPartitionPolicy`, `listPartitionPolicyRuns`, `getPartitionPolicyRun`, `planPartitionPolicy` |  |
 | Grants | `listGrants`, `createGrant`, `revokeGrants`, `applyGrantTemplate` |  |
 | Health | `getHealth`, `getReadiness` |  |
 | Logs | `listLogs` |  |
 | Metrics | `queryMetrics` |  |
 | Query | `executeQuery`, `cancelStatement` |  |
 | Rebalance | `getRebalanceStatus`, `startRebalance`, `previewRebalancePlan`, `listRebalanceReports`, `getRebalanceReport`, `stopRebalance` |  |
-| Replication | `getReplicationTopology`, `getFailoverStatus`, `listFailoverReports`, `getFailoverReport` | `restorePreferredPrimaries` |
+| Replication | `getReplicationTopology`, `getFailoverStatus`, `listFailoverReports`, `getFailoverReport`, `restorePreferredPrimaries`, `abandonMapGroupBootstrap` | |
 | Server groups | `listServerGroups`, `createServerGroup`, `deleteServerGroup` |  |
-| Servers | `listServers`, `getServer`, `addServer`, `removeServer`, `updateServer`, `renewServerCertificates`, `revokeServerCertificates`, `failoverServer` |  |
+| Servers | `listServers`, `getServer`, `addServer`, `removeServer`, `updateServer`, `renewServerCertificates`, `revokeServerCertificates`, `failoverServer`, `drainServer`, `previewServerDrain` |  |
 | Configuration | `listConfigParameters`, `getConfigParameter`, `previewConfigChange`, `applyConfigChange`, `listConfigChanges`, `revertConfigChange`, `listConfigServers`, `getConfigSummary`, `getClusterTime`, `listTimeZones`, `restartPendingInstances` |  |
 | Settings | `getClusterSettings`, `updateClusterSettings`, `resetAutoFailoverCounter` |  |
 | Network access | `getNetworkAccess`, `replaceNetworkAccess` |  |
+| Data transfer | `exportTable`, `importTable`, `createDataUpload`, `getDataUpload`, `uploadDataChunk`, `deleteDataUpload`, `listDataExports`, `getDataExport`, `downloadDataExport`, `deleteDataExport` |  |
 | Setup | `initCluster`, `joinCluster`, `getNodeState`, `checkSetupToken` |  |
 | Tasks | `listTasks`, `getTask`, `cancelTask` |  |
 | This server | `getThisServer`, `listThisServerInstances`, `getThisServerInstance`, `restartThisServerInstance`, `listThisServerLogs`, `getThisServerResources`, `startThisServerInstance`, `stopThisServerInstance`, `leaveCluster`, `getThisServerSettings`, `updateThisServerSettings` |  |
@@ -1068,6 +1151,8 @@ first step that is not recorded `done`. What the engine promises:
 - A `NonIdempotent` step that was recorded `running` but not `done` is **not** run again: the task fails with the
   code `step_interrupted` (not retryable) and names the step, because it is unknown whether the effect happened. The
   steps after it do not run. A crash before the `running` record leaves the step untouched, so it runs once.
+  A step that can read its own effect has a `Recover` (`task.Step.Recover`): it is asked first, `true` records the step `done` without
+  running it, `false` (the effect is provably not there) runs it, and an error is `step_interrupted` as before. A step that cannot tell must not have one.
 - A task whose process died is never lost and never stays `running` forever: once the lease expired it is resumed or
   failed as above, as long as some server runs the engine. A task that has all steps `done` is recorded `done`.
 - Secrets live only in the process that started the task; a resumed step that needs one fails with
@@ -1081,7 +1166,7 @@ hook end the process: `crash_test.go` simulates the death with a store that refu
 (`TestTaskEngineSurvivesAKilledProcess`, real PostgreSQL, WSL) starts the test binary as helper processes that
 `os.Exit(137)` at each point, then a second process takes the task over; the steps count their runs in a side file.
 The real task `server.add` is killed with SIGKILL at each of its steps by `TestJoinInterruptedAtEveryStepResumes`.
-No task kind of the product is marked `NonIdempotent` today (all steps check what exists before they create).
+Only the two steps of the distributed schemas that call the extension once (`Make the schema distributed`, `Make the schema local`) are marked `NonIdempotent`, with a `Recover` (see Distributed schemas); every other step checks what exists before it creates.
 
 ## Not done in this increment, and the manager's state on a leader change
 
@@ -1792,7 +1877,7 @@ revocation). Contract 0.6.0 and its breaking and additive changes: `kingres/api/
 
 | Finding | Result | What changed | Test |
 |---|---|---|---|
-| CP2-01 / CP-07 forwarded identity by name | fixed | Per-request SCRAM-style proof of a session of the named user, checked against the user's verifier by the leader only (`internal/fwdproof`, `internal/scram`, `auth/proofkey.go`); cluster-wide reads carry an assertion signed by the leader (`POST /gather-authorize`) instead of a proof, so no other member ever receives a value from which a ClientKey can be derived; pending servers authorize nothing; `Proxy.Allow` runs after the guard. See `internal-api.md`, "Forwarded identities need a proof". | `fwdproof` tests, `internalapi` `TestPendingServerAuthorizesNothing`, `TestUnprovenIdentityIsRefusedBeforeTheBackend`, clustertest `TestForwardedIdentityNeedsTheProofOfASession` (real three-server cluster; with the check switched off the same forward without a proof answered 200) |
+| CP2-01 / CP-07 forwarded identity by name | fixed | Per-request SCRAM-style proof of a session of the named user, checked against the user's verifier by the leader only (`internal/fwdproof`, `internal/scram`, `auth/proofkey.go`); cluster-wide reads carry an assertion signed by the leader (`POST /gather-authorize`) instead of a proof, so no other member receives a value from which a ClientKey can be derived, except the candidate of a failover of the map group, which receives the proof of the operator's request because the leader is gone (F4-05, ADR 0026); pending servers authorize nothing; `Proxy.Allow` runs after the guard. See `internal-api.md`, "Forwarded identities need a proof". | `fwdproof` tests, `internalapi` `TestPendingServerAuthorizesNothing`, `TestUnprovenIdentityIsRefusedBeforeTheBackend`, clustertest `TestForwardedIdentityNeedsTheProofOfASession` (real three-server cluster; with the check switched off the same forward without a proof answered 200) |
 | CP2-02 ops to admin through `addServer` | fixed (breaking) | `addServer` needs `kingres_admin`; a certificate is issued only for a request an administrator made and that names the candidate's certificate; verifiers only after that; a pending server authorizes nothing | clustertest `TestOpsCannotAddAServer`. The run before the fix was not completed, so the first half (the leader signs for an ops caller's server) is confirmed by reading only |
 | CP2-03 pin dropped through a follower | fixed | the receiving server normalizes body and header pin (malformed: 400 everywhere) and forwards one value; the leader uses it for both sources | `httpapi` `TestAddServerPinThroughAFollower` (13 cases) |
 | CP2-05 password before fingerprint | fixed (breaking) | `joinCluster` and `addServer` need a pin or an explicit `allowUnpinned: true` | `TestAddServerPinThroughAFollower`, clustertest `TestJoinPinFlowFromThePanels` |
@@ -1836,7 +1921,7 @@ revocation). Contract 0.6.0 and its breaking and additive changes: `kingres/api/
 
 ### Decisions
 
-1. **Forwarded identities carry a SCRAM-style proof** checked against the user's verifier, sent to the leader only (a receiver of a proof recovers the ClientKey, as a SCRAM server does; a gather therefore carries an assertion signed by the leader, not a proof). A signed assertion of the
+1. **Forwarded identities carry a SCRAM-style proof** checked against the user's verifier, sent to the leader only (the one exception is the request of an operator for the failover of the map group, sent to the candidate that becomes the leader, ADR 0026; a receiver of a proof recovers the ClientKey, as a SCRAM server does; a gather therefore carries an assertion signed by the leader, not a proof). A signed assertion of the
    forwarding server's certificate was rejected: the member's key signs anything, the proof needs a secret that only
    a server that saw the password has.
 2. **A pending server authorizes nothing** except its own join: every call to the leader needs catalog membership.
@@ -3047,6 +3132,8 @@ Built (contract 0.13.0): `internal/failover/journal` (the local journal), `inter
 
 **Not built:** the escrow of the key of the certificate authority (an alert, `certificateAuthorityUnavailable`, says what the operator does by hand: restore `pki/ca.key` and `pki/revoked.json` of the old leader from its backup into the pki directory of the new leader and restart kingresd), the second condition of the gate (the instance of group 0 in recovery), `graceful` for the map group. `Preflight` still refuses the map group with 422 `unsupported_operation` when the leader is alive (the request then goes to the leader).
 
+**The map group with a live old leader (a switchover, a restore, a hard failover).** A planned switchover of the map group (`failoverServer` with `mode: graceful` for the leader's server, and a `restorePreferredPrimaries` that has to move group 0) is built: the map group is the last group of the task; its step `Stop the old primary cleanly` first starts the bootstrap of the chosen standby's server (`POST /failover/map/start` with `planned`, accepted from the old server only), then marks, lets the standby replay the mark, stops the old leader with a fast shutdown, and sends the candidate the proof (`POST /failover/map/proof`); the candidate takes the released lease, promotes on the proof after `switchover_verify`, becomes the leader, marks the task's group 0 row promoted with the new term and opens the gate, and the new leader's engine claims the task and runs again the steps that the old leader could not record (the clean stop, the verification, the lease and the hand-over, the promotion skip because the standby is out of recovery). A **hard** failover of a server whose map group primary answers is still refused with 422 `unsupported_operation`, and the bootstrap itself still refuses a live old server unless the old leader's own task asks (409 `conflict` for an automatic start, 422 `unsupported_operation` for a manual one), and never asks the old server to demote. When the standby refuses the proof after the stop, the candidate lets go of the lease and tells the old leader, whose task rolls back and whose primary is started again by its lease manager; when the old leader's kingresd ends after the stop, the candidate reads the proof from the old leader's server and promotes on it (`docs/design/ha-phase5-part2.md`, "The two open points of the delta, settled").
+
 ## Automatic failover (increment 6 of ha-phase5-part2.md, no change of the contract)
 
 Code: `internal/failover/auto.go` (`Evaluate`, the rule of design 4.2 and 4.3 as a function of a view; `Auto`, the loop every 5 s on the manager leader),
@@ -3070,6 +3157,16 @@ Code: `internal/failover/switchover.go` (the steps), `cmd/kingresd/switchover.go
 Per group (ordinary groups; the map group still answers 422 for `graceful`): `Freeze`, `Choose the standby` (a standby that streams from the primary; the verdict is none), `Stop the writes`, `Let distributed transactions end`, `Stop the old primary cleanly` (mark, the standby replays the mark, fast shutdown, the lease released), `Verify the new primary` (`switchover_verify`, repeated for 30 s), then `Wait for the old lease`, `Hand the lease`, `Promote` and the steps of every failover. Any failure before the promotion rolls back (`rollbackSwitchover`: the leases of the run are released, the old primary is resumed, the writes are let in again) and fails with `standby_behind`, `switchover_unproven`, `cannot_quiesce` or `prepared_transactions_pending`; a cancel does the same through `OnFail`; the cancel guard refuses from the start of `Promote`. The access rules of the old primary are put back in the last step, before its rebuild.
 
 Deviations from the design: the old primary becomes a standby by the rebuild of increment 4 (`pg_rewind`, which finds nothing to rewind after a clean stop), not by the adoption `/standby/adopt {clean}` of 6.3; the phases `quiescing`, `waitingForTransactions`, `stopping`, `verifying` and `writesPausedSince` of `GET /failover` are not reported yet (the steps are named in the task, and the report has the events `quiesced`, `stoppedClean`, `verified` and `writesResumed` with `pauseMs`); `Unquiesce` is not persisted across a restart of kingresd (the failed task puts the rules back).
+
+## The restore of the preferred primaries, the plan of a switchover and the phases (increment 7, round 2; contract 0.13.0 text only)
+
+`POST /replication/restore-preferred-primaries` (optional body `{shardGroupIds, dryRun}`) starts the task `replication.restorePreferredPrimaries`: a switchover (the steps of
+round 1) per group whose primary is not on its preferred server (the server of the group's first node by id), from the server that took it over; code in
+`internal/failover/restore.go` and the per-group `Input.Olds`. Groups at home are not listed, a group whose preferred server has no ready standby and the map group are
+reported `skipped`; a group that fails before its promotion is rolled back and reported `failed` while the task goes on and ends `partial`; 422 `unprocessable` when
+nothing needs to be restored. `dryRun` answers the plan for a restore and for a switchover (`writesPausedSeconds`, the steps, verdict `none`). `GET /failover` names the phase of
+a group of a switchover or restore from the task's steps and `writesPausedSince` from the events `quiesced` and `writesResumed`. See the design ("Increment 7, round 2") for
+what is not built.
 
 ## The signing keys of the ledger (phase 7, steps 3 and 4, contract 0.11.0)
 
@@ -3457,9 +3554,9 @@ submission is partial and passes it to `Resume` at the next attempt, and notes c
 
 The review ([report](../docs/reviews/2026-11-20-kingresd-anchoring-wiring-and-publication-fixes.md)) found one high, five medium, eight low defects and three notes (P7A-01 to P7A-17). Each is fixed with a test that fails for a one-line mutant that brings the defect back; the fixes are not reviewed yet.
 
-* **Restoring the system database (P7A-02, [ADR 0025](../docs/adr/0025-restore-of-the-system-database-is-accepted-by-an-operator.md), design 9.4).** The chain logs are derived again from the chains; the aggregate log and the events are not, and no computation brings them back. A restored database that is behind `published.json` is refused with the critical alert `ledgerSignerUnavailable` (subject `published-state`), which now says what was published, what the database holds and a confirmation of sixteen hexadecimal digits. The procedure: (1) read the alert and check that the database really was restored and that no newer backup of it exists; (2) restart every `kingresd` after the restore of the system database (as before); (3) on the host of the manager leader write the confirmation of the alert, and on a second line a reason of up to 200 printable ASCII characters, into `<ledger-keys-dir>/accept-restore`; (4) the leader makes the record what the database holds, one generation higher, keeps the old record as `published.json.before-restore-<generation>`, removes the file, and publishes the signed event `restore-acknowledged` before it signs anything else. The other holders take the new generation when the leader sends its record. The logs fork against a mirror that holds the old checkpoints; the event is the public statement of that. A confirmation of another situation is ignored.
+* **Restoring the system database (P7A-02, [ADR 0025](../docs/adr/0025-restore-of-the-system-database-is-accepted-by-an-operator.md), design 9.4).** The chain logs are derived again from the chains; the aggregate log and the events are not, and no computation brings them back. A restored database that is behind `published.json` is refused with the critical alert `ledgerSignerUnavailable` (subject `published-state`), which now says what was published, what the database holds and a confirmation of sixteen hexadecimal digits. The procedure: (1) read the alert and check that the database really was restored and that no newer backup of it exists; (2) restart every `kingresd` after the restore of the system database (as before); (3) on the host of the manager leader write the confirmation of the alert, and on a second line a reason of up to 200 printable ASCII characters, into `<ledger-keys-dir>/accept-restore`; (4) the leader makes the record what the database holds, one generation higher, keeps the old record as `published.json.before-restore-<generation>` (written whole into a temporary file, synced and renamed, with the directory synced, and before anything changes; a copy that is already there is never written over, the new one then gets a suffix `.1`, `.2`, ...: P7R-11), removes the file, and publishes the signed event `restore-acknowledged` before it signs anything else. The other holders take the new generation when the leader sends its record. The logs fork against a mirror that holds the old checkpoints; the event is the public statement of that. A confirmation of another situation is ignored. Two properties of this that are accepted and stated (P7R-11): the event is announced at the start of the next round, but a key task may append another event between the acceptance and that round, so the event `restore-acknowledged` is not always the first event after the acceptance (the record is consistent either way, and the verifier reads the event wherever it is); and a cleared note of an accepted restore can come back from a holder that still has it, which is harmless because the event is keyed by `generation:<n>` and publishing it again finds the existing one.
 * **The due list (P7A-01).** `Store.Due(set, perTarget)` selects by state and by due time in the query (pending for the submit job, submitted and claimed for the upgrade job) and limits to 100 records for each target; tests on the memory store and on PostgreSQL.
-* **Credentials (P7A-03).** The job `ledger.anchor.credentials` (every 60 s, on the leader) fetches the files this server lacks from the other holders (`credentials/fetch`), gives the holders the files they lack (`credentials/list` says which) and takes away the files of deleted targets; what it cannot do is the alert `ledgerAnchorFailed` with the subject `target:<id>|credentials`. A target that cannot be built fails its records at once (`target_unbuildable`) with the cause in the alert; Retry after the fix. The REST answer of a create or update does not change (201, 200); a failed distribution is an alert within 10 s.
+* **Credentials (P7A-03).** The job `ledger.anchor.credentials` (every 60 s, on the leader) fetches the files this server lacks from the other holders (`credentials/fetch`), gives the holders the files they lack (`credentials/list` says which) and takes away the files of deleted targets; what it cannot do is the alert `ledgerAnchorFailed` with the subject `target:<id>|credentials`. A target that cannot be built fails its records at once (`target_unbuildable`) with the cause in the alert; Retry after the fix. **Only when every other holder answered that it has no file** (P7R-08: the answer 404 with the text "This server has no credentials file for the target."; a server that is alone is in this case too): when a holder did not answer, or answered anything else, the file may exist, so the records of the target are retried with backoff (`credentials_unreached`, class retryable, the usual retry limits apply), the alert names the holders that could not be asked, and the job asks again every minute; a new leader whose only file-holding predecessor is down therefore does not fail the records for good. The job takes the files of a target away from the holders only for a target that is absent from a list of the targets read **after** the holders were asked (P7R-10: `CreateTarget` commits the row first and writes the files after, so a file that the report shows belongs to a row that exists when the list is read; a target that is created while the job asks is never taken for an orphan). A late worker of an earlier term that met `ErrDeposed` no longer ends the first pass of a later term of the same server (P7R-03: the error is kept with its term). The REST answer of a create or update does not change (201, 200); a failed distribution is an alert within 10 s. **A holder that holds an older file is brought up to date (P7F-01, P7G-02):** every credentials file carries a rotation generation (a counter, 0 for a file of an earlier version) and the stamp of its rotation (16 random bytes), inside the file (inside the sealed text of a sealed file); a rotation writes a generation one above the highest that the leader and the holders it could ask hold. `credentials/list` also says, for each file, the generation and a digest (an HMAC keyed with the stamp, so that a digest that leaks cannot be tested against guesses of a secret, compared in constant time). No time decides anything: not the time of the file system (a restore from a backup resets it) and not one that a holder reports. The job gives the file to a holder with a lower generation, takes the file of a holder with a higher generation before it gives anything away (`credentials/fetch` of that holder), gives a file of the same generation that differs to nobody (the alert asks the operator to enter the credentials again, which makes a higher generation), and a server refuses to write a file of a lower generation over a higher one, or another of the same generation (`409 older_generation`), whoever sends it. The job keeps the alert while a holder cannot be asked or was not given the file, and clears it only when the pass saw every holder current or gave the file to every holder that was behind. A worker asks the holders before it builds a target (at most once in 30 s for each target and term) and takes a newer file first; when a newer file exists and cannot be taken the record waits (`credentials_stale`, class retryable) and nothing is sent with the old credentials; when the holders cannot be asked at all (the old leader is down) the worker goes on with its own file. A file that a holder gave and this server could not write is `credentials_unreached` (retryable), no longer the final `target_unbuildable`. A newer file that cannot be taken is waited for 30 minutes (`credentials_stale`, retryable) and then fails the records for good with an alert (Retry after the fix); a file that does not open here (another passphrase) fails them at once; a passphrase file that cannot be read is a matter of this server (retryable, like a full disk). The event `restore-acknowledged` now has the subject `generation:<n>:<first 16 hex digits of the sum of the replaced record>` (P7F-07), so a second restore that reaches the same generation number is announced too.
 * **Passes (P7A-04).** One worker for each target, the pass waits 20 s at most; a hung target keeps its worker and does not hold the others.
 * **Evidence (P7A-05, P7A-09).** A receipt is compared with the record before it makes it anchored (the key and the sum of the note, the digest, the imprint of the token); the evidence file `json` is for an anchored record only (404 otherwise), with the time of the anchoring.
 * **A chain that answers another chain id (P7A-06)** is retired only when the same id answers in every round for 30 minutes (the same time as for a database that vanished); an alert from the first answer. The clock is in memory (P7A-16): a change of leader starts it again. This is in `ledgerround/chain.go`.
@@ -3502,3 +3599,217 @@ increment is installed in the installation of the tests.
 
 Not done: the rebalance does not look for an unfinished table task before it moves a bucket of the group (the extension refuses a move of a group that an operation claims; the rebalance then reports the move as failed); `Table.operation`
 (the unfinished task of a table) of the design is not in the contract yet; `relatedTables` of the distribute request (distribute with related tables) is increment 9.7; the free space of other servers.
+
+## Elasticity (phase 10, contract 0.15.0): strategies and weights, drain, automatic mode, split
+
+Design: [shard-phase10.md](../docs/design/shard-phase10.md), sections 4, 6, 8, 9, 11 and 21.11. The first increment (the six rebalance operations by bucket count) was built earlier (contract 0.9.0);
+this is what 0.15.0 adds. All of it needs the sharding extension 0.8; against an older one the plan stays the plan by bucket count (`kingres.rebalance_plan()`) and anything else is refused with
+422 `unsupported_operation`.
+
+**Strategies, threshold, weights (increment 2).** `rebalance.Options` has `strategy` (`byBucketCount`, `byDiskSize`), `threshold`, `drainOnly`, `maxMovesPerServer`, `acknowledgeFailures`,
+`cleanupDelaySeconds` and the trigger of the run; `Resolve` fills what a request leaves out from the cluster settings (`kingres_cp.cluster_setting`, keys `rebalance.*`) and the default threshold of the
+strategy (0 by bucket count, 0.1 by disk size), so the run records what it really used. `PG.Plan` calls `kingres.plan_rebalance(strategy, threshold, NULL, drain_only, extra_load, exclude_groups, NULL)`
+on the map group primary of the database, with the load of the other databases as `extra_load` (their `group_load`, matched to the groups of this database by the host and port of the primary, because group numbers belong to one
+catalog each), and `excludeServerIds` as `exclude_groups`. `previewRebalancePlan` adds the strategy, the threshold, `imbalance` (the worst deviation of a receiver, from `group_load`), `loadBefore` and `loadAfter` per
+server and the warning `groupUnavailable`. The weight of a server is `kingres.node.weight` (the same on every node row of the server); `PATCH /servers/{id}` with `weight` writes it with
+`set_node_property(node, NULL, weight)` and `Server.weight` reads it (absent when the column does not exist). The new settings are `rebalance.strategy`, `threshold`, `maxMovesPerServer`, `maxMoveAttempts`,
+`maxDiskUsedFraction` and `maxStandbyLagBytes`; `updateClusterSettings` takes them in `RebalanceSettingsUpdate` (every member optional). Migration `0040_rebalance_phase10.sql` adds `reason` and `cost` to
+`rebalance_move` (it has a number range of its own so that it does not collide with the failover and ledger migrations).
+
+**Drain (increment 3).** `previewServerDrain` and `drainServer` (`internal/rebalance/drain.go`). *Departure from the design:* a drain is a task of kind `rebalance` (subject `cluster/cluster`) whose options say
+trigger `drain` and name the server, not a task of kind `server.drain`. The exclusion of server operations (the triggers of migrations 0009 to 0016), the stop, the resume, the report, the alert and the pause of a
+rebalance by a failover then hold for a drain without a second copy; a drain cannot run beside a rebalance, which the design wanted anyway. The task has the extra steps that only a drain runs (a rebalance
+skips them): `Stop new buckets from landing on the server` (the flag goes to false first), the usual `Compute the plan` and `Move buckets` (with the server added to the excluded groups), `Wait until the server owns no bucket`
+(no bucket on its groups, and no move away from it still in `cleaning`, which lasts as long as `move_cleanup_delay`), `Write the report` and `Remove the server` (only with `removeWhenDone`: the removal is the task of
+`removeServer`, started after the drain task has ended because the two exclude each other; if the manager restarts in between, the server stays drained and the operator removes it). Refused before a task
+exists: an unknown server (404), `last_server`, `no_receiving_server`, `server_hosts_map_group`, `replicas_cannot_be_kept` (fewer servers than `replicaCount + 1` would remain; `acceptFewerReplicas` overrides), `group_degraded`,
+`node_state_invalid` for a dead server, and 422 when the server holds ordinary tables that leave with it (`acknowledgeLocalData`). The standbys that the server hosts are relocated by the step `Relocate the standbys hosted on the server` (step 5 of the design): the server
+is put in the cluster setting `drain.excludedServers`, `standby.Leader` (hook `Excluded`, `standby.WithoutServers`) leaves it out of the ring, the reconcile creates the replacements on the other servers before it removes the old ones, and the
+step waits until `kingres.node` has no standby on the server; a group that no other server can take makes the step fail with `replicas_cannot_be_kept`, or stay with fewer standbys with `acceptFewerReplicas`. A server given back to service (`shouldHaveShards` true)
+leaves the setting. **Not built yet:** the hand-over of the map group (step 4: refused with `server_hosts_map_group`; it will be the planned switchover of the map group of the failover branch, see design section 22). Cancelling the task keeps the flag false (the server stays `draining`).
+
+**Automatic mode (increment 4).** `internal/rebalance/automatic.go`. The job `RunAuto` runs on the manager leader (`IsLeader`) every `checkIntervalSeconds`; it does nothing while `rebalance.automatic.enabled` is false (the default).
+The decision is the pure function `Evaluate(settings, facts)`: the window; the plan with the automatic strategy and threshold (default 0.15); the imbalance held for `settleSeconds`; the last change of the servers older than
+`settleAfterTopologySeconds`; `minIntervalSeconds` since the last automatic run (waived by a server that waits for a rebalance and by a drain flag); and no safety rule (`SafetyBlockers`: a failover, or a primary changed within `failoverSettleSeconds`,
+a group without a primary or without the standbys the replica count asks for, a server that is dead or suspect or an unfinished change of the servers, a failed earlier move that nobody acknowledged, a cluster check that fails).
+The timers are rows of the system database (`autostate.*`, `topology.changedAt`, the end of the last automatic run), so a new leader does not restart them. An automatic run asks `autoGuard` before each move and
+pauses (stopped by `safetyRule`) when a rule fails; the job resumes it when the rules have held for `settleSeconds`; a run that an operator stopped is left alone. A failed automatic run raises the alert `rebalanceFailed`
+and suspends the mode until an operator starts a rebalance (a manual start acknowledges it). `RebalanceStatus.automatic` shows the last evaluation.
+
+**Split (design step 6).** `previewBucketSplit` and `splitBucket` (`internal/rebalance/split.go`), task kind `bucket.split` (subject `bucket`, id `database/colocationId/bucket`): `Check that the split can start`,
+`Split the bucket` (calls `kingres.split_bucket` in a session of its own and follows `kingres.bucket_split` for the detail; a lost lease or a cancel calls `cancel_bucket_split`; a step repeated after a takeover finds the record and
+settles it with `resume_bucket_splits()`), `Check the new buckets`. The orphans are dropped by the extension after `move_cleanup_delay` (`cleanup_bucket_splits`, called by its recovery worker); the task does not wait for that.
+**Cancelling a split, and its limit.** The extension looks at a request to cancel (`cancel_bucket_split(id)`) only during the backfill, before each batch of rows is copied; after the backfill it cannot stop the split, and it refuses the request while the split is switching.
+The step `Split the bucket` is not interruptible by the engine (an interrupted step ends the task as cancelled whatever the extension does). The step itself watches for the request (every second), passes it on and says truthfully what came of it:
+(a) the request reached the backfill: the extension undoes the split (the children and the triggers go, the bucket is `active` again) and the task **fails with the code `cancelled`** and the text "The split was cancelled before its switch and undone: the bucket is unchanged"; the bucket can be split again;
+(b) the request came too late (the extension refused it, or accepted it and the split completed all the same): the task records in its detail "The cancel request came too late: the split had passed its backfill and goes on to its end", **goes on and ends `done`** (the step `Check the new buckets` runs), and the bucket list shows the children. A task is therefore never `cancelled` while the split completes.
+The cancel guard of the kind (`splitCancellable`) accepts a cancel until the split step is done or the "too late" note is recorded; a cancel after that is answered 409 `task_not_cancellable`, which is the truthful answer. A split whose session is lost (a restart of `kingresd`) is not touched by a lost lease or a shutdown: the task is taken over, finds the record and settles it with
+`resume_bucket_splits()`. The cluster test of the split shows both cases (the gate `split_after_triggers` for the undo, `split_after_backfill` for the late cancel, which ends done with the children in the bucket list).
+The preview does not look for a table without a primary key: the extension refuses it when the split starts and the task fails with `split_unsupported`. `listColocationGroups` and `listBuckets` read `max_modulus`, `modulus` and `kind`.
+
+Tests: unit tests in `internal/rebalance` (`options_test.go`, `drain_test.go`, `automatic_test.go`, `split_test.go`), `internal/ops` and `internal/api`; the cluster test `internal/clustertest/rebalance_strategies_test.go`
+(strategies, weights, exclusion, settings, a drain-only run) needs the 0.8 extension in the installation of the tests (`scripts/install-extensions.sh`).
+
+## Distributed schemas (phase 11, step 13, contract 0.15.0)
+
+Design: [shard-phase11.md](../docs/design/shard-phase11.md), sections 13 and 16. The extension (0.8) does the work; `internal/ops/schemas.go` lists the schemas, refuses what can be refused before a task exists and runs three tasks,
+`internal/httpapi/handlers_schemas.go` has the five operations (`listSchemas`, `getSchema`, `distributeSchema`, `undistributeSchema`, `moveSchema`).
+
+- **Reading.** A schema is listed from the map group primary (this server): every schema that is not a system schema, joined with `kingres.schemas` (group, state, size, target of a move) when the extension has it; a database without the extension 0.8, or
+  without sharding, lists its schemas with `distribution: null`. `getSchema` adds the blockers (`kingres.schema_inventory`, the unsupported rows), the pin (`kingres.internal_schema_pinned`, for example a ledger table), the unfinished `schema.move`
+  task of the schema and the tables that have neither a primary key nor a replica identity.
+- **Tasks** (subject type `schema`, id `database/schema`, one unfinished task per schema): `schema.distribute` (`Check the schema`, `Set REPLICA IDENTITY FULL` when asked, `Make the schema distributed` through `distribute_schema`, `Verify on every server`),
+  `schema.move` (`Check the move`, `Copy the data` through `move_schema` in a session of its own with the phase of `bucket_move` as detail, `Switch`, `Clean up the old copy`; cancelled with `cancel_bucket_move` until the switch, the task does not wait for the
+  old copy to be emptied) and `schema.undistribute` (`Check the schema`, `Move first` when a target is given, `Make the schema local`, `Verify on every server`). A step that repeats after a restart reads the catalog first and does nothing when its result is there.
+  `Make the schema distributed` and `Make the schema local` are `NonIdempotent` with a `Recover`: a leader killed inside the call of the extension (which prepares a transaction on the other nodes first) leaves the step recorded `running`; the next leader reads whether the schema is distributed (or local), records the step `done` when it is, and otherwise asks `kingres.recover_prepared_transactions()` to settle what the cut call left prepared before the call is made again.
+- **Refusals before a task exists:** `schema_not_distributable` (422, the objects in `errors`), `conflict` (already distributed, local, or the mode is `row`), `schema_move_in_progress`, `schema_pinned`, `rebalance_in_progress` (a move waits for a rebalance),
+  422 `unprocessable` (target group missing, not receiving, or the current one; tables without a key unless `setReplicaIdentityFull`).
+- **Tables that a move cannot copy** are those whose replica identity is NOTHING (a primary key does not help) and those with the default identity and no primary key; the 422 names every one of them in `errors` (code `replica_identity_missing`) and in its text.
+  The same check, without the way out, refuses a `Make local` that names a group to move to first (`undistributeSchema` has no `setReplicaIdentityFull`): no task is made that would fail in its second step.
+- **Exclusion.** Migration `0041_schema_tasks_exclusion.sql` is a second trigger on `kingres_cp.task`: the three schema kinds and a failover (or the restore of preferred primaries) exclude each other (KX007 for the schema task, KX006 for the failover), and `schema.move` and
+  `schema.undistribute` (which may move the schema first) and a rebalance exclude each other (KX002, KX001); `schema.distribute` moves nothing and lives beside a rebalance. They also exclude `server.add`, `server.remove` and `server.leave`, both ways (KX007 for the schema task, KX006 for the server task), since a move to a group whose server is being joined or removed must not run. The answer is 409 `operation_in_progress` naming the other kind (a rebalance that is refused keeps
+  `rebalance_in_progress`); `task.MemStore` follows the same rules. A paused failover or rebalance still excludes, as for the other kinds.
+- **Cancel.** The step `Copy the data` (and `Move first`) is not interruptible: it polls the cancel mark itself (`task.Env.CancelRequested`) and asks the extension to stop the move only while the phase is `preparing`, `copying` or `catching_up` (`cancel_bucket_move`).
+  The answer is truthful: the extension undid the move and the task **fails with the code `cancelled`** and says the schema is unchanged, on its old group; or the request came in the switch (the extension refuses), the task goes on, ends `done` and says so in its detail.
+  The guard (`moveCancellable`, `undistributeCancellable`) refuses a request (409 `task_not_cancellable`) from the phase `switching` on, read from the detail the step records, and once the copy step is done; the mark of a request that arrived before is not followed.
+  A cancel of a `Make local` that is moving first is a cancel of that move; once `Make the schema local` has started, there is nothing to cancel. `getTask`, `listTasks` and the answer of the cancel narrow `cancellable` with the guard of the kind (`withCancelGuard`), so the console shows no Cancel button for a move that is switching.
+- **After a leader change, or a dead session** the copy step finds the move that nobody drives in `kingres.bucket_move` (a record that a dead leader left, or one whose call returned an error): the task asks the extension to settle it, now and then again every twice `kingres_shard.node_timeout` plus a second (`resume_bucket_moves()` skips a move in preparing or switching younger than that), and gives up ten minutes after the call ended; one to the same group is followed, one to another group is a `schema_move_in_progress`,
+  and a move that ended `failed` is started again, up to three times, unless a person asked to cancel.
+  A failed call of `distribute_schema` or `undistribute_schema` whose schema is in the state the call was to make counts as made (a backend of a dead leader may have finished it while the step was recovered). `Make the schema local` after a `Move first` ends the cleaning of its own move at once (`internal_continue_cleaning`), because the extension refuses while a move of the schema is cleaning; `Move first` records where the schema went, which is what a cancel before the making local leaves. Only SQLSTATE 55000 of `cancel_bucket_move` means too late; other failures are tried again.
+- **The sharding mode.** `createDatabase` takes `sharding.mode` and `distributeNewSchemas` and calls `kingres.set_sharding_mode` after the extension is installed; `updateDatabase` changes them synchronously, and a refusal of the extension is 409 `sharding_mode_in_use`.
+  `Database.sharding` shows `mode` and `distributeNewSchemas` (read from `kingres.sharding_settings`), `bucketCount` is null in mode `schema`, `stats.distributedSchemaCount` counts `kingres.dist_schema`, `getDatabaseCreateOptions` lists `shardingModes`.
+  `listColocationGroups` has `kind` and `schemaName`.
+- **Not done:** `inFlightMoves[].kind` and `schemaName` of the rebalance status, `BucketDistribution.servers[].primarySchemas`, the schema units in the rebalance plan (the extension does not plan them yet), and the schema moves made by a drain (a drain moves buckets only; schemas stay on the server).
+
+Tests: `internal/ops/schemas_test.go` (blockers, error mapping, hostile names, the cancel guard) and the cluster test `internal/clustertest/schemas_test.go` (list, blockers, distribute, move with the rows checked, make local, the replica identity,
+the mode refusal), `internal/clustertest/schemas_tasks_test.go` (tables a move cannot copy, the cancel before and after the switch, the exclusion of a rebalance and a failover, a move followed after the leader was killed, the distribute step killed before and after its effect), `internal/task/recover_test.go` (`Recover`, `CancelRequested`, the exclusion in the memory store) and `internal/rebalance/failover_exclusion_pg_test.go` (the trigger of migration 0041); they need the 0.8 extension in the installation of the tests.
+
+## Analytics: approximate aggregates, storage and time partitioning (phase 12, contract 0.17.0)
+
+Designs: `kingres/docs/design/analytics-phase12-queries.md` section 12 and `analytics-phase12-storage.md` sections 10.6 and 13. The contract is revision 0.17.0
+(11 operations, three task kinds, six problem codes, two alert kinds); it is revision 0.17.0 (written as 0.18.0 on the branch and renumbered by the integrator of g16; the migrations stay 0035 and 0036). Every operation acts on the tables and databases of **this server's instance**, where the
+manager leader runs: a plain table that lives on another group's instance is not found here (distributed tables and their partitions are a later step,
+D1a and D1b of the design).
+
+### Preload (the fix that the analytics needed)
+
+`shared_preload_libraries` of every instance is `kingres_shard,kingres_ledger,kingres_columnar` (`instance.PreloadLibraries`). Without `kingres_columnar`
+nothing can write a columnar table and `kingres_timepart` refuses every conversion; `kingres_timepart` and `kingres_sketch` need no preload. An instance made
+by an earlier package has the old list in `kingres-managed.conf`: `EnsureConfig` (run when `kingresd` starts) rewrites the file when the list differs, and
+the new list takes effect at the next restart of the instance. A server whose instance has not been restarted answers `409 extension_missing` (naming the
+library and the server) to a storage conversion, and says what to do.
+
+### Extensions in databases and on new servers
+
+`database.create` installs `kingres_columnar` and `kingres_timepart` (`installAnalytics`, on this server and, through the apply kind `database.create`, on every
+other server) when the package of the server contains them; an older package makes a database without them, as before. `kingres_sketch` is not installed by
+`database.create`: the task `database.approximateAggregates` installs it. A server that is added gets every extension that is installed in a database of the
+leader (`globals/apply` already copies the list), the three of this phase included, and the database settings (`ALTER DATABASE ... SET`) with them. A database
+that was made before this version gets `kingres_columnar` and `kingres_timepart` at the first use of a storage or policy operation (`ensureExtensions`; a
+deviation from the design, which answers `extension_missing` for an extension that is not installed: there would be no way to install it from the console).
+
+New closed kinds of the internal call `apply` (leader only): `extension.check`, `extension.install`, `extension.verify` and `database.settings`. They carry a database
+and an extension name of a closed list (`kingres_sketch`, `kingres_columnar`, `kingres_timepart`) and never SQL. A refusal that matters comes back as an internal
+error with the problem code (`extension_unavailable`, `extension_version_mismatch`, `sketch_hash_mismatch`, `extension_missing`), which `healable` does not retry. The
+leader reads the version that another server has installed with the internal call `exec` (read-only statement; `ops.RemoteQuerier`, implemented by
+`membership.Manager.Query`), so `getApproximateAggregates` is one of the leader-bound reads (a follower forwards it).
+
+### `database.approximateAggregates`
+
+Subject: the database (the subject of `database.update`, so a second `database.*` task on it is `409 operation_in_progress`). Steps: `Check the servers` (this server
+first: its default version is the one the others must have; then every other server), one `Install the extension on server <id>` for each server, `Verify versions
+and hashes` (versions and `kingres_sketch.self_test()` of every server; it names **every** server that differs, with the code of the first), `Apply the database settings`
+(`kingres_shard.count_distinct_mode`, `count_distinct_error_rate`, `enable_sketch_pushdown`, on every server; a server whose `kingres_shard` does not know a setting
+skips it and the step says so in its detail) and `Record the settings` (migration 0035: three columns of `kingres_cp.database_setting`). A server that cannot be reached is
+waited for, with the server named in the detail, as in every cluster-wide task. Turning it off sets `count_distinct_mode` to `exact` and the pushdown off, resets the error
+rate and never drops the extension. `getApproximateAggregates` shows the setting and the installed version of each server (`ok`, `notInstalled`, `versionMismatch`,
+`unreachable`); `Database.approximateAggregates` carries the setting.
+
+### `table.setStorage`
+
+`setTableStorage` and `setPartitionStorage` start the task (subject `database/schema.table`, or `database/schema.partition`). Steps for a table: `Check the table`, `Convert the storage`
+(`ALTER TABLE ... SET ACCESS METHOD`, one transaction under an `ACCESS EXCLUSIVE` lock, which the step says; the options of the request are set as the `kingres_columnar.*` settings
+of that transaction) and `Analyze the table`; for a partition `Check the partition`, `Convert the partition` (`CALL kingres.convert_partition`: the new partition is built aside and swapped in)
+and `Analyze the partition`. The request is checked as the first step would check it, before a task exists (`409 conversion_refused` with the reasons: a partitioned table has no storage of
+its own, a ledger table, a distributed table, a publication, foreign keys, and for a partition the reasons of `kingres.timepart__convert_refusal`), and again by the step, because the state can
+change in between. A table that already has the format is not converted (the step says so). The convert step can be cancelled while it runs; the conversion is one transaction and rolls back.
+`listTables` and `getTable` carry `storage` (access method, partition formats, the totals and options of the columnar format) and, for a table that is range-partitioned on one time column,
+`partitioning.columnType`, `hasPolicy` and `defaultPartition`; `listTables?storage=` filters (a partitioned table matches when any partition does). `listTablePartitions` also lists the partitions
+of an ordinary range- or list-partitioned table, with access method, bounds, size and compression ratio.
+
+### Policies and `partition.maintain`
+
+`getPartitionPolicy`, `putPartitionPolicy`, `deletePartitionPolicy` and `planPartitionPolicy` are synchronous and call `kingres.timepart_set_policy`, `timepart_unset_policy`, `timepart_plan` (and
+`timepart__plan_rows` for a policy that is only in the request). A duration is an ISO 8601 text checked by a pattern here and by the extension (the grid, the time zone, the retention against the
+partition size), and a refusal of the extension becomes a `400` with the field it names or `409 partition_policy_conflict` (not range-partitioned on a time column, a default partition). A policy that
+is put is due at once (`nextRunAt` is now). `createdBy` is the PostgreSQL role that wrote the policy, which is the service role; the audit log has the signed-in role.
+
+`runPartitionPolicy` and the scheduler start `partition.maintain` (subject `database/schema.table`). Steps: `Begin the run`, `Create partitions`, `Convert partitions`, `Retire partitions`, `Finish the run`. `begin`
+looks for the run of this task (`kingres_cp.partition_run_task`, migration 0036) before it makes one with `kingres.timepart_begin_run`, and waits while another run of the table is going (the reason is in the
+detail); each phase is `CALL kingres.timepart_run_phase`, which records every action before and after it, so a task taken over after a crash goes on with the action it was in; `finish` closes the run. An action
+that fails (a lock timeout) does not fail the step: the run ends `partial` and the next run tries again; an SQL error of a step fails the task and marks the run `failed`. The runs are the records of the extension
+(`kingres.timepart_run`, `timepart_run_action`) with the task and the role that asked from `partition_run_task`; a run made from SQL is shown as `manual`.
+
+`internal/partsched` is the scheduler: two jobs of `internal/scheduler` (they run on the manager leader only, with its term): `partition.schedule` every `partition-scheduler-interval` (default 1m; environment
+`KINGRES_PARTITION_SCHEDULER_INTERVAL`) asks `kingres.timepart_due(now)` in every database that has `kingres_timepart` and starts one task for each table that has no unfinished task (it holds no state: after a change of
+the leader the new leader asks again), and `partition.alerts` every five minutes reads `kingres.timepart_check()` and raises or clears `partitionsAheadLow` and `partitionPolicyFailed` (the last run failed, or was
+`partial` twice in a row), subject `database:<db>|tableschema:<s>|tablename:<t>` (see below). The counters `kingres_partition_runs_total`, `kingres_partition_runs_failed_total` and `kingres_partition_actions_failed_total` are on `/metrics`.
+
+### Tests
+
+Unit: `internal/ops` (`approx_test.go`: the five steps with fake servers, a version that differs, a package that lacks the extension, the hash, a server that is down, a failure at every call, the process that dies at every
+call), `internal/partsched` (a fake clock and backend). PostgreSQL-backed (`scripts\run-integration.ps1 -Packages ./internal/ops,./internal/store/pgstore,./internal/instance -Run ...`):
+`TestIntegrationSetStorage*`, `TestIntegrationPartitionPolicyResource`, `TestIntegrationMaintain*` (a run, a locked partition, a task interrupted at each of its five steps), `TestIntegrationPartitionScheduler*`,
+`TestIntegrationTableStorage` (pgstore), `TestEnsureConfigBringsThePreloadUpToDate`. Cluster tests of three servers: `TestApproximateAggregates` and `TestTableStorageAndPartitionPolicies` in `internal/clustertest`.
+Not covered: a server whose package has another version of `kingres_sketch` (all servers of the tests share one installation; the case is in the unit tests), and the library not preloaded on a running instance
+(unit test with a fake backend).
+
+### After the independent review of the analytics control plane (P12C-01 to P12C-16)
+
+The review is in `kingres/docs/reviews/2026-11-22-control-plane-phase12.md`; its "Fixes" section lists every finding. What changed in behaviour:
+
+- **The time of a run is the time of the server (P12C-01).** `runPartitionPolicy` takes `asOf` only within five minutes of the time of the instance (`maintainSkew`), otherwise 400 on `/asOf`; the scheduler goes
+  through the same check, so a leader whose clock jumped starts nothing. `planPartitionPolicy` keeps a free `asOf` (it changes nothing). `next_run_at` can therefore never be moved far from now.
+- **A run is always closed (P12C-02).** `kingres.timepart_finish_run` runs for every end of a run: the finish step, a run that the extension recorded as failed at `begin` (the owner changed, the policy was never verified:
+  the task fails with `partition_policy_conflict` and the reason), an error of a phase (`failRun` marks the run failed and closes it) and, for a failure that no step saw (a cancel, a lost lease), the hook `OnFail` of the kind.
+  Closing moves `next_run_at` and prunes the old runs, so a policy that fails is not started at every tick. As a second line the scheduler leaves a table alone for five minutes (`maintainBackoff`) after a failed run.
+- **Preload (P12C-03).** `kingres_columnar` is in the list only when the installation has the library file (`pg_config --pkglibdir`): a package that was not upgraded with `kingresd`, or an image that mixes versions, gets the old
+  list and its instances still start. `EnsureConfig` logs a warning when it rewrites the list, reloads a running instance (so that `shared_preload_libraries` shows as pending a restart in the configuration view and the
+  restart of the console lists it) and repairs a file that names a library that is not there. The list takes effect at a restart: restart the instances with the console's restart of pending instances (it orders the pairs of standbys and primaries by the rule of the configuration design; for this setting the safe order is the standbys of a group before
+  its primary, and the restart by hand follows it); a primary that was restarted first and then wrote columnar WAL would be ahead of a standby that cannot replay it. A conversion to columnar is therefore refused (`extension_missing`) until **every server of the cluster** has loaded the library (the leader asks each server with `extension.check`, with the library check), and says to restart the instance of the server it names.
+- **One rule for the owners of tables (P12C-04, P12C-05).** The conversion of a table or a partition and the runs of a policy both open the service connection with `kingres_timepart.trust_table_owners = on` (`trustedConn`). The owner of the table is a role of
+  this cluster; the code it can cause to run while a partition is made, attached or converted (an index expression, a default, a trigger) runs as the service role for the time of the call, and the connection is closed
+  at its end. The owner needs `CREATE` on the schema of the partition. Since the second review this is open only for tables of superusers unless the cluster setting `analytics.allowNonSuperuserOwners` is on (P12D-04); the contract text says so. A refusal by PostgreSQL privileges (42501) is `conversion_refused`, not a retryable step failure.
+- **Conversion (P12C-06, P12C-07, P12C-15).** A table that is columnar already gets new options through `columnar_set_options` (for the stripes to come; the step says so) instead of a silent no-op. The `ALTER TABLE ... SET ACCESS METHOD` and the `ANALYZE` ask for their lock
+  with `lock_timeout` (200 ms since P12D-05, 3 s at first) and try again, saying "Waiting for a lock held by another session" in the detail, for ten minutes at most, then fail with the retryable `operation_in_progress`; a reader of the table is never queued behind a conversion
+  that waits for a long transaction. The claim of another run of the table (55P03 of the extension) is `operation_in_progress` too, and a conversion of a partition is refused while a `partition.maintain` task of its table is unfinished.
+- **A run that this instance does not have is an error (P12C-08).** After a takeover by a server whose instance does not hold the run that `partition_run_task` names, the step fails with a clear message instead of ending the task as done.
+- **Alerts do not flap (P12C-09).** `Checks` returns the databases it could read; an alert of a database that was not read is left as it is. The alerts carry the table in `AlertSubject.tableSchema` and `tableName` (stored as `database:<db>|tableschema:<s>|tablename:<t>`, with `|` and `%` escaped).
+- **The scheduled run no longer needs the library (P12C-10).** Only a run by hand is refused when the policy converts and the library is not loaded; a scheduled run goes on creating and retiring partitions and the extension records what it cannot convert.
+- **Reads do not write (P12C-11).** `getPartitionPolicy`, `listPartitionPolicyRuns`, `getPartitionPolicyRun`, `planPartitionPolicy` and `deletePartitionPolicy` only ask whether `kingres_timepart` is installed (404 / an empty list / `extension_missing` for a plan with a policy in the request);
+  the writes install it. The reads of policies, runs and `listTablePartitions` are leader-bound.
+- **Messages that say the truth (P12C-12, P12C-16).** A table that the leader's instance does not have is 404 with a detail that names the limit; the contract text says it for every operation. `conversion_refused` carries typed `blockers`; `dryRun=true` on both storage operations answers the same reasons as `TableStoragePreview` and installs nothing. The
+  remedy for a library that is not loaded is "restart the instance", not "edit shared_preload_libraries" (the setting is managed).
+- **Others.** `putPartitionPolicy` is refused while a run goes (P12C-13). `maintainRunning` asks the task store by kind and subject (`Engine.ActiveFor`), not in the newest 200 tasks (P12C-14). Versions of `kingres_sketch` compare as numbers (`0.10` is above `0.9`).
+  The steps of `database.approximateAggregates` can be interrupted by a cancel; the list of servers is fixed when the task is made (a server added meanwhile is covered by the next request), and a failure at `Apply the database settings` leaves the settings on the servers that took them: the same request, repeated, finishes it.
+
+### After the second independent review of the analytics control plane (P12D-01 to P12D-09)
+
+The review is in `kingres/docs/reviews/2026-11-22-control-plane-phase12-fixes.md`, with a "Fixes" section. What changed in behaviour:
+
+- **A clock that stepped (P12D-01).** The skew check of P12C-01 compares the leader's clock with the instance's, and both follow the host: a step of the host clock (NTP, a resumed virtual machine, a date set by hand) passed it. A scheduled run is now also
+  compared with the history of the policy: a time more than seven days plus the policy's `create_ahead` after the last run (after `updated_at` for a policy that never ran) is refused with a `ClockError`, the policy is not started,
+  and the alert `partitionPolicyFailed` says that the clock of the host may have jumped. The seven days are what a stop of kingresd may be; a run by hand, bounded by the skew only, goes on when the time is right.
+- **A failure before any run exists (P12D-02).** When `kingres.timepart_begin_run` itself raises there is no run to close. The hook `OnFail` then moves `next_run_at` of the policy by the back-off (five minutes), which survives a change
+  of the leader, and the process remembers the failure by table (`failed`), so that four ticks make one task and not four. A begin step that finds the run of an earlier pass already failed closes it and fails with the reason.
+- **Standbys (P12D-03).** The library check of a conversion asks every instance of every server (`Local.LocalInstances`), standbys included; a standby that was not restarted blocks a columnar conversion and the message names the instance and says to restart it, standbys first.
+- **Owners that are not superusers (P12D-04).** The cluster setting `analytics.allowNonSuperuserOwners` (default `false`; `PATCH` of the cluster settings, `analytics.allowNonSuperuserOwners`) decides whether the conversion of a table and the runs of a policy are open for tables
+  whose owner is not a superuser. Off, the conversion is refused with `conversion_refused` (blocker `owner_not_trusted`), a policy cannot be set (`partition_policy_conflict`), a run by hand is refused the same way, and the scheduler does
+  not retry such a table: it logs the refusal once and raises one `partitionPolicyFailed` alert for it, which clears when the owner changes or the setting is turned on. `PartitionPolicy` and `TableStoragePreview` carry `tableOwner` and `ownerTrusted`. The trust text of the contract
+  is corrected: with the setting on, the administrator trusts the owners of those tables as himself, because the code of the owner (an index expression, a default, a trigger) runs in the session of the service role for the time of a call.
+- **The reader stall (P12D-05).** The conversion asks for the lock with `lock_timeout` of 200 ms (it was 3 s) and pauses 3 s between tries, so a reader of the table waits behind the request at most 200 ms at a time. It still retries for ten minutes at most.
+- **Alerts of what is gone (P12D-06).** `Checks` reports which databases it could not read; an alert of a database that is no longer there (dropped, extension removed) is cleared, an alert of a database that could not be read is left as it is.
+- **The preload list (P12D-07).** The library `kingres_columnar` is left out of the list only for an instance that has no columnar table: a marker file (`columnar-preload`) records that the list once had it, and an instance with the marker keeps the library even when the
+  installation lacks it (a warning in the log says so; the instance cannot start until the package that has the file is back, which is better than dropping the library from under columnar tables). `EnsureConfig` writes the marker and reloads a running instance only when the list changed.
+- **Leader-ahead skew (P12D-08).** A skew refusal or a refusal for the owner is an issue of the policy and one alert for it, not a failure counted at every tick; the scheduler logs a change of the reason once.
+- **Smaller (P12D-09).** `maintainRunning` fails closed (`service_unavailable` when the task store cannot say). The back-off looks at the last run only. Tests cover the registration of `OnFail`, the mapping of 42501 and the reload of a running instance.

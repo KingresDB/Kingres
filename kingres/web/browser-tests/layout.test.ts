@@ -11,7 +11,8 @@ import {
   HA_SWITCHES,
   ROUTES,
   SECURITY_TABS,
-  STATES,
+  OLDER_STATES,
+  TRANSFER_STATES,
   clickText,
   go,
   launch,
@@ -184,7 +185,38 @@ for (const [label, width, height] of [
     it('dialogs, the proof with its digests and the stopped state do not push the page sideways or out of the window', async () => {
       await page.setViewport({ width, height })
       const failures: string[] = []
-      for (const state of STATES) {
+      for (const state of OLDER_STATES) {
+        await go(page, state.route)
+        await state.open(page)
+        const g = await geometry()
+        if (g.scrollWidth > g.innerWidth)
+          failures.push(
+            `${state.name}: page ${g.scrollWidth} > window ${g.innerWidth} (${g.offenders.join(', ')})`,
+          )
+        const dialog = await page.evaluate(() => {
+          const el = document.querySelector('[role="dialog"]')
+          if (!el) return null
+          const r = el.getBoundingClientRect()
+          return { left: r.left, right: r.right, width: window.innerWidth }
+        })
+        if (dialog && (dialog.left < -1 || dialog.right > dialog.width + 1))
+          failures.push(`${state.name}: the dialog is outside the window`)
+        await state.close?.(page)
+      }
+      expect(failures).toEqual([])
+    })
+  })
+}
+
+for (const [label, width, height] of [
+  ['1366 px', 1366, 820],
+  ['320 px', 320, 640],
+] as const) {
+  describe(`the data transfer states (0.19.0) fit the window at ${label} (0.19.0)`, () => {
+    it('the panel, the settings group and the export and import dialogs do not push the page sideways or out of the window', async () => {
+      await page.setViewport({ width, height })
+      const failures: string[] = []
+      for (const state of TRANSFER_STATES) {
         await go(page, state.route)
         await state.open(page)
         const g = await geometry()

@@ -132,12 +132,12 @@ func (f *flaky) Check(ctx context.Context, dbs []string) error {
 	return f.fakeCluster.Check(ctx, dbs)
 }
 
-func (f *flaky) Plan(ctx context.Context, dbs []string) ([]Move, error) {
+func (f *flaky) Plan(ctx context.Context, dbs []string, o Options) ([]Move, error) {
 	f.plans++
 	if f.plans <= f.planFails {
 		return nil, errors.New("dial error: connection refused")
 	}
-	return f.fakeCluster.Plan(ctx, dbs)
+	return f.fakeCluster.Plan(ctx, dbs, o)
 }
 
 // RB-05: a refused connection is retried in Check and in Plan alike; a short outage does not stop the run.

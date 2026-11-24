@@ -48,6 +48,10 @@ type Forwarder interface {
 // are answered by the leader too.
 var leaderBoundReads = map[string]bool{
 	"listTasks": true, "getTask": true, "getClusterSettings": true,
+	// The extension versions of the other servers are read by the leader (the internal call exec is leader-only).
+	"getApproximateAggregates": true,
+	// The policies, their runs and the partitions of a plain table are read from the instance that the leader runs.
+	"getPartitionPolicy": true, "listPartitionPolicyRuns": true, "getPartitionPolicyRun": true, "listTablePartitions": true,
 	// Configuration from the console (phase 13): the leader can ask every server.
 	"listConfigParameters": true, "getConfigParameter": true, "listConfigChanges": true, "listConfigServers": true,
 	"getConfigSummary": true, "getClusterTime": true, "listTimeZones": true,
@@ -66,6 +70,9 @@ var leaderBoundReads = map[string]bool{
 	"getLedgerPublication": true, "getLedgerAggregate": true, "listLedgerAggregates": true, "listLedgerDigests": true,
 	// The anchor targets and records are in the leader's system database too (phase 7, step 10).
 	"listLedgerAnchorTargets": true, "getLedgerAnchorTarget": true, "listLedgerAnchors": true, "downloadLedgerAnchor": true, "getLedgerBundle": true,
+	// The staged files of the data transfer and their records are on the leader (contract 0.19.0). The other operations of the tag
+	// change something and go to the leader as every mutating operation does; the two streaming ones are relayed.
+	"getDataUpload": true, "listDataExports": true, "getDataExport": true, "downloadDataExport": true,
 }
 
 // forwardsToLeader tells whether an operation is run by the leader. Mutating
@@ -118,6 +125,10 @@ func (s *Server) tryForward(c *call, w http.ResponseWriter, r *http.Request) (bo
 	}
 	if done, err := s.mapFailoverIntercept(c, w, r); done {
 		return true, err
+	}
+	if c.op.Streams != "" {
+		// The relay does not buffer: the body goes to the leader as it is read and the answer comes back as it is written.
+		return s.tryForwardStream(c, w, r)
 	}
 	leaderID, self, err := fw.Leader(r.Context())
 	if err != nil || leaderID == "" {

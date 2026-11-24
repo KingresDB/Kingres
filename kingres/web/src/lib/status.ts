@@ -17,6 +17,8 @@ import type {
   ReplicationMember,
   Database,
   ClusterOverview,
+  DataExport,
+  DataUpload,
 } from '@/api/types'
 import { safeText } from './safe-text'
 
@@ -90,6 +92,44 @@ export const TASK_STATE: Record<TaskState, StatusMeta> = tolerant({
   paused: { tone: 'warn', icon: WARN, label: 'Paused' },
   failed: { tone: 'danger', icon: BAD, label: 'Failed' },
   done: { tone: 'ok', icon: OK, label: 'Done' },
+})
+
+/** The state of a staged export file (contract 0.19.0). */
+export const EXPORT_STATE: Record<DataExport['state'], StatusMeta> = tolerant({
+  building: { tone: 'info', icon: HALF, label: 'Being written' },
+  ready: { tone: 'ok', icon: OK, label: 'Ready' },
+  failed: {
+    tone: 'danger',
+    icon: BAD,
+    label: 'Failed',
+    hint: 'The task failed and the partial file was removed.',
+  },
+  expired: {
+    tone: 'neutral',
+    icon: RING,
+    label: 'Expired',
+    hint: 'The retention time has passed; the file is deleted.',
+  },
+  lost: {
+    tone: 'warn',
+    icon: WARN,
+    label: 'Lost',
+    hint: 'The file or its key is gone from the server.',
+  },
+  deleted: { tone: 'neutral', icon: RING, label: 'Deleted' },
+})
+
+/** The state of an upload (contract 0.19.0). */
+export const UPLOAD_STATE: Record<DataUpload['state'], StatusMeta> = tolerant({
+  receiving: { tone: 'info', icon: HALF, label: 'Receiving' },
+  complete: { tone: 'ok', icon: OK, label: 'Complete' },
+  lost: {
+    tone: 'warn',
+    icon: WARN,
+    label: 'Lost',
+    hint: 'The staged file is gone; start a new upload.',
+  },
+  deleted: { tone: 'neutral', icon: RING, label: 'Deleted' },
 })
 
 export const SEVERITY: Record<AlertSeverity, StatusMeta> = tolerant({
@@ -194,6 +234,7 @@ export const ALERT_KIND_LABEL: Record<AlertKind, string> = {
   certificateRenewalFailed: 'Certificate renewal failed',
   replicationPending: 'A change has not reached a server yet',
   taskFailed: 'Task failed',
+  rebalanceFailed: 'Automatic rebalance failed',
   leaseLost: 'Primary lost its lease',
   groupWithoutSynchronousStandby: 'Commits no longer wait for a standby',
   groupUnderReplicated: 'Shard group has too few standbys',
@@ -215,6 +256,10 @@ export const ALERT_KIND_LABEL: Record<AlertKind, string> = {
   ledgerSignerUnavailable: 'Ledger checkpoints cannot be signed',
   ledgerDigestOverdue: 'No ledger digest for too long',
   certificateAuthorityUnavailable: 'The certificate authority is unavailable',
+  partitionsAheadLow: 'Partitions ahead are running low',
+  partitionPolicyFailed: 'A partitioning policy failed',
+  transferStagingLow: 'The staging area of the data transfer is nearly full',
+  extensionSchemaUntrusted: 'The schema of a KingresDB extension cannot be trusted',
 }
 
 /** The label of an alert kind; a kind from a newer server is shown as sent (through SafeName). */
@@ -240,6 +285,16 @@ export const TASK_KIND_LABEL: Record<TaskKind, string> = {
   'table.undistribute': 'Undistribute a table',
   'table.alter': 'Change the distribution of a table',
   'table.partition': 'Change the partitions of a table',
+  'bucket.split': 'Split a bucket',
+  'schema.distribute': 'Distribute a schema',
+  'schema.move': 'Move a schema',
+  'schema.undistribute': 'Make a schema local',
+
+  'database.approximateAggregates': 'Change approximate aggregates',
+  'table.setStorage': 'Change the storage of a table',
+  'partition.maintain': 'Maintain the partitions of a table',
+  'table.export': 'Export a table as CSV',
+  'table.import': 'Import a CSV file into a table',
   rebalance: 'Rebalance',
   'replication.restorePreferredPrimaries': 'Restore preferred primaries',
   'ledger.verify': 'Verify the ledger',
@@ -343,6 +398,7 @@ export const AUDIT_ACTION_LABEL: Record<AuditAction, string> = {
   updateServer: 'Change a server',
   removeServer: 'Remove a server',
   failoverServer: 'Fail over a server',
+  abandonMapGroupBootstrap: 'Give up the bootstrap of the map group',
   autoFailover: 'Automatic failover',
   createServerGroup: 'Create a server group',
   deleteServerGroup: 'Delete a server group',
@@ -357,6 +413,19 @@ export const AUDIT_ACTION_LABEL: Record<AuditAction, string> = {
   attachTablePartition: 'Attach a partition',
   detachTablePartition: 'Detach a partition',
   dropTablePartition: 'Drop a partition',
+  drainServer: 'Drain a server',
+  splitBucket: 'Split a bucket',
+  previewBucketSplit: 'Preview the split of a bucket',
+  distributeSchema: 'Distribute a schema',
+  undistributeSchema: 'Make a schema local',
+  moveSchema: 'Move a schema',
+
+  configureApproximateAggregates: 'Change approximate aggregates',
+  setTableStorage: 'Change the storage of a table',
+  setPartitionStorage: 'Change the storage of a partition',
+  putPartitionPolicy: 'Set a partitioning policy',
+  deletePartitionPolicy: 'Remove a partitioning policy',
+  runPartitionPolicy: 'Run a partitioning policy',
   enableTableLedger: 'Enable the ledger of a table',
   restorePreferredPrimaries: 'Restore preferred primaries',
   startRebalance: 'Start a rebalance',
@@ -416,6 +485,14 @@ export const AUDIT_ACTION_LABEL: Record<AuditAction, string> = {
   setTableSignaturePolicy: 'Set the signature policy of a ledger table',
   upgradeLedgerExtension: 'Upgrade the ledger extension',
   acknowledgeLedgerDivergence: 'Acknowledge a diverged ledger chain',
+  exportTable: 'Export a table as CSV',
+  importTable: 'Import a CSV file into a table',
+  createDataUpload: 'Start an upload',
+  deleteDataUpload: 'Delete an upload',
+  downloadDataExport: 'Download an export file',
+  deleteDataExport: 'Delete an export file',
+  'dataTransfer.completed': 'A data transfer ended',
+  'dataTransfer.purged': 'Staged transfer files were removed',
 }
 
 /** The words for an audit action; an action from a newer server is shown as sent. */

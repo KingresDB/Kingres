@@ -359,3 +359,40 @@ func TestVersionMismatchAlertLifecycle(t *testing.T) {
 		t.Errorf("resolved: %+v", page)
 	}
 }
+
+func TestEvaluateExtensionSchemaUntrusted(t *testing.T) {
+	rd := monitor.Readings{Host: "h1", InstanceUp: true, ExtensionsChecked: true, ExtensionsUntrusted: []monitor.ExtensionReading{
+		{Database: "shop", Extension: "kingres_ledger", Schema: "kingres", Reason: "schemaOwner"},
+		{Database: "shop", Extension: "kingres_shard", Schema: "kingres", Reason: "foreignObject", Detail: "view kingres.ledger_pending"},
+		{Database: "blog", Extension: "kingres_sketch", Schema: "kingres_sketch", Reason: "schemaCreate"},
+	}}
+	conds, ev := monitor.Evaluate(rd)
+	if !ev["extensionSchemaUntrusted"] {
+		t.Fatalf("the kind is evaluated when the extensions were checked: %v", ev)
+	}
+	m := kindsOf(conds)
+	shop := m["extensionSchemaUntrusted|server:h1|database:shop"]
+	if shop.Severity != "critical" || !strings.Contains(shop.Message, "kingres_ledger") || !strings.Contains(shop.Message, "kingres_shard") || !strings.Contains(shop.Message, "view kingres.ledger_pending") {
+		t.Errorf("shop: %+v", shop)
+	}
+	if blog := m["extensionSchemaUntrusted|server:h1|database:blog"]; blog.Severity != "critical" || !strings.Contains(blog.Message, "kingres_sketch") {
+		t.Errorf("blog: %+v", blog)
+	}
+	if len(conds) != 2 {
+		t.Errorf("one alert per database: %v", conds)
+	}
+	// Trusted everywhere: evaluated and empty, so an open alert clears; not checked: not evaluated, so it neither raises nor clears.
+	if c, ev := monitor.Evaluate(monitor.Readings{Host: "h1", InstanceUp: true, ExtensionsChecked: true}); len(c) != 0 || !ev["extensionSchemaUntrusted"] {
+		t.Errorf("trusted: %v %v", c, ev)
+	}
+	if _, ev := monitor.Evaluate(monitor.Readings{Host: "h1", InstanceUp: true}); ev["extensionSchemaUntrusted"] {
+		t.Errorf("not checked: %v", ev)
+	}
+	found := false
+	for _, k := range monitor.Managed {
+		found = found || k == "extensionSchemaUntrusted"
+	}
+	if !found {
+		t.Error("the kind is not in Managed")
+	}
+}

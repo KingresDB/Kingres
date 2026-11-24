@@ -95,10 +95,14 @@ try {
     Copy-Item (Join-Path $PSScriptRoot 'wsl-allowed-skips.txt') (Join-Path $stage 'wsl-allowed-skips.txt')
     Copy-Item (Join-Path (Split-Path $module -Parent) 'api/openapi.yaml') (Join-Path $stage 'openapi.yaml')
     Copy-Item (Join-Path $module 'README.md') (Join-Path $stage 'README.md')
+    # Sources that tests of the wiring read (cmd/kingresd/sources_test.go looks for them in KINGRES_TEST_BIN/src).
+    New-Item -ItemType Directory (Join-Path $stage 'src') | Out-Null
+    Copy-Item (Join-Path $module 'cmd/kingresd/main.go') (Join-Path $stage 'src')
+    Copy-Item (Join-Path $module 'cmd/kingresd/failover.go') (Join-Path $stage 'src')
     # Copy into WSL so that the binaries run from the native file system.
     $wslStage = ConvertTo-WslPath $stage
     $wslScript = ConvertTo-WslPath (Join-Path $PSScriptRoot 'run-wsl-tests.sh')
-    & wsl.exe -d $Distro -u $WslUser bash -c "rm -rf ~/kw-cp/test/bin$laneSuffix && mkdir -p ~/kw-cp/test/bin$laneSuffix && cp '$wslStage'/kingresd '$wslStage'/kingres-verify '$wslStage'/*.test '$wslStage'/openapi.yaml '$wslStage'/README.md '$wslStage'/operations_gen.go.txt '$wslStage'/wsl-allowed-skips.txt ~/kw-cp/test/bin$laneSuffix/ && cp -r '$wslStage'/fixtures ~/kw-cp/test/bin$laneSuffix/ && chmod +x ~/kw-cp/test/bin$laneSuffix/*.test ~/kw-cp/test/bin$laneSuffix/kingresd ~/kw-cp/test/bin$laneSuffix/kingres-verify && { if [ -f '$wslStage'/kingres-watchdog ]; then cp '$wslStage'/kingres-watchdog ~/kw-cp/test/bin$laneSuffix/ && chmod +x ~/kw-cp/test/bin$laneSuffix/kingres-watchdog; fi; }"
+    & wsl.exe -d $Distro -u $WslUser bash -c "rm -rf ~/kw-cp/test/bin$laneSuffix && mkdir -p ~/kw-cp/test/bin$laneSuffix && cp '$wslStage'/kingresd '$wslStage'/kingres-verify '$wslStage'/*.test '$wslStage'/openapi.yaml '$wslStage'/README.md '$wslStage'/operations_gen.go.txt '$wslStage'/wsl-allowed-skips.txt ~/kw-cp/test/bin$laneSuffix/ && cp -r '$wslStage'/fixtures '$wslStage'/src ~/kw-cp/test/bin$laneSuffix/ && chmod +x ~/kw-cp/test/bin$laneSuffix/*.test ~/kw-cp/test/bin$laneSuffix/kingresd ~/kw-cp/test/bin$laneSuffix/kingres-verify && { if [ -f '$wslStage'/kingres-watchdog ]; then cp '$wslStage'/kingres-watchdog ~/kw-cp/test/bin$laneSuffix/ && chmod +x ~/kw-cp/test/bin$laneSuffix/kingres-watchdog; fi; }"
     if ($Install -and $Install -notmatch '^[A-Za-z0-9_./~$-]+$') { throw "-Install must be a plain path inside WSL, got '$Install'" }
     $envInstall = "export KINGRES_TEST_BIN=`$HOME/kw-cp/test/bin$laneSuffix; "
     if ($Install) { $envInstall += "export KINGRES_INSTALL=$Install; " }

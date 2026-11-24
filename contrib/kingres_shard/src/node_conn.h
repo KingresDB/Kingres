@@ -65,6 +65,8 @@ typedef struct KsConn
 	bool		via_previous;
 	/* the participant is a node that is being demoted (S9-05): its standbys are not waited for */
 	bool		sync_exempt;
+	/* the participant is the node that add_node is making part of the cluster: its extension is made in this very transaction (P12S-04) */
+	bool		new_node;
 	/*
 	 * a statement of a user (outside of every control call) wrote through this session in the
 	 * current transaction (S11-01): closing the session loses that write, so the transaction must

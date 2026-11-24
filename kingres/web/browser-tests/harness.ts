@@ -207,6 +207,7 @@ export const ROUTES = [
   '/servers/10.0.0.13',
   '/databases',
   '/databases/shop',
+  '/databases/shop/tables/public/orders',
   '/shards',
   '/replication',
   '/rebalance',
@@ -460,6 +461,122 @@ const freshFailover = async (page: Page): Promise<void> => {
     failoverBlock: null,
     taskDurationMs: 800,
   })
+}
+
+/** Clicks a button of the table row whose first cell says `name` (the tables list of a database). */
+async function clickRowButton(page: Page, name: string, label: string): Promise<void> {
+  await page.waitForSelector('[data-testid="export-csv"]', { timeout: 30_000 })
+  const ok = await page.evaluate(
+    (n, l) => {
+      const row = [...document.querySelectorAll('tbody tr')].find(
+        (r) => r.querySelector('th')?.textContent?.trim() === n,
+      )
+      const button = [...(row?.querySelectorAll('button') ?? [])].find(
+        (b) => b.textContent?.trim() === l,
+      )
+      button?.click()
+      return !!button
+    },
+    name,
+    label,
+  )
+  if (!ok) throw new Error(`No button ${label} in the row ${name}`)
+  await dialogOpen(page)
+}
+
+/** Chooses a CSV file in the import dialog the way a person does: a file in the input, and its change event. */
+async function chooseCsv(page: Page, name: string, text: string): Promise<void> {
+  await page.evaluate(
+    (n, t) => {
+      const input = document.querySelector<HTMLInputElement>('#import-file')
+      if (!input) throw new Error('No file input')
+      const transfer = new DataTransfer()
+      transfer.items.add(new File([t], n, { type: 'text/csv', lastModified: 1 }))
+      input.files = transfer.files
+      input.dispatchEvent(new Event('change', { bubbles: true }))
+    },
+    name,
+    text,
+  )
+  await page.waitForSelector('[data-testid="csv-preview"]', { timeout: 20_000 })
+  await sleep(250)
+}
+
+const NOTES_CSV = 'note_id,body,created_at\n1,hello,2026-01-01\n2,world,2026-01-02\n'
+const fastTasks = (page: Page) => setMock(page, { taskDurationMs: 400 })
+const slowTasks = (page: Page) => setMock(page, { taskDurationMs: 4000 })
+
+/** Closes the open dialog with its close button (a step of the import dialog has no Cancel). */
+const closeX = async (page: Page): Promise<void> => {
+  await page.click('[role="dialog"] [data-dialog-close]')
+  await sleep(200)
+}
+
+/** Goes through the options step of the import dialog and starts it. */
+async function startImport(page: Page): Promise<void> {
+  await page.click('[data-testid="to-options"]')
+  await page.waitForSelector('[data-testid="all-or-nothing"]', { timeout: 20_000 })
+  await sleep(200)
+  // A file whose earlier import had no known outcome asks for the tick before it is imported again.
+  const ack = await page.$('[data-testid="ack-repeat"]')
+  if (ack) await ack.click()
+  await page.click('[data-testid="start-import"]')
+}
+
+/** Puts the tables of increment 9.7 back as they were: the switches off, and the partitioned tables the states added gone. */
+const freshTables = async (page: Page): Promise<void> => {
+  await setMock(page, {
+    tableFail: null,
+    tableSlow: false,
+    tableBusy: false,
+    tableForeignKeys: [],
+    taskDurationMs: 800,
+  })
+  await page.evaluate(() => {
+    const mock = (
+      window as unknown as {
+        __kingresMock: {
+          state: () => {
+            databases: {
+              info: { name: string }
+              tables: { name: string; distribution: { colocationId: number | null } | null }[]
+              colocations: { colocationId: number }[]
+              buckets: Map<number, unknown>
+            }[]
+            partitions?: Record<string, unknown>
+          }
+        }
+      }
+    ).__kingresMock
+    const s = mock.state()
+    const shop = s.databases.find((d) => d.info.name === 'shop')
+    if (!shop) return
+    const gone = shop.tables.filter((t) => t.name.startsWith('measurements'))
+    const groups = new Set(gone.map((t) => t.distribution?.colocationId))
+    shop.tables = shop.tables.filter((t) => !t.name.startsWith('measurements'))
+    shop.colocations = shop.colocations.filter((g) => !groups.has(g.colocationId))
+    for (const id of groups) if (id != null) shop.buckets.delete(id)
+    delete s.partitions
+  })
+}
+
+/** Opens the page of a table of the database `shop` through the list of its tables. */
+async function openTablePage(page: Page, table: string): Promise<void> {
+  await page.evaluate((name) => {
+    ;(
+      window as unknown as { __queryClient: { invalidateQueries: () => unknown } }
+    ).__queryClient.invalidateQueries()
+    void name
+  }, table)
+  await sleep(500)
+  await page.waitForFunction(
+    (name) =>
+      [...document.querySelectorAll('a')].some((a) => a.textContent?.trim() === `public.${name}`),
+    { timeout: 20_000 },
+    table,
+  )
+  await clickText(page, `public.${table}`, 'a')
+  await page.waitForSelector('[data-testid="table-facts"]', { timeout: 20_000 })
 }
 
 /**
@@ -1118,6 +1235,81 @@ export const STATES: PageState[] = [
     },
   },
   {
+    // 0.14.0, increment 9.7: a table the user partitioned by range, with its partitions and the buttons that change them.
+    name: 'table page: the partitions of a table (0.14.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await freshTables(page)
+      await page.evaluate(() =>
+        (
+          window as unknown as {
+            __kingresMock: { urlSwitch: (name: string, text: string) => void }
+          }
+        ).__kingresMock.urlSwitch('tables', 'partitions'),
+      )
+      await openTablePage(page, 'measurements')
+      await page.waitForSelector('[data-testid="partition-list"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: freshTables,
+  },
+  {
+    name: 'table dialog: a change that the table cannot take, with the lines that stop it (0.14.0)',
+    needsMock: true,
+    route: '/databases/shop/tables/public/customers',
+    open: async (page) => {
+      await freshTables(page)
+      await clickWhenThere(page, '[data-testid="undistribute-table"]')
+      await dialogOpen(page)
+      await page.waitForSelector('[role="dialog"] [data-testid="table-blockers"]', {
+        timeout: 20_000,
+      })
+      await sleep(250)
+    },
+    close: cancel,
+  },
+  {
+    name: 'table dialog: distribute a table, with the preview of the change (0.14.0)',
+    needsMock: true,
+    route: '/databases/shop/tables/public/notes',
+    open: async (page) => {
+      await freshTables(page)
+      await clickWhenThere(page, '[data-testid="distribute-table"]')
+      await dialogOpen(page)
+      await page.waitForSelector('[role="dialog"] [data-testid="table-change-eligible"]', {
+        timeout: 20_000,
+      })
+      await sleep(250)
+    },
+    close: cancel,
+  },
+  {
+    name: 'table dialog: a task that failed, in words (0.14.0)',
+    needsMock: true,
+    route: '/databases/shop/tables/public/notes',
+    open: async (page) => {
+      await freshTables(page)
+      await setMock(page, { tableFail: 'space' })
+      await clickWhenThere(page, '[data-testid="distribute-table"]')
+      await dialogOpen(page)
+      await page.waitForSelector('[role="dialog"] [data-testid="table-change-eligible"]', {
+        timeout: 20_000,
+      })
+      await clickText(page, 'Distribute table', '[role="dialog"] button')
+      await page.waitForFunction(
+        () =>
+          document.querySelector('[role="dialog"]')?.textContent?.includes('Not enough free space'),
+        { timeout: 30_000 },
+      )
+      await sleep(300)
+    },
+    close: async (page) => {
+      await clickText(page, 'Close', '[role="dialog"] button')
+      await freshTables(page)
+    },
+  },
+  {
     // 0.11.0, Console C: the Client keys tab (keys of three states, the tables with their policy) and its dialogs.
     name: 'client keys tab (0.11.0)',
     needsMock: true,
@@ -1206,6 +1398,201 @@ export const STATES: PageState[] = [
     },
   },
   {
+    name: 'settings: data transfer group (0.19.0)',
+    route: '/settings',
+    open: async (page) => {
+      await page.waitForSelector('[data-testid="data-transfer-settings"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+  },
+  {
+    name: 'transfers panel with export files (0.19.0)',
+    needsMock: true,
+    route: '/databases',
+    open: async (page) => {
+      await urlSwitch(page, 'transfer', 'exports')
+      await page.waitForSelector('[data-testid="transfers-panel"] tbody tr', { timeout: 30_000 })
+      await sleep(250)
+    },
+  },
+  {
+    name: 'transfers panel while data transfer is off (0.19.0)',
+    needsMock: true,
+    route: '/databases',
+    open: async (page) => {
+      await urlSwitch(page, 'transfer', 'off')
+      await page.waitForSelector('[data-testid="transfers-off"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await page.evaluate(() => {
+        const mock = (
+          window as unknown as {
+            __kingresMock: { state: () => { settings: { dataTransfer?: { enabled: boolean } } } }
+          }
+        ).__kingresMock
+        const dt = mock.state().settings.dataTransfer
+        if (dt) dt.enabled = true
+        void (
+          window as unknown as { __queryClient: { invalidateQueries: () => unknown } }
+        ).__queryClient.invalidateQueries()
+      })
+      await sleep(300)
+    },
+  },
+  {
+    name: 'export CSV dialog (0.19.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await clickRowButton(page, 'public.orders', 'Export CSV')
+      await page.waitForSelector('[data-testid="export-consistency-before"]', { timeout: 20_000 })
+    },
+    close: cancel,
+  },
+  {
+    name: 'export CSV dialog, spreadsheet guard off and an acknowledgement (0.19.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await clickRowButton(page, 'public.othercode', 'Export CSV')
+      await page.click('[data-testid="spreadsheet-safe"]')
+      await page.waitForSelector('[data-testid="spreadsheet-warning"]', { timeout: 20_000 })
+      await clickText(page, 'Export table', '[role="dialog"] button')
+      await page.waitForSelector('[data-testid="acknowledge-code"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: cancel,
+  },
+  {
+    name: 'export CSV result with the download (0.19.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await fastTasks(page)
+      await clickRowButton(page, 'public.skewme', 'Export CSV')
+      await clickText(page, 'Export table', '[role="dialog"] button')
+      await page.waitForSelector('[data-testid="download-start"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await closeDialogs(page)
+      await slowTasks(page)
+    },
+  },
+  {
+    name: 'export CSV failed (0.19.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await fastTasks(page)
+      await clickRowButton(page, 'public.failme', 'Export CSV')
+      await clickText(page, 'Export table', '[role="dialog"] button')
+      await page.waitForSelector('[role="dialog"] [role="alert"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await closeDialogs(page)
+      await slowTasks(page)
+    },
+  },
+  {
+    name: 'import CSV dialog, file chosen with the preview (0.19.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await clickRowButton(page, 'public.notes', 'Import CSV')
+      await chooseCsv(page, 'notes.csv', NOTES_CSV)
+    },
+    close: cancel,
+  },
+  {
+    name: 'import CSV dialog, the options and what all or nothing means (0.19.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await clickRowButton(page, 'public.notes', 'Import CSV')
+      await chooseCsv(page, 'notes.csv', NOTES_CSV)
+      await page.click('[data-testid="to-options"]')
+      await page.waitForSelector('[data-testid="all-or-nothing"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: closeX,
+  },
+  {
+    name: 'import CSV dialog, the session ended in the middle of the upload (0.19.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await urlSwitch(page, 'transfer', 'session')
+      await clickRowButton(page, 'public.notes', 'Import CSV')
+      await chooseCsv(page, 'notes.csv', NOTES_CSV)
+      await startImport(page)
+      await page.waitForSelector('[data-testid="upload-password"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await clickText(page, 'Cancel the upload', '[role="dialog"] button')
+      await closeX(page)
+    },
+  },
+  {
+    name: 'import CSV dialog, the file is too large (0.19.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await clickRowButton(page, 'public.notes', 'Import CSV')
+      // A file of 3 GiB: the size is what the browser reports; only its first bytes are read.
+      await page.evaluate((t) => {
+        const input = document.querySelector<HTMLInputElement>('#import-file')
+        if (!input) throw new Error('No file input')
+        const file = new File([t], 'big.csv', { type: 'text/csv' })
+        Object.defineProperty(file, 'size', { value: 3 * 1024 ** 3 })
+        const transfer = new DataTransfer()
+        transfer.items.add(file)
+        input.files = transfer.files
+        input.dispatchEvent(new Event('change', { bubbles: true }))
+      }, NOTES_CSV)
+      await page.waitForSelector('[data-testid="file-refused"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: cancel,
+  },
+  {
+    name: 'import CSV failed with a whitelisted sentence (0.19.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await fastTasks(page)
+      await clickRowButton(page, 'public.notes', 'Import CSV')
+      await chooseCsv(page, 'badrow.csv', NOTES_CSV)
+      await startImport(page)
+      await page.waitForSelector('[data-testid="import-failed-note"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await closeDialogs(page)
+      await slowTasks(page)
+    },
+  },
+  {
+    name: 'import CSV, the outcome is not known (0.19.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await fastTasks(page)
+      await clickRowButton(page, 'public.notes', 'Import CSV')
+      await chooseCsv(page, 'outcome.csv', NOTES_CSV)
+      await startImport(page)
+      await page.waitForSelector('[data-testid="outcome-unknown"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await closeDialogs(page)
+      await slowTasks(page)
+    },
+  },
+  {
     name: 'system database stopped',
     route: '/this-server',
     open: async (page) => {
@@ -1238,3 +1625,186 @@ export const STATES: PageState[] = [
     },
   },
 ]
+
+/** Puts the states of phase 12 (contract 0.18.0) back as they were: the switches off, the tables, partitions and policies of the states gone. */
+const freshAnalytics = async (page: Page): Promise<void> => {
+  await setMock(page, { tableSlow: false, taskDurationMs: 800 })
+  await page.evaluate(() => {
+    const mock = (
+      window as unknown as {
+        __kingresMock: {
+          state: () => {
+            databases: { info: { name: string }; tables: { name: string }[] }[]
+            partitions?: Record<string, unknown>
+            analytics?: unknown
+            alerts: { kind: string }[]
+          }
+        }
+      }
+    ).__kingresMock
+    const s = mock.state()
+    const shop = s.databases.find((d) => d.info.name === 'shop')
+    if (shop) shop.tables = shop.tables.filter((t) => t.name !== 'clicks' && t.name !== 'metrics')
+    if (s.partitions) delete s.partitions['shop/public.metrics']
+    delete s.analytics
+    s.alerts = s.alerts.filter(
+      (a) => a.kind !== 'partitionsAheadLow' && a.kind !== 'partitionPolicyFailed',
+    )
+    ;(
+      window as unknown as { __queryClient: { invalidateQueries: () => unknown } }
+    ).__queryClient.invalidateQueries()
+  })
+  await sleep(300)
+}
+
+/** The pages and dialogs of phase 12: the card and dialog of approximate aggregates, the Storage column, the table page with its partitions, policy and runs, their dialogs, and the plan summary of the workbench. */
+export const ANALYTICS_STATES: PageState[] = [
+  {
+    name: 'database page: approximate aggregates, on (0.18.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await freshAnalytics(page)
+      await urlSwitch(page, 'analytics', 'on')
+      await page.waitForSelector('[data-testid="aggregates-facts"]', { timeout: 20_000 })
+      await page.waitForFunction(
+        () =>
+          document
+            .querySelector('[data-testid="aggregates-mode"]')
+            ?.textContent?.includes('Approximate'),
+        { timeout: 20_000 },
+      )
+      await sleep(250)
+    },
+    close: freshAnalytics,
+  },
+  {
+    name: 'approximate aggregates dialog, with the consequence (0.18.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await freshAnalytics(page)
+      await page.waitForSelector(
+        '[data-testid="aggregates-configure"]:not([aria-disabled="true"])',
+        {
+          timeout: 20_000,
+        },
+      )
+      await page.click('[data-testid="aggregates-configure"]')
+      await dialogOpen(page)
+      await page.click('#aa-enabled')
+      await page.select('[data-testid="aa-mode"]', 'approximate')
+      await page.waitForSelector('[data-testid="aa-consequence"]', { timeout: 10_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await closeDialogs(page)
+      await freshAnalytics(page)
+    },
+  },
+  {
+    name: 'tables list: the Storage column and its filter (0.18.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await freshAnalytics(page)
+      await urlSwitch(page, 'analytics', 'timeseries')
+      await page.waitForSelector('[data-testid="storage-mixed"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: freshAnalytics,
+  },
+  {
+    name: 'table page: storage, partitions, policy and runs (0.18.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await freshAnalytics(page)
+      await urlSwitch(page, 'analytics', 'timeseries')
+      await openTablePage(page, 'metrics')
+      await page.waitForSelector('[data-testid="policy-runs"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: freshAnalytics,
+  },
+  {
+    name: 'convert storage dialog of a partition (0.18.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await freshAnalytics(page)
+      await urlSwitch(page, 'analytics', 'timeseries')
+      await openTablePage(page, 'metrics')
+      await clickWhenThere(page, '[data-testid^="convert-metrics_p"]:not([aria-disabled="true"])')
+      await dialogOpen(page)
+      await page.waitForSelector('[data-testid="storage-partition-note"]', { timeout: 10_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await closeDialogs(page)
+      await freshAnalytics(page)
+    },
+  },
+  {
+    name: 'time-partitioning policy dialog with a preview that deletes (0.18.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await freshAnalytics(page)
+      await urlSwitch(page, 'analytics', 'timeseries')
+      await openTablePage(page, 'metrics')
+      await clickWhenThere(page, '[data-testid="policy-edit"]:not([aria-disabled="true"])')
+      await dialogOpen(page)
+      await page.waitForSelector('[data-testid="policy-form"]', { timeout: 20_000 })
+      await page.$eval('[data-testid="policy-retention"]', (el) => {
+        ;(el as HTMLInputElement).value = '5'
+        el.dispatchEvent(new Event('input', { bubbles: true }))
+      })
+      await page.click('[data-testid="policy-preview"]')
+      await page.waitForSelector('[data-testid="policy-preview-deletes"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await closeDialogs(page)
+      await freshAnalytics(page)
+    },
+  },
+  {
+    name: 'run now dialog and a run with its actions (0.18.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await freshAnalytics(page)
+      await urlSwitch(page, 'analytics', 'timeseries')
+      await openTablePage(page, 'metrics')
+      await clickWhenThere(page, '[data-testid^="run-open-"]')
+      await dialogOpen(page)
+      await page.waitForSelector('[data-testid="run-details"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await closeDialogs(page)
+      await freshAnalytics(page)
+    },
+  },
+  {
+    name: 'workbench: the summary above a plan (0.18.0)',
+    needsMock: true,
+    route: '/workbench',
+    open: async (page) => {
+      await freshAnalytics(page)
+      await page.$eval('#w-sql', (el) => {
+        ;(el as HTMLTextAreaElement).value =
+          'explain select * from orders o join events e on o.customer_id = e.customer_id'
+        el.dispatchEvent(new Event('input', { bubbles: true }))
+      })
+      await clickText(page, 'Run')
+      await page.waitForSelector('[data-testid="plan-summary"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+  },
+]
+/** The states of the data transfer (contract 0.19.0): they are run apart from the older ones, so that each run stays inside the time of one test. */
+export const TRANSFER_STATES = STATES.filter((s) => s.name.includes('(0.19.0)'))
+/** Every state that is not one of the data transfer. */
+export const OLDER_STATES = STATES.filter((s) => !s.name.includes('(0.19.0)'))

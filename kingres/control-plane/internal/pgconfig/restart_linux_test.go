@@ -36,7 +36,7 @@ stop) rm -f "$pid"; exit 0 ;;
 esac
 exit 0
 `
-	for _, p := range []string{"pg_ctl", "initdb", "pg_basebackup", "pg_rewind"} {
+	for _, p := range []string{"pg_ctl", "initdb", "pg_basebackup", "pg_rewind", "postgres"} {
 		if err := os.WriteFile(filepath.Join(bin, p), []byte(script), 0o755); err != nil { //nolint:gosec // a test script
 			t.Fatal(err)
 		}

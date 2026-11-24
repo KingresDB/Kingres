@@ -284,6 +284,9 @@ func newLedgerParts(cfg config.Config, svc *cluster.Service, self string, log *s
 	if err := sched.Add(stateSyncJob(pubState, members, holderHosts, log.With("component", "ledger-state"))); err != nil {
 		return nil, err
 	}
+	if err := sched.Add(transferJanitorJob(opsSvc)); err != nil {
+		return nil, err
+	}
 	opsSvc.LedgerDigest, opsSvc.LedgerDigests = coll.Digest, coll.Digests
 	opsSvc.LedgerRetireDatabase = func(ctx context.Context, db string) error {
 		return coll.RetireDatabase(ctx, db, ledgerround.ReasonDropped, true)
@@ -328,6 +331,9 @@ func newLedgerParts(cfg config.Config, svc *cluster.Service, self string, log *s
 	}
 	anch, err := newLedgerAnchor(cfg, dir, sys, sched, members, calls, self, log, alertFn)
 	if err != nil {
+		return nil, err
+	}
+	if err := addPartitionJobs(sched, opsSvc, sys, cfg.PartitionSchedulerInterval, log); err != nil {
 		return nil, err
 	}
 	return &ledgerParts{svc: s, sched: sched, coll: coll, listener: listener, anchor: anch, log: log}, nil

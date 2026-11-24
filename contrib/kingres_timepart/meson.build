@@ -53,6 +53,7 @@ tests += {
       't/007_convert_standby.pl',
       't/008_convert_prepared.pl',
       't/009_convert_ddl_race.pl',
+      't/010_schema_spoof.pl',
     ],
   },
 }

@@ -47,6 +47,8 @@ type Runner struct {
 	// Probes are extra checks run in every round: each returns the conditions that exist
 	// and the alert kinds it evaluated (only those may be cleared).
 	Probes []func(ctx context.Context, now time.Time) ([]Condition, map[string]bool)
+	// Extra gives further metrics of this server for every round (name and value); nil: none. The data transfer gives its staging use here.
+	Extra func(ctx context.Context) map[string]float64
 
 	tracker *PendingTracker
 	round   int
@@ -116,6 +118,11 @@ func (r *Runner) Once(ctx context.Context, now time.Time) {
 		r.downSince = time.Time{}
 	}
 	r.sample(ctx, c, now, &rd)
+	if r.Extra != nil {
+		for name, v := range r.Extra(ctx) {
+			r.Ring.Add(Series{Metric: name, ServerID: r.Host}, now, f(v))
+		}
+	}
 	r.certificates(now, &rd)
 	if r.round%3 == 0 {
 		r.ledger(ctx, c, now, &rd)

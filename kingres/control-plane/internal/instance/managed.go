@@ -32,9 +32,13 @@ const (
 	ReasonInternal        = "internal"
 	ReasonSuperuserOnly   = "superuserOnly"
 	ReasonSessionInternal = "sessionInternal"
+	ReasonControlPlane    = "controlPlaneSession"
+	ReasonStartRisk       = "startRisk"
 )
 
 func managed(text string) Reason { return Reason{ReasonManaged, text} }
+
+func logging(text string) Reason { return Reason{ReasonLogging, text} }
 
 // ManagedParameters are the parameters kingresd itself writes or relies on (design config-phase13.md,
 // "Managed parameters"). It is the one list that the renderer, the standby code and the API share:
@@ -45,7 +49,18 @@ var ManagedParameters = map[string]Reason{
 	"listen_addresses":                  managed("kingresd sets the addresses the other servers and kingresd itself connect to; a wrong value cuts the server off."),
 	"port":                              managed("kingresd sets the port the other servers and kingresd itself connect to."),
 	"unix_socket_directories":           managed("kingresd connects to the instance through this socket."),
-	"shared_preload_libraries":          managed("the extensions of the cluster (kingres_shard, kingres_ledger) are loaded through it."),
+	"unix_socket_permissions":           managed("kingresd connects to the instance through this socket; a mode that closes it locks kingresd out."),
+	"unix_socket_group":                 managed("kingresd connects to the instance through this socket; a group that does not exist stops the server from starting."),
+	"log_destination":                   logging("the console reads the log files the collector writes; another destination leaves them empty."),
+	"log_transaction_sample_rate":       managed("statement text must never be written to a log."),
+	"log_statement_sample_rate":         managed("statement text must never be written to a log."),
+	"log_min_duration_sample":           managed("statement text must never be written to a log."),
+	"log_file_mode":                     logging("the console reads the log files, which need a mode its user can read."),
+	"syslog_facility":                   logging("the logs go to the files the console reads."),
+	"syslog_ident":                      logging("the logs go to the files the console reads."),
+	"syslog_sequence_numbers":           logging("the logs go to the files the console reads."),
+	"syslog_split_messages":             logging("the logs go to the files the console reads."),
+	"shared_preload_libraries":          managed("the extensions of the cluster (kingres_shard, kingres_ledger, kingres_columnar) are loaded through it."),
 	"ssl":                               managed("kingresd sets the TLS files of the cluster certificates."),
 	"ssl_cert_file":                     managed("the cluster certificate of this server."),
 	"ssl_key_file":                      managed("the key of the cluster certificate of this server."),

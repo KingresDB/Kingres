@@ -353,6 +353,9 @@ func (s *Service) stepSystemDB(ctx context.Context, _ *task.Env) error {
 	if _, err := sysdb.Migrate(ctx, sc); err != nil {
 		return fmt.Errorf("applying migrations: %w", err)
 	}
+	if err := HardenSystemDatabase(ctx, sc); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -497,4 +500,31 @@ func (s *Service) archive(t task.Task) {
 	if err != nil {
 		s.log.Error("archiving the setup task", "error", err)
 	}
+}
+
+// HardenSystemDatabase takes from PUBLIC what it has in the system database: CONNECT and TEMPORARY on the database, CREATE in its schema public. CONNECT is
+// then given to the cluster roles only (kingres_admin, kingres_ops, kingres_readonly, kingres_stats), which is what a sign-in to the console needs: the
+// authenticator connects as the signing-in role, which is a member of one of them. The service role is a superuser and needs nothing. It is idempotent; c is a
+// service connection to the system database. A role that has CONNECT of its own or that is a superuser is not touched.
+func HardenSystemDatabase(ctx context.Context, c *pgx.Conn) error {
+	db := sqlx.MustIdent(sysdb.Database)
+	if err := execB(ctx, c, new(sqlx.Builder).Text("REVOKE ALL ON DATABASE").ID(db).Text("FROM PUBLIC")); err != nil {
+		return fmt.Errorf("revoking the privileges of PUBLIC on the system database: %w", err)
+	}
+	for _, r := range ClusterRoles {
+		ok, err := roleExists(ctx, c, r)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		if err := execB(ctx, c, new(sqlx.Builder).Text("GRANT CONNECT ON DATABASE").ID(db).Text("TO").ID(sqlx.MustIdent(r))); err != nil {
+			return fmt.Errorf("granting CONNECT on the system database to %s: %w", r, err)
+		}
+	}
+	if err := execB(ctx, c, new(sqlx.Builder).Text("REVOKE CREATE ON SCHEMA public FROM PUBLIC")); err != nil {
+		return fmt.Errorf("revoking CREATE on the schema public of the system database: %w", err)
+	}
+	return nil
 }

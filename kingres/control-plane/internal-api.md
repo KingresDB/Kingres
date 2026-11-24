@@ -52,6 +52,7 @@ version 1, the caller \"2\"."}` when the number is missing or different.
 | `POST /internal/v1/exec` | leader | one statement on a local database through the local socket |
 | `POST /internal/v1/forward` | member, answered only by the leader | one operation of the public contract, run as the identity the forwarding server proves with the proof of a session (see "Forwarded identities need a proof") |
 | `POST /internal/v1/gather` | any peer, with an assertion of the leader | this server's part of a cluster-wide read (`listLogs`, `listAlerts`, `queryMetrics`) or the acknowledgement of an alert it holds, run as the identity the leader's assertion vouches for; a request that carries a proof is refused; see "Cluster-wide reads" |
+| `POST /internal/v1/forward-stream` | member, answered only by the leader | a streaming operation of the data transfer: a frame, then raw bytes each way (see "The streaming relay") |
 | `POST /internal/v1/gather-authorize` | member, answered only by the leader | the asking server sends the gather request with the proof of the user's session; the leader checks it as for `forward` and answers with an assertion signed with the key of its own server certificate |
 | `POST /internal/v1/pki/renew` | member, answered only by the leader | the caller asks the CA holder for a new certificate for itself; see "Certificate renewal" |
 | `GET /internal/v1/pki/csr` | leader | a certificate request for this server's names, made from its key |
@@ -86,7 +87,7 @@ version 1, the caller \"2\"."}` when the number is missing or different.
 | `POST /internal/v1/ledger/key/list` | leader | `{}` -> `{fingerprints: [...]}`: the key files this server has, nothing else |
 | `POST /internal/v1/ledger/anchor/credentials/install` | leader | give this server the credentials file of an anchor target: `{targetId, kind, file}`, `file` the standard base64 of the file as the leader holds it (clear or sealed, never a passphrase; design 6.8); the callee opens it with its own passphrase file and writes it again under its own sealing (`409 passphrase_mismatch` when it cannot open it, `422 credentials_invalid` for a file that is not the credentials of that kind, `400 bad_request` for a kind this server does not have); installing credentials that are there replaces them; the answer is `{}`; no answer and no error text holds a credential |
 | `POST /internal/v1/ledger/anchor/credentials/remove` | leader | delete the credentials file of a target (`{targetId}`; a file that is not there is not an error); the answer is `{}` |
-| `POST /internal/v1/ledger/anchor/credentials/list` | leader | `{}` -> `{ids: [...]}`: the targets this server has a credentials file for, nothing else; the job `ledger.anchor.credentials` of the leader compares it with the targets to give a holder the files it lacks and to take away the files of targets that are gone || `POST /internal/v1/ledger/anchor/credentials/fetch` | leader | `{targetId}` -> `{file}`: the credentials file of the target as this server holds it (standard base64, clear or sealed, never a passphrase), `404 not_found` when it has none; a leader that lacks a file asks the other holders for it and installs it as for `install` |
+| `POST /internal/v1/ledger/anchor/credentials/list` | leader | `{}` -> `{ids: [...], copies: [{id, generation, digest}]}`: the targets this server has a credentials file for, and for each file that opens its rotation generation (a counter inside the file, 0 for a file of an earlier version) and a digest that is an HMAC keyed with the stamp of the rotation, which never leaves the file through this call (P7F-01, P7G-02, P7G-05; no value and no time; an older server sends no copies); `credentials/install` answers `409 older_generation` when this server holds a file of a higher generation, or another of the same generation; the job `ledger.anchor.credentials` of the leader compares it with the targets to give a holder the files it lacks and to take away the files of targets that are gone || `POST /internal/v1/ledger/anchor/credentials/fetch` | leader | `{targetId}` -> `{file}`: the credentials file of the target as this server holds it (standard base64, clear or sealed, never a passphrase), `404 not_found` when it has none; a leader that lacks a file asks the other holders for it and installs it as for `install` |
 | `POST /internal/v1/ledger/anchor/credentials/fetch` | leader | `{targetId}` -> `{file}`: the credentials file of the target as this server holds it (standard base64, clear or sealed, never a passphrase), `404 not_found` when it has none; a leader that lacks a file asks the other holders for it and installs it as for `install` |
 | `POST /internal/v1/ledger/state/get` | leader | `{}` -> the record of what was published that this server keeps outside the system database (`{logs: {origin: {size, root}}, events, eventHash}`: the highest size and root of every log with a signed checkpoint, the number of events and the hash of the last one; no secret); `404 no_state` when this server has none. A server that is about to lead and has no record asks the others for theirs before it takes what its database holds as the starting point |
 | `POST /internal/v1/ledger/state/merge` | leader | the same object: the callee merges it into its own record (the larger size per log, the larger event count; `409 fork` when the two disagree on the root of one size or on the last event, and nothing is merged); the answer is `{}`. The leader sends its record to every holder at every pass of the job `ledger.state.sync` |
@@ -169,6 +170,10 @@ verifier in its own PostgreSQL (`pg_authid.rolpassword`) before it does anything
   holds every verifier, runs every cluster operation and is trusted with everything already. **A compromised
   leader is a compromised cluster; that is inherent** (it is also the server that holds the CA key in the
   current design).
+  **One exception (F4-05, ADR 0026):** the request of an operator for the failover of the map group is sent with a proof of kind `mapStart` to the candidate that
+  promotes the map group, because the leader is the server that is gone. The candidate is the next leader and already holds every verifier, and may learn the
+  operator's ClientKey; it ends when the password changes. A session of the token kind has no proof key and gets `503 service_unavailable` for this operation when the
+  candidate is another server.
 - It refuses a proof whose `issuedAt` is more than two minutes from its clock and a nonce it has accepted before
   (a bounded replay cache that only fills with proofs that verified). The answer to a refused proof is
   `401 identity_unproven`; the forwarding server tells its client `401 unauthenticated` ("sign in again").
@@ -216,6 +221,36 @@ assertion), and it cannot make the leader or another member accept an identity i
 **leader** can do: everything (it holds the CA key, every verifier, the system database, and receives every
 proof); that is inherent to a design in which the leader runs the cluster operations and checks the proofs.
 
+## The streaming relay (data transfer, contract 0.19.0)
+
+`POST /internal/v1/forward-stream` relays the two operations of the contract that carry a body of any size (`uploadDataChunk`,
+`x-streams: upload`, and `downloadDataExport`, `x-streams: download`). `forward` cannot: it reads the body whole, answers into a buffer of
+32 MiB and accepts 16 MiB. The call is **member-only and answered only by the manager leader** (policy `ToLeader`; the membership check is
+made by the backend, as for `forward`, so that a stopped instance answers in the documented way). The version of the internal protocol stays `1`:
+it is a new call only.
+
+| Direction | Frame | Content |
+|---|---|---|
+| request | 4-byte big-endian length (1 to 65536), then JSON | the members of `forward` without `body`: `operationId`, `pathParams`, `query`, `identity`, `requestId`, `sourceAddress`, `source`, `proof`, and `header`: the request headers the operation uses, only `Range`, `Upload-Offset`, `Content-Length` and `Content-Type` (any other name is refused) |
+| request | then | the raw body: the chunk of an upload (at most 256 MiB, **no 16 MiB limit**); nothing for a download |
+| response | 4-byte length, then JSON | `{status, header}`: the status of the operation and the headers of the allowlist `Content-Type`, `Location`, `Retry-After`, `Allow`, `Content-Language`, `Preference-Applied`, `Content-Disposition`, `Content-Length`, `Content-Range`, `Accept-Ranges`, `ETag`, `Upload-Offset`, `Cache-Control`, `X-Content-Type-Options` |
+| response | then | the raw bytes, flushed as they are written (none for a 204) |
+
+- The proof is checked exactly as for `forward`, with the **kind `forward-stream`** (a proof made for `forward` does not hold here), and it
+  binds the frame, **including the `header` members**; it does not cover the raw body (bytes of any size on the mutual TLS connection between
+  two members). A frame larger than 64 KiB is `413 frame_too_large`, a frame that is cut, empty, not JSON, with an unknown member, with a `body`, with
+  an assertion or with a header of another call is `400 bad_request`, a proof that does not hold `401 identity_unproven`, and nothing runs in any of these cases.
+- The leader runs the operation through the same pipeline as a public request (role check, the setting `dataTransfer.enabled`, handler, audit);
+  the audit event of a download is written when its stream ends.
+- **Deadlines.** The server has a read timeout of 30 s of the whole request, which a chunk of minutes would break. The stream operation
+  moves the read and the write deadline of the connection with every read and every write (`http.ResponseController`, package `relay`): a
+  stream that makes progress is not ended, one that stops for 60 s is. The request context of an upload chunk ends after 15 minutes. HTTP/2 on the public side
+  and HTTP/1.1 on the internal side were both tested (spike S1, see the design note).
+- **Nothing is buffered** beyond one segment of 64 KiB on either server. A stream that fails after the frame went out cannot change its status:
+  the leader cuts the connection (a short body for the client of the follower) and the Content-Length of a download makes it visible.
+- The calling server uses a client of its own without the overall 30 s limit of the other calls, and never repeats a stream call (a body that
+  was read cannot be read again; the console resumes an upload at the offset the server holds).
+
 ## Cluster-wide reads (gather)
 
 `listLogs`, `listAlerts` and `queryMetrics` answer for the whole cluster from any server. The server that
@@ -246,6 +281,17 @@ An alert's id is `ordinal << 32 | local id`: the ordinal is the number the leade
 (`kingres_cp.server.ordinal`, sent to every server in the peer directory, `peers.json`). The id is unique in the
 cluster, below 2^53 (what a browser holds in a JSON number), and tells the receiving server which server holds
 the alert, so `acknowledgeAlert` goes straight to it (it audits the acknowledgement, once).
+
+## Extensions and database settings (phase 12)
+
+Four more closed kinds of `POST /internal/v1/apply` (leader only, parameters are structured values, never SQL): `extension.check` (`{database, extension, version?, preload?}`:
+the package of this server has the extension, at that default version; with `preload` its library is in `shared_preload_libraries`), `extension.install`
+(`CREATE EXTENSION IF NOT EXISTS`, or `ALTER EXTENSION ... UPDATE` when it is installed at another version), `extension.verify` (`{database, extension, version, hash?}`: the installed version
+and, for `kingres_sketch`, `self_test()`) and `database.settings` (`{database, settings}`: `ALTER DATABASE ... SET`, or `RESET` for an empty value, of a closed list of three
+`kingres_shard` settings; a setting that the server does not know is skipped). The extension is one of `kingres_sketch`, `kingres_columnar` and `kingres_timepart`. A refusal that the
+leader must tell apart comes back with the status of the problem and its code in `code`: `422 extension_unavailable`, `409 extension_version_mismatch`, `409 sketch_hash_mismatch` and
+`409 extension_missing`; `healable` does not retry them. The leader also uses `POST /internal/v1/exec` for one read-only statement per server (the version of `kingres_sketch` that a server
+has installed, for `getApproximateAggregates`); that is the first caller of `exec` in the product.
 
 ## Certificate renewal
 
@@ -387,8 +433,14 @@ Types: `cmd/kingresd/ha_failover.go`, `internal/standby/freeze.go`. A `GET` carr
 | Call | Answer |
 |---|---|
 | `GET /failover/position?group=<g>` (any peer) | `{server, group, instanceId, role, inRecovery, timeline, receiveLsn, replayLsn, receiverState, systemIdentifier, catalogTerm}` of the instance of this server whose role file names the group (a standby in preference); `receiveLsn` is the flushed WAL position (the received one in recovery, the current flush position of a primary), `catalogTerm` is `null` when the instance has no catalog or it cannot be read. `404 no_instance` when this server runs no instance of the group, `503 unavailable` when it cannot be read. Read-only. |
-| `POST /failover/map/start` (any peer) | `{server, requestedBy, allowDataLoss, comment, trigger}` (`trigger` is `manual` or `automatic`, default `manual`; the candidate monitor of the automatic failover starts the bootstrap on its own server with `automatic`) -> `{}`: the receiver of an operator's request for the failover of the map group asks a server that hosts a ready standby of group 0 to run the bootstrap. The callee proves what it needs itself (B1): the catalog it holds names `server` as the primary of the map group, a ready registered standby of group 0 runs here, a majority of the servers is heard. It answers the refusal (`422 unprocessable`, `409 no_replica_available`, `503 quorum_unavailable`) or `{}` and runs B2 to B8 in the background. |
+| `POST /failover/map/start` (any peer) | `{server, requestedBy, allowDataLoss, comment, trigger}` (`trigger` is `manual` or `automatic`, default `manual`; the candidate monitor of the automatic failover starts the bootstrap on its own server with `automatic`) -> `{}`: the receiver of an operator's request for the failover of the map group asks a server that hosts a ready standby of group 0 to run the bootstrap. The callee proves what it needs itself (B1): the catalog it holds names `server` as the primary of the map group, a ready registered standby of group 0 runs here, a majority of the servers is heard. It answers the refusal (`422 unprocessable`, `409 no_replica_available`, `503 quorum_unavailable`) or `{}` and runs B2 to B8 in the background. **Signed form (F4-05).** The request of an operator is sent as `{request, username, clusterRoles, requestId, proof}`: `request` is the body above exactly as signed, `proof` the proof of the operator's session (`fwdproof`, kind `mapStart`, over the two servers, the user, the roles, the operation `failoverServer` with its `serverId` and the bytes of `request`). The callee verifies it against the verifier of the role in its copy of the system database (`401 identity_unproven` when it does not verify, was used before, or was made for another sender; `503 unavailable` when the verifier cannot be read) and requires `kingres_ops` among the roles (`403 forbidden`); the decision `allowDataLoss` and the author are then the proven operator's. The plain form is accepted only for a planned switchover (`planned`, from the old leader's own task, whose server is the caller); any other plain request is `401 identity_unproven`. |
 | `POST /failover/map/continue` (any peer) | the journal of a bootstrap (`internal/failover/journal`) -> `{}`: a candidate that found another standby of group 0 better handed it the lease (`transfer`) and tells it to resume; `409 not_candidate` when the pin is not this server's, `409 stale_term` when the catalog of this server does not match the journal. The callee adopts the journal and resumes. |
+| `POST /failover/map/abandon` (any peer) | `{reason}` -> `{abandoned, resumedServer}`: gives up the bootstrap of the map group that is in progress on this server (0.18.0, F4-06); `409 conflict` when it already promoted the standby, or when the standby cannot be shown (by the instance or by its control data) to be still in recovery after the promotion was begun. A planned switchover that is given up also asks the old leader's server to end the hold of its primary (`resumedServer`). The probe, the mark of the journal and the release of the lease run under the standby agent's lifecycle lock that the promoting call holds across `pg_promote` (F6-02). The server that received `abandonMapGroupBootstrap` asks every other server with it. |
+| `POST /failover/map/proof` (any peer) | `{checkpoint, clusterState}` -> `{}`: the old leader of a planned switchover of the map group tells the candidate how it was left (the shutdown checkpoint and `shut down`); accepted from the journal's old server only, for a journal marked planned (`409 conflict` otherwise, `403 forbidden` from another server). The candidate promotes on it after `switchover_verify`. |
+| `POST /failover/map/refused` (any peer) | `{reason}` -> `{}`: the candidate of a planned switchover of the map group tells the old leader (whose task asked it to start the bootstrap) that the standby could not prove the old leader's stop; accepted only from the server that task started the bootstrap on (`409 conflict` otherwise). The old leader's task rolls back and its primary is started again. |
+| `GET /failover/map/checkpoint` (any peer) | -> `{checkpoint, clusterState}`: pg_controldata of the primary of the map group on this server, which must not run (`409 not_stopped` when it does, `409 not_primary` without one): the candidate reads the proof from here when the old leader's task could not send it. |
+| `GET /failover/map/bootstrap?old=<server>` (any peer) | -> `{active, standby}`: whether a bootstrap that names the asking server as the old leader is in progress on this server, and what the standby of the map group that this server hosts is (`in_recovery`, shown by the instance or by its control data when it is down; `primary`, it was promoted; `unknown`; `none`). `403 forbidden` when `old` is not the caller. The old leader of a planned switchover asks it about every server before it ends a hold nothing owns (F6-01). |
+| `POST /failover/map/resume` (any peer) | `{strict?}` -> `{resumed, detail}`: this server ends the hold of its primary of the map group when nothing owns it: the hand-over marker is on disk, no server reports an active bootstrap that names this server or a promoted standby, and the server that the group was handed to (recorded in the demote call, `candidate`) answers and shows its standby in recovery; an unreachable candidate, or one whose standby cannot be read, blocks (F7-01). Without a record, and with `strict` (the operator's call), every server must answer and none may say `unknown` (otherwise `resumed` is false and `detail` says why). The candidate that gave its bootstrap up, and an operator through `abandonMapGroupBootstrap`, call it; the server's own loop (every ten seconds, from the start of kingresd) does the same (F6-01, F6-03). |
 | `GET /catalog/nodes` (any peer) | `[{ID, Group, Host, Port, Primary, Active}]`: the rows of `kingres.node` of the system catalog as the answering server reads them. The client entry point of a server that can no longer read its own catalog (its only primary was failed over and is held back) asks the other servers with it, so that it forwards to the ring instead of resetting the connection (F3-09). |
 | `GET /liveness` (any peer) | `{server, peers: [{server, state: live\|suspect\|dead\|unknown, silenceMs}]}`: the heartbeat tracker of the answering server; a failover asks every server to corroborate a death. |
 | `GET /failover/state?group=<g>` (leader) | `{server, group, instances: [{id, port, role, origin, group, term, running, inRecovery}], holds, leaseState, adopted, attached, relinquished, frozen, catalogTerm, preparedTransactions, destination}`: what this server knows of the group; a task that is not sure what its last call did asks it. |
@@ -431,6 +483,22 @@ that an earlier call began (the role file already says primary, the instance is 
 could not be attached to the promoted instance, so that the step hands the lease over again. `prepared` acts in the database named by `database`
 (the system database when absent): every database has a catalog of its own. `GET /failover/state` adds `enforced` (the lease manager of the
 server would stop a primary of the group whose lease lapsed: it does so only when its plan says the group has a standby).
+
+Changes of the fixes for the review of increments 4 to 7 (F4-01 to F4-17, 2026-11-20 and 2026-11-21), all inside internal API version "1":
+- `quiesce`, `mark` and `verify` need the fence header of a task run (`400 bad_request` without it, as `demote` and `promote`); `unquiesce` and `resume` do not
+  (the repair loop that undoes a switchover left behind has no run), so they carry the catalog term instead.
+- `expectedTerm` is carried by `quiesce`, `unquiesce`, `resume`, `mark`, `demote` with `mode: fast` and `lease`; the callee answers `409 stale_term` when it has
+  seen a newer term. `mark` and the clean stop need the term: a callee that runs the primary and cannot read its term refuses (`503 unavailable`).
+- `demote` has `mode: fast` (the clean stop of a switchover: `{stopped, transferred, released, checkpoint, clusterState}`; repeated, it reads the checkpoint of the
+  stopped instance again) as well as `immediate`. `promote` carries `checkpoint` and `clusterState` of a switchover: the callee runs `switchover_verify` before
+  `pg_promote` and refuses with `409 unprovable` or `409 standby_behind`.
+- `quiesce` answers `{quiesced, remaining}` (the sessions that are not the service role's and are still open), ends sessions on the local socket as well, and
+  waits until the postmaster has loaded the hold rules (`pg_conf_load_time()`). The hold is the hold rules on disk (`pg_hba.conf.kingres-quiesced` keeps the
+  previous file), so `GET /failover/state` says `quiesced` after a restart of kingresd.
+- `POST /failover/map/start`: a call that came from a member is always handled as manual (the candidate monitor starts an automatic bootstrap on its own
+  server). A start for an old server that the candidate hears is refused: `409 conflict` for an automatic one, `422 unsupported_operation` for a manual one,
+  until the map group with a live old leader is built (README, "A failover, a switchover or a restore that involves the map group"). `POST /failover/map/continue`
+  is accepted only from a server that hosts a ready standby of the map group and only for a journal cut at B4.
 
 ### The ledger keys (ledger phase 7, step 4)
 
@@ -487,7 +555,7 @@ fence token; a client time limit that ended after the connection was made is not
 | `POST /failover/promote` | `already` for an instance that is out of recovery (it re-applies the empty list and attaches the lease); a promotion that did not finish is asked again |
 | `POST /standby/repoint` | no-op when `primary_conninfo` and the slot are the ones asked for; only waits for the walreceiver |
 | `POST /lease/grant` | a renewal; `transferTo` by the caller that is no longer the holder is refused (`granted: false`); `release` of a free group answers `granted: true` |
-| `POST /task/record`, `/settle`, `/reserve`, `/leave-cluster`, `/leave-status`, `/add-server`, `/forward`, `/pki/renew`, `/exec`, `/heartbeat` | made by servers outside a step, or repeated by design; not repeated by the client |
+| `POST /task/record`, `/settle`, `/reserve`, `/leave-cluster`, `/leave-status`, `/add-server`, `/forward`, `/forward-stream`, `/pki/renew`, `/exec`, `/heartbeat` | made by servers outside a step, or repeated by design; not repeated by the client |
 | `GET` calls | reads |
 
 The failover steps (increment 3) are no-ops on a second execution in the same way: each checks what exists before it acts (the pinned standby in
