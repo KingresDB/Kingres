@@ -9,6 +9,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/auth"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
@@ -67,6 +68,7 @@ func (s *Server) failoverServer(c *call, w http.ResponseWriter, r *http.Request)
 	if err := s.body(w, r, &req); err != nil {
 		return err
 	}
+	req.ActorIsAdmin = auth.Allows(c.session.ClusterRoles, auth.RoleAdmin)
 	t, plan, err := fo.Start(r.Context(), c.session.Username, server, req)
 	if err != nil {
 		return s.failoverProblem(r, err)

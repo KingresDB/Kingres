@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KingresDB Management API
-  version: 0.32.0
+  version: 0.33.0
   summary: REST API of the KingresDB management panel, CLI and manager.
   description: |
     The single REST API served by `kingresd` on every KingresDB server. The web panel
@@ -1054,6 +1054,10 @@ paths:
         the server is not primary of or a target that is not a standby of the group. While `kingresd` lacks a
         part of the design, the request answers 422 `unsupported_operation`: this revision's server implements
         `hard` and `graceful` for ordinary groups.
+
+        **0.33.0, the role for a loss of data.** A hard request that includes the map group of a server that is alive (see 0.28.0) and carries
+        `allowDataLoss: true` is refused with 403 `forbidden` unless the session has `kingres_admin`; the operation otherwise needs `kingres_ops`, and the
+        same request for an ordinary group, or for the map group without `allowDataLoss`, stays with `kingres_ops`.
 
         **0.13.0, the planned switchover (`graceful`).** For each group, in this order: the writes of the group stop on the old primary
         (new connections go elsewhere, the other sessions are ended), the distributed transactions end, the old primary stops with a fast

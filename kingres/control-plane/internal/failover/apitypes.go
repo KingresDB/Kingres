@@ -202,6 +202,9 @@ type Request struct {
 	AllowDataLoss bool            `json:"allowDataLoss"`
 	DryRun        bool            `json:"dryRun"`
 	Comment       string          `json:"comment"`
+	// ActorIsAdmin is set by the handler from the session, never from the body: a hard failover of the live leader of the map group that accepts
+	// a loss of data needs kingres_admin, as giving up a stuck bootstrap does (phase 5 review L7).
+	ActorIsAdmin bool `json:"-"`
 }
 
 // SkippedOut is the skipped member of FailoverGroupPlan.

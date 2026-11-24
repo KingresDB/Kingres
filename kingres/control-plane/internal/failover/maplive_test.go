@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
 
@@ -461,5 +462,28 @@ func TestAHardFailoverRereadsTheLivePrimaryBeforeTheFence(t *testing.T) {
 	var pe *PauseError
 	if !errors.As(err, &pe) || w.index("demote ") >= 0 || w.count("map-abandon s2") != 1 {
 		t.Fatalf("want a pause before the fence and the bootstrap given up: %v\n%s", err, strings.Join(w.log, "\n"))
+	}
+}
+
+// Phase 5 review L7: accepting a loss of data in a hard failover of the live leader of the map group needs kingres_admin, as giving up a stuck
+// bootstrap does; the same request without the loss, and an ordinary group with the loss, stay with kingres_ops.
+func TestAHardFailoverOfTheLiveMapGroupThatAcceptsALossNeedsAnAdministrator(t *testing.T) {
+	ctx := context.Background()
+	w := mapWorld()
+	s := &Service{Runner: w.runner()}
+	_, err := s.Resolve(ctx, "t", "s1", Request{Mode: ModeHard, AllowDataLoss: true})
+	var p *problem.Problem
+	if !errors.As(err, &p) || p.Status != 403 {
+		t.Fatalf("an operator accepted a loss for the map group: %v", err)
+	}
+	if _, err := s.Resolve(ctx, "t", "s1", Request{Mode: ModeHard, AllowDataLoss: true, ActorIsAdmin: true}); err != nil {
+		t.Fatalf("an administrator: %v", err)
+	}
+	if _, err := s.Resolve(ctx, "t", "s1", Request{Mode: ModeHard}); err != nil {
+		t.Fatalf("no loss accepted: %v", err)
+	}
+	s2 := &Service{Runner: gracefulWorld().runner()}
+	if _, err := s2.Resolve(ctx, "t", "s1", Request{Mode: ModeHard, AllowDataLoss: true}); err != nil {
+		t.Fatalf("an ordinary group with the loss: %v", err)
 	}
 }
