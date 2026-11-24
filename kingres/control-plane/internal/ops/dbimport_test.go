@@ -224,8 +224,8 @@ func TestSafeNameBoundsAndCleans(t *testing.T) {
 }
 
 func TestPrivateNameIsTheTasksOwn(t *testing.T) {
-	if privateName(41) != "kingres_import_41" || !dbNameRE.MatchString(privateName(1<<40)) {
-		t.Errorf("%q", privateName(41))
+	if privateName(41, "ab12") != "kingres_import_41_ab12" || !dbNameRE.MatchString(privateName(1<<40, "0123456789ab")) {
+		t.Errorf("%q", privateName(41, "ab12"))
 	}
 	// A name that a request may give can never be a private name, so a task cannot be made to work in, or drop, another task's database.
 	for _, n := range []string{"kingres_import_7", "kingres_import_", "postgres", "template0", "template1", "kingres_system", "Upper", "a b", "", "x;y", strings.Repeat("a", 64), "1abc"} {
@@ -427,6 +427,24 @@ func TestExprFunctionNames(t *testing.T) {
 	for _, tc := range cases {
 		if got := strings.Join(exprFunctionNames(tc.in), ","); got != tc.want {
 			t.Errorf("%q: %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// L5: the suffix that the control plane adds to a violated key is on a line of its own, so that a comment at the end of the text of the archive does not swallow
+// it, and a text that is NOT VALID already is not given a second one.
+func TestNotValidText(t *testing.T) {
+	cases := map[string]string{
+		"ALTER TABLE a.t ADD CONSTRAINT c FOREIGN KEY (x) REFERENCES a.p (id)":                       "ALTER TABLE a.t ADD CONSTRAINT c FOREIGN KEY (x) REFERENCES a.p (id)\n NOT VALID",
+		"ALTER TABLE a.t ADD CONSTRAINT c FOREIGN KEY (x) REFERENCES a.p (id) -- trailing":           "ALTER TABLE a.t ADD CONSTRAINT c FOREIGN KEY (x) REFERENCES a.p (id) -- trailing\n NOT VALID",
+		"ALTER TABLE a.t ADD CONSTRAINT c FOREIGN KEY (x) REFERENCES a.p (id) NOT VALID":             "ALTER TABLE a.t ADD CONSTRAINT c FOREIGN KEY (x) REFERENCES a.p (id) NOT VALID",
+		"ALTER TABLE a.t ADD CONSTRAINT c FOREIGN KEY (x) REFERENCES a.p (id) not\tvalid -- c":       "ALTER TABLE a.t ADD CONSTRAINT c FOREIGN KEY (x) REFERENCES a.p (id) not\tvalid -- c",
+		"ALTER TABLE a.t ADD CONSTRAINT c FOREIGN KEY (x) REFERENCES a.p (id) /* NOT VALID */":       "ALTER TABLE a.t ADD CONSTRAINT c FOREIGN KEY (x) REFERENCES a.p (id) /* NOT VALID */\n NOT VALID",
+		"ALTER TABLE a.t ADD CONSTRAINT c FOREIGN KEY (x) REFERENCES a.p (id) -- NOT VALID\n-- more": "ALTER TABLE a.t ADD CONSTRAINT c FOREIGN KEY (x) REFERENCES a.p (id) -- NOT VALID\n-- more\n NOT VALID",
+	}
+	for in, want := range cases {
+		if got := notValidText(in); got != want {
+			t.Errorf("%q: %q, want %q", in, got, want)
 		}
 	}
 }

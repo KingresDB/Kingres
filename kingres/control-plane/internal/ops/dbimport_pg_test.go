@@ -105,19 +105,24 @@ func TestTableTrustedOnARealCatalog(t *testing.T) {
 		"create table public.with_sleep (id int, v text default pg_sleep(0)::text)",
 		"create view public.a_view as select 1 as x")
 	mk("other_owner", "create table public.foreign_owned (id int)")
+	ext := map[string]string{}
+	for table, ok := range map[string]bool{"ok1": true, "part": true, "with_trigger": false, "with_rule": false, "with_policy": false, "with_rls": false, "with_fn": false, "with_fn_idx": false,
+		"with_check": false, "with_sleep": false, "a_view": false, "foreign_owned": false, "does_not_exist": false} {
+		tx, err := c.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = tableTrusted(ctx, tx, "public", table, "imp_owner", ext)
+		_ = tx.Rollback(ctx)
+		if (err == nil) != ok {
+			t.Errorf("table %s: trusted=%v, want %v (%v)", table, err == nil, ok, err)
+		}
+	}
 	tx, err := c.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	ext := map[string]string{}
-	for table, ok := range map[string]bool{"ok1": true, "part": true, "with_trigger": false, "with_rule": false, "with_policy": false, "with_rls": false, "with_fn": false, "with_fn_idx": false,
-		"with_check": false, "with_sleep": false, "a_view": false, "foreign_owned": false, "does_not_exist": false} {
-		err := tableTrusted(ctx, tx, "public", table, "imp_owner", ext)
-		if (err == nil) != ok {
-			t.Errorf("table %s: trusted=%v, want %v (%v)", table, err == nil, ok, err)
-		}
-	}
 	// The error names the table and the reason, and never a value.
 	if err := tableTrusted(ctx, tx, "public", "with_fn", "imp_owner", ext); err == nil || !strings.Contains(err.Error(), "public.mine") {
 		t.Errorf("the reason for with_fn: %v", err)
