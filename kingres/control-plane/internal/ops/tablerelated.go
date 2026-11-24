@@ -683,7 +683,7 @@ const relatedGraphCTE = `WITH RECURSIVE e AS (
 func (b pgBackend) Graph(ctx context.Context, p tableParams) (g relGraph, err error) {
 	err = b.with(ctx, p.Database, func(c *pgx.Conn) error {
 		rows, err := c.Query(ctx, relatedGraphCTE+`
-			SELECT n.nspname, r.relname, pg_catalog.greatest(r.reltuples, 0)::pg_catalog.int8, pg_catalog.pg_total_relation_size(r.oid), cl.dist
+			SELECT n.nspname, r.relname, greatest(r.reltuples, 0)::pg_catalog.int8, pg_catalog.pg_total_relation_size(r.oid), cl.dist
 			  FROM cl JOIN pg_catalog.pg_class r ON r.oid = cl.relid JOIN pg_catalog.pg_namespace n ON n.oid = r.relnamespace
 			 ORDER BY n.nspname, r.relname`, p.rel())
 		if err != nil {
