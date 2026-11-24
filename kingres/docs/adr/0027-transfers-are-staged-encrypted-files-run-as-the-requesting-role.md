@@ -1,8 +1,9 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # ADR 0027: Exports are staged encrypted files, and transfers run as the role that asked
 
-- Status: Proposed
-- Date: 2026-11-22
+- Status: Accepted
+- Date: 2026-11-23 (proposed 2026-11-22)
+- Implemented in: phase 14a, `kingres/control-plane` (`internal/staging`, `internal/relay`, `internal/transfer`, the tasks `table.export` and `table.import`); built and reviewed on the staging branch of the first release.
 - Source: [../design/data-export-import.md](../design/data-export-import.md) (decisions 1, 2, 4 and 9, "Roles, privileges and audit", "What may run")
 
 ## Context
