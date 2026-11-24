@@ -91,6 +91,12 @@ type Leader struct {
 	alertedOld map[string]bool
 	// early are the standbys whose entry goes out as Ready before the record is ready (see markReady).
 	early map[int64]bool
+	// planMu makes the reading of the records and the overlay of early one step against markReady (which writes the record
+	// and drops the entry from early under it): a list can never carry a record from before a change together with an
+	// overlay from after it (phase 5 review M-B).
+	planMu sync.Mutex
+	// afterList is called in buildPlan between the reading of the records and the overlay (tests only).
+	afterList func()
 }
 
 // NewLeader prepares the leader's side; Run starts it.
@@ -627,15 +633,20 @@ func (l *Leader) buildPlan(ctx context.Context, version int64) (PlanRequest, top
 	if err != nil {
 		return PlanRequest{}, t, err
 	}
-	recs, err := l.st.list(ctx)
-	if err != nil {
-		return PlanRequest{}, t, err
-	}
 	replicas, err := l.replicas(ctx)
 	if err != nil {
 		return PlanRequest{}, t, err
 	}
 	p := PlanRequest{Version: version, Replicas: replicas}
+	l.planMu.Lock()
+	defer l.planMu.Unlock()
+	recs, err := l.st.list(ctx)
+	if err != nil {
+		return PlanRequest{}, t, err
+	}
+	if l.afterList != nil {
+		l.afterList()
+	}
 	for _, r := range recs {
 		if r.State == stateRemoving {
 			continue // a standby on its way out is not named any more
@@ -792,7 +803,9 @@ func (l *Leader) createStandby(ctx context.Context, env *task.Env, e Entry) erro
 	}
 	_ = env.SetDetail(ctx, "")
 	l.audit(ctx, env, "standbyCreated", entry, audit.OutcomeSuccess, map[string]any{"port": res.Port})
-	return l.publish(ctx)
+	// The record is ready now: the primary's server must take the final list too, or it would keep an older one that a
+	// stale list of another task may have left with the entry not Ready (phase 5 review M-B).
+	return l.publish(ctx, g.Primary)
 }
 
 // markReady makes the standby of rec ready. The order is the safety rule: a standby a failover may use (a record in the
@@ -805,12 +818,16 @@ func (l *Leader) markReady(ctx context.Context, rec Record, primary string, port
 	l.mu.Lock()
 	l.early[rec.ID] = true
 	l.mu.Unlock()
+	err := l.publish(ctx, primary)
+	// The record is written and the entry released in one step against buildPlan (planMu).
+	l.planMu.Lock()
+	defer l.planMu.Unlock()
 	defer func() {
 		l.mu.Lock()
 		delete(l.early, rec.ID)
 		l.mu.Unlock()
 	}()
-	if err := l.publish(ctx, primary); err != nil {
+	if err != nil {
 		return err
 	}
 	return l.st.setState(ctx, rec.ID, stateReady, port)

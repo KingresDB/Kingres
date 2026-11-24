@@ -781,15 +781,28 @@ func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) erro
 		}
 		// The freeze of the group lapses (default five minutes): it is kept while the step waits.
 		if r.now().Sub(frozenAt) >= freezeRenewEvery {
+			// An upkeep: the step passed the freeze at its start. In a graceful switchover the old primary is stopped by now and
+			// its freeze handler or state may answer an error or say the group is not frozen; that must not end the wait with
+			// the group stopped and no rollback (phase 5 review L-1). Only an end of the call (the context) and an answer that
+			// says a newer run of the task exists stand the step down; anything else is logged and tried again soon.
 			if err := sc.ensureFrozen(ctx); err != nil {
-				return err
+				if cerr := ctx.Err(); cerr != nil {
+					return cerr
+				}
+				if errors.Is(err, fence.ErrFenced) {
+					return err
+				}
+				r.log().Warn("failover: renewing the freeze of the group while waiting for the lease", "group", sc.group, "error", err)
+				frozenAt = r.now().Add(-freezeRenewEvery + 5*time.Second)
+			} else {
+				frozenAt = r.now()
 			}
-			frozenAt = r.now()
 		}
 		if !r.hearsMajority(ctx, members) {
 			if quorumSince.IsZero() {
 				quorumSince = r.now()
 			}
+			errSince = time.Time{} // errors on either side of a time without a majority are not one run (phase 5 review L-2)
 			if r.now().Sub(quorumSince) > orDur(r.QuorumWait, time.Minute) {
 				r.Plan.Alert(ctx, "failoverBlocked", "warning", subjectOf(sc.group, sc.old()), "The server that runs the failover cannot hear a majority of the servers.", true)
 				if sc.in.graceful() {
@@ -798,6 +811,7 @@ func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) erro
 					// repair of switchovers finishes what a server that cannot be reached still holds (F4-02).
 					return sc.rollbackFailed(ctx, CodeQuorumUnavailable, true, "this server cannot hear a majority of the servers; shard group %d was given back to %s", sc.group, sc.old())
 				}
+				sc.releaseFenceAdoption(ctx)
 				return &PauseError{Reason: "This server cannot hear a majority of the servers (quorum_unavailable); nothing was done. Repair the network or repeat the request from a server that can."}
 			}
 			sc.detail(ctx, "waiting for a majority of the servers to be heard")
@@ -820,6 +834,7 @@ func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) erro
 					if sc.in.graceful() {
 						return sc.rollbackFailed(ctx, CodeLeaseUnavailable, true, "the lease of shard group %d could not be taken (%v); shard group %d was given back to %s", sc.group, err, sc.group, sc.old())
 					}
+					sc.releaseFenceAdoption(ctx)
 					return &PauseError{Reason: fmt.Sprintf("The lease of shard group %d could not be taken from this server (%v); nothing was promoted. Repair the cause and repeat the request.", sc.group, err)}
 				}
 			} else if ans.Held {
@@ -851,6 +866,14 @@ func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) erro
 			return err
 		}
 	}
+}
+
+// releaseFenceAdoption stops this server renewing the fence lease it may have adopted for the group before a pause. An adoption has no
+// lifetime of its own: left in place it is renewed for as long as the server runs, the old primary (which may be alive and cut off)
+// cannot renew its lease, and the group would stay without a primary while the task waits for an operator, although nothing was
+// promoted. The repeat of the request takes the lease again (phase 5 review L-3). Best effort; an adoption of an attached primary is never released.
+func (sc *stepCtx) releaseFenceAdoption(ctx context.Context) {
+	_, _ = sc.r.Peers.Lease(context.WithoutCancel(ctx), sc.r.Plan.Self(), LeaseRequest{Group: sc.group, Role: LeaseRelease})
 }
 
 func ptr[T any](v T) *T { return &v }

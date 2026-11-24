@@ -146,7 +146,11 @@ type Manager struct {
 	// The rounds of different groups run side by side (phase 5 review M2), so each group has its own lock; rsem bounds how
 	// many rounds run at once.
 	rmus map[int32]*sync.Mutex
-	rsem chan struct{}
+	// rsem is taken before a round lock (a group that waits in the queue holds nothing a release waits for), and hands its
+	// places on in the order of asking (phase 5 review M-C).
+	rsem *fairSem
+	// renewing is the set of groups with a round that runs or waits for a place (the loop starts no second one).
+	renewing map[int32]bool
 
 	// fl counts the renewal requests that are on their way to a grantor (flights.go).
 	fl flights
@@ -159,7 +163,10 @@ type Manager struct {
 	// lease in that time must not start the instance: the start would find it still running (and do nothing),
 	// the stop would then end it, and the markers the start removed would leave nothing to start it again.
 	fencing map[int32]bool
-	wg      sync.WaitGroup
+	// fenceRun is set from the moment Check hands a fence of the group to a goroutine until that goroutine ended: a second
+	// fence of the same group is never started while one runs (phase 5 review M-A).
+	fenceRun map[int32]bool
+	wg       sync.WaitGroup
 	// enf is what the lease manager last knew about which groups are enforced
 	// (loaded lazily from the lease directory, see recordEnforced).
 	enf map[int32]bool
@@ -194,7 +201,7 @@ func New(c Config) (*Manager, error) {
 	if err := os.MkdirAll(c.Dir, 0o700); err != nil {
 		return nil, fmt.Errorf("lease: creating %s: %w", c.Dir, err)
 	}
-	m := &Manager{c: c, rmus: map[int32]*sync.Mutex{}, rsem: make(chan struct{}, maxParallelRounds), groups: map[int32]*groupState{}, starting: map[int32]bool{}, fencing: map[int32]bool{}, adopted: map[int32]*adoption{}, relinq: map[int32]bool{}, base: uint64(time.Now().UnixNano())}
+	m := &Manager{c: c, rmus: map[int32]*sync.Mutex{}, rsem: newFairSem(maxParallelRounds), renewing: map[int32]bool{}, groups: map[int32]*groupState{}, starting: map[int32]bool{}, fencing: map[int32]bool{}, fenceRun: map[int32]bool{}, adopted: map[int32]*adoption{}, relinq: map[int32]bool{}, base: uint64(time.Now().UnixNano())}
 	m.loadRelinquished()
 	if b, err := os.ReadFile(filepath.Join(c.Dir, topologyFile)); err == nil {
 		var t Topology
@@ -301,40 +308,43 @@ func (m *Manager) renewGroups(ctx context.Context, wait bool) {
 	}
 	var local sync.WaitGroup
 	for _, g := range groups {
-		rl := m.rmuFor(g)
-		if !wait && !rl.TryLock() {
-			continue // the round of this group is still on its way
-		}
-		work := func() {
-			if wait {
-				rl.Lock()
-			}
-			m.renewOne(ctx, g, t, rl)
-		}
 		if wait {
 			local.Add(1)
-			go func() { defer local.Done(); work() }()
-		} else {
-			m.wg.Add(1)
-			go func() { defer m.wg.Done(); work() }()
+			go func() { defer local.Done(); m.renewOne(ctx, g) }()
+			continue
 		}
+		m.mu.Lock()
+		busy := m.renewing[g]
+		m.renewing[g] = true
+		m.mu.Unlock()
+		if busy {
+			continue // the round of this group is still on its way (or waits for a place)
+		}
+		m.wg.Add(1)
+		go func() {
+			defer m.wg.Done()
+			defer func() { m.mu.Lock(); delete(m.renewing, g); m.mu.Unlock() }()
+			m.renewOne(ctx, g)
+		}()
 	}
 	local.Wait()
 }
 
-// renewOne runs the round of one group; rl is the group's round lock, held by the caller, and released here.
-func (m *Manager) renewOne(ctx context.Context, g int32, t Topology, rl *sync.Mutex) {
-	select {
-	case m.rsem <- struct{}{}:
-		defer func() { <-m.rsem }()
-	case <-ctx.Done():
-		rl.Unlock()
+// renewOne runs the round of one group. It takes a place of the semaphore first and the round lock of the group after it:
+// a group that waits for a place holds no lock, so ReleaseGroup waits only for a round of its own group that really runs
+// (phase 5 review M-C). The topology is read once both are held, not the one of the start of the pass: after a wait in the
+// queue it may be several round times old, and a group removed or moved meanwhile must not be renewed.
+func (m *Manager) renewOne(ctx context.Context, g int32) {
+	if !m.rsem.acquire(ctx) {
 		return
 	}
-	// The list was taken before the rounds began; a group that was released or handed over meanwhile is not
-	// asked for (F2-02). The check is made with the round lock held, which ReleaseGroup waits for.
+	defer m.rsem.release()
+	rl := m.rmuFor(g)
+	rl.Lock()
+	// A group that was released or handed over meanwhile is not asked for (F2-02). The check is made with the round lock
+	// held, which ReleaseGroup waits for.
 	m.warnUnattributed(g)
-	if m.mayRenew(g, t) {
+	if t, ok := m.topologyNow(); ok && m.mayRenew(g, t) {
 		m.round(ctx, g, t.Members)
 	}
 	rl.Unlock()
@@ -570,7 +580,13 @@ func (m *Manager) afterAcquired(ctx context.Context, group int32, wasLost bool) 
 // succeed; that window is at most one round (duration minus margin), and a
 // primary that was stopped while kingresd was away stays stopped (the fence
 // marker).
-func (m *Manager) Check(ctx context.Context) {
+//
+// Check returns when the fences it started ended (tests rely on that); Run uses check without waiting.
+func (m *Manager) Check(ctx context.Context) { m.check(ctx, true) }
+
+// check is Check; without wait it returns as soon as the fences are on their way, tracked by m.wg. A stop that hangs
+// (up to 30 s) must not keep the next pass from judging the other groups (phase 5 review M-A).
+func (m *Manager) check(ctx context.Context, wait bool) {
 	m.mu.Lock()
 	var expired, refence []int32
 	now := m.c.Clock.Mono()
@@ -579,8 +595,9 @@ func (m *Manager) Check(ctx context.Context) {
 			// The lease is over and was not won again: the stop is repeated until it succeeds, and whether the group is
 			// enforced is asked every time (a group that became enforced after its lease ran out must not keep a primary
 			// that runs with no lease, F2-05).
-			if !st.triedFence || now-st.lastFence >= FenceRetry {
+			if (!st.triedFence || now-st.lastFence >= FenceRetry) && !m.fenceRun[g] {
 				st.triedFence, st.lastFence = true, now
+				m.fenceRun[g] = true
 				refence = append(refence, g)
 			}
 			continue
@@ -598,22 +615,36 @@ func (m *Manager) Check(ctx context.Context) {
 		if !st.have || m.c.Clock.Mono() >= st.validUntil-m.c.Margin {
 			st.lost = true
 			st.triedFence, st.lastFence = true, now
-			expired = append(expired, g)
+			if !m.fenceRun[g] {
+				// A fence of an earlier loss may still run; the retry path above takes the group after it ended.
+				m.fenceRun[g] = true
+				expired = append(expired, g)
+			}
 		}
 	}
 	m.mu.Unlock()
 	// Each group is fenced in its own goroutine: a stop that hangs (up to 30 s) must not delay the fence of another group past its margin
-	// (phase 5 review L3). Check returns when every one ended.
+	// (phase 5 review L3). With wait, check returns when every one ended.
 	var wg sync.WaitGroup
-	for _, g := range expired {
+	run := func(g int32, f func(context.Context, int32)) {
 		wg.Add(1)
-		go func() { defer wg.Done(); m.lose(ctx, g) }()
+		m.wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer m.wg.Done()
+			defer func() { m.mu.Lock(); delete(m.fenceRun, g); m.mu.Unlock() }()
+			f(ctx, g)
+		}()
+	}
+	for _, g := range expired {
+		run(g, m.lose)
 	}
 	for _, g := range refence {
-		wg.Add(1)
-		go func() { defer wg.Done(); m.refence(ctx, g) }()
+		run(g, m.refence)
 	}
-	wg.Wait()
+	if wait {
+		wg.Wait()
+	}
 }
 
 // FenceRetry is how often the stop of a primary whose lease is lost is tried again while it still runs.
@@ -781,7 +812,7 @@ func (m *Manager) Run(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				m.Check(ctx)
+				m.check(ctx, false)
 			}
 		}
 	}()

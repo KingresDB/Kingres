@@ -195,9 +195,7 @@ func TestARoundIsNotSentForAGroupThatWasReleasedAfterTheListWasTaken(t *testing.
 	r.m.mu.Lock()
 	r.m.relinq[2] = true // released after the pass took its list
 	r.m.mu.Unlock()
-	rl := r.m.rmuFor(2)
-	rl.Lock()
-	r.m.renewOne(ctx, 2, top, rl)
+	r.m.renewOne(ctx, 2)
 	r.m.fl.waitAll()
 	for _, c := range rv.seen()[mark:] {
 		if c == "grant:2" {

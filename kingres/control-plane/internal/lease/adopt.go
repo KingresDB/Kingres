@@ -212,9 +212,36 @@ func (m *Manager) loadRelinquished() {
 	for _, f := range files {
 		var g int32
 		if _, err := fmt.Sscanf(strings.TrimPrefix(filepath.Base(f), RelinquishedMarker+"."), "%d", &g); err == nil {
+			if m.staleTransferMarker(f, g) {
+				// kingresd ended between the marker and the answer of the grantors, and this server's own grantor never moved the
+				// lease: the transfer did not take effect here and a majority of the others cannot have the lease of a server that
+				// keeps its own grant (phase 5 review L-4). The marker is dropped; otherwise the group would never be renewed again.
+				if err := os.Remove(f); err == nil || errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+			}
 			m.relinq[g] = true
 		}
 	}
+}
+
+// staleTransferMarker says that the marker file is the "transferring to X" of a Transfer that did not reach this server's
+// own grantor: the grantor does not name X as the holder of the group.
+func (m *Manager) staleTransferMarker(file string, group int32) bool {
+	b, err := os.ReadFile(file)
+	if err != nil || m.c.Grantor == nil {
+		return false
+	}
+	to, ok := strings.CutPrefix(strings.TrimSpace(string(b)), "transferring to ")
+	if !ok || to == "" {
+		return false
+	}
+	for _, e := range m.c.Grantor.Snapshot() {
+		if e.Group == group && e.Holder == to {
+			return false
+		}
+	}
+	return true
 }
 
 // TransferResult is what a hand-over found.
