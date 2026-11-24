@@ -18,6 +18,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/config"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover/journal"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/lease"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/standby"
 )
 
 // The local recovery of a map group that is held back for good (phase 5, the case that no server can end): a planned switchover or a hard failover of the map group stopped
@@ -115,7 +116,17 @@ func releaseMapHold(cfg config.Config, r releaseHoldArgs, log *slog.Logger, out 
 	}
 	const group = 0
 	candidate, rerr := lease.ReleaseHold(filepath.Join(cfg.DataDir, leaseDirName), group, r.lost)
+	freezeCleared := false
+	if rerr == nil {
+		// the failover that froze the synchronous list is given up with the hold; a frozen list would keep the primary waiting for the lost standby until the freeze lapses
+		if cleared, ferr := standby.ClearFreezeOnDisk(cfg.DataDir, group); ferr != nil {
+			log.Warn("the freeze of the synchronous standby list could not be removed; it lapses by itself", "error", ferr)
+		} else {
+			freezeCleared = cleared
+		}
+	}
 	details := map[string]any{"lostServerId": r.lost, "serverId": self, "acceptDataLoss": true, "recordedCandidate": candidate}
+	details["freezeCleared"] = freezeCleared
 	if u, uerr := user.Current(); uerr == nil {
 		details["osUser"] = u.Username
 	}

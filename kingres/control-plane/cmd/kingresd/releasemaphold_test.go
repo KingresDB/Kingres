@@ -143,6 +143,10 @@ func TestTheReleaseCommandRefusesWhatIsNotSafe(t *testing.T) {
 // With both words the command ends the hold, leaves the start waiting for the lease, writes an audit record that the audit log keeps, and the lock is free again.
 func TestTheReleaseCommandEndsTheHoldAndRecordsIt(t *testing.T) {
 	dir, args := holdRig(t, "s3")
+	freeze := filepath.Join(dir, "failover-freeze.json")
+	if err := os.WriteFile(freeze, []byte(`{"frozen":{"0":99999999999999},"owners":{"0":{"Task":16,"Epoch":3}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	out, err := runCommand(args("-lost", "s3", "-accept-data-loss"))
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out)
@@ -151,10 +155,13 @@ func TestTheReleaseCommandEndsTheHoldAndRecordsIt(t *testing.T) {
 		t.Fatalf("held %v candidate %v wait %v", held, cand, wait)
 	}
 	got := auditText(dir)
-	for _, want := range []string{`"action":"releaseMapGroupHold"`, `"source":"cli"`, `"outcome":"success"`, `"lostServerId":"s3"`, `"acceptDataLoss":true`, `"resourceType":"shardGroup"`} {
+	for _, want := range []string{`"action":"releaseMapGroupHold"`, `"source":"cli"`, `"outcome":"success"`, `"lostServerId":"s3"`, `"acceptDataLoss":true`, `"freezeCleared":true`, `"resourceType":"shardGroup"`} {
 		if !strings.Contains(got, want) {
 			t.Errorf("the audit record lacks %s: %s", want, got)
 		}
+	}
+	if b, _ := os.ReadFile(freeze); strings.Contains(string(b), "99999999999999") {
+		t.Errorf("the freeze of the list of the map group is still on disk: %s", b)
 	}
 	if !strings.Contains(out, "released") {
 		t.Errorf("the log line is missing: %s", out)

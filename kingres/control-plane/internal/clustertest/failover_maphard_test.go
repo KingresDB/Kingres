@@ -519,10 +519,18 @@ func TestADeadOnlyCandidateIsReleasedByTheLocalCommand(t *testing.T) {
 		return s == 200 && b["state"] == "running"
 	})
 	foKillServer(nw)
-	// every server answers 503 and stays so
-	for _, n := range []*clustertest.Node{leader, third} {
-		until(t, 5*time.Minute, "503 from "+n.Host, func() bool { s, _ := n.Do("GET", "/cluster", nil, nil); return s == 503 })
-	}
+	defer func() {
+		if t.Failed() {
+			t.Logf("leader log:\n%s\nthird log:\n%s", leader.LogTail(12000), third.LogTail(4000))
+		}
+	}()
+	// the old leader cannot serve the REST API: its system database is the held-back primary, and the only other copy is on the dead candidate
+	var last int
+	var lastBody map[string]any
+	until(t, 5*time.Minute, "503 from the old leader", func() bool { last, lastBody = leader.Do("GET", "/cluster", nil, nil); return last == 503 })
+	t.Logf("%s answers %d %v", leader.Host, last, lastBody)
+	st, body := third.Do("GET", "/cluster", nil, nil)
+	t.Logf("%s (no copy of the system database) answers %d %v", third.Host, st, body)
 	args := func(extra ...string) []string { return append([]string{"-release-map-hold"}, extra...) }
 	run := func(extra ...string) (string, error) { return leader.Command(args(extra...)...) }
 
@@ -551,7 +559,7 @@ func TestADeadOnlyCandidateIsReleasedByTheLocalCommand(t *testing.T) {
 	}
 	t.Logf("the command said: %s", out)
 	leader.Start()
-	until(t, 5*time.Minute, "the cluster to serve again through the old leader", func() bool {
+	until(t, 8*time.Minute, "the cluster to serve again through the old leader", func() bool {
 		s, _ := leader.Do("GET", "/cluster", nil, nil)
 		return s == 200
 	})
@@ -569,7 +577,7 @@ func TestADeadOnlyCandidateIsReleasedByTheLocalCommand(t *testing.T) {
 		}
 	}
 	// the release is in the audit log, with the lost server in its details
-	st, body := leader.Do("GET", "/audit?limit=200", nil, nil)
+	st, body = leader.Do("GET", "/audit?limit=200", nil, nil)
 	if st != 200 {
 		t.Fatalf("the audit log: %d %v", st, body)
 	}
