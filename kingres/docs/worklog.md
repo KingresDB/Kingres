@@ -7,6 +7,24 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-24 (branch rel-prep, from g2): the documentation of the first release brought up to g2
+
+### What was done
+
+- **CHANGELOG.** The database export and import entries moved from `[Unreleased]` into `[0.1.0]` (g2 holds everything planned for the first release); new entries for the security hardening of the extensions and the alert `extensionSkipped`, the split locks, drain step 4 and the standby lag rule, time partitioning of distributed tables (`kingres_timepart` 0.3), `pg_stat_statements` and `plpgsql`, the hard failover of the map group with `lostServerId`, the escrow of the CA key and the switchover fix; the contract is 0.30.0. The Pending part is rewritten item by item (done, still open, dropped); the heading stays for the release step to remove.
+- **Operator guide.** Section 6 (escrow, hard failover of the map group, the verdict, the lost candidate, the second standby), section 4 (drain hand-over, standby lag), section 10 (`extensionSkipped`), section 11 (distributed tables), new sections 13 (export and import of a database) and 14 (`pg_stat_statements`, PL/pgSQL). The guide README and the limitations follow.
+- **README.** The phase table follows g2. Nothing is claimed as released.
+
+### How it was verified
+
+Every statement was read against `kingres/api/openapi.yaml`, the design notes and the work log of g2; the relative links and anchors of the changed files resolve (a script, run on Windows). No code was changed and no test was run.
+
+### Still open
+
+See the Pending part of the CHANGELOG. Two points of the guide are from the text of the design and not from a run: what exactly repeats the apply of an extension after `extensionSkipped`, and the list of predefined roles that make an importer dangerous.
+
+---
+
 ## 2026-11-24: the integration branch g2 (nine branches merged onto g16s)
 
 Branch `g2`, from g16s (`cc5008adb2`), nine merge commits in this order: `xcat-2`, `split-fix`, `pgss`, `p12-dist-tp`, `ca-escrow`, `p10-drain4`, `p5-hard`, `p14b`, `p14c`.
