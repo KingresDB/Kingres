@@ -440,7 +440,7 @@ None.
 #### Additive
 - `importDatabase` (`POST /database-imports`, task kind `database.import`; needs `kingres_admin`).
 - `ProblemCode` has `archive_statement_refused` and `ledger_restart_not_acknowledged`; `foreign_key_violation` is a code of a failed task.
-- `AlertKind` has `extensionSkipped` (`warning`; subject `server:<id>|database:<name>`): an extension of a database was not installed on a server because a role of the tenant made a schema of the extension its own, so its owner there differs from the owner on the leader. The operation that found it (adding a server, for one) goes on without that extension. The alert is cleared when a later apply of that extension on that server succeeds, or when the database is dropped; its message names the extension, the schema and the two owners.
+- `AlertKind` has `extensionSkipped` (`warning`; subject `server:<id>|database:<name>|extension:<name>`, one alert for each skipped extension, `aspect` is `extension:<name>`): an extension of a database was not installed on a server because a role of the tenant made a schema of the extension its own, so its owner there differs from the owner on the leader. The operation that found it (adding a server, for one) goes on without that extension. The alert is cleared when a later apply of that extension on that server succeeds, or when the database is dropped; its message names the extension, the schema and the two owners.
 - `TaskKind` has `database.import`; `AuditAction` has `importDatabase`.
 - Schemas: `ImportDatabaseRequest` (closed; `acknowledgeLedgerRestart`, `onForeignKeyViolation`, `keepOnFailure`). The work is done in a private database name.
 

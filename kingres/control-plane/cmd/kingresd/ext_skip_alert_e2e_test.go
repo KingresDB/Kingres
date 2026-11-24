@@ -39,15 +39,18 @@ func TestExtensionSkippedAlertIsRaisedAndCleared(t *testing.T) {
 	}
 	raise(ctx, "dbskip", "pgcrypto", "schema x of extension pgcrypto is owned by intruder on this server and by o on the leader")
 	got := open()
-	for _, want := range []string{"warning", "server:h1|database:dbskip", "Extension pgcrypto was not installed in database dbskip on server h1", "owned by intruder on this server and by o on the leader"} {
+	for _, want := range []string{"warning", "server:h1|database:dbskip|extension:pgcrypto", "Extension pgcrypto was not installed in database dbskip on server h1", "owned by intruder on this server and by o on the leader"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("the alert does not hold %q: %s", want, got)
 		}
 	}
-	// Another extension of the same database replaces the text (one open alert per subject); the clearing of the first one then leaves it.
+	// Another extension of the same database has its own alert: both stay visible with their own text, and the clearing of the first one leaves the second.
 	raise(ctx, "dbskip", "hstore", "schema y of extension hstore is owned by intruder on this server and by o on the leader")
+	if got := open(); !strings.Contains(got, "Extension pgcrypto was not installed") || !strings.Contains(got, "Extension hstore was not installed") || !strings.Contains(got, "server:h1|database:dbskip|extension:hstore") {
+		t.Errorf("a second skipped extension hides the first: %s", got)
+	}
 	clear(ctx, "dbskip", "pgcrypto")
-	if got := open(); !strings.Contains(got, "Extension hstore was not installed") {
+	if got := open(); !strings.Contains(got, "Extension hstore was not installed") || strings.Contains(got, "pgcrypto") {
 		t.Errorf("the apply of another extension cleared the alert: %s", got)
 	}
 	// An apply of an extension on another database or server does not clear it.
