@@ -580,7 +580,10 @@ static void
 move_drop_if_held(const LOCKTAG *tag)
 {
 	while (LockHeldByMe(tag, ExclusiveLock, false))
-		(void) LockRelease(tag, ExclusiveLock, true);
+	{
+		if (!LockRelease(tag, ExclusiveLock, true))
+			break;					/* not a session hold: nothing more to let go of here */
+	}
 }
 
 /*

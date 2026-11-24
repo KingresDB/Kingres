@@ -83,6 +83,7 @@ my ($b, $src, $tgt, $move, $on);
 	is($out, '0', 'A: the cleanup finishes no move') or diag($err);
 	unlike($err, qr/WARNING|ERROR/, 'A: and does not warn: it is not an error');
 	is(orphans($on, "orphan_${move}_"), '1', 'A: the orphan is still there');
+	like(slurp_file($on->logfile), qr/kingres_shard: orphan table kingres\.orphan_${move}_1 was not dropped: cannot drop table orphan_${move}_1 because other objects depend on it/, 'A: the log of the node says why the drop was refused');
 	is(objects($on), '3,1', 'A: and every object of the tenant is still there (nothing is dropped with CASCADE)');
 	is(q1($n1, "SELECT phase FROM kingres.bucket_move WHERE move_id = $move"), 'cleaning', 'A: the move is still cleaning');
 	like(q1($n1, "SELECT detail FROM kingres.bucket_move WHERE move_id = $move"), qr/^the old copy cannot be dropped, objects of its owner depend on it: /, 'A: its record says why');
@@ -191,10 +192,11 @@ my ($b, $src, $tgt, $move, $on);
 	is($rc, 0, 'G: the bucket moves, with both tables') or diag($err);
 	my $mv = q1($n1, q{SELECT max(move_id) FROM kingres.bucket_move});
 	is(orphans($on4, "orphan_${mv}_"), '2', 'G: two orphans wait');
-	my @names = split /\n/, q1($on4, "SELECT relname FROM pg_class WHERE relnamespace = 'kingres'::regnamespace AND relname ~ '^orphan_${mv}_[0-9]+\$' ORDER BY relname");
-	# a foreign key between the two orphans: the one that is dropped first is the one the other depends on
-	($rc, $out, $err) = run_sql($on4, "ALTER TABLE kingres.$names[1] ADD CONSTRAINT ks_fk FOREIGN KEY (id) REFERENCES kingres.$names[0] (id) NOT VALID");
-	is($rc, 0, 'G: a foreign key between the two orphans (the later references the earlier)') or diag($err);
+	my $of = sub { my ($node, $id, $col) = @_; return q1($node, "SELECT c.relname FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid WHERE c.relnamespace = 'kingres'::regnamespace AND c.relname ~ '^orphan_${id}_[0-9]+\$' AND a.attname = '$col'"); };
+	my ($o1, $o2) = ($of->($on4, $mv, 'v'), $of->($on4, $mv, 'w'));
+	# a foreign key from the orphan of the second table to the orphan of the first, whatever the order of their names
+	($rc, $out, $err) = run_sql($on4, "ALTER TABLE kingres.$o2 ADD CONSTRAINT ks_fk FOREIGN KEY (id) REFERENCES kingres.$o1 (id) NOT VALID");
+	is($rc, 0, 'G: a foreign key from the orphan of m2 to the orphan of m1') or diag($err);
 
 	($rc, $out, $err) = run_sql($n1, q{SELECT kingres.cleanup_moved_buckets(true)});
 	is($out, '0', 'G: the cleanup finishes no move') or diag($err);
@@ -225,8 +227,9 @@ my ($b, $src, $tgt, $move, $on);
 	($rc, $out, $err) = run_sql($n1, "SELECT kingres.move_bucket($C, $b5, " . other($b5) . ")");
 	is($rc, 0, 'G2: bucket 5 moves') or diag($err);
 	$mv = q1($n1, q{SELECT max(move_id) FROM kingres.bucket_move});
-	@names = split /\n/, q1($on5, "SELECT relname FROM pg_class WHERE relnamespace = 'kingres'::regnamespace AND relname ~ '^orphan_${mv}_[0-9]+\$' ORDER BY relname");
+	my @names = split /\n/, q1($on5, "SELECT relname FROM pg_class WHERE relnamespace = 'kingres'::regnamespace AND relname ~ '^orphan_${mv}_[0-9]+\$' ORDER BY relname");
 	is(scalar(@names), 2, 'G2: two orphans wait');
+	# the key goes from the orphan whose name sorts later to the one that sorts first, so that the first drop of a pass fails
 	($rc, $out, $err) = run_sql($on5, "ALTER TABLE kingres.$names[1] ADD CONSTRAINT ks_fk FOREIGN KEY (id) REFERENCES kingres.$names[0] (id) NOT VALID");
 	is($rc, 0, 'G2: a foreign key between them') or diag($err);
 	is(q1($n1, q{SELECT kingres.cleanup_moved_buckets(true)}), '1', 'G2: the cleanup finishes the move');
@@ -269,6 +272,20 @@ my ($b, $src, $tgt, $move, $on);
 	is(q1($n1, q{SELECT kingres.cleanup_moved_buckets(true)}), '1', 'H: the next pass finishes the move');
 	is(q1($pon, "SELECT count(*) FROM pg_class WHERE relnamespace = 'kingres'::regnamespace AND relname ~ '^orphan_${mv}_'"), '0', 'H: the orphan and its leaves are gone');
 	is(clean(), '', 'H: check_cluster() finds nothing');
+}
+
+# ---------------------------------------------------------------------------
+# I. the rule of the name, and the text when an orphan is left with nothing to name (a table of the right name made by hand)
+# ---------------------------------------------------------------------------
+{
+	q1($n1, q{CREATE TABLE kingres.orphan_777_1 (id int); CREATE TABLE kingres.orphan_777_x (id int); CREATE TABLE kingres.orphan_s777_x (id int)});
+	is(q1($n1, q{SELECT kingres.internal_orphan_blockers('orphan_777_')}), '1 orphan table(s) are still there and the DROP was refused, see the log of the node', 'I: an orphan with nothing to name is still said to be there');
+	is(q1($n1, q{SELECT coalesce(kingres.internal_orphan_blockers('orphan_s777_'), 'null')}), 'null', 'I: a table whose name is not orphan_s<id>_<digits> is not an orphan of the split');
+	is(q1($n1, q{SELECT kingres.internal_drop_orphans(777)}), '1', 'I: the cleanup drops the orphan of the name and only that');
+	is(q1($n1, q{SELECT count(*) FROM pg_class WHERE relnamespace = 'kingres'::regnamespace AND relname IN ('orphan_777_x', 'orphan_s777_x')}), '2', 'I: the others stay');
+	is(q1($n1, q{SELECT coalesce(kingres.internal_orphan_blockers('orphan_777_'), 'null')}), 'null', 'I: and nothing is left to say');
+	q1($n1, q{DROP TABLE kingres.orphan_777_x, kingres.orphan_s777_x});
+	is(clean(), '', 'I: check_cluster() finds nothing');
 }
 
 # ---------------------------------------------------------------------------

@@ -3422,7 +3422,7 @@ BEGIN
                   WHERE c.relnamespace OPERATOR(pg_catalog.=) 'kingres'::pg_catalog.regnamespace
                     AND c.relkind IN ('r', 'p')
                     AND NOT c.relispartition
-                    AND pg_catalog.starts_with(c.relname, pg_catalog.format('orphan_%s_', p_move))
+                    AND c.relname OPERATOR(pg_catalog.~) pg_catalog.format('^orphan_%s_[0-9]+$', p_move)
                   ORDER BY c.relname
         LOOP
             BEGIN
@@ -3430,7 +3430,8 @@ BEGIN
                 n := n OPERATOR(pg_catalog.+) 1;
                 v_pass := v_pass OPERATOR(pg_catalog.+) 1;
             EXCEPTION WHEN dependent_objects_still_exist THEN
-                NULL;       -- objects depend on it: it stays (a later pass may drop what it waits for), internal_orphan_blockers() says which
+                -- objects depend on it: it stays (a later pass may drop what it waits for), internal_orphan_blockers() says which
+                RAISE LOG 'kingres_shard: orphan table kingres.% was not dropped: %', r.relname, SQLERRM;
             END;
         END LOOP;
         EXIT WHEN v_pass OPERATOR(pg_catalog.=) 0;
@@ -3464,7 +3465,7 @@ BEGIN
                 n := n OPERATOR(pg_catalog.+) 1;
                 v_pass := v_pass OPERATOR(pg_catalog.+) 1;
             EXCEPTION WHEN dependent_objects_still_exist THEN
-                NULL;
+                RAISE LOG 'kingres_shard: old partition kingres.% was not dropped: %', x.relname, SQLERRM;
             END;
         END LOOP;
         EXIT WHEN v_pass OPERATOR(pg_catalog.=) 0;
@@ -3490,11 +3491,11 @@ BEGIN
     SELECT pg_catalog.array_agg(DISTINCT u.relid) INTO v_family
       FROM (SELECT c.oid AS relid FROM pg_catalog.pg_class c
              WHERE c.relnamespace OPERATOR(pg_catalog.=) 'kingres'::pg_catalog.regnamespace AND c.relkind IN ('r', 'p') AND NOT c.relispartition
-               AND pg_catalog.starts_with(c.relname, p_prefix)
+               AND c.relname OPERATOR(pg_catalog.~) ('^' OPERATOR(pg_catalog.||) p_prefix OPERATOR(pg_catalog.||) '[0-9]+$')
             UNION
             SELECT t.relid FROM pg_catalog.pg_class c, LATERAL pg_catalog.pg_partition_tree(c.oid) t
              WHERE c.relnamespace OPERATOR(pg_catalog.=) 'kingres'::pg_catalog.regnamespace AND c.relkind OPERATOR(pg_catalog.=) 'p' AND NOT c.relispartition
-               AND pg_catalog.starts_with(c.relname, p_prefix)) u;
+               AND c.relname OPERATOR(pg_catalog.~) ('^' OPERATOR(pg_catalog.||) p_prefix OPERATOR(pg_catalog.||) '[0-9]+$')) u;
     IF v_family IS NULL THEN
         RETURN NULL;
     END IF;
@@ -3520,7 +3521,7 @@ BEGIN
     IF v_text IS NULL THEN
         v_text := pg_catalog.format('%s orphan table(s) are still there and the DROP was refused, see the log of the node', (SELECT pg_catalog.count(*) FROM pg_catalog.pg_class c
                                       WHERE c.relnamespace OPERATOR(pg_catalog.=) 'kingres'::pg_catalog.regnamespace AND c.relkind IN ('r', 'p') AND NOT c.relispartition
-                                        AND pg_catalog.starts_with(c.relname, p_prefix)));
+                                        AND c.relname OPERATOR(pg_catalog.~) ('^' OPERATOR(pg_catalog.||) p_prefix OPERATOR(pg_catalog.||) '[0-9]+$')));
     END IF;
     RETURN pg_catalog.left(v_text, 1000);
 END;
@@ -4029,7 +4030,13 @@ BEGIN
         END;
         RAISE;
     END;
-    PERFORM kingres.internal_move_unlock(v_id);
+    -- the release after a good move cannot be skipped by a cancel either
+    BEGIN
+        PERFORM kingres.internal_move_release(v_id, v_colo, v_bucket);
+    EXCEPTION WHEN OTHERS OR query_canceled THEN
+        PERFORM kingres.internal_move_release(v_id, v_colo, v_bucket);
+        RAISE;
+    END;
     RETURN v_id;
 END;
 $$;
