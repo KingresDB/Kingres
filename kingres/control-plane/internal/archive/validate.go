@@ -592,6 +592,15 @@ func coherent(m Manifest, cat Catalog, byTable map[string]*CatalogTable) error {
 	if m.CatalogVersion != cat.CatalogVersion {
 		return invalid("manifest", ManifestName, "the manifest and the catalog have different catalog versions")
 	}
+	if cat.NeedsShard() {
+		shard := false
+		for _, e := range m.Extensions {
+			shard = shard || e.Name == "kingres_shard"
+		}
+		if !shard {
+			return invalid("extension_missing", "kingres_shard", "the catalog has distributed tables and the manifest does not list kingres_shard")
+		}
+	}
 	excluded := map[string]bool{}
 	for _, t := range m.Options.ExcludedTables {
 		if byTable[t] == nil {

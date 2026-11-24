@@ -4,6 +4,7 @@
 package ops
 
 import (
+	"context"
 	"os"
 	"reflect"
 	"strings"
@@ -39,5 +40,22 @@ func TestImportVerifiesTheShardingExtensionFirst(t *testing.T) {
 	}
 	if got := extensionsToRequire(false, []string{extguard.Ledger}); !reflect.DeepEqual(got, []string{extguard.Ledger}) {
 		t.Errorf("without it: %v", got)
+	}
+}
+
+// M1 of the review of g2: the setup of the private database refuses a schema or an extension that would put something of the archive in the schemas of KingresDB, before
+// any connection is used (and so before anything is made or granted).
+func TestSetupPrivateRefusesTheSchemasOfKingres(t *testing.T) {
+	o := &Ops{}
+	for _, op := range []importCreateOp{
+		{Name: privDB, Schemas: []string{"kingres"}, Role: "r"},
+		{Name: privDB, Schemas: []string{"kingres_transfer"}, Role: "r"},
+		{Name: privDB, Extensions: []importExtSpec{{Name: "pgcrypto", Schema: "kingres"}}, Role: "r"},
+		{Name: privDB, Extensions: []importExtSpec{{Name: "citext", Schema: "kingres_x"}}, Role: "r"},
+		{Name: privDB, Extensions: []importExtSpec{{Name: "kingres_ledger", Schema: "kingres_x"}}, Role: "r"},
+	} {
+		if err := o.setupPrivateLocal(context.Background(), op); err == nil || !strings.Contains(err.Error(), "not valid") {
+			t.Errorf("%+v: %v", op, err)
+		}
 	}
 }

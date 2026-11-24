@@ -197,6 +197,10 @@ func (m *Manifest) check() *Error {
 		if e := ident(x.Name, "the schema of an extension", x.Schema); e != nil {
 			return e
 		}
+		// The schemas of KingresDB are its own: an extension of the list that is not one of KingresDB's cannot live in them, and no extension in kingres_* at all.
+		if ReservedSchema(x.Schema) && (x.Schema != "kingres" || !strings.HasPrefix(x.Name, "kingres_")) {
+			return invalid("extension_schema", x.Name, "an extension is in a schema that KingresDB keeps for itself")
+		}
 	}
 	if m.CatalogVersion != CatalogVersion {
 		return invalid("catalog_version", ManifestName, "catalogVersion is not %d", CatalogVersion)

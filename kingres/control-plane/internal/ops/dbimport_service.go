@@ -269,6 +269,11 @@ func (o *Ops) stepIMDistribute(ctx context.Context, env *task.Env) error {
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
 	sharded := hasExt(res.Manifest, extguard.Shard)
+	// Which tables are distributed comes from the catalog, and the calls below reach the schema kingres: the extension must be in the manifest (and is then
+	// verified by requireExtensions) before any statement that names it is run.
+	if cat.NeedsShard() && !sharded {
+		return transfer.Errorf(transfer.CodeArchiveInvalid, false, "the catalog has distributed tables and the manifest does not list kingres_shard")
+	}
 	var needColumnar bool
 	for _, ct := range cat.Tables {
 		if len(ct.Columnar) > 0 {

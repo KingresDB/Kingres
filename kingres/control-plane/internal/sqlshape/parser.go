@@ -218,7 +218,7 @@ func (p *parser) qname() []string {
 
 func protectedSchema(s string) bool {
 	l := strings.ToLower(s)
-	return l == "kingres" || l == "information_schema" || strings.HasPrefix(l, "pg_")
+	return l == "kingres" || strings.HasPrefix(l, "kingres_") || l == "information_schema" || strings.HasPrefix(l, "pg_")
 }
 
 // target reads the name of an object that the statement creates or changes and refuses the schemas of the system and of the extension.

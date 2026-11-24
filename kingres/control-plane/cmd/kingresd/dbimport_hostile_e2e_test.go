@@ -156,6 +156,25 @@ func TestDatabaseImportRefusesHostileArchives(t *testing.T) {
 		{"an extension outside the closed list", func(v *variant) {
 			v.Man.Extensions = append(v.Man.Extensions, archive.ManifestExtension{Name: "dblink", Version: "1.2", Schema: "public"})
 		}, "archive_invalid"},
+		// The second review of g2 (M1): the catalog says which tables are distributed, so the manifest must carry the sharding extension, and the schemas of KingresDB are
+		// its own.
+		{"a hash table and no kingres_shard in the manifest", func(v *variant) {
+			var keep []archive.ManifestExtension
+			for _, x := range v.Man.Extensions {
+				if x.Name != "kingres_shard" {
+					keep = append(keep, x)
+				}
+			}
+			v.Man.Extensions = keep
+		}, "archive_invalid"},
+		{"an extension of the list in the schema kingres", func(v *variant) {
+			v.Man.Extensions = append(v.Man.Extensions, archive.ManifestExtension{Name: "pgcrypto", Version: "1.3", Schema: "kingres"})
+		}, "archive_invalid"},
+		{"an extension of the list in a schema kingres_x", func(v *variant) {
+			v.Man.Extensions = append(v.Man.Extensions, archive.ManifestExtension{Name: "citext", Version: "1.6", Schema: "kingres_transfer"})
+		}, "archive_invalid"},
+		{"a table moved into the schema kingres", func(v *variant) { v.Files[archive.PostDataName] += "ALTER TABLE public.victim SET SCHEMA kingres;\n" }, "archive_statement_refused"},
+		{"a table in the schema kingres_transfer", func(v *variant) { v.Files[archive.PreDataName] += "CREATE TABLE kingres_transfer.x (a int);\n" }, "archive_statement_refused"},
 		{"file_fdw in the manifest", func(v *variant) {
 			v.Man.Extensions = append(v.Man.Extensions, archive.ManifestExtension{Name: "file_fdw", Version: "1.0", Schema: "public"})
 		}, "archive_invalid"},

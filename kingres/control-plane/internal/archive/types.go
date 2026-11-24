@@ -291,3 +291,24 @@ func NewInvalid(code, object, msg string) *Error { return invalid(code, object, 
 
 // AllowedExtension reports whether an archive may name the extension (the closed list of the import, design step 5).
 func AllowedExtension(name string) bool { return closedExtensions[name] }
+
+// NeedsShard says whether the catalog holds anything that only the sharding extension can make or keep: a hash or reference table, a table of a distributed
+// schema, a distributed schema or a colocation group. An archive with such a catalog and no kingres_shard in its manifest is not coherent.
+func (c Catalog) NeedsShard() bool {
+	if len(c.DistributedSchemas) > 0 || len(c.ColocationGroups) > 0 {
+		return true
+	}
+	for _, t := range c.Tables {
+		if t.Kind != "local" || t.UserPartitioning != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// ReservedSchema says whether a schema name is one that KingresDB keeps for itself: kingres, kingres_transfer and every kingres_*. Only the extensions of KingresDB
+// (kingres_*) may live in kingres, and nothing else may be made in the others.
+func ReservedSchema(name string) bool {
+	l := strings.ToLower(name)
+	return l == "kingres" || strings.HasPrefix(l, "kingres_")
+}
