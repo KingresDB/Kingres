@@ -501,7 +501,8 @@ func checkSwitchPoint(t *testing.T, ps []writeProbe, leader *clustertest.Node, t
 // P2. The candidate takes the lease and dies before it promotes (its promoting call never answers and then its server is killed): the old leader's primary is stopped and
 // held back for a server that cannot answer. With one standby of the map group the declaration that the server is lost does not release the old leader: no other standby
 // shows that nothing was promoted, and the hold stays (the cluster has no second copy of the map group to prove it; with a second standby the declaration ends the hold, which
-// the unit tests of the callee show).
+// the unit tests of the callee show). The declaration reaches the old leader only with the proof of the operator's session (a member's word is refused), so this test makes
+// it as an operator does, through the REST API on a third server; the call of a member without the proof is refused with 401, and the hold stays.
 func TestADeadOnlyCandidateDeclaredLostDoesNotReleaseTheOldLeader(t *testing.T) {
 	c, _, _, leader, nw, _ := mapSwitchoverEnv(t)
 	var third *clustertest.Node
@@ -522,14 +523,31 @@ func TestADeadOnlyCandidateDeclaredLostDoesNotReleaseTheOldLeader(t *testing.T) 
 		Resumed bool   `json:"resumed"`
 		Detail  string `json:"detail"`
 	}
-	// the old leader sees the server dead after a while; until then it answers that the server is heard
-	until(t, 5*time.Minute, "the old leader to judge the declaration", func() bool {
-		code, err := third.InternalCall(leader, "POST", "/failover/map/resume", map[string]any{"strict": true, "lost": nw.Host}, &out)
-		t.Logf("resume call: %d %v %+v", code, err, out)
-		return err == nil && code == 200 && !strings.Contains(out.Detail, "is heard")
+	// a member's word for the declaration is not taken: the old leader asks for the proof of the operator's session
+	if code, err := third.InternalCall(leader, "POST", "/failover/map/resume", map[string]any{"strict": true, "lost": nw.Host}, &out); err != nil || code != 401 || out.Resumed {
+		t.Fatalf("a declaration without the proof of a session must be refused with 401: %d %v %+v", code, err, out)
+	}
+	// the operator's own declaration (his session signs it for the old leader); the old leader sees the server dead after a while, and until then the call is refused as the
+	// server is heard
+	until(t, 3*time.Minute, "the operator to sign in on the third server", func() bool { return third.Login(clustertest.AdminUser, clustertest.AdminPass) })
+	declare := func() (int, map[string]any) {
+		return third.Do("POST", "/failover/map/abandon", map[string]any{"reason": "the candidate is dead", "lostServerId": nw.Host}, nil)
+	}
+	var res map[string]any
+	until(t, 8*time.Minute, "the cluster to judge the declaration", func() bool {
+		st, body := declare()
+		t.Logf("declaration: %d %v", st, body)
+		if st == 200 {
+			res = body
+			return true
+		}
+		return false
 	})
-	if out.Resumed || !strings.Contains(out.Detail, "no standby of the map group could be shown to be in recovery") {
-		t.Fatalf("the old leader was released without a second copy of the map group: %+v", out)
+	if res["resumedServerId"] != nil && res["resumedServerId"] != "" {
+		t.Fatalf("the old leader was released without a second copy of the map group: %v", res)
+	}
+	if st, _ := leader.Do("GET", "/cluster", nil, nil); st == 200 {
+		t.Fatalf("the old leader serves again although its hold must stay")
 	}
 	if code, err := third.InternalCall(leader, "POST", "/failover/map/resume", map[string]any{"strict": true}, &out); err != nil || code != 200 || out.Resumed {
 		t.Fatalf("without the declaration the hold of a dead candidate must stay: %d %v %+v", code, err, out)
