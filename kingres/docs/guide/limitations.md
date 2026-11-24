@@ -2,7 +2,7 @@
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Limitations of the first release
 
-Read this before you decide what to run on KingresDB. Each item is a boundary that the design or a review stated, not an accident. Items marked **Open** are left open by the design. The state is that of the integration branch of the first release (REST contract 0.30.0) on 2026-11-24.
+Read this before you decide what to run on KingresDB. Each item is a boundary that the design or a review stated, not an accident. Items marked **Open** are left open by the design. The state is that of the integration branch of the first release (REST contract 0.33.0) on 2026-11-24.
 
 ## Consistency
 
@@ -26,8 +26,8 @@ Read this before you decide what to run on KingresDB. Each item is a boundary th
 ## High availability
 
 - Failover, planned switchover (also of the map group), a hard failover of the map group while its server is alive, restore of preferred primaries and automatic failover are built into `kingresd`. They were reviewed and fixed, and the cluster tests pass on both majors. The measured loops were run once per test group; one test of the switchover set failed once on PostgreSQL 18.7 for a cause that is not found and passed on every rerun. **Open:** many repeated loops. Treat failover as new.
-- The escrow of the certificate authority key is **off until an administrator switches it on** and has no console page (REST only). A server that holds a copy can become the authority, so only switch it on when the servers that host standbys of the map group are as trusted as the leader. Without it, after a failover of the map group the new leader raises a critical alert until the operator restores `pki/ca.key` and `pki/revoked.json` from a backup of the old leader ([operator-guide.md](operator-guide.md), section 6).
-- A hard failover of the map group whose standby then dies cannot be released by `lostServerId` when the map group has **only one** standby: every REST call, on every server, answers 503 until a second standby of the map group exists. The case with a second standby is covered by unit tests, not by a cluster test. The console has no field for `lostServerId`.
+- The escrow of the certificate authority key is **off until an administrator switches it on** and is switched on and off on the Certificate authority tab of the Security page (or by REST). A server that holds a copy can become the authority, so only switch it on when the servers that host standbys of the map group are as trusted as the leader. Without it, after a failover of the map group the new leader raises a critical alert until the operator restores `pki/ca.key` and `pki/revoked.json` from a backup of the old leader ([operator-guide.md](operator-guide.md), section 6).
+- A hard failover of the map group whose standby then dies cannot be released by `lostServerId` when the map group has **only one** standby: every REST call, on every server, answers 503 until a second standby of the map group exists. The case with a second standby is covered by unit tests, not by a cluster test.
 - A drain hands the map group over (step 4) and a rebalance is held back while a standby lags by more than `maxStandbyLagBytes`; a drain moves the distributed schemas of the server together with its buckets.
 - An old leader of a map group switchover that cannot resolve its hold because every other server is gone does not resume by itself; an operator ends the hold with the abandon call once a standby answers.
 - Automatic failover is off by default. Two failures at once, and a failure during a rebalance, are not tested on a cluster.

@@ -16,7 +16,7 @@ Also useful: [../../CHANGELOG.md](../../CHANGELOG.md) (what changed), [../../REA
 
 ## How to read the markers
 
-The guide describes the integration branch of the first release (REST contract 0.30.0, `kingres_shard` 0.9, `kingres_timepart` 0.3), checked against its code and documents on 2026-11-24. No release has been made. A part that is still being written carries the word **In progress**: it is not in the release as it stands, and the text says what is known. A boundary that the design leaves open carries the word **Open**. Do not rely on either in production.
+The guide describes the integration branch of the first release (REST contract 0.33.0, `kingres_shard` 0.9, `kingres_timepart` 0.3), checked against its code and documents on 2026-11-24. No release has been made. A part that is still being written carries the word **In progress**: it is not in the release as it stands, and the text says what is known. A boundary that the design leaves open carries the word **Open**. Do not rely on either in production.
 
 ## KingresDB in one page
 
