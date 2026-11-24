@@ -1796,6 +1796,11 @@ kingres_internal_detach_bucket(PG_FUNCTION_ARGS)
 			appendStringInfo(&sql, "ALTER TABLE %s.%s SET SCHEMA " KINGRES_SHARD_SCHEMA,
 							 quote_identifier(nsp), quote_identifier(lname));
 			spi_stmt(sql.data);
+			/* the leftover is the bootstrap superuser's from here on: the owner of the table must not be able to attach views, keys or triggers to what the extension drops later */
+			resetStringInfo(&sql);
+			appendStringInfo(&sql, "ALTER TABLE " KINGRES_SHARD_SCHEMA ".%s OWNER TO %s", quote_identifier(lname),
+							 quote_identifier(GetUserNameFromId(BOOTSTRAP_SUPERUSERID, false)));
+			spi_stmt(sql.data);
 		}
 	}
 
@@ -1837,6 +1842,11 @@ kingres_internal_detach_bucket(PG_FUNCTION_ARGS)
 	resetStringInfo(&sql);
 	appendStringInfo(&sql, "ALTER TABLE %s.%s SET SCHEMA " KINGRES_SHARD_SCHEMA,
 					 quote_identifier(nsp), quote_identifier(orphan));
+	spi_stmt(sql.data);
+	/* the orphan is the bootstrap superuser's from here on (see the same for the leaves above) */
+	resetStringInfo(&sql);
+	appendStringInfo(&sql, "ALTER TABLE " KINGRES_SHARD_SCHEMA ".%s OWNER TO %s", quote_identifier(orphan),
+					 quote_identifier(GetUserNameFromId(BOOTSTRAP_SUPERUSERID, false)));
 	spi_stmt(sql.data);
 	SPI_finish();
 	PG_RETURN_VOID();

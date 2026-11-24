@@ -11,6 +11,36 @@
 
 \echo Use "ALTER EXTENSION kingres_shard UPDATE TO '0.9'" to load this file. \quit
 
+-- The schema of the extension must not be one that a role that is not a superuser holds or can create objects in: that role would own what the service role, a
+-- superuser, reads and runs.  The check is the same in every script of the extension, the install scripts of the older versions and the upgrade scripts too (a
+-- schema that was made, or given away, after the install is met by ALTER EXTENSION ... UPDATE).  A schema that does not exist yet is made by the script.
+DO $kgchk$
+DECLARE
+    v_schema pg_catalog.text := 'kingres';
+    v_owner  pg_catalog.name;
+BEGIN
+    SELECT r.rolname INTO v_owner
+      FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner
+     WHERE n.nspname OPERATOR(pg_catalog.=) v_schema AND NOT r.rolsuper;
+    IF v_owner IS NOT NULL THEN
+        RAISE EXCEPTION 'the schema % already exists and is owned by %, which is not a superuser', v_schema, v_owner
+            USING ERRCODE = 'insufficient_privilege',
+                  HINT = 'Drop the schema, or make a superuser its owner, before CREATE EXTENSION or ALTER EXTENSION ... UPDATE.';
+    END IF;
+    IF EXISTS (SELECT 1
+                 FROM pg_catalog.pg_namespace n,
+                      LATERAL pg_catalog.aclexplode(COALESCE(n.nspacl, pg_catalog.acldefault('n', n.nspowner))) a
+                WHERE n.nspname OPERATOR(pg_catalog.=) v_schema
+                  AND a.privilege_type OPERATOR(pg_catalog.=) 'CREATE'
+                  AND (a.grantee OPERATOR(pg_catalog.=) 0
+                       OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles g WHERE g.oid OPERATOR(pg_catalog.=) a.grantee AND g.rolsuper))) THEN
+        RAISE EXCEPTION 'the schema % grants CREATE to a role that is not a superuser (or to PUBLIC)', v_schema
+            USING ERRCODE = 'insufficient_privilege',
+                  HINT = 'Revoke CREATE on the schema before CREATE EXTENSION or ALTER EXTENSION ... UPDATE.';
+    END IF;
+END
+$kgchk$;
+
 -- ---------------------------------------------------------------------------
 -- The version handshake
 -- ---------------------------------------------------------------------------
@@ -1372,3 +1402,155 @@ REVOKE ALL ON FUNCTION
 -- =========================================================================
 -- PHASE 11, the leftovers                                                    [end]
 -- =========================================================================
+
+-- ---------------------------------------------------------------------------
+-- Objects that the extension moves into the schema kingres belong to the bootstrap superuser, and the capture function of a split
+-- is written with qualified operators (review XCAT-2, M1 to M3)
+-- ---------------------------------------------------------------------------
+
+-- A retired table (kingres_old_<oid>) and its identity sequences left the schema of the user with the owner they had: the owner could attach views, foreign keys
+-- and triggers to a table that the extension drops later, and the drop would fail for good.  Moved into kingres, the table is the bootstrap superuser's (ALTER
+-- TABLE ... OWNER TO takes the sequences that the table owns with it).  Nothing reads the retired copy as its old owner: the privileges of the other roles
+-- are revoked below, and the checks and the cleanup run as a superuser.
+CREATE OR REPLACE FUNCTION kingres.internal_retire_table(p_relid regclass, p_op bigint)
+    RETURNS regclass
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_oid  pg_catalog.oid := p_relid::pg_catalog.oid;
+    v_nsp  pg_catalog.text;
+    v_name pg_catalog.text;
+    v_new  pg_catalog.text := pg_catalog.format('kingres_old_%s', p_relid::pg_catalog.oid);
+    r      pg_catalog.record;
+    k      pg_catalog.int4 := 0;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    SELECT n.nspname, c.relname INTO v_nsp, v_name
+      FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+     WHERE c.oid OPERATOR(pg_catalog.=) v_oid;
+    FOR r IN SELECT t.tgname FROM pg_catalog.pg_trigger t
+              WHERE t.tgrelid OPERATOR(pg_catalog.=) v_oid
+                AND (t.tgname LIKE 'kingres\_capture\_%' OR t.tgname LIKE 'kingres\_notrunc\_%')
+    LOOP
+        EXECUTE pg_catalog.format('DROP TRIGGER %I ON %s', r.tgname, p_relid);
+    END LOOP;
+    EXECUTE pg_catalog.format('DROP TABLE IF EXISTS kingres.tlog_%s_1', p_op);
+    FOR r IN SELECT c.conname FROM pg_catalog.pg_constraint c
+              WHERE c.conrelid OPERATOR(pg_catalog.=) v_oid AND c.contype OPERATOR(pg_catalog.=) 'f' AND c.conparentid OPERATOR(pg_catalog.=) 0
+    LOOP
+        EXECUTE pg_catalog.format('ALTER TABLE %s DROP CONSTRAINT %I', p_relid, r.conname);
+    END LOOP;
+    FOR r IN SELECT ic.relname FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class ic ON ic.oid OPERATOR(pg_catalog.=) i.indexrelid
+              WHERE i.indrelid OPERATOR(pg_catalog.=) v_oid ORDER BY i.indexrelid
+    LOOP
+        k := k OPERATOR(pg_catalog.+) 1;
+        EXECUTE pg_catalog.format('ALTER INDEX %I.%I RENAME TO %I', v_nsp, r.relname, pg_catalog.format('kingres_old_%s_i%s', v_oid, k));
+    END LOOP;
+    FOR r IN SELECT a.attnum, pg_catalog.pg_get_serial_sequence(pg_catalog.format('%I.%I', v_nsp, v_name), a.attname::pg_catalog.text) AS seq
+               FROM pg_catalog.pg_attribute a
+              WHERE a.attrelid OPERATOR(pg_catalog.=) v_oid AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped AND a.attidentity OPERATOR(pg_catalog.<>) ''
+    LOOP
+        EXECUTE pg_catalog.format('ALTER SEQUENCE %s RENAME TO %I', r.seq, pg_catalog.format('kingres_old_%s_s%s', v_oid, r.attnum));
+    END LOOP;
+    EXECUTE pg_catalog.format('ALTER TABLE %I.%I RENAME TO %I', v_nsp, v_name, v_new);
+    EXECUTE pg_catalog.format('ALTER TABLE %I.%I SET SCHEMA kingres', v_nsp, v_new);
+    EXECUTE pg_catalog.format('ALTER TABLE kingres.%I OWNER TO %I', v_new, (SELECT ro.rolname FROM pg_catalog.pg_roles ro WHERE ro.oid OPERATOR(pg_catalog.=) 10::pg_catalog.oid));
+    EXECUTE pg_catalog.format('REVOKE ALL ON kingres.%I FROM PUBLIC', v_new);
+    -- (a rename does not change privileges: whoever could read the table could read the copy)
+    -- table privileges and column privileges (a role may hold only the second: REVOKE ALL on the table takes both)
+    FOR r IN SELECT DISTINCT s.grantee
+               FROM (SELECT x.grantee FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) x
+                      WHERE c.oid OPERATOR(pg_catalog.=) p_relid::pg_catalog.oid AND x.grantee OPERATOR(pg_catalog.<>) c.relowner
+                     UNION
+                     SELECT x.grantee FROM pg_catalog.pg_attribute a, pg_catalog.pg_class c, pg_catalog.aclexplode(a.attacl) x
+                      WHERE a.attrelid OPERATOR(pg_catalog.=) p_relid::pg_catalog.oid AND a.attacl IS NOT NULL
+                        AND c.oid OPERATOR(pg_catalog.=) a.attrelid AND x.grantee OPERATOR(pg_catalog.<>) c.relowner) s
+              WHERE s.grantee OPERATOR(pg_catalog.<>) 0
+    LOOP
+        EXECUTE pg_catalog.format('REVOKE ALL ON kingres.%I FROM %I', v_new, (SELECT ro.rolname FROM pg_catalog.pg_roles ro WHERE ro.oid OPERATOR(pg_catalog.=) r.grantee));
+    END LOOP;
+    RETURN pg_catalog.format('kingres.%I', v_new)::pg_catalog.regclass;
+END;
+$$;
+
+-- The capture function of a split (internal_split_prepare): every operator of its body is qualified (the function runs with the rights of the owner of the table, and
+-- the owner may change its search_path with ALTER FUNCTION).  It stays the table owner's, and the reason is the children: they are the owner's tables, with the owner's
+-- triggers and defaults, so the function must run as the owner or those would run with the rights of whoever writes the old partition (a superuser, the router).  A
+-- function that the owner altered to SECURITY INVOKER or to another search_path cannot be hijacked by an operator any more.
+CREATE OR REPLACE FUNCTION kingres.internal_split_prepare(p_split bigint, p_bucket int, p_modulus int, p_parts int, p_inspect pg_catalog.jsonb, p_lock_ms int)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    el       pg_catalog.jsonb;
+    j        pg_catalog.int4;
+    r        pg_catalog.int4;
+    v_new    pg_catalog.int4 := p_modulus OPERATOR(pg_catalog.*) p_parts;
+    v_parent pg_catalog.text;
+    v_part   pg_catalog.text;
+    v_child  pg_catalog.text;
+    v_with   pg_catalog.text;
+    v_fn     pg_catalog.text;
+    v_cols   pg_catalog.text;
+    v_vals   pg_catalog.text;
+    v_set    pg_catalog.text;
+    v_pkl    pg_catalog.text;
+    v_pkm    pg_catalog.text;
+    v_dist   pg_catalog.text;
+    v_del    pg_catalog.text;
+    v_ins    pg_catalog.text;
+    v_trunc  pg_catalog.text;
+    v_body   pg_catalog.text;
+    v_owner  pg_catalog.text;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    PERFORM pg_catalog.set_config('lock_timeout', p_lock_ms::pg_catalog.text, true);
+    FOR el IN SELECT x FROM pg_catalog.jsonb_array_elements(p_inspect) x LOOP
+        v_parent := pg_catalog.format('%I.%I', el OPERATOR(pg_catalog.->>) 'schema', el OPERATOR(pg_catalog.->>) 'table');
+        -- P10R-02: the children and the capture trigger belong to the owner of the table, as the bucket partitions do, and the trigger function runs with the
+        -- owner's rights.  Whoever writes the table writes the old partition and so fires the trigger; the child must take the row whatever rights the writer has
+        -- on it (none: the writer has them on the parent), and what the owner's constraints and defaults run as is the owner, never the superuser who splits.
+        SELECT r.rolname INTO v_owner FROM pg_catalog.pg_class c JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) c.relowner
+         WHERE c.oid OPERATOR(pg_catalog.=) v_parent::pg_catalog.regclass::pg_catalog.oid;
+        IF NOT pg_catalog.has_schema_privilege(v_owner, (el OPERATOR(pg_catalog.->>) 'schema'), 'USAGE') THEN
+            RAISE EXCEPTION 'the owner % of table % has no USAGE on its schema: the capture trigger of a split runs with the rights of the owner', v_owner, v_parent
+                USING ERRCODE = 'insufficient_privilege';
+        END IF;
+        v_part := pg_catalog.format('%I.%I', el OPERATOR(pg_catalog.->>) 'schema', el OPERATOR(pg_catalog.->>) 'part');
+        v_dist := pg_catalog.quote_ident(el OPERATOR(pg_catalog.->>) 'dist');
+        v_with := CASE WHEN pg_catalog.jsonb_typeof(el OPERATOR(pg_catalog.->) 'reloptions') OPERATOR(pg_catalog.=) 'array'
+                       THEN kingres.internal_with_clause(ARRAY(SELECT pg_catalog.jsonb_array_elements_text(el OPERATOR(pg_catalog.->) 'reloptions'))) ELSE '' END;
+        SELECT pg_catalog.string_agg(pg_catalog.quote_ident(c), ', '), pg_catalog.string_agg('NEW.' OPERATOR(pg_catalog.||) pg_catalog.quote_ident(c), ', '),
+               pg_catalog.string_agg(pg_catalog.format('%I = EXCLUDED.%I', c, c), ', ')
+          INTO v_cols, v_vals, v_set FROM pg_catalog.jsonb_array_elements_text(el OPERATOR(pg_catalog.->) 'cols') c;
+        SELECT pg_catalog.string_agg(pg_catalog.quote_ident(c), ', '), pg_catalog.string_agg(pg_catalog.format('%I OPERATOR(pg_catalog.=) OLD.%I', c, c), ' AND ')
+          INTO v_pkl, v_pkm FROM pg_catalog.jsonb_array_elements_text(el OPERATOR(pg_catalog.->) 'pk') c;
+        v_del := ''; v_ins := ''; v_trunc := '';
+        FOR j IN 0 .. p_parts OPERATOR(pg_catalog.-) 1 LOOP
+            r := p_bucket OPERATOR(pg_catalog.+) (j OPERATOR(pg_catalog.*) p_modulus);
+            v_child := pg_catalog.format('%I.%I', el OPERATOR(pg_catalog.->>) 'schema', pg_catalog.format('%s_s%s_%s', el OPERATOR(pg_catalog.->>) 'table', p_split, r));
+            EXECUTE pg_catalog.format('CREATE TABLE %s (LIKE %s INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING INDEXES INCLUDING STORAGE INCLUDING COMMENTS) %s', v_child, v_parent, v_with);
+            EXECUTE pg_catalog.format('ALTER TABLE %s ADD CONSTRAINT ks_bucket_check CHECK (pg_catalog.satisfies_hash_partition(%L::pg_catalog.regclass::pg_catalog.oid, %s, %s, %s))',
+                                      v_child, v_parent, v_new, r, v_dist);
+            EXECUTE pg_catalog.format('COMMENT ON TABLE %s IS %L', v_child, 'kingres_shard bucket split ' OPERATOR(pg_catalog.||) p_split::pg_catalog.text);
+            EXECUTE pg_catalog.format('ALTER TABLE %s OWNER TO %I', v_child, v_owner);
+            v_del := v_del OPERATOR(pg_catalog.||) pg_catalog.format(E'        IF pg_catalog.satisfies_hash_partition(%L::pg_catalog.regclass::pg_catalog.oid, %s, %s, OLD.%s) THEN DELETE FROM %s WHERE %s; END IF;\n',
+                                                                    v_parent, v_new, r, v_dist, v_child, v_pkm);
+            v_ins := v_ins OPERATOR(pg_catalog.||) pg_catalog.format(E'        IF pg_catalog.satisfies_hash_partition(%L::pg_catalog.regclass::pg_catalog.oid, %s, %s, NEW.%s) THEN INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (%s) DO UPDATE SET %s; END IF;\n',
+                                                                    v_parent, v_new, r, v_dist, v_child, v_cols, v_vals, v_pkl, v_set);
+            v_trunc := v_trunc OPERATOR(pg_catalog.||) CASE WHEN v_trunc OPERATOR(pg_catalog.=) '' THEN '' ELSE ', ' END OPERATOR(pg_catalog.||) v_child;
+        END LOOP;
+        v_fn := pg_catalog.format('split_capture_%s_%s', p_split, el OPERATOR(pg_catalog.->>) 'ord');
+        v_body := pg_catalog.format(E'BEGIN\n    IF TG_OP OPERATOR(pg_catalog.=) ''TRUNCATE'' THEN\n        TRUNCATE %s;\n        RETURN NULL;\n    END IF;\n    IF TG_OP OPERATOR(pg_catalog.=) ANY (ARRAY[''UPDATE'', ''DELETE'']::pg_catalog.text[]) THEN\n%s    END IF;\n    IF TG_OP OPERATOR(pg_catalog.=) ANY (ARRAY[''INSERT'', ''UPDATE'']::pg_catalog.text[]) THEN\n%s    END IF;\n    RETURN NULL;\nEND', v_trunc, v_del, v_ins);
+        EXECUTE pg_catalog.format('CREATE FUNCTION kingres.%I() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS %L', v_fn, v_body);
+        EXECUTE pg_catalog.format('REVOKE ALL ON FUNCTION kingres.%I() FROM PUBLIC', v_fn);
+        EXECUTE pg_catalog.format('ALTER FUNCTION kingres.%I() OWNER TO %I', v_fn, v_owner);
+        PERFORM kingres.internal_ddl(pg_catalog.format('CREATE TRIGGER ks_split_capture_row AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION kingres.%I()', v_part, v_fn));
+        PERFORM kingres.internal_ddl(pg_catalog.format('ALTER TABLE %s ENABLE ALWAYS TRIGGER ks_split_capture_row', v_part));
+        PERFORM kingres.internal_ddl(pg_catalog.format('CREATE TRIGGER ks_split_capture_truncate AFTER TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION kingres.%I()', v_part, v_fn));
+        PERFORM kingres.internal_ddl(pg_catalog.format('ALTER TABLE %s ENABLE ALWAYS TRIGGER ks_split_capture_truncate', v_part));
+    END LOOP;
+END;
+$$;
