@@ -692,7 +692,7 @@ func TestTheRESTDeclarationOfALostServerWorksAcrossRealServers(t *testing.T) {
 	if st, body := leader.Do("PATCH", "/settings/cluster", map[string]any{"defaultReplicaCount": 2}, nil); st != 200 && st != 202 {
 		t.Fatalf("two standbys for every group: %d %v", st, body)
 	}
-	waitStandbys(t, c, 2)
+	waitStandbysFor(t, c, 2, 10*time.Minute)
 	views := topology(t, leader)[0]
 	var nw, third *clustertest.Node
 	for _, n := range c.Nodes {
