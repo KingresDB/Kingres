@@ -1198,6 +1198,7 @@ BEGIN
     RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_layout() t;
     RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_layout_partitions(v_skip) t;
     RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_splits(v_skip) t;
+    RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_blocked_orphans() t;
     RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_ledger(v_skip) t;
     RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_schemas(v_skip) t;
     RETURN QUERY SELECT t.check_name, t.node_id, t.object, t.detail FROM kingres.internal_check_table_operations(v_skip) t;
@@ -3371,6 +3372,273 @@ REVOKE ALL ON FUNCTION
 
 -- =========================================================================
 -- Moves: the lock of the start                                                                                         [end]
+-- =========================================================================
+
+-- =========================================================================
+-- Orphan tables with objects of the tenant that depend on them                                                         [begin]
+-- =========================================================================
+
+-- The old copy of a moved or split bucket stays in schema kingres as an orphan table until the cleanup drops it.  The owner of the distributed table, a tenant, can
+-- attach to a bucket partition (the statements that the extension does not refuse on one) objects that depend on it: a view or a materialized view that selects
+-- from it, a foreign key of another table that references it, a function that takes its row type.  Those objects stay with the orphan after the move.  A plain
+-- DROP TABLE refuses such a table (2BP01), and the cleanup failed with that error at every pass of the recovery worker: the move stayed in "cleaning" for ever,
+-- silently, and the orphan stayed.
+--
+-- The cleanup never drops what the owner made.  It never uses CASCADE: a view, a materialized view, a table with its rows or a function of a tenant would be dropped
+-- by a superuser, and the objects that a cascade reaches are not the ones the cleanup knows.  What a plain DROP TABLE removes with the table is only what belongs to
+-- the table itself (its indexes, constraints, triggers, rules, policies, statistics, comments, privileges, its membership in a publication); DROP runs none of it,
+-- no function of the owner is called, and the event triggers that run at a DROP are those of a superuser.  The orphan that has dependents is left as it is and said
+-- clearly: the record of the move (or split) says in "detail" what depends on it, check_cluster() reports it as orphan_blocked, and the next pass of the cleanup drops
+-- the orphan once the owner (or an operator) has dropped the dependents.
+
+-- Drops the orphan tables of a move on this node, the ones that nothing depends on; those with dependents stay.  Returns how many were dropped.
+CREATE OR REPLACE FUNCTION kingres.internal_drop_orphans(p_move bigint)
+    RETURNS int
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    r pg_catalog.record;
+    n pg_catalog.int4 := 0;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    SET LOCAL lock_timeout = '5s';
+    FOR r IN SELECT c.relname FROM pg_catalog.pg_class c
+              WHERE c.relnamespace OPERATOR(pg_catalog.=) 'kingres'::pg_catalog.regnamespace
+                AND c.relkind IN ('r', 'p')
+                AND NOT c.relispartition
+                AND pg_catalog.starts_with(c.relname, pg_catalog.format('orphan_%s_', p_move))
+              ORDER BY c.relname
+    LOOP
+        BEGIN
+            EXECUTE pg_catalog.format('DROP TABLE kingres.%I', r.relname);
+            n := n OPERATOR(pg_catalog.+) 1;
+        EXCEPTION WHEN dependent_objects_still_exist THEN
+            NULL;       -- objects of its owner depend on it: it stays, internal_orphan_blockers() says which
+        END;
+    END LOOP;
+    RETURN n;
+END;
+$$;
+
+-- The same for the old partitions of a split.
+CREATE OR REPLACE FUNCTION kingres.internal_split_drop_orphans(p_split bigint)
+    RETURNS int
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    x pg_catalog.record;
+    n pg_catalog.int4 := 0;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    FOR x IN SELECT c.relname FROM pg_catalog.pg_class c
+              WHERE c.relnamespace OPERATOR(pg_catalog.=) 'kingres'::pg_catalog.regnamespace AND c.relkind OPERATOR(pg_catalog.=) 'r'
+                AND c.relname OPERATOR(pg_catalog.~) pg_catalog.format('^orphan_s%s_[0-9]+$', p_split)
+              ORDER BY c.relname
+    LOOP
+        BEGIN
+            EXECUTE pg_catalog.format('DROP TABLE kingres.%I', x.relname);
+            n := n OPERATOR(pg_catalog.+) 1;
+        EXCEPTION WHEN dependent_objects_still_exist THEN
+            NULL;
+        END;
+    END LOOP;
+    RETURN n;
+END;
+$$;
+
+-- On the node of the orphans: what keeps the orphan tables whose name starts with p_prefix ('orphan_<move>_' or 'orphan_s<split>_') from being dropped, as text; null when
+-- nothing does.  The dependents are the objects that depend in the normal way on one of the tables (or a leaf of it, an index of it, its row type), which is what a DROP
+-- without CASCADE refuses, leaving out the objects that belong to the set of orphans itself.  It reads the catalogs only.
+CREATE FUNCTION kingres.internal_orphan_blockers(p_prefix text)
+    RETURNS text
+    LANGUAGE plpgsql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_family pg_catalog.oid[];
+    v_text   pg_catalog.text;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    -- the orphans and their leaves
+    SELECT pg_catalog.array_agg(DISTINCT u.relid) INTO v_family
+      FROM (SELECT c.oid AS relid FROM pg_catalog.pg_class c
+             WHERE c.relnamespace OPERATOR(pg_catalog.=) 'kingres'::pg_catalog.regnamespace AND c.relkind IN ('r', 'p') AND NOT c.relispartition
+               AND pg_catalog.starts_with(c.relname, p_prefix)
+            UNION
+            SELECT t.relid FROM pg_catalog.pg_class c, LATERAL pg_catalog.pg_partition_tree(c.oid) t
+             WHERE c.relnamespace OPERATOR(pg_catalog.=) 'kingres'::pg_catalog.regnamespace AND c.relkind OPERATOR(pg_catalog.=) 'p' AND NOT c.relispartition
+               AND pg_catalog.starts_with(c.relname, p_prefix)) u;
+    IF v_family IS NULL THEN
+        RETURN NULL;
+    END IF;
+    SELECT pg_catalog.string_agg(q.what, '; ' ORDER BY q.what) INTO v_text
+      FROM (SELECT DISTINCT pg_catalog.format('%s depends on %s', pg_catalog.pg_describe_object(d.classid, d.objid, d.objsubid),
+                                              pg_catalog.pg_describe_object(d.refclassid, d.refobjid, 0)) AS what
+              FROM pg_catalog.pg_depend d
+             WHERE d.deptype OPERATOR(pg_catalog.=) 'n'
+               AND ((d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass
+                     AND (d.refobjid OPERATOR(pg_catalog.=) ANY (v_family)
+                          OR d.refobjid OPERATOR(pg_catalog.=) ANY (SELECT i.indexrelid FROM pg_catalog.pg_index i WHERE i.indrelid OPERATOR(pg_catalog.=) ANY (v_family))))
+                    OR (d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_type'::pg_catalog.regclass
+                        AND d.refobjid OPERATOR(pg_catalog.=) ANY (SELECT c.reltype FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) ANY (v_family))))
+               -- not an object of the set itself: a table of the set, a constraint of one of its tables, the row type of one of them
+               AND NOT (d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objid OPERATOR(pg_catalog.=) ANY (v_family))
+               AND NOT (d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_constraint'::pg_catalog.regclass
+                        AND EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k WHERE k.oid OPERATOR(pg_catalog.=) d.objid AND k.conrelid OPERATOR(pg_catalog.=) ANY (v_family)))
+               AND NOT (d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_type'::pg_catalog.regclass
+                        AND EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.reltype OPERATOR(pg_catalog.=) d.objid AND c.oid OPERATOR(pg_catalog.=) ANY (v_family)))) q;
+    RETURN pg_catalog.left(v_text, 1000);
+END;
+$$;
+
+-- What the cleanup of a move found: the orphans that stay are named in the record (the check and the operator read it there).  Same as in 0.8 otherwise.
+CREATE OR REPLACE FUNCTION kingres.internal_continue_cleaning(p_move bigint, p_owner bool, p_force bool)
+    RETURNS text
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    m       kingres.bucket_move%ROWTYPE;
+    v_src   pg_catalog.int4;
+    v_tgt   pg_catalog.int4;
+    v_sql   pg_catalog.text;
+    v_blk   pg_catalog.text;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    PERFORM kingres.internal_require_map_group();
+    IF NOT p_owner AND kingres.internal_move_alive(p_move) THEN
+        RETURN 'skipped';
+    END IF;
+    SELECT * INTO m FROM kingres.bucket_move b WHERE b.move_id OPERATOR(pg_catalog.=) p_move FOR UPDATE SKIP LOCKED;
+    IF NOT FOUND THEN
+        RETURN 'skipped';
+    END IF;
+    IF m.phase OPERATOR(pg_catalog.<>) 'cleaning' THEN
+        RETURN m.phase;
+    END IF;
+    v_src := kingres.internal_group_node(m.source_group);
+    v_tgt := kingres.internal_group_node(m.target_group);
+    IF v_src IS NULL OR v_tgt IS NULL THEN
+        RETURN 'waiting';
+    END IF;
+
+    IF NOT m.replication_dropped THEN
+        PERFORM kingres.internal_drop_move_replication(p_move, v_src, v_tgt);
+        UPDATE kingres.bucket_move b SET replication_dropped = true, updated_at = pg_catalog.clock_timestamp()
+         WHERE b.move_id OPERATOR(pg_catalog.=) p_move;
+    END IF;
+
+    IF NOT p_force AND pg_catalog.clock_timestamp() OPERATOR(pg_catalog.<) m.cleanup_after THEN
+        RETURN 'waiting';
+    END IF;
+
+    -- No transaction of this node may still be prepared on the source or the target:
+    -- a participant of the switch that is not committed has not detached (or
+    -- attached) yet, and the orphan tables do not exist before it has.
+    v_sql := pg_catalog.format('SELECT pg_catalog.count(*) FROM pg_catalog.pg_prepared_xacts WHERE gid LIKE %L',
+                               'kingres\_' OPERATOR(pg_catalog.||) (SELECT l.node_id::pg_catalog.text FROM kingres.local_node l) OPERATOR(pg_catalog.||) '\_%');
+    IF kingres.internal_exec_scalar(v_src, v_sql, 20000) IS DISTINCT FROM '0'
+       OR kingres.internal_exec_scalar(v_tgt, v_sql, 20000) IS DISTINCT FROM '0' THEN
+        RETURN 'waiting';
+    END IF;
+
+    BEGIN
+        IF EXISTS (SELECT 1 FROM kingres.colocation c WHERE c.colocation_id OPERATOR(pg_catalog.=) m.colocation_id AND c.kind OPERATOR(pg_catalog.=) 'schema') THEN
+            -- the old copy of a distributed schema: its tables on the source, emptied (bounded lock wait); not when that group holds the schema again
+            IF NOT EXISTS (SELECT 1 FROM kingres.bucket_map bm WHERE bm.colocation_id OPERATOR(pg_catalog.=) m.colocation_id AND bm.bucket OPERATOR(pg_catalog.=) 0
+                              AND bm.group_id OPERATOR(pg_catalog.=) m.source_group) THEN
+                PERFORM kingres.internal_node_exec(v_src, pg_catalog.format('SELECT kingres.internal_schema_shells(%s, false)', m.colocation_id), 60000);
+            END IF;
+        ELSE
+            PERFORM kingres.internal_node_exec(v_src, pg_catalog.format('SELECT kingres.internal_drop_orphans(%s)', p_move), 60000);
+            -- the orphans that objects of their owner depend on were not dropped: say which objects
+            v_blk := kingres.internal_exec_scalar(v_src, pg_catalog.format('SELECT kingres.internal_orphan_blockers(%L)', pg_catalog.format('orphan_%s_', p_move)), 20000);
+        END IF;
+    EXCEPTION WHEN lock_not_available OR query_canceled THEN
+        UPDATE kingres.bucket_move b SET detail = 'waiting for readers of the old partitions to finish', updated_at = pg_catalog.clock_timestamp()
+         WHERE b.move_id OPERATOR(pg_catalog.=) p_move;
+        RETURN 'waiting';
+    END;
+    IF v_blk IS NOT NULL THEN
+        UPDATE kingres.bucket_move b
+           SET detail = pg_catalog.left('the old copy cannot be dropped, objects of its owner depend on it: ' OPERATOR(pg_catalog.||) v_blk, 1500),
+               updated_at = pg_catalog.clock_timestamp()
+         WHERE b.move_id OPERATOR(pg_catalog.=) p_move;
+        RETURN 'blocked';
+    END IF;
+    PERFORM kingres.internal_fault_point('move_cleanup_after_orphans');
+    UPDATE kingres.bucket_move b
+       SET phase = 'done', detail = NULL, updated_at = pg_catalog.clock_timestamp(), finished_at = pg_catalog.clock_timestamp()
+     WHERE b.move_id OPERATOR(pg_catalog.=) p_move;
+    RETURN 'done';
+END;
+$$;
+
+-- The cleanup of the splits: an old partition with dependents stays and the record says which.
+CREATE OR REPLACE FUNCTION kingres.cleanup_bucket_splits(p_force bool DEFAULT false)
+    RETURNS int
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    s pg_catalog.record;
+    n pg_catalog.int4 := 0;
+    v_owner pg_catalog.int4;
+    v_blk   pg_catalog.text;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    PERFORM kingres.internal_require_map_group();
+    FOR s IN SELECT b.* FROM kingres.bucket_split b WHERE b.phase OPERATOR(pg_catalog.=) 'cleaning' AND (p_force OR b.cleanup_after OPERATOR(pg_catalog.<=) pg_catalog.clock_timestamp()) ORDER BY b.split_id LOOP
+        BEGIN
+            v_owner := kingres.internal_group_node(s.group_id);
+            CONTINUE WHEN v_owner IS NULL;
+            PERFORM kingres.internal_exec_scalar(v_owner, pg_catalog.format('SELECT kingres.internal_split_drop_orphans(%s)', s.split_id));
+            v_blk := kingres.internal_exec_scalar(v_owner, pg_catalog.format('SELECT kingres.internal_orphan_blockers(%L)', pg_catalog.format('orphan_s%s_', s.split_id)));
+            IF v_blk IS NOT NULL THEN
+                UPDATE kingres.bucket_split b
+                   SET detail = pg_catalog.left('the old partitions cannot be dropped, objects of their owner depend on them: ' OPERATOR(pg_catalog.||) v_blk, 1500),
+                       updated_at = pg_catalog.clock_timestamp()
+                 WHERE b.split_id OPERATOR(pg_catalog.=) s.split_id;
+                CONTINUE;
+            END IF;
+            UPDATE kingres.bucket_split b SET phase = 'done', detail = NULL, updated_at = pg_catalog.clock_timestamp(), finished_at = pg_catalog.clock_timestamp() WHERE b.split_id OPERATOR(pg_catalog.=) s.split_id;
+            n := n OPERATOR(pg_catalog.+) 1;
+        EXCEPTION WHEN OTHERS THEN
+            NULL;
+        END;
+    END LOOP;
+    RETURN n;
+END;
+$$;
+
+-- check_cluster(): an orphan table that a move or a split could not drop because objects of its owner depend on it.  Local to the map group primary, reads the records only.
+CREATE FUNCTION kingres.internal_check_blocked_orphans()
+    RETURNS TABLE (check_name text, node_id int, object text, detail text)
+    LANGUAGE plpgsql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+BEGIN
+    IF pg_catalog.to_regclass('kingres.bucket_move') IS NULL OR pg_catalog.to_regclass('kingres.bucket_split') IS NULL THEN
+        RETURN;
+    END IF;
+    RETURN QUERY
+        SELECT 'orphan_blocked'::pg_catalog.text, NULL::pg_catalog.int4, pg_catalog.format('bucket move %s', b.move_id), b.detail
+          FROM kingres.bucket_move b
+         WHERE b.phase OPERATOR(pg_catalog.=) 'cleaning' AND b.detail OPERATOR(pg_catalog.~~) 'the old copy cannot be dropped%'
+        UNION ALL
+        SELECT 'orphan_blocked'::pg_catalog.text, NULL::pg_catalog.int4, pg_catalog.format('bucket split %s', b.split_id), b.detail
+          FROM kingres.bucket_split b
+         WHERE b.phase OPERATOR(pg_catalog.=) 'cleaning' AND b.detail OPERATOR(pg_catalog.~~) 'the old partitions cannot be dropped%'
+         ORDER BY 3;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION kingres.internal_orphan_blockers(text), kingres.internal_check_blocked_orphans() FROM PUBLIC;
+
+-- =========================================================================
+-- Orphan tables with objects of the tenant that depend on them                                                           [end]
 -- =========================================================================
 
 CREATE OR REPLACE FUNCTION kingres.move_bucket(colocation_id int, bucket int, target_group int)
