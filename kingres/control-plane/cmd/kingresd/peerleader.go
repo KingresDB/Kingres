@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -21,13 +22,27 @@ type peerAnswer struct {
 // or names nobody is not counted, so a minority on the far side of a partition, or servers that remember an old leader, cannot make a caller the leader.
 // Nothing is kept between calls: a leader that changed is seen at the next call.
 func agreedLeader(ctx context.Context, peers []string, total int, ask func(ctx context.Context, peer string) (peerAnswer, error)) string {
+	// The members are asked side by side (phase 5 review L4): one that does not answer costs one timeout for the call, not one per member.
+	answers := make([]peerAnswer, len(peers))
+	ok := make([]bool, len(peers))
+	var wg sync.WaitGroup
+	for i, p := range peers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
+			if a, err := ask(cctx, p); err == nil {
+				answers[i], ok[i] = a, true
+			}
+		}()
+	}
+	wg.Wait()
 	counted := 1 // this server
 	leader := ""
-	for _, p := range peers {
-		cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		a, err := ask(cctx, p)
-		cancel()
-		if err != nil || a.HeldBack || a.Leader == "" {
+	for i := range peers {
+		a := answers[i]
+		if !ok[i] || a.HeldBack || a.Leader == "" {
 			continue
 		}
 		if leader != "" && a.Leader != leader {

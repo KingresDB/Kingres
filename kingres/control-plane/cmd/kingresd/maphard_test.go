@@ -13,9 +13,9 @@ import (
 	"testing"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover"
-	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover/journal"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover/mapgroup"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/lease"
 )
 
