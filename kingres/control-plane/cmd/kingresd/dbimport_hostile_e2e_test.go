@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -58,10 +59,11 @@ func smallArchive(t testing.TB, e *cp, db string) []byte {
 func TestDatabaseImportRefusesHostileArchives(t *testing.T) {
 	e, off := transferOn(t)
 	defer off()
+	imp := importerOf(t, e)
 	base := smallArchive(t, e, "dbhostile")
 	// The good archive imports, so every refusal below is the work of what was changed.
-	good := e.uploadArchive(t, base)
-	e.importOK(t, map[string]any{"uploadId": good, "database": "dbhostile_ok"})
+	good := imp.uploadArchive(t, base)
+	imp.importOK(t, map[string]any{"uploadId": good, "database": "dbhostile_ok"})
 	if got := query(t, e, "dbhostile_ok", "select count(*) from public.victim"); got != "[[2]]" {
 		t.Fatalf("the good archive: %s", got)
 	}
@@ -139,6 +141,18 @@ func TestDatabaseImportRefusesHostileArchives(t *testing.T) {
 		}, "archive_statement_refused"},
 		{"a table the catalog does not list", func(v *variant) { v.Files[archive.PreDataName] += "CREATE TABLE public.sneaky (a int);\n" }, "archive_invalid"},
 		{"a table of the catalog that the files do not create", func(v *variant) { v.AddTable("public", "ghost", "a") }, "archive_invalid"},
+		{"a sequence of the schema kingres (the colocation ids)", func(v *variant) {
+			v.Cat.Sequences = append(v.Cat.Sequences, archive.CatalogSequence{Schema: "kingres", Name: "colocation_id_seq", OwnedBy: "public.victim.id", LastValue: 900000000, IsCalled: true})
+		}, "archive_invalid"},
+		{"a sequence of the ledger schema", func(v *variant) {
+			v.Cat.Sequences = append(v.Cat.Sequences, archive.CatalogSequence{Schema: "kingres_ledger", Name: "ledger_seq", OwnedBy: "public.victim.id", LastValue: 900000000, IsCalled: true})
+		}, "archive_invalid"},
+		{"a sequence of pg_catalog", func(v *variant) {
+			v.Cat.Sequences = append(v.Cat.Sequences, archive.CatalogSequence{Schema: "pg_catalog", Name: "x_seq", OwnedBy: "public.victim.id", LastValue: 900000000, IsCalled: true})
+		}, "archive_invalid"},
+		{"a sequence owned by a column of a table that is not there", func(v *variant) {
+			v.Cat.Sequences = append(v.Cat.Sequences, archive.CatalogSequence{Schema: "public", Name: "s_ghost", OwnedBy: "public.ghost.id", LastValue: 900000000, IsCalled: true})
+		}, "archive_invalid"},
 		{"an extension outside the closed list", func(v *variant) {
 			v.Man.Extensions = append(v.Man.Extensions, archive.ManifestExtension{Name: "dblink", Version: "1.2", Schema: "public"})
 		}, "archive_invalid"},
@@ -184,8 +198,8 @@ func TestDatabaseImportRefusesHostileArchives(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			v := readVariant(t, base)
 			tc.mod(v)
-			up := e.uploadArchive(t, v.Bytes(t))
-			st, out := e.importDB(t, map[string]any{"uploadId": up, "database": "dbhostile_x"})
+			up := imp.uploadArchive(t, v.Bytes(t))
+			st, out := imp.importDB(t, map[string]any{"uploadId": up, "database": "dbhostile_x"})
 			if st != 202 {
 				// A refusal at the request is as good: nothing was started.
 				if st != 422 {
@@ -217,6 +231,7 @@ func TestDatabaseImportRefusesHostileArchives(t *testing.T) {
 func TestDatabaseImportHiddenTextIsNotRun(t *testing.T) {
 	e, off := transferOn(t)
 	defer off()
+	imp := importerOf(t, e)
 	base := smallArchive(t, e, "dbhidden")
 	v := readVariant(t, base)
 	v.Files[archive.PreDataName] += "CREATE TABLE public.h_comment (a int) /* ; DROP TABLE public.victim ; GRANT ALL ON ALL TABLES IN SCHEMA pg_catalog TO PUBLIC */;\n" +
@@ -227,9 +242,9 @@ func TestDatabaseImportHiddenTextIsNotRun(t *testing.T) {
 	for _, n := range []string{"h_comment", "h_dollar", "h_string", "h_line", "h_e"} {
 		v.AddTable("public", n, "a")
 	}
-	up := e.uploadArchive(t, v.Bytes(t))
+	up := imp.uploadArchive(t, v.Bytes(t))
 	before := snapshot(t, e)
-	e.importOK(t, map[string]any{"uploadId": up, "database": "dbhidden_ok"})
+	imp.importOK(t, map[string]any{"uploadId": up, "database": "dbhidden_ok"})
 	if got := query(t, e, "dbhidden_ok", "select count(*) from public.victim"); got != "[[2]]" {
 		t.Errorf("victim after the import: %s", got)
 	}
@@ -282,13 +297,14 @@ func TestDatabaseImportRefusesADangerousRole(t *testing.T) {
 func TestDatabaseImportWithdrawsTheAccessOfTheRole(t *testing.T) {
 	e, off := transferOn(t)
 	defer off()
+	imp := importerOf(t, e)
 	base := smallArchive(t, e, "dbaccess")
-	up := e.uploadArchive(t, base)
+	up := imp.uploadArchive(t, base)
 	results := map[string]string{}
 	var mu sync.Mutex
 	try := func(step string, id string) {
 		cfg, _ := pgx.ParseConfig("")
-		cfg.Host, cfg.Port, cfg.Database, cfg.User, cfg.Password = "127.0.0.1", uint16(e.pgPort), id, adminUser, adminPass //nolint:gosec // test port
+		cfg.Host, cfg.Port, cfg.Database, cfg.User, cfg.Password = "127.0.0.1", uint16(e.pgPort), id, importerName, importerPass //nolint:gosec // test port
 		cfg.TLSConfig, cfg.Fallbacks = nil, nil
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
@@ -310,11 +326,11 @@ func TestDatabaseImportWithdrawsTheAccessOfTheRole(t *testing.T) {
 		if id == "" || (step != "Create the tables" && step != "Distribute the tables" && step != "Create the views" && step != "Load the data" && step != "Enable the ledger and the policies" && step != "Verify") {
 			return nil
 		}
-		try(step, "kingres_import_"+id)
+		try(step, ops.ImportPrivateName())
 		return nil
 	}
 	defer func() { ops.ImportHook = nil }()
-	st, out := e.importDB(t, map[string]any{"uploadId": up, "database": "dbaccess_ok"})
+	st, out := imp.importDB(t, map[string]any{"uploadId": up, "database": "dbaccess_ok"})
 	if st != 202 {
 		t.Fatalf("%d %v", st, out)
 	}
@@ -338,6 +354,7 @@ func TestDatabaseImportWithdrawsTheAccessOfTheRole(t *testing.T) {
 func TestDatabaseImportCleansUp(t *testing.T) {
 	e, off := transferOn(t)
 	defer off()
+	imp := importerOf(t, e)
 	base := smallArchive(t, e, "dbclean")
 	// A failure in the middle of the work: the data step fails (the manifest lies about the rows).
 	v := readVariant(t, base)
@@ -349,10 +366,10 @@ func TestDatabaseImportCleansUp(t *testing.T) {
 			}
 		}
 	}
-	bad := e.uploadArchive(t, v.Bytes(t))
+	bad := imp.uploadArchive(t, v.Bytes(t))
 	e.waitNoPrivate(t)
 	before := snapshot(t, e)
-	e.importFails(t, map[string]any{"uploadId": bad, "database": "dbclean_x"}, "row_count_mismatch")
+	imp.importFails(t, map[string]any{"uploadId": bad, "database": "dbclean_x"}, "row_count_mismatch")
 	if names := e.waitNoPrivate(t); len(names) != 0 || e.databaseExists(t, "dbclean_x") {
 		t.Errorf("after a failure: %v", names)
 	}
@@ -360,7 +377,7 @@ func TestDatabaseImportCleansUp(t *testing.T) {
 		t.Errorf("a failed import changed the cluster:\n%s\n%s", before, after)
 	}
 	// keepOnFailure: the private database stays, under its private name, and nothing of the final name exists.
-	e.importFails(t, map[string]any{"uploadId": bad, "database": "dbclean_x", "keepOnFailure": true}, "row_count_mismatch")
+	imp.importFails(t, map[string]any{"uploadId": bad, "database": "dbclean_x", "keepOnFailure": true}, "row_count_mismatch")
 	time.Sleep(2 * time.Second)
 	names := e.privateDatabases(t)
 	if len(names) != 1 || e.databaseExists(t, "dbclean_x") {
@@ -372,7 +389,7 @@ func TestDatabaseImportCleansUp(t *testing.T) {
 	}
 	_ = sc.Close(context.Background())
 	// A cancel while the data is loaded.
-	good := e.uploadArchive(t, base)
+	good := imp.uploadArchive(t, base)
 	reached := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
@@ -388,7 +405,7 @@ func TestDatabaseImportCleansUp(t *testing.T) {
 		return nil
 	}
 	defer func() { ops.ImportHook = nil }()
-	st, out := e.importDB(t, map[string]any{"uploadId": good, "database": "dbclean_c"})
+	st, out := imp.importDB(t, map[string]any{"uploadId": good, "database": "dbclean_c"})
 	if st != 202 {
 		t.Fatalf("%d %v", st, out)
 	}
@@ -428,56 +445,43 @@ func (e *cp) waitNoPrivate(t testing.TB) []string {
 func TestDatabaseImportNeverUsesADatabaseItDidNotMake(t *testing.T) {
 	e, off := transferOn(t)
 	defer off()
+	imp := importerOf(t, e)
 	base := smallArchive(t, e, "dbnever")
-	up := e.uploadArchive(t, base)
-	var mu sync.Mutex
-	var taskID string
-	waitID := func() string {
-		for i := 0; i < 100; i++ {
-			mu.Lock()
-			id := taskID
-			mu.Unlock()
-			if id != "" {
-				return id
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
-		return ""
-	}
+	up := imp.uploadArchive(t, base)
+	var made string
 	sc := e.serviceConn(t, "postgres")
 	defer func() { _ = sc.Close(context.Background()) }()
 	defer func() { ops.ImportHook = nil }()
 	// 1. The private name exists already (made by the service role's own hand here, without the marker of a task).
 	ops.ImportHook = func(ctx context.Context, step string) error {
 		if step == "Create the private database" {
-			if _, err := sc.Exec(ctx, "create database kingres_import_"+waitID()); err != nil {
+			made = ops.ImportPrivateName()
+			if _, err := sc.Exec(ctx, "create database "+made); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
-	st, out := e.importDB(t, map[string]any{"uploadId": up, "database": "dbnever_a"})
+	st, out := imp.importDB(t, map[string]any{"uploadId": up, "database": "dbnever_a"})
 	if st != 202 {
 		t.Fatalf("%d %v", st, out)
 	}
-	mu.Lock()
-	taskID = idOf(out)
-	mu.Unlock()
 	done := e.waitTask(t, out)
+	// The name is not one that can be guessed: the id of the task and a random part.
+	if ok, _ := regexp.MatchString("^kingres_import_[0-9]+_[0-9a-f]{12}$", made); !ok {
+		t.Errorf("the private name %q", made)
+	}
 	if done["state"] != "failed" || taskCode(done) != "forbidden" {
 		t.Fatalf("a private name that exists: %v %q (%s)", done["state"], taskCode(done), taskMessage(done))
 	}
 	time.Sleep(3 * time.Second)
-	if names := e.privateDatabases(t); len(names) != 1 || names[0] != "kingres_import_"+taskID {
+	if names := e.privateDatabases(t); len(names) != 1 || names[0] != made {
 		t.Errorf("the database that the task did not make was dropped or something else is left: %v", names)
 	}
-	if _, err := sc.Exec(context.Background(), "drop database kingres_import_"+taskID); err != nil {
+	if _, err := sc.Exec(context.Background(), "drop database "+made); err != nil {
 		t.Fatal(err)
 	}
 	// 2. The final name is taken after the work was done and before the name is taken.
-	mu.Lock()
-	taskID = ""
-	mu.Unlock()
 	ops.ImportHook = func(ctx context.Context, step string) error {
 		if step == "Take the final name" {
 			if _, err := sc.Exec(ctx, "create database dbnever_b"); err != nil {
@@ -486,7 +490,7 @@ func TestDatabaseImportNeverUsesADatabaseItDidNotMake(t *testing.T) {
 		}
 		return nil
 	}
-	st, out = e.importDB(t, map[string]any{"uploadId": up, "database": "dbnever_b"})
+	st, out = imp.importDB(t, map[string]any{"uploadId": up, "database": "dbnever_b"})
 	if st != 202 {
 		t.Fatalf("%d %v", st, out)
 	}

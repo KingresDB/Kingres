@@ -4,6 +4,7 @@
 package clustertest_test
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -109,6 +110,13 @@ func TestDatabaseImportOverThreeServers(t *testing.T) {
 		}
 		return uid
 	}
+	// The importer is a role of kingres_admin as the API makes it, with CREATEROLE and the creator as a member, used as it is.
+	leader.Expect(201, "POST", "/roles", map[string]any{"name": "dbi_admin", "password": "Importer-Passw0rd-1", "clusterRoles": []string{"kingres_admin"}})
+	for _, n := range []*clustertest.Node{f1, f2} {
+		if !n.Login("dbi_admin", "Importer-Passw0rd-1") {
+			t.Fatalf("the importer cannot sign in on node %d", n.Index)
+		}
+	}
 	uid := upload(f1, body)
 	// Imported through another follower: the work and the files are the leader's.
 	st, out = f2.Do("POST", "/database-imports", map[string]any{"uploadId": uid, "database": "dbm3_copy", "acknowledgeLedgerRestart": true}, nil)
@@ -119,9 +127,30 @@ func TestDatabaseImportOverThreeServers(t *testing.T) {
 	if done["state"] != "done" {
 		t.Fatalf("import task: %v", done["error"])
 	}
+	// What the importer owns is read as the service role.
+	sq := func(db, sql string) string {
+		c := leader.ServicePG(db)
+		defer func() { _ = c.Close(context.Background()) }()
+		rows, err := c.Query(context.Background(), sql)
+		if err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		defer rows.Close()
+		var out [][]any
+		for rows.Next() {
+			vals, err := rows.Values()
+			if err != nil {
+				t.Fatalf("%s: %v", sql, err)
+			}
+			out = append(out, vals)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		return fmt.Sprint(out)
+	}
 	digest := func(db, tb string) string {
-		r := q(db, "select count(*), coalesce(md5(string_agg(x::text, '|' order by x::text)), '') from "+tb+" x")
-		return fmt.Sprint(r["rows"])
+		return sq(db, "select count(*), coalesce(md5(string_agg(x::text, '|' order by x::text)), '') from "+tb+" x")
 	}
 	for _, tb := range []string{"public.t_plain", "public.refdata", "public.d_hash", "public.d_two", "public.d_part", "public.c_events", "public.acc", "tn.docs"} {
 		if a, b := digest("dbm3", tb), digest("dbm3_copy", tb); a != b {
@@ -129,18 +158,18 @@ func TestDatabaseImportOverThreeServers(t *testing.T) {
 		}
 	}
 	// The buckets are spread over the groups, the colocation of the two tables is kept.
-	if got := fmt.Sprint(q("dbm3_copy", "select count(distinct group_id) >= 2 from kingres.bucket_map")["rows"]); got != "[[true]]" {
+	if got := sq("dbm3_copy", "select count(distinct group_id) >= 2 from kingres.bucket_map"); got != "[[true]]" {
 		t.Errorf("the buckets of the imported database are in one group: %s", got)
 	}
-	if got := fmt.Sprint(q("dbm3_copy", "select count(distinct colocation_id) from kingres.dist_table where method = 'hash'")["rows"]); got != fmt.Sprint(q("dbm3", "select count(distinct colocation_id) from kingres.dist_table where method = 'hash'")["rows"]) {
+	if got := sq("dbm3_copy", "select count(distinct colocation_id) from kingres.dist_table where method = 'hash'"); got != sq("dbm3", "select count(distinct colocation_id) from kingres.dist_table where method = 'hash'") {
 		t.Errorf("the colocation groups differ: %s", got)
 	}
 	// The schema is distributed here too, and its table is the schema's.
-	if a, b := fmt.Sprint(q("dbm3", "select count(*) from kingres.dist_schema")["rows"]), fmt.Sprint(q("dbm3_copy", "select count(*) from kingres.dist_schema")["rows"]); a != b || a != "[[1]]" {
+	if a, b := sq("dbm3", "select count(*) from kingres.dist_schema"), sq("dbm3_copy", "select count(*) from kingres.dist_schema"); a != b || a != "[[1]]" {
 		t.Errorf("distributed schemas: source %s, imported %s", a, b)
 	}
 	// The sequence of the serial column continues above the rows on the node that takes the insert.
-	if got := fmt.Sprint(q("dbm3_copy", "insert into public.t_plain (name) values ('z') returning id")["rows"]); got != "[[3]]" {
+	if got := sq("dbm3_copy", "insert into public.t_plain (name) values ('z') returning id"); got != "[[3]]" {
 		t.Errorf("the serial column continues with %s", got)
 	}
 	// The ledger of the imported database is consistent: a digest builds the block of the entries of the loaded rows, and the verification reads it.

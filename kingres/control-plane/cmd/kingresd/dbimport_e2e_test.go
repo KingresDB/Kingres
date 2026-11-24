@@ -120,16 +120,51 @@ func digests(t testing.TB, e *cp, db string) map[string]string {
 	return out
 }
 
+// query runs a statement as the service role (the tables belong to the importer, the source to another role) and returns the rows as the workbench prints them.
 func query(t testing.TB, e *cp, db, sql string) string {
 	t.Helper()
-	r := e.expect(t, 200, "POST", "/query", map[string]any{"database": db, "sql": sql})
-	return fmt.Sprint(r["rows"])
+	c := e.serviceConn(t, db)
+	defer func() { _ = c.Close(context.Background()) }()
+	rows, err := c.Query(context.Background(), sql)
+	if err != nil {
+		t.Fatalf("%s: %v", sql, err)
+	}
+	defer rows.Close()
+	var out [][]any
+	for rows.Next() {
+		vals, err := rows.Values()
+		if err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		out = append(out, vals)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("%s: %v", sql, err)
+	}
+	return fmt.Sprint(out)
+}
+
+// The importer: a role of the cluster role kingres_admin as the API makes it (it has CREATEROLE, and the role that made it is a member of it), used as it is; it owns what it imports.
+const importerName, importerPass = "dbi_admin", "Importer-Passw0rd-1"
+
+func importerOf(t testing.TB, e *cp) *cp {
+	t.Helper()
+	st, out, _ := e.call("POST", "/roles", map[string]any{"name": importerName, "password": importerPass, "clusterRoles": []string{"kingres_admin"}}, nil)
+	if st != 201 && st != 409 {
+		t.Fatalf("the importer role: %d %v", st, out)
+	}
+	tok, ok := e.loginAs(importerName, importerPass)
+	if !ok {
+		t.Fatal("login of the importer")
+	}
+	return e.as(tok)
 }
 
 // The round trip: a database with every kind of table is exported, imported under a new name and compared table by table.
 func TestDatabaseImportRoundTrip(t *testing.T) {
 	e, off := transferOn(t)
 	defer off()
+	imp := importerOf(t, e)
 	buildExportFixture(t, e, "dbsrc")
 	// A ledger table whose signature policy is required: the import enters its rows first and sets the policy again after the verification.
 	ssrc := e.serviceConn(t, "dbsrc")
@@ -144,9 +179,9 @@ func TestDatabaseImportRoundTrip(t *testing.T) {
 	}
 	// For the test of the other major: the archive of this one is kept with the digests of its source.
 	writeArchiveKept(t, e, body, digests(t, e, "dbsrc"))
-	up := e.uploadArchive(t, body)
+	up := imp.uploadArchive(t, body)
 	// An archive with ledger tables needs the acknowledgement.
-	if st, out := e.importDB(t, map[string]any{"uploadId": up, "database": "dbdst"}); st != 202 {
+	if st, out := imp.importDB(t, map[string]any{"uploadId": up, "database": "dbdst"}); st != 202 {
 		t.Fatalf("request: %d %v", st, out)
 	} else {
 		done := e.waitTask(t, out)
@@ -157,7 +192,7 @@ func TestDatabaseImportRoundTrip(t *testing.T) {
 	if names := e.privateDatabases(t); len(names) != 0 {
 		t.Fatalf("a refused import left databases: %v", names)
 	}
-	done := e.importOK(t, map[string]any{"uploadId": up, "database": "dbdst", "acknowledgeLedgerRestart": true})
+	done := imp.importOK(t, map[string]any{"uploadId": up, "database": "dbdst", "acknowledgeLedgerRestart": true})
 	detail, _ := done["detail"].(string)
 	if !strings.Contains(detail, "policy disabled: public.ev") || !strings.Contains(detail, "ledger: public.acc starts a new chain") {
 		t.Errorf("the detail of the import: %q", detail)
@@ -169,7 +204,7 @@ func TestDatabaseImportRoundTrip(t *testing.T) {
 		t.Fatal("the final database does not exist")
 	}
 	// Every table, row for row.
-	src, dst := digests(t, e, "dbsrc"), digests(t, e, "dbdst")
+	src, dst := digests(t, e, "dbsrc"), digests(t, imp, "dbdst")
 	for _, tb := range roundTripTables {
 		if src[tb] != dst[tb] {
 			t.Errorf("table %s: source %s, imported %s", tb, src[tb], dst[tb])
@@ -177,11 +212,11 @@ func TestDatabaseImportRoundTrip(t *testing.T) {
 	}
 	// The distribution: the same tables, the same method and column, the same bucket count and the same colocation sets.
 	dist := "select d.relid::text, d.method, coalesce(d.dist_column::text, ''), coalesce(c.bucket_count, 0) from kingres.dist_table d left join kingres.colocation c using (colocation_id) order by 1"
-	if a, b := query(t, e, "dbsrc", dist), query(t, e, "dbdst", dist); a != b {
+	if a, b := query(t, e, "dbsrc", dist), query(t, imp, "dbdst", dist); a != b {
 		t.Errorf("distribution: source %s, imported %s", a, b)
 	}
 	sets := "select string_agg(relid::text, ',' order by relid::text) from kingres.dist_table where colocation_id is not null group by colocation_id order by 1"
-	if a, b := query(t, e, "dbsrc", sets), query(t, e, "dbdst", sets); a != b {
+	if a, b := query(t, e, "dbsrc", sets), query(t, imp, "dbdst", sets); a != b {
 		t.Errorf("colocation sets: source %s, imported %s", a, b)
 	}
 	// The ledger: enabled for the same tables, a new and consistent chain, the entries of the loaded rows.
@@ -211,7 +246,7 @@ func TestDatabaseImportRoundTrip(t *testing.T) {
 	// A materialized view is made WITH NO DATA and refreshed last, so its content is the one of a refresh now; the source is refreshed to compare with it.
 	query(t, e, "dbsrc", "refresh materialized view public.mv_plain")
 	// Constraints are valid, comments, views, the materialized view, the enum, the domain and the sequence are there.
-	if got := query(t, e, "dbdst", "select count(*) from pg_constraint where not convalidated"); got != "[[0]]" {
+	if got := query(t, imp, "dbdst", "select count(*) from pg_constraint where not convalidated"); got != "[[0]]" {
 		t.Errorf("invalid constraints: %s", got)
 	}
 	for _, c := range []string{
@@ -219,22 +254,22 @@ func TestDatabaseImportRoundTrip(t *testing.T) {
 		"select * from public.v_plain order by id", "select * from public.mv_plain",
 		"select enum_range(null::app.mood)::text", "select typname from pg_type where typname = 'posint'",
 	} {
-		if a, b := query(t, e, "dbsrc", c), query(t, e, "dbdst", c); a != b {
+		if a, b := query(t, e, "dbsrc", c), query(t, imp, "dbdst", c); a != b {
 			t.Errorf("%s: source %s, imported %s", c, a, b)
 		}
 	}
 	// A sequence continues above the largest value of its column.
-	if got := query(t, e, "dbdst", "insert into app.items (label) values ('z') returning id"); got != "[[3]]" {
+	if got := query(t, imp, "dbdst", "insert into app.items (label) values ('z') returning id"); got != "[[3]]" {
 		t.Errorf("the identity sequence of app.items continues with %s", got)
 	}
-	if got := query(t, e, "dbdst", "insert into public.t_plain (name) values ('n') returning id"); got != "[[5]]" {
+	if got := query(t, imp, "dbdst", "insert into public.t_plain (name) values ('n') returning id"); got != "[[5]]" {
 		t.Errorf("the serial sequence of t_plain continues with %s", got)
 	}
 	// The importing role owns what it made, and the database is owned by it.
-	if got := query(t, e, "dbdst", "select distinct pg_get_userbyid(relowner) from pg_class where relname in ('t_plain', 'd_hash', 'refdata')"); got != "[[root_admin]]" {
+	if got := query(t, imp, "dbdst", "select distinct pg_get_userbyid(relowner) from pg_class where relname in ('t_plain', 'd_hash', 'refdata')"); got != "[[dbi_admin]]" {
 		t.Errorf("owners: %s", got)
 	}
-	if got := query(t, e, "postgres", "select pg_get_userbyid(datdba) from pg_database where datname = 'dbdst'"); got != "[[root_admin]]" {
+	if got := query(t, e, "postgres", "select pg_get_userbyid(datdba) from pg_database where datname = 'dbdst'"); got != "[[dbi_admin]]" {
 		t.Errorf("owner of the database: %s", got)
 	}
 	// The database is in the list of the databases.
@@ -242,7 +277,7 @@ func TestDatabaseImportRoundTrip(t *testing.T) {
 		t.Errorf("getDatabase: %d", st)
 	}
 	// A second import under the same name is refused at the request.
-	if st, out := e.importDB(t, map[string]any{"uploadId": up, "database": "dbdst", "acknowledgeLedgerRestart": true}); st != 409 || problemCode(out) != "already_exists" {
+	if st, out := imp.importDB(t, map[string]any{"uploadId": up, "database": "dbdst", "acknowledgeLedgerRestart": true}); st != 409 || problemCode(out) != "already_exists" {
 		t.Errorf("a second import under the same name: %d %v", st, out)
 	}
 }
@@ -272,6 +307,7 @@ func TestDatabaseImportOfAnArchiveFromAnotherMajor(t *testing.T) {
 	}
 	e, off := transferOn(t)
 	defer off()
+	imp := importerOf(t, e)
 	here := 0
 	fmt.Sscan(strings.Trim(query(t, e, "postgres", "select current_setting('server_version_num')::int / 10000"), "[]"), &here)
 	found := 0
@@ -285,24 +321,24 @@ func TestDatabaseImportOfAnArchiveFromAnotherMajor(t *testing.T) {
 		if b, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf("digests-%d.json", major))); err == nil {
 			_ = json.Unmarshal(b, &want)
 		}
-		up := e.uploadArchive(t, body)
+		up := imp.uploadArchive(t, body)
 		name := fmt.Sprintf("dbfrom%d", major)
 		req := map[string]any{"uploadId": up, "database": name, "acknowledgeLedgerRestart": true}
 		if major > here {
-			e.importFails(t, req, "archive_incompatible")
+			imp.importFails(t, req, "archive_incompatible")
 			if e.databaseExists(t, name) || len(e.waitNoPrivate(t)) != 0 {
 				t.Errorf("an archive of major %d on %d left something", major, here)
 			}
 			continue
 		}
-		e.importOK(t, req)
-		got := digests(t, e, name)
+		imp.importOK(t, req)
+		got := digests(t, imp, name)
 		for _, tb := range roundTripTables {
 			if want[tb] == "" || got[tb] != want[tb] {
 				t.Errorf("the archive of major %d imported on %d: table %s is %s, its source was %s", major, here, tb, got[tb], want[tb])
 			}
 		}
-		if q := query(t, e, name, "select count(*) from kingres.dist_table"); q == "[[0]]" {
+		if q := query(t, imp, name, "select count(*) from kingres.dist_table"); q == "[[0]]" {
 			t.Errorf("no distributed table after the import of the archive of major %d", major)
 		}
 	}
