@@ -60,7 +60,8 @@ const (
 	// LeaderOrHeldBack: the leader, and also, while this server's instance is held back (so that it cannot read its
 	// catalog and does not know the leader), the server that the other members name as the leader. The old primary of a
 	// failover is in that state when it is rebuilt: its instance is stopped and may not start before it is a standby, and
-	// the leader has to be able to tell it so. The call proves what it needs itself (the rebuild of an old primary does).
+	// the leader has to be able to tell it so; the end of the freeze, the end of the hold and the state of a failover
+	// are made to it in that state too. The call proves what it needs itself (the rebuild of an old primary does).
 	LeaderOrHeldBack
 	// Bootstrap: no client certificate. The first contact of a join, before
 	// the two sides share a CA: authenticated by the new server's setup token
@@ -146,8 +147,12 @@ var Calls = map[string]Policy{
 	// The read calls and the freeze of the failover (internal-api.md, "Failover groundwork").
 	"GET /failover/position": AnyPeer,
 	"GET /liveness":          AnyPeer,
-	"GET /failover/state":    LeaderOnly,
-	"GET /catalog/nodes":     AnyPeer,
+	// The calls that a switchover or a failover makes to the old primary's server after the promotion (the check that its primary does not run, the
+	// end of the hold, the end of the freeze) are "leader or held back": that server's instance is stopped and may not start before it is a
+	// standby, so once the leader it last verified is forgotten it cannot read the catalog, and the end of the freeze, which the rebuild waits for,
+	// must not wait for an instance that waits for the rebuild.
+	"GET /failover/state": LeaderOrHeldBack,
+	"GET /catalog/nodes":  AnyPeer,
 	// The bootstrap of the map group runs while the manager leader is gone: any member may ask a candidate, and the candidate proves what it needs itself.
 	"POST /failover/map/start":     AnyPeer,
 	"POST /failover/map/continue":  AnyPeer,
@@ -158,7 +163,7 @@ var Calls = map[string]Policy{
 	"GET /failover/map/bootstrap":  AnyPeer,
 	"POST /failover/map/resume":    AnyPeer,
 	"POST /failover/freeze":        LeaderOnly,
-	"POST /failover/unfreeze":      LeaderOnly,
+	"POST /failover/unfreeze":      LeaderOrHeldBack,
 	"POST /failover/standbys-gone": LeaderOnly,
 
 	// The calls of the failover task (internal-api.md, "Failover"): all from the leader, each acting on the
@@ -169,7 +174,7 @@ var Calls = map[string]Policy{
 	"POST /failover/prepared": LeaderOnly,
 	// The calls of the planned switchover (design 5.2): stop the writes of a group, mark the position, ask a standby for the proof, undo.
 	"POST /failover/quiesce":   LeaderOnly,
-	"POST /failover/unquiesce": LeaderOnly,
+	"POST /failover/unquiesce": LeaderOrHeldBack,
 	"POST /failover/mark":      LeaderOnly,
 	"POST /failover/verify":    LeaderOnly,
 	"POST /failover/resume":    LeaderOnly,
@@ -236,6 +241,10 @@ var fenceRequired = map[string]bool{"POST /failover/demote": true, "POST /failov
 	// is not a live run of the task cannot make them. The undo calls (unquiesce, resume) are not fenced: the repair of a switchover that a task left
 	// behind has no run to show.
 	"POST /failover/quiesce": true, "POST /failover/mark": true, "POST /failover/verify": true}
+
+// heldBackFenced are the calls of policy LeaderOrHeldBack that a held-back server accepts only with the fence header of a task run: the
+// server cannot read its catalog term, so the live run (task and epoch) is what proves that the caller is not a superseded leader.
+var heldBackFenced = map[string]bool{"GET /failover/state": true, "POST /failover/unquiesce": true, "POST /failover/unfreeze": true}
 
 // CallError is an error with the status and code the internal API answers.
 type CallError struct {
@@ -540,6 +549,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
+			// A held-back server judges these calls by the run that makes them alone: without the header they are refused.
+			if heldBack && r.Header.Get(fence.Header) == "" && heldBackFenced[key] {
+				fail(w, http.StatusConflict, "fenced", "A held-back server accepts this call only with the fence header of a task run.")
+				return
+			}
 			// F3-13: a call that stops or promotes an instance names the run it is made for; one without the header is
 			// refused (a caller that holds the leader's certificate, or a defect, must not stop a primary without a run).
 			if r.Header.Get(fence.Header) == "" && fenceRequired[key] && s.be.Fence != nil {
@@ -590,7 +604,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "GET /state":
 		writeJSON(w, http.StatusOK, s.be.State(ctx))
 	case "GET /leader":
-		writeJSON(w, http.StatusOK, map[string]string{"leader": s.be.Leader()})
+		// heldBack tells a caller that asks the members because it cannot read its own catalog to ignore this answer: this server cannot read
+		// its catalog either, and what it names is only what it remembers.
+		held := s.be.Unavailable != nil && s.be.Unavailable()
+		writeJSON(w, http.StatusOK, map[string]any{"leader": s.be.Leader(), "heldBack": held})
 	case "GET /revoked":
 		out := map[string]any{"serials": s.be.Revoked()}
 		if s.be.CRLNumber != nil {

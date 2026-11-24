@@ -223,14 +223,16 @@ func FormatLSN(v uint64) string { return fmt.Sprintf("%X/%X", v>>32, v&0xfffffff
 
 // StateInstance is one instance of a server in the answer of GET /failover/state.
 type StateInstance struct {
-	ID         int    `json:"id"`
-	Port       int    `json:"port"`
-	Role       string `json:"role"`
-	Origin     string `json:"origin"`
-	Group      int32  `json:"group"`
-	Term       int64  `json:"term"`
-	Running    bool   `json:"running"`
-	InRecovery *bool  `json:"inRecovery"`
+	ID      int    `json:"id"`
+	Port    int    `json:"port"`
+	Role    string `json:"role"`
+	Origin  string `json:"origin"`
+	Group   int32  `json:"group"`
+	Term    int64  `json:"term"`
+	Running bool   `json:"running"`
+	// RunningUnknown: the server could not say whether the instance runs (Running means nothing then).
+	RunningUnknown bool  `json:"runningUnknown,omitempty"`
+	InRecovery     *bool `json:"inRecovery"`
 }
 
 // State is the answer of GET /failover/state: one server's knowledge of one group.
@@ -747,4 +749,15 @@ type MapCheckpoint struct {
 type MapAbandonResult struct {
 	Abandoned     bool   `json:"abandoned"`
 	ResumedServer string `json:"resumedServerId,omitempty"`
+}
+
+// RunningUnknown says that the server could not tell whether an instance of the group runs: what the instance looks like is not known, so a leader
+// that decides on it (the rebuild of an old primary) waits.
+func (s State) RunningUnknown() bool {
+	for _, i := range s.Instances {
+		if i.Group == s.Group && i.RunningUnknown {
+			return true
+		}
+	}
+	return false
 }

@@ -610,3 +610,55 @@ func leaseLines(log string) string {
 	}
 	return "\n" + strings.Join(keep, "\n")
 }
+
+// The old primary's server forgets the leader it last verified once its instance has been stopped for a while (60 s): its instance cannot read the
+// catalog, so every leader call to it was answered "the instance waits for its group lease", and the last step of the switchover ("Lift the freeze"),
+// which comes before the rebuild that starts that instance, waited for it until the task ran into its bound. The task is paused before that step, the
+// fault `leader:forget` makes the old server forget at once (so that the race does not depend on how long the steps take), and the task goes on: it
+// ends done, because the calls to the old server after the promotion (the state, the end of the hold, the end of the freeze) are accepted from the
+// server that the other members name as the leader.
+func TestSwitchoverEndsWhenTheOldServerForgotTheLeader(t *testing.T) {
+	e := swCluster(t)
+	c, port, pool, leader, g, old, nw, w := e.c, e.port, e.pool, e.leader, e.g, e.old, e.nw, e.w
+	leader.SetFaults(fault.Spec{FailoverPoint: fmt.Sprintf("Group %d: %s:before", g, failover.StepUnfreeze), FailoverMode: "pause"})
+	id := swRequest(t, leader, old, nw, g)
+	task := foWaitTask(t, leader, id, 8*time.Minute, "paused", "failed", "done")
+	if task["state"] != "paused" {
+		t.Fatalf("the task did not pause before the end of the freeze: %v", task)
+	}
+	old.SetFaults(fault.Spec{FailoverPoint: "leader:forget", FailoverMode: "forget"})
+	leader.Heal()
+	st, resp := leader.DoThroughRestart("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "graceful", "shardGroupIds": []int{g}}, nil)
+	if st != 202 && st != 200 {
+		t.Fatalf("the repeated request: %d %v", st, resp)
+	}
+	swWait(t, e, id, 3*time.Minute)
+	if host := swPrimaryHost(t, leader, g); host != nw.Host {
+		t.Fatalf("the primary of group %d is on %s, want %s", g, host, nw.Host)
+	}
+	// The end of the freeze and of the hold reached the old server, which still cannot read its catalog: its state says so (and the call needs the
+	// fence header of a run, which InternalCall carries).
+	var ost failover.State
+	if code, err := leader.InternalCall(old, "GET", fmt.Sprintf("/failover/state?group=%d", g), nil, &ost); err != nil || code != 200 {
+		t.Fatalf("the state of the old server: %d %v", code, err)
+	}
+	if ost.Frozen || ost.Quiesced {
+		t.Errorf("the old server still holds the freeze (%v) or the hold of the writes (%v) after the switchover ended done", ost.Frozen, ost.Quiesced)
+	}
+	old.Heal()
+	before := w.count()
+	until(t, 2*time.Minute, "writes after the switchover", func() bool { return w.count() > before+30 })
+	acked := w.Stop()
+	for _, n := range c.Nodes {
+		if n == old {
+			continue
+		}
+		have := foReadIDs(t, n, port, pool)
+		for rid := range acked {
+			if !have[rid] {
+				t.Errorf("acknowledged row %d is missing when read through %s", rid, n.Host)
+				break
+			}
+		}
+	}
+}

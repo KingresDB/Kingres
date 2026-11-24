@@ -821,25 +821,33 @@ var _ = monitor.Condition{}
 // The callee side: what a server does on its own instances when the leader asks.
 
 func staleTerm(ctx context.Context, d *haDeps, expected int64, strict bool) error {
+	err, unread := staleTermRead(ctx, d, expected, strict)
+	_ = unread
+	return err
+}
+
+// staleTermRead is staleTerm that also says whether the term could not be read (the server is held back): a call that is not strict then went
+// unjudged, and the caller decides what is safe without it.
+func staleTermRead(ctx context.Context, d *haDeps, expected int64, strict bool) (err error, unread bool) {
 	if expected < 0 {
-		return nil // the caller does not know the term (a negative value says so); 0 is the term of a cluster that never failed over
+		return nil, false // the caller does not know the term (a negative value says so); 0 is the term of a cluster that never failed over
 	}
-	c, err := d.Svc.SystemConn(ctx)
-	if err != nil {
-		d.Log.Warn("failover: the catalog term of this server cannot be read; the call is not judged by it", "error", err)
-		return unreadableTerm(strict)
+	c, cerr := d.Svc.SystemConn(ctx)
+	if cerr != nil {
+		d.Log.Warn("failover: the catalog term of this server cannot be read; the call is not judged by it", "error", cerr)
+		return unreadableTerm(strict), true
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
 	var term int64
-	if err := c.QueryRow(ctx, `SELECT term FROM kingres.catalog_status`).Scan(&term); err != nil {
-		d.Log.Warn("failover: the catalog term of this server cannot be read; the call is not judged by it", "error", err)
-		return unreadableTerm(strict)
+	if qerr := c.QueryRow(ctx, `SELECT term FROM kingres.catalog_status`).Scan(&term); qerr != nil {
+		d.Log.Warn("failover: the catalog term of this server cannot be read; the call is not judged by it", "error", qerr)
+		return unreadableTerm(strict), true
 	}
 	d.Log.Debug("failover: the catalog term of this server", "term", term, "expected", expected)
 	if term > expected {
-		return &internalapi.CallError{Status: http.StatusConflict, Code: "stale_term", Message: "The catalog has a newer term than the failover knows."}
+		return &internalapi.CallError{Status: http.StatusConflict, Code: "stale_term", Message: "The catalog has a newer term than the failover knows."}, false
 	}
-	return nil
+	return nil, false
 }
 
 func badBody(what string) error {
