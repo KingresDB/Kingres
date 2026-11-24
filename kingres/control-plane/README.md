@@ -1,4 +1,3 @@
-| `standby-port-end` | `standby-port-base + 499` | last port tried for a new standby instance; with the base it gives a server a range of its own (a one-machine cluster, a test run) |
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # kingresd: the KingresDB control plane
 
@@ -2369,6 +2368,7 @@ setting is `replica.default` in `kingres_cp.cluster_setting`, ADR 0011).
 | `slot-retention-warn-bytes` | `1073741824` | WAL a standby's slot may retain before `replicationLagHigh` is raised |
 | `slot-retention-limit-bytes` | `4294967296` | WAL a standby's slot may retain before it is dropped and the standby rebuilt |
 | `standby-port-base` | `pg-port + 1000` | first port tried for a new standby instance (the first free one from there is used and recorded) |
+| `standby-port-end` | `standby-port-base + 499` | last port tried for a new standby instance; with the base it gives a server a range of its own (a one-machine cluster, a test run) |
 
 The replica count itself is the cluster setting `defaultReplicaCount` (`PATCH /settings/cluster`).
 
