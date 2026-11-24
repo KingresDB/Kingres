@@ -499,10 +499,11 @@ func checkSwitchPoint(t *testing.T, ps []writeProbe, leader *clustertest.Node, t
 }
 
 // P2. The candidate takes the lease and dies before it promotes (its promoting call never answers and then its server is killed): the old leader's primary is stopped and
-// held back for a server that cannot answer. Without the declaration the hold stays; with it (naming the dead server) the old leader ends the hold and serves the map group
-// again, and no acknowledged row is lost.
-func TestADeadCandidateDeclaredLostReleasesTheOldLeader(t *testing.T) {
-	c, port, pool, leader, nw, w := mapSwitchoverEnv(t)
+// held back for a server that cannot answer. With one standby of the map group the declaration that the server is lost does not release the old leader: no other standby
+// shows that nothing was promoted, and the hold stays (the cluster has no second copy of the map group to prove it; with a second standby the declaration ends the hold, which
+// the unit tests of the callee show).
+func TestADeadOnlyCandidateDeclaredLostDoesNotReleaseTheOldLeader(t *testing.T) {
+	c, _, _, leader, nw, _ := mapSwitchoverEnv(t)
 	var third *clustertest.Node
 	for _, n := range c.Nodes {
 		if n != leader && n != nw {
@@ -517,34 +518,20 @@ func TestADeadCandidateDeclaredLostReleasesTheOldLeader(t *testing.T) {
 		return s == 200 && b["state"] == "running"
 	})
 	foKillServer(nw)
-	// The operator's call cannot be made in this cluster: with one standby of the map group, the system database that sessions are checked against is the stopped primary
-	// and the dead standby, so every REST call answers 503. The call that the REST operation makes to the old leader is made here directly (strict, naming the lost server);
-	// the old leader asks the servers that are left and decides by its own view of the dead one.
 	var out struct {
 		Resumed bool   `json:"resumed"`
 		Detail  string `json:"detail"`
 	}
-	if code, err := third.InternalCall(leader, "POST", "/failover/map/resume", map[string]any{"strict": true}, &out); err != nil || code != 200 || out.Resumed {
-		t.Fatalf("without the declaration the hold of a dead candidate must stay: %d %v %+v", code, err, out)
-	}
-	until(t, 5*time.Minute, "the old leader to accept the declaration", func() bool {
+	// the old leader sees the server dead after a while; until then it answers that the server is heard
+	until(t, 5*time.Minute, "the old leader to judge the declaration", func() bool {
 		code, err := third.InternalCall(leader, "POST", "/failover/map/resume", map[string]any{"strict": true, "lost": nw.Host}, &out)
 		t.Logf("resume call: %d %v %+v", code, err, out)
-		return err == nil && code == 200 && out.Resumed
+		return err == nil && code == 200 && !strings.Contains(out.Detail, "is heard")
 	})
-	t.Logf("the hold was ended: %+v", out)
-	until(t, 5*time.Minute, "the old leader to hold the map group again", func() bool {
-		hosts, _ := primaryOf(t, leader)
-		return hosts[0] == leader.Host
-	})
-	before := w.count()
-	until(t, 5*time.Minute, "writes after the release", func() bool { return w.count() > before+30 })
-	acked := w.Stop()
-	have := foReadIDs(t, leader, port, pool)
-	for rid := range acked {
-		if !have[rid] {
-			t.Errorf("acknowledged row %d is missing when read through %s", rid, leader.Host)
-			break
-		}
+	if out.Resumed || !strings.Contains(out.Detail, "no standby of the map group could be shown to be in recovery") {
+		t.Fatalf("the old leader was released without a second copy of the map group: %+v", out)
+	}
+	if code, err := third.InternalCall(leader, "POST", "/failover/map/resume", map[string]any{"strict": true}, &out); err != nil || code != 200 || out.Resumed {
+		t.Fatalf("without the declaration the hold of a dead candidate must stay: %d %v %+v", code, err, out)
 	}
 }
