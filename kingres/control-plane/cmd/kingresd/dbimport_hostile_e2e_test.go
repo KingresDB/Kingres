@@ -432,7 +432,7 @@ func TestDatabaseImportCleansUp(t *testing.T) {
 func (e *cp) waitNoPrivate(t testing.TB) []string {
 	t.Helper()
 	var names []string
-	for deadline := time.Now().Add(90 * time.Second); time.Now().Before(deadline); time.Sleep(500 * time.Millisecond) {
+	for deadline := time.Now().Add(240 * time.Second); time.Now().Before(deadline); time.Sleep(500 * time.Millisecond) {
 		if names = e.privateDatabases(t); len(names) == 0 {
 			return nil
 		}

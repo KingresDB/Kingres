@@ -77,13 +77,16 @@ func TestDatabaseImportEndsTheSessionOfAMember(t *testing.T) {
 		return nil
 	}
 	defer func() { ops.ImportHook = nil }()
+	started := time.Now()
 	st, out := imp.importDB(t, map[string]any{"uploadId": up, "database": "dbmember_x"})
 	if st != 202 {
 		t.Fatalf("%d %v", st, out)
 	}
 	done := e.waitTask(t, out)
+	failedAfter := time.Since(started)
 	// The compensation of a failed task runs after the task is recorded as failed.
 	names := e.waitNoPrivate(t)
+	t.Logf("the task ended after %v, the private database was gone after %v", failedAfter.Round(time.Second), time.Since(started).Round(time.Second))
 	mu.Lock()
 	defer mu.Unlock()
 	if held != nil {
