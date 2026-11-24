@@ -87,6 +87,8 @@ type Manager struct {
 	startTO             time.Duration
 	stopTO              time.Duration
 	gate                func(id int) error
+	// runner replaces the execution of the PostgreSQL programs in a test (nil: run them).
+	runner func(ctx context.Context, prog string, args ...string) (string, error)
 }
 
 // New validates the options and returns a Manager.
@@ -370,9 +372,20 @@ func (m *Manager) start(ctx context.Context, id int) error {
 		return fmt.Errorf("instance: creating the socket directory: %w", err)
 	}
 	data, _ := m.DataDir(id)
+	logPath := filepath.Join(data, "kingres-startup.log")
+	// The startup log is appended to by every start: the reason of this start is what comes after the size it had before it.
+	var logFrom int64
 	pgStart := func() (string, error) {
-		return m.run(ctx, "pg_ctl", "start", "-D", data, "-w", "-t", secs(m.startTO),
-			"-l", filepath.Join(data, "kingres-startup.log"))
+		if st, serr := os.Stat(logPath); serr == nil {
+			logFrom = st.Size()
+		} else {
+			logFrom = 0
+		}
+		// pg_ctl runs under its own deadline, not the one of the request: a request that is cancelled in the middle
+		// of a start (the caller gave up, the leader ended) must not kill pg_ctl and leave a postmaster that nobody waits for.
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.startTO+startBackstop)
+		defer cancel()
+		return m.run(sctx, "pg_ctl", "start", "-D", data, "-w", "-t", secs(m.startTO), "-l", logPath)
 	}
 	out, err := pgStart()
 	if err != nil {
@@ -385,12 +398,15 @@ func (m *Manager) start(ctx context.Context, id int) error {
 		if err != nil {
 			// pg_ctl only says that the postmaster stopped; the reason (a port that is taken, a recovery that
 			// failed) is in the startup log, so the end of it goes into the error, which the log of kingresd keeps.
-			if tail := startupLogTail(data); tail != "" {
+			tail, bind := startupLogSince(logPath, logFrom)
+			if tail != "" {
 				out += "\nstartup log: " + tail
 			}
-			return fmt.Errorf("instance: pg_ctl start: %w: %s", err, out)
+			return &startError{err: fmt.Errorf("instance: pg_ctl start: %w: %s", err, out), portInUse: bind}
 		}
 	}
+	// The instance ran: its port is not provisional any more (StartStandby).
+	m.clearNeverStarted(id)
 	// The instance started with this file: every value of it was read at the start, so it is the last good one.
 	if gerr := m.MarkConfigGood(id); gerr != nil && !os.IsNotExist(gerr) {
 		m.log.Warn("keeping the running override file failed", "instance", id, "error", gerr)
@@ -567,25 +583,54 @@ func writeAtomic(path string, b []byte) error {
 	return nil
 }
 
-// startupLogTail returns the end (at most 2 KiB, newlines folded to " | ") of kingres-startup.log of the data directory, or "".
-func startupLogTail(data string) string {
-	f, err := os.Open(filepath.Join(data, "kingres-startup.log")) //nolint:gosec // a fixed name below the data directory
+// startBackstop is how long past the -t of pg_ctl its process may live before it is killed (pg_ctl ends itself at -t).
+const startBackstop = 30 * time.Second
+
+// startError is the error of a failed pg_ctl start. portInUse says that the startup log written by this start names
+// a bind failure ("Address already in use", "could not bind"): the port of the instance is taken by another program.
+type startError struct {
+	err       error
+	portInUse bool
+}
+
+func (e *startError) Error() string { return e.err.Error() }
+func (e *startError) Unwrap() error { return e.err }
+
+// IsPortInUse reports whether err is a failed start whose startup log shows that the port could not be bound.
+func IsPortInUse(err error) bool {
+	var se *startError
+	return errors.As(err, &se) && se.portInUse
+}
+
+// startupLogSince returns the end (at most 2 KiB, newlines folded to " | ") of what kingres-startup.log got after
+// offset from, and whether that text names a bind failure. A log that cannot be read gives "" and false.
+func startupLogSince(path string, from int64) (tail string, bind bool) {
+	f, err := os.Open(path) //nolint:gosec // a fixed name below the data directory
 	if err != nil {
-		return ""
+		return "", false
 	}
 	defer func() { _ = f.Close() }()
 	st, err := f.Stat()
 	if err != nil {
-		return ""
+		return "", false
 	}
-	const keep = 2048
-	off := int64(0)
-	if st.Size() > keep {
-		off = st.Size() - keep
+	if from < 0 || from > st.Size() {
+		from = 0 // the log was replaced: all of it belongs to this start
+	}
+	const keep, readMax = 2048, 64 << 10
+	off := from
+	if st.Size()-off > readMax {
+		off = st.Size() - readMax
 	}
 	b := make([]byte, st.Size()-off)
 	n, _ := f.ReadAt(b, off)
-	return strings.Join(strings.Fields(strings.ReplaceAll(string(b[:n]), "\n", " | ")), " ")
+	b = b[:n]
+	text := string(b)
+	bind = strings.Contains(text, "Address already in use") || strings.Contains(text, "could not bind")
+	if len(b) > keep {
+		text = string(b[len(b)-keep:])
+	}
+	return strings.Join(strings.Fields(strings.ReplaceAll(text, "\n", " | ")), " "), bind
 }
 
 func secs(d time.Duration) string { return strconv.Itoa(int(d.Seconds())) }
@@ -594,6 +639,9 @@ func secs(d time.Duration) string { return strconv.Itoa(int(d.Seconds())) }
 // output (bounded) is returned for error messages; no program here receives a
 // password on its command line or in its environment.
 func (m *Manager) run(ctx context.Context, prog string, args ...string) (string, error) {
+	if m.runner != nil {
+		return m.runner(ctx, prog, args...)
+	}
 	cmd := exec.CommandContext(ctx, filepath.Join(m.bin, prog), args...) //nolint:gosec // fixed program names; arguments are built from validated values
 	cmd.Env = []string{"PATH=" + m.bin + string(os.PathListSeparator) + os.Getenv("PATH"), "LC_MESSAGES=C"}
 	for _, k := range []string{"LANG", "LC_ALL", "HOME", "LD_LIBRARY_PATH"} {

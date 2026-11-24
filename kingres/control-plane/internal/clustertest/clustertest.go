@@ -53,9 +53,11 @@ type Node struct {
 	// IntPort is the internal API port (APIPort+1).
 	IntPort int
 	PGPort  int
-	Dir     string
-	DataDir string
-	LogFile string
+	// StandbyBase and StandbyEnd are the ports this node may use for its standby instances (0: kingresd's default).
+	StandbyBase, StandbyEnd int
+	Dir                     string
+	DataDir                 string
+	LogFile                 string
 	// Extra are further command-line flags of kingresd (a test that needs a
 	// setting, for example a short certificate lifetime); they apply from the next Start.
 	Extra []string
@@ -113,6 +115,7 @@ func New(t testing.TB, n int) *Cluster {
 			Dir: dir, DataDir: filepath.Join(dir, "data"), LogFile: filepath.Join(dir, "kingresd.log"),
 			client: &http.Client{Timeout: 3 * time.Minute, Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}} //nolint:gosec // the node under test, on loopback
 		nd.IntPort = nd.APIPort + 1
+		nd.StandbyBase, nd.StandbyEnd, _ = pgtest.StandbyPortRange(i, n)
 		if err := os.MkdirAll(dir, 0o700); err != nil { //nolint:gosec // a directory of the test root
 			t.Fatal(err)
 		}
@@ -149,6 +152,10 @@ func (n *Node) args() []string {
 	args := []string{"-listen", n.Host + ":" + strconv.Itoa(n.APIPort), "-internal-listen", n.Host + ":" + strconv.Itoa(n.IntPort),
 		"-data-dir", n.DataDir, "-socket-dir", filepath.Join(n.Dir, "s"), "-log-format", "json", "-login-rate-limit", "1000",
 		"-pg-bin-dir", pgtest.BinDir(), "-pg-port", strconv.Itoa(n.PGPort), "-pg-listen", "127.0.0.1," + n.Host, "-server-host", n.Host, "-fault-dir", n.FaultDir()}
+	if n.StandbyBase > 0 {
+		// Before n.Extra, so that a test can still choose its own.
+		args = append(args, "-standby-port-base", strconv.Itoa(n.StandbyBase), "-standby-port-end", strconv.Itoa(n.StandbyEnd))
+	}
 	return append(args, n.Extra...)
 }
 

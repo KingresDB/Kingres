@@ -48,6 +48,9 @@ type HAConfig struct {
 	// server's pg-port plus 1000). It is kept away from pg-port + 1, which on a
 	// machine that runs several servers is the next server's port that is not bound yet.
 	StandbyPortBase int
+	// StandbyPortEnd is the last port tried for a new standby instance (0: 499 ports from StandbyPortBase). A one-machine
+	// cluster that shares the host with other servers gives each server a range of its own with the two.
+	StandbyPortEnd int
 
 	// ClientListen is the client entry point (empty: off); ClientStandbyListen the
 	// optional second one that forwards to a local standby (empty: off).
@@ -104,6 +107,9 @@ func (h HAConfig) validate() error {
 			errs = append(errs, fmt.Errorf("%s %q is not host:port: %w", a.key, a.v, err))
 		}
 	}
+	if h.StandbyPortEnd != 0 && h.StandbyPortEnd < h.StandbyPortBase {
+		errs = append(errs, errors.New("standby-port-end must not be below standby-port-base"))
+	}
 	if h.ClientListen != "" && h.ClientListen == h.ClientStandbyListen {
 		errs = append(errs, errors.New("client-listen and client-standby-listen must differ"))
 	}
@@ -145,6 +151,8 @@ func init() {
 			apply: integer(func(c *Config) *int64 { return &c.HA.SlotWarnBytes }, 1)},
 		setting{key: "standby-port-base", env: "KINGRES_STANDBY_PORT_BASE", usage: "first port tried for a new standby instance (default: pg-port plus 1000)",
 			apply: haInt(func(c *Config) *int { return &c.HA.StandbyPortBase }, 1024)},
+		setting{key: "standby-port-end", env: "KINGRES_STANDBY_PORT_END", usage: "last port tried for a new standby instance (default: 499 ports from standby-port-base)",
+			apply: haInt(func(c *Config) *int { return &c.HA.StandbyPortEnd }, 1024)},
 		setting{key: "slot-retention-limit-bytes", env: "KINGRES_SLOT_RETENTION_LIMIT_BYTES", usage: "WAL a standby's slot may retain before it is dropped (default 4294967296)",
 			apply: integer(func(c *Config) *int64 { return &c.HA.SlotLimitBytes }, 1)},
 		setting{key: "client-listen", env: "KINGRES_CLIENT_LISTEN", usage: "host:port of the client entry point that forwards PostgreSQL connections to the group primary (empty: off)",
