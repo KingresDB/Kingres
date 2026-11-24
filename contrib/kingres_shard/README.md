@@ -2960,6 +2960,13 @@ the undo are bounded (`max(200 ms, move_switch_timeout / 10)`, P10R-13): a lock 
 that dies is settled by `kingres.resume_bucket_splits()` (the recovery worker calls it), which runs that undo for every split whose session is gone. The live mark of a split is released
 on every way out of `split_bucket()`, also an error after the switch (P10R-06), so the recovery does not wait for a session that is still open. `kingres.cancel_bucket_split(id)` stops a split
 that has not reached its switch. `kingres.check_cluster()` says `split_stalled`, `split_trigger` and `split_child_table`.
+The live mark and the lock of the group are session-bound. `split_bucket()` takes two advisory locks, both at session level: one on the colocation group, from before the record of the
+split is written until the session holds the other, and the mark of the split itself (an advisory lock on the split id). The recovery worker takes a split with neither for dead,
+so the record is never visible without one of them. Both are let go in one handler on every way out of the function, an error or a cancel included, and a wait for either
+gives up after `kingres_shard.node_timeout` seconds with `object_in_use` (a second `split_bucket()` of the same group meanwhile waits for the lock of the group, then finds the
+group being split). What does not end is the *session*: a connection that a pool keeps and hands to another client after the call has returned holds nothing from the call, but a
+call that is still running (for example one that a client library did not cancel) keeps its locks until it ends. A pool that resets the session with `DISCARD ALL` or closes it
+on cancel therefore needs nothing more; one that reuses a session in the middle of a call would keep the split alive, and the recovery leaves a live split alone.
 While a split runs, `create_distributed_table()` and the other changes of the group's tables are refused (the same check as for a move) and the bucket cannot be moved. The bucket
 map's state is `splitting`, and `kingres.bucket_split` is readable by superusers only. `kingres.check_cluster()` does not compare the partitions of a colocation group that has an
 unfinished split with the bucket map: between the owner's switch and the catalog change (normally milliseconds, longer when a node is down) the bounds differ and that is no damage
