@@ -41,6 +41,10 @@ type world struct {
 	leaseHeldByOld bool            // the grantors still renew the old holder
 	leaseErr       error           // the call that takes the fence lease fails with this error
 	frozen         bool
+	// From the first call that asks for the fence lease on, the renewal of the freeze fails with renewFreezeErr, and a
+	// state read says the group is not frozen when renewUnfrozen is set (an old primary that is stopped).
+	renewFreezeErr error
+	renewUnfrozen  bool
 	promoted       map[string]bool
 	promoteErr     map[string]error // scripted errors for the first calls, by server
 	promoteN       map[string]int
@@ -204,7 +208,7 @@ func (p fpeers) State(_ context.Context, server string, g int32) (State, error) 
 		}
 	}
 	p.w.mu.Unlock()
-	st := State{Server: server, Group: g, Holds: p.w.lease[server], Frozen: p.w.frozen}
+	st := State{Server: server, Group: g, Holds: p.w.lease[server], Frozen: p.w.frozen && !(p.w.renewUnfrozen && p.w.count("lease-fence") > 0)}
 	if server == p.w.oldSrv {
 		f := false
 		st.Instances = []StateInstance{{ID: 1, Group: g, Running: p.w.oldWritable, InRecovery: &f, Role: "primary"}}
@@ -250,6 +254,10 @@ func (p fpeers) LeaseSettings(_ context.Context, server string) (LeaseSettings, 
 func (p fpeers) Freeze(_ context.Context, server string, g int32, ttl time.Duration) error {
 	if err := p.unreach(server); err != nil {
 		return err
+	}
+	if p.w.renewFreezeErr != nil && p.w.count("lease-fence") > 0 {
+		p.w.rec("freeze-error %s", server)
+		return p.w.renewFreezeErr
 	}
 	p.w.rec("freeze %s", server)
 	p.w.frozen = true

@@ -781,10 +781,22 @@ func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) erro
 		}
 		// The freeze of the group lapses (default five minutes): it is kept while the step waits.
 		if r.now().Sub(frozenAt) >= freezeRenewEvery {
+			// An upkeep: the step passed the freeze at its start. In a graceful switchover the old primary is stopped by now and
+			// its freeze handler or state may answer an error or say the group is not frozen; that must not end the wait with
+			// the group stopped and no rollback (phase 5 review L-1). Only an end of the call (the context) and an answer that
+			// says a newer run of the task exists stand the step down; anything else is logged and tried again soon.
 			if err := sc.ensureFrozen(ctx); err != nil {
-				return err
+				if cerr := ctx.Err(); cerr != nil {
+					return cerr
+				}
+				if errors.Is(err, fence.ErrFenced) {
+					return err
+				}
+				r.log().Warn("failover: renewing the freeze of the group while waiting for the lease", "group", sc.group, "error", err)
+				frozenAt = r.now().Add(-freezeRenewEvery + 5*time.Second)
+			} else {
+				frozenAt = r.now()
 			}
-			frozenAt = r.now()
 		}
 		if !r.hearsMajority(ctx, members) {
 			if quorumSince.IsZero() {

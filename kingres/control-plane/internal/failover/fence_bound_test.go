@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fence"
 )
 
 // Phase 5 review M3: the call that takes the fence lease keeps failing with an error that says nothing about the lease (a
@@ -62,5 +64,43 @@ func TestTheFreezeIsRenewedWhileTheStepWaitsForTheLease(t *testing.T) {
 	_, _ = runAll(t, r, hardInput())
 	if n := w.count("freeze s1"); n < 14 {
 		t.Fatalf("the freeze was sent %d times in a wait of 400 s", n)
+	}
+}
+
+// Phase 5 review L-1: the renewal of the freeze inside the wait for the lease is an upkeep, not a step of its own. When the
+// old primary is already stopped (a graceful switchover) its freeze handler may answer an error, or its state may say the group
+// is not frozen; the step must go on waiting for the lease and end the way the wait ends, not fail with the group stopped
+// and no rollback.
+func TestAFreezeRenewalThatFailsDoesNotEndTheWaitForTheLease(t *testing.T) {
+	for name, set := range map[string]func(w *world){
+		"an error": func(w *world) {
+			w.renewFreezeErr = &CallError{Status: 500, Code: "internal", Message: "the freeze handler failed"}
+		},
+		"not frozen": func(w *world) { w.renewUnfrozen = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := gracefulWorld()
+			w.leaseHeldByOld = true
+			set(w)
+			r := w.runner()
+			r.LeaseWait = 100 * time.Second
+			w.fakeClock(r)
+			_, err := runAll(t, r, gracefulInput())
+			failedWith(t, w, err, CodeLeaseStillHeld)
+		})
+	}
+}
+
+// A renewal that the callee answers as fenced (it has seen a newer run of the task) still stands the step down.
+func TestAFreezeRenewalAnsweredAsFencedStandsTheStepDown(t *testing.T) {
+	w := gracefulWorld()
+	w.leaseHeldByOld = true
+	w.renewFreezeErr = &CallError{Status: 409, Code: "fenced", Message: "a newer run"}
+	r := w.runner()
+	r.LeaseWait = 100 * time.Second
+	w.fakeClock(r)
+	_, err := runAll(t, r, gracefulInput())
+	if !errors.Is(err, fence.ErrFenced) {
+		t.Fatalf("want the stand-down, got %v", err)
 	}
 }
