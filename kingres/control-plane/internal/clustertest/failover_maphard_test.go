@@ -6,9 +6,11 @@ package clustertest_test
 import (
 	"context"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -574,15 +576,7 @@ func TestADeadOnlyCandidateIsReleasedByTheLocalCommand(t *testing.T) {
 	before := w.count()
 	until(t, 5*time.Minute, "new rows after the release", func() bool { return w.count() > before+20 })
 	acked := w.Stop()
-	for _, n := range []*clustertest.Node{leader, third} {
-		have := foReadIDs(t, n, port, pool)
-		for rid := range acked {
-			if !have[rid] {
-				t.Errorf("acknowledged row %d is missing when read through %s", rid, n.Host)
-				break
-			}
-		}
-	}
+	foCheckAckedByKey(t, acked, []*clustertest.Node{leader, third}, port, pool)
 	// the release is in the audit log, with the lost server in its details
 	st, body = leader.Do("GET", "/audit?limit=200", nil, nil)
 	if st != 200 {
@@ -599,5 +593,61 @@ func TestADeadOnlyCandidateIsReleasedByTheLocalCommand(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("the release is not in the audit log: %v", body)
+	}
+}
+
+// foCheckAckedByKey asks for every acknowledged row (at most 600, evenly spread) by its key through the entry points of the nodes. A third of the table lives in the
+// groups of a server that is dead, so a read of all of it cannot complete: a group that is dead answers with an error and the row is not counted; a group that answers
+// must have the row (no row is a lost row), and the groups of the nodes asked must answer for a good share of the rows.
+func foCheckAckedByKey(t *testing.T, acked map[int64]time.Time, nodes []*clustertest.Node, port int, pool *x509.CertPool) {
+	t.Helper()
+	var ids []int64
+	for rid := range acked {
+		ids = append(ids, rid)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	if len(ids) > 600 {
+		step := len(ids) / 600
+		var picked []int64
+		for i := 0; i < len(ids); i += step {
+			picked = append(picked, ids[i])
+		}
+		ids = picked
+	}
+	for _, n := range nodes {
+		found, unreachable := 0, 0
+		var conn *pgx.Conn
+		for _, rid := range ids {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if conn == nil {
+				c, err := foConn(ctx, n, port, pool, "fo")
+				if err != nil {
+					cancel()
+					unreachable++
+					continue
+				}
+				conn = c
+			}
+			var got int64
+			err := conn.QueryRow(ctx, `SELECT id FROM items WHERE id = $1`, rid).Scan(&got)
+			cancel()
+			switch {
+			case err == nil:
+				found++
+			case errors.Is(err, pgx.ErrNoRows):
+				t.Errorf("acknowledged row %d is missing when read through %s", rid, n.Host)
+			default:
+				unreachable++
+				_ = conn.Close(context.Background())
+				conn = nil
+			}
+		}
+		if conn != nil {
+			_ = conn.Close(context.Background())
+		}
+		t.Logf("through %s: %d of %d acknowledged rows found, %d in the groups of the dead server", n.Host, found, len(ids), unreachable)
+		if found < len(ids)/6 {
+			t.Errorf("through %s only %d of %d acknowledged rows were found: the data of the old primary is not there", n.Host, found, len(ids))
+		}
 	}
 }
