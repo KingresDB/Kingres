@@ -49,6 +49,8 @@ type haDeps struct {
 	OnCertificateInstalled func(func())
 	// LastLeader remembers the leader the catalog named last.
 	LastLeader *leaderMemory
+	// LostIdentityCheck verifies the proof of an operator's declaration that a server is lost against the cached keys of the administrators (nil: refused). It reads nothing from the local instance, which is stopped while the primary of the map group is held back.
+	LostIdentityCheck func(ctx context.Context, kind fwdproof.Kind, peer string, req internalapi.ForwardRequest) error
 	// IdentityCheck verifies the proof of an operator's session that a member sends with a request it forwards (nil: nothing can be proven and such a request is refused).
 	IdentityCheck func(ctx context.Context, kind fwdproof.Kind, peer string, req internalapi.ForwardRequest) error
 	// Fault is the fault-injection hook of the tests (nil in production); a feature

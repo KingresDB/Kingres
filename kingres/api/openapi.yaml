@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KingresDB Management API
-  version: 0.33.0
+  version: 0.34.0
   summary: REST API of the KingresDB management panel, CLI and manager.
   description: |
     The single REST API served by `kingresd` on every KingresDB server. The web panel
@@ -8507,9 +8507,13 @@ components:
           $ref: '#/components/schemas/ServerId'
           description: |
             Added in 0.28.0. The operator declares that this server, to which the map group was handed (a hard failover of a live leader's server or a planned
-            switchover), is lost. It must not be heard by the cluster (409 `conflict` otherwise). The old leader then ends the hold of its primary without the word of that
-            server, when the hold was made for it (or has no record), every other server answers, none runs a bootstrap that names the old leader and none was promoted;
-            what the lost server may have promoted and acknowledged before it was lost is accepted with the declaration. A new request for the failover may then choose
+            switchover), is lost. It must be seen dead by the cluster, that is silent for the failure timeout (409 `conflict` while it is heard, suspect or not known yet). The server that
+            answers sends the proof of the operator's session only to the old leader of the map group, the server that the catalog names as its primary, after that server says that
+            its primary is held back; the old leader checks it against the keys of the administrators that it cached while its system database ran. The old leader then ends the hold
+            of its primary without the word of that server, when the hold was made for it (or has no record), the lost server is seen dead again right before the release and does not
+            answer, every other server answers, none runs a bootstrap that names the old leader and none was promoted; what the lost server may have promoted and acknowledged
+            before it was lost is accepted with the declaration. A call that releases nothing is an error, never an empty success: 409 `conflict` when the old leader refuses (its
+            reason is in the message; a stale cache of the administrators' keys is one), 503 when no old leader answers, reports a hold or can be found. A new request for the failover may then choose
             another standby. It is part of the audit event.
     AbandonMapGroupBootstrapResult:
       type: object
@@ -11721,6 +11725,7 @@ components:
         (a wrong setup token), `autoFailover` (a failover started by the manager, actor `system`). From 0.5.0 also `certificateRenewed` and `certificateRenewalFailed` (a server renewed its certificates by itself, or failed to; actor `system`). From 0.7.0 also `leaseLost`, `leaseFenced` and `leaseAcquired` (the lease of a shard group, actor `system`, resource type `shardGroup`, resource id the group id) and the operation `cancelStatement`; and the standby events `standbyCreated`, `standbyRemoved`, `standbyRebuilt` (resource type `standby`, by the leader), `standbyInstanceStarted`, `standbyInstanceRemoved`, `standbyInstanceRebuilt` (by the server that runs the instance), `synchronousStandbyNamesChanged` and `replicationSlotDropped` (by the server that runs the primary), all with actor `system` unless an administrator started the task. A denied
         or failed call of an operation is recorded under that operation's id with `outcome` `denied` or
         `failure`. Read-only operations are not audited except `executeQuery` and (0.19.0) `downloadDataExport`, because it is where data leaves. From 0.19.0 also `dataTransfer.completed` (a data transfer task ended, written by the task) and `dataTransfer.purged` (the janitor deleted staged files), actor `system`. An upload chunk is not an event.
+        From 0.34.0 also `releaseMapGroupHold` (written by the local command `kingresd -release-map-hold`, which ends the hold of the primary of the map group on the server of the old leader when no server can: source `cli`, actor `system`, resource type `shardGroup`, resource id `0`; `details` name the lost server, the server the command ran on and the operating system user; `outcome` is `failure` when the command was refused after it began).
       enum:
         - login
         - logout
@@ -11738,6 +11743,7 @@ components:
         - removeServer
         - failoverServer
         - abandonMapGroupBootstrap
+        - releaseMapGroupHold
         - autoFailover
         - createServerGroup
         - deleteServerGroup

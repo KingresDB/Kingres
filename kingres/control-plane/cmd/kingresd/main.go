@@ -96,10 +96,26 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			rest = append(rest, a)
 		}
 	}
-	args = rest
+	args, rh, err := splitReleaseHold(rest)
+	if err != nil {
+		return err
+	}
 	cfg, err := config.Load(args, env, stderr)
 	if err != nil {
 		return err
+	}
+	if rh.requested {
+		var lvl slog.LevelVar
+		lvl.Set(cfg.SlogLevel())
+		return releaseMapHold(cfg, rh, newLogger(cfg, stderr, &lvl), stderr)
+	}
+	if !stopOnly {
+		// One kingresd owns a data directory (the local commands refuse while it runs). A restart by the service manager may start before the old process is gone.
+		unlockDir, lerr := lockDataDir(cfg.DataDir, 30*time.Second)
+		if lerr != nil {
+			return fmt.Errorf("%w (data directory %s)", lerr, cfg.DataDir)
+		}
+		defer unlockDir()
 	}
 	// The level can be changed while running (updateThisServerSettings).
 	var logLevel slog.LevelVar
@@ -559,6 +575,16 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	foDeps.d = hd
 	hd.MapFailover = foDeps.mf
 	hd.IdentityCheck = newIdentityChecker(authn, serverHost)
+	// The declaration that a server is lost is checked at a held-back old leader against the administrators' keys that this server cached on disk (adminkeys.go).
+	adminKeyCache := openAdminKeys(filepath.Join(cfg.DataDir, "failover"), func() string { return node.Snapshot().ClusterID }, cfg.HA.AdminKeysMaxAge, log)
+	hd.LostIdentityCheck = newIdentityChecker(adminKeyCache, serverHost)
+	if svc.Enabled() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runAdminKeys(bgCtx, adminKeyCache, serviceAdminVerifiers(svc), adminKeysEvery, log)
+		}()
+	}
 	if members != nil && foDeps.mf != nil {
 		wireEscrow(members, foDeps.mf)
 	}

@@ -2418,6 +2418,8 @@ decides the ports later): with neither key below set nothing listens.
 | `client-max-connections` | `KINGRES_CLIENT_MAX_CONNECTIONS` | `1000` | connections forwarded at once, both entry points together; one more is closed at once and counted |
 | `client-connect-timeout` | `KINGRES_CLIENT_CONNECT_TIMEOUT` | `5s` | time to choose the destination and connect to it |
 | `client-idle-timeout` | `KINGRES_CLIENT_IDLE_TIMEOUT` | `1h` | a forwarded connection with no byte in either direction for that long is closed |
+| `allow-no-watchdog` | `KINGRES_ALLOW_NO_WATCHDOG` | `false` | tests and development only: lets `kingresd` start without the lease watchdog program `kingres-watchdog`; without the setting a server that runs the lease protocol refuses to start when the program is in neither `pg-bin-dir` nor the directory of `kingresd` |
+| `admin-keys-max-age` | `KINGRES_ADMIN_KEYS_MAX_AGE` | `72h` | how old the cache of the administrators' keys (`failover/admin-keys.json`) may be before the declaration that a server is lost refuses it; it must be positive, there is no unbounded mode |
 
 **What it does.** It accepts a TCP connection and connects it to a destination it chooses, then copies bytes in both
 directions, from the first byte. It never reads, parses, buffers or logs what the client sends: the startup packet, an

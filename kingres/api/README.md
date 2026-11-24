@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.33.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.34.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and, when it is built, the planned `kingres-cli` (it does not exist yet). Lint it and run the mechanical rule check with:
 
 ```
@@ -392,6 +392,26 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.34.0
+
+Revision for the local recovery of a map group that is held back for good. Summary for the panel:
+0 operations added (178 operations, 142 paths); **one audit action added**; nothing else changes in the contract.
+
+#### Breaking
+
+None.
+
+#### Additive
+
+This revision is additive:
+
+- `AuditAction` gains `releaseMapGroupHold`, written by the local command `kingresd -release-map-hold -lost <serverId> -accept-data-loss` (source `cli`, resource type `shardGroup`, resource id `0`). A client that lists the audit log must accept the new value.
+
+#### Documentation
+
+- `AuditAction` describes the event. The command is not a REST operation.
+- `abandonMapGroupBootstrap`: the text of `lostServerId` now says "seen dead", who receives the proof, and the errors (409 or 503) of a declaration that releases nothing.
 
 ### 0.33.0
 

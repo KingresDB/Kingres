@@ -160,7 +160,21 @@ func (n *Node) args() []string {
 		// Before n.Extra, so that a test can still choose its own.
 		args = append(args, "-standby-port-base", strconv.Itoa(n.StandbyBase), "-standby-port-end", strconv.Itoa(n.StandbyEnd))
 	}
+	if !hasWatchdog() {
+		// kingres-watchdog is not built next to the binary under test (a development machine): without it a server refuses to start
+		args = append(args, "-allow-no-watchdog")
+	}
 	return append(args, n.Extra...)
+}
+
+// hasWatchdog says whether the lease watchdog program is next to kingresd or in the PostgreSQL program directory.
+func hasWatchdog() bool {
+	for _, d := range []string{filepath.Dir(os.Getenv("KINGRESD_BIN")), pgtest.BinDir()} {
+		if st, err := os.Stat(filepath.Join(d, "kingres-watchdog")); err == nil && !st.IsDir() {
+			return true
+		}
+	}
+	return false
 }
 
 // Start starts the process; it returns when the REST API answers.
@@ -721,4 +735,17 @@ func (n *Node) PGAt(ctx context.Context, port int, user, pass, db string) (*pgx.
 	cfg.Host, cfg.Port, cfg.Database, cfg.User, cfg.Password = "127.0.0.1", uint16(port), db, user, pass //nolint:gosec // test ports
 	cfg.TLSConfig, cfg.Fallbacks, cfg.ConnectTimeout = nil, nil, 10*time.Second
 	return pgx.ConnectConfig(ctx, cfg)
+}
+
+// Command runs the binary under test once with the node's settings and the extra arguments (a local command of kingresd such as -release-map-hold) and returns
+// its combined output and its error. The output is appended to the log of the node.
+func (n *Node) Command(extra ...string) (string, error) {
+	n.t.Helper()
+	cmd := exec.CommandContext(context.Background(), os.Getenv("KINGRESD_BIN"), append(n.args(), extra...)...) //nolint:gosec // the binary under test
+	out, err := cmd.CombinedOutput()
+	if lf, ferr := os.OpenFile(n.LogFile, os.O_APPEND|os.O_WRONLY, 0o600); ferr == nil {
+		_, _ = lf.Write(out)
+		_ = lf.Close()
+	}
+	return string(out), err
 }

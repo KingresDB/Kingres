@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -345,4 +346,29 @@ func (a *Agent) loadFreezes() {
 			a.gone[s] = now + min(rest, MaxGone)
 		}
 	}
+}
+
+// ClearFreezeOnDisk removes the freeze of the group from the file of the data directory, while no kingresd runs on it (the local command that releases the hold of the
+// map group: the failover that froze the list is given up, and a list that stays frozen would make the primary wait for a standby that is lost until the freeze
+// lapses). It says whether a freeze was there. The "gone" servers are not touched.
+func ClearFreezeOnDisk(dataDir string, group int32) (bool, error) {
+	p := filepath.Join(dataDir, freezeFileName)
+	b, err := os.ReadFile(p) //nolint:gosec // fixed name in the data directory
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var f freezeFile
+	if err := json.Unmarshal(b, &f); err != nil {
+		return false, fmt.Errorf("standby: %s cannot be read: %w", freezeFileName, err)
+	}
+	if _, ok := f.Frozen[group]; !ok {
+		return false, nil
+	}
+	delete(f.Frozen, group)
+	delete(f.Owners, group)
+	b, _ = json.Marshal(f)
+	return true, pki.WriteFile(p, b, 0o600)
 }

@@ -6,9 +6,11 @@ package clustertest_test
 import (
 	"context"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -498,18 +500,24 @@ func checkSwitchPoint(t *testing.T, ps []writeProbe, leader *clustertest.Node, t
 	}
 }
 
-// P2. The candidate takes the lease and dies before it promotes (its promoting call never answers and then its server is killed): the old leader's primary is stopped and
-// held back for a server that cannot answer. With one standby of the map group the declaration that the server is lost does not release the old leader: no other standby
-// shows that nothing was promoted, and the hold stays (the cluster has no second copy of the map group to prove it; with a second standby the declaration ends the hold, which
-// the unit tests of the callee show).
-func TestADeadOnlyCandidateDeclaredLostDoesNotReleaseTheOldLeader(t *testing.T) {
-	c, _, _, leader, nw, _ := mapSwitchoverEnv(t)
+// P2 (local recovery). The candidate, the only standby of the map group, takes the lease and dies before it promotes: the old leader's primary of the map group is stopped
+// and held back for a server that cannot answer, and the cluster has no second copy of the system database that could show that nothing was promoted. Every REST call
+// answers 503. The way out is the local command of kingresd on the server of the old leader: it is refused without its two words, for the server it runs on, for another
+// server than the one the hold was made for and while kingresd runs on the data directory; with both words and kingresd stopped it ends the hold, the old primary starts
+// when its server holds the lease, the cluster serves again with every row the old primary acknowledged, and the release is in the audit log.
+func TestADeadOnlyCandidateIsReleasedByTheLocalCommand(t *testing.T) {
+	c, port, pool, leader, nw, w := mapSwitchoverEnv(t)
 	var third *clustertest.Node
 	for _, n := range c.Nodes {
 		if n != leader && n != nw {
 			third = n
 		}
 	}
+	// the old leader keeps the keys of the administrators on disk, so that it can check the declaration of a lost server while its system database is stopped
+	until(t, 2*time.Minute, "the cache of the administrators' keys on the old leader", func() bool {
+		b, err := os.ReadFile(filepath.Join(leader.DataDir, "failover", "admin-keys.json"))
+		return err == nil && strings.Contains(string(b), clustertest.AdminUser)
+	})
 	nw.SetFaults(fault.Spec{FailoverPoint: "promote:unavailable", FailoverMode: "unavailable"})
 	_ = mapHardRequest(t, leader, nw, true)
 	mapStopped(t, leader)
@@ -518,20 +526,231 @@ func TestADeadOnlyCandidateDeclaredLostDoesNotReleaseTheOldLeader(t *testing.T) 
 		return s == 200 && b["state"] == "running"
 	})
 	foKillServer(nw)
-	var out struct {
-		Resumed bool   `json:"resumed"`
-		Detail  string `json:"detail"`
+	defer func() {
+		if t.Failed() {
+			t.Logf("leader log:\n%s", quietLog(leader.LogTail(60000)))
+			mc, _ := os.ReadFile(filepath.Join(leader.DataDir, "instances", "1", "pgdata", "kingres-managed.conf"))
+			pl := leader.InstanceLogs()
+			t.Logf("managed settings of the old primary:\n%s\nits log (tail):\n%s", mc, pl[max(0, len(pl)-5000):])
+		}
+	}()
+	// the old leader cannot serve the REST API: its system database is the held-back primary, and the only other copy is on the dead candidate
+	var last int
+	var lastBody map[string]any
+	until(t, 5*time.Minute, "503 from the old leader", func() bool { last, lastBody = leader.Do("GET", "/cluster", nil, nil); return last == 503 })
+	t.Logf("%s answers %d %v", leader.Host, last, lastBody)
+	st, body := third.Do("GET", "/cluster", nil, nil)
+	t.Logf("%s (no copy of the system database) answers %d %v", third.Host, st, body)
+	args := func(extra ...string) []string { return append([]string{"-release-map-hold"}, extra...) }
+	run := func(extra ...string) (string, error) { return leader.Command(args(extra...)...) }
+
+	// refused: without the words, for the server it runs on, and while kingresd runs on the data directory
+	for name, extra := range map[string][]string{
+		"no words":         nil,
+		"no acceptance":    {"-lost", nw.Host},
+		"no declaration":   {"-accept-data-loss"},
+		"the local server": {"-lost", leader.Host, "-accept-data-loss"},
+		"kingresd running": {"-lost", nw.Host, "-accept-data-loss"},
+	} {
+		if out, err := run(extra...); err == nil {
+			t.Fatalf("%s: the command ran\n%s", name, out)
+		} else if name == "kingresd running" && !strings.Contains(out, "stop kingresd") {
+			t.Fatalf("%s: the refusal does not say why:\n%s", name, out)
+		}
 	}
-	// the old leader sees the server dead after a while; until then it answers that the server is heard
-	until(t, 5*time.Minute, "the old leader to judge the declaration", func() bool {
-		code, err := third.InternalCall(leader, "POST", "/failover/map/resume", map[string]any{"strict": true, "lost": nw.Host}, &out)
-		t.Logf("resume call: %d %v %+v", code, err, out)
-		return err == nil && code == 200 && !strings.Contains(out.Detail, "is heard")
+	leader.Stop()
+	// the hold was made for the candidate; another server named lost does not release it
+	if out, err := run("-lost", third.Host, "-accept-data-loss"); err == nil || !strings.Contains(out, nw.Host) {
+		t.Fatalf("the hold was released for a server it was not made for: %v\n%s", err, out)
+	}
+	out, err := run("-lost", nw.Host, "-accept-data-loss")
+	if err != nil {
+		t.Fatalf("the command: %v\n%s", err, out)
+	}
+	t.Logf("the command said: %s", out)
+	leader.Start()
+	// the sessions of kingresd are in its memory: the operator signs in again once the system database is back
+	until(t, 8*time.Minute, "the cluster to serve again through the old leader", func() bool {
+		if !leader.Login(clustertest.AdminUser, clustertest.AdminPass) {
+			return false
+		}
+		s, _ := leader.Do("GET", "/cluster", nil, nil)
+		return s == 200
 	})
-	if out.Resumed || !strings.Contains(out.Detail, "no standby of the map group could be shown to be in recovery") {
-		t.Fatalf("the old leader was released without a second copy of the map group: %+v", out)
+	until(t, 3*time.Minute, "writes after the release", func() bool { return w.count() > 0 })
+	before := w.count()
+	until(t, 5*time.Minute, "new rows after the release", func() bool { return w.count() > before+20 })
+	acked := w.Stop()
+	foCheckAckedByKey(t, acked, []*clustertest.Node{leader, third}, port, pool)
+	// the release is in the audit log, with the lost server in its details
+	st, body = leader.Do("GET", "/audit?action=releaseMapGroupHold&limit=50", nil, nil)
+	if st != 200 {
+		t.Fatalf("the audit log: %d %v", st, body)
 	}
-	if code, err := third.InternalCall(leader, "POST", "/failover/map/resume", map[string]any{"strict": true}, &out); err != nil || code != 200 || out.Resumed {
-		t.Fatalf("without the declaration the hold of a dead candidate must stay: %d %v %+v", code, err, out)
+	found, refusedRecorded := false, false
+	items, _ := body["items"].([]any)
+	for _, it := range items {
+		ev, _ := it.(map[string]any)
+		if ev["action"] == "releaseMapGroupHold" {
+			d, _ := ev["details"].(map[string]any)
+			if ev["outcome"] == "success" && ev["source"] == "cli" && d["lostServerId"] == nw.Host {
+				found = true
+			}
+			if ev["outcome"] == "failure" && d["lostServerId"] == third.Host {
+				refusedRecorded = true
+			}
+		}
+	}
+	if !found {
+		t.Errorf("the release is not in the audit log: %v", body)
+	}
+	if !refusedRecorded {
+		t.Errorf("the refused release (another server named lost) is not in the audit log: %v", body)
+	}
+}
+
+// foCheckAckedByKey asks for every acknowledged row (at most 600, evenly spread) by its key through the entry points of the nodes. A third of the table lives in the
+// groups of a server that is dead, so a read of all of it cannot complete: a group that is dead answers with an error and the row is not counted; a group that answers
+// must have the row (no row is a lost row), and the groups of the nodes asked must answer for a good share of the rows.
+func foCheckAckedByKey(t *testing.T, acked map[int64]time.Time, nodes []*clustertest.Node, port int, pool *x509.CertPool) {
+	t.Helper()
+	var ids []int64
+	for rid := range acked {
+		ids = append(ids, rid)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	if len(ids) > 600 {
+		step := len(ids) / 600
+		var picked []int64
+		for i := 0; i < len(ids); i += step {
+			picked = append(picked, ids[i])
+		}
+		ids = picked
+	}
+	for _, n := range nodes {
+		// the entry point of a node that was just restarted needs a moment before the first key is answered (the groups that are alive answer for some keys)
+		until(t, 3*time.Minute, "a key answered through the entry point of "+n.Host, func() bool {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			c, err := foConn(ctx, n, port, pool, "fo")
+			if err != nil {
+				return false
+			}
+			defer func() { _ = c.Close(context.Background()) }()
+			for _, rid := range ids {
+				var got int64
+				if c.QueryRow(ctx, `SELECT id FROM items WHERE id = $1`, rid).Scan(&got) == nil {
+					return true
+				}
+			}
+			return false
+		})
+		found, unreachable := 0, 0
+		var conn *pgx.Conn
+		for _, rid := range ids {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if conn == nil {
+				c, err := foConn(ctx, n, port, pool, "fo")
+				if err != nil {
+					cancel()
+					unreachable++
+					continue
+				}
+				conn = c
+			}
+			var got int64
+			err := conn.QueryRow(ctx, `SELECT id FROM items WHERE id = $1`, rid).Scan(&got)
+			cancel()
+			switch {
+			case err == nil:
+				found++
+			case errors.Is(err, pgx.ErrNoRows):
+				t.Errorf("acknowledged row %d is missing when read through %s", rid, n.Host)
+			default:
+				unreachable++
+				_ = conn.Close(context.Background())
+				conn = nil
+			}
+		}
+		if conn != nil {
+			_ = conn.Close(context.Background())
+		}
+		t.Logf("through %s: %d of %d acknowledged rows found, %d in the groups of the dead server", n.Host, found, len(ids), unreachable)
+		if found < len(ids)/6 {
+			t.Errorf("through %s only %d of %d acknowledged rows were found: the data of the old primary is not there", n.Host, found, len(ids))
+		}
+	}
+}
+
+// P2 (REST). With a second standby of the map group the operator declares the dead candidate lost through REST, on a third server, and the proof of his session reaches the
+// held-back old leader, which checks it against the keys of the administrators that it cached while its system database ran, releases its hold, and serves again. The
+// old leader's kingresd runs and its instance is stopped; the session that signs is made after the hold began, so the key of the session comes from a server that can still
+// read a verifier. A server that is alive and a server that is no candidate are refused first.
+func TestTheRESTDeclarationOfALostServerWorksAcrossRealServers(t *testing.T) {
+	c := clustertest.FormWithExtra(t, 3, append([]string{"-lease-duration", "12s", "-lease-renew", "2s", "-lease-margin", "3s"}, standbyArgs...), nil)
+	leader := c.Leader()
+	if st, body := leader.Do("PATCH", "/settings/cluster", map[string]any{"defaultReplicaCount": 2}, nil); st != 200 && st != 202 {
+		t.Fatalf("two standbys for every group: %d %v", st, body)
+	}
+	waitStandbysFor(t, c, 2, 10*time.Minute)
+	views := topology(t, leader)[0]
+	var nw, third *clustertest.Node
+	for _, n := range c.Nodes {
+		switch {
+		case n == leader:
+		case n.Host == views[0].server:
+			nw = n
+		default:
+			third = n
+		}
+	}
+	if nw == nil || third == nil {
+		t.Fatalf("the two standbys of the map group are on %v", views)
+	}
+	defer func() {
+		if t.Failed() {
+			t.Logf("old leader log:\n%s\nthird log:\n%s", quietLog(leader.LogTail(40000)), quietLog(third.LogTail(20000)))
+		}
+	}()
+	until(t, 2*time.Minute, "the cache of the administrators' keys on the old leader", func() bool {
+		b, err := os.ReadFile(filepath.Join(leader.DataDir, "failover", "admin-keys.json"))
+		return err == nil && strings.Contains(string(b), clustertest.AdminUser)
+	})
+	nw.SetFaults(fault.Spec{FailoverPoint: "promote:unavailable", FailoverMode: "unavailable"})
+	_ = mapHardRequest(t, leader, nw, true)
+	mapStopped(t, leader)
+	until(t, 3*time.Minute, "the candidate to hold the lease and wait for its promotion", func() bool {
+		s, b := nw.Do("GET", "/failover", nil, nil)
+		return s == 200 && b["state"] == "running"
+	})
+	foKillServer(nw)
+	// the session of the operator is made now, while the old leader's system database is stopped
+	until(t, 3*time.Minute, "the operator to sign in on the third server", func() bool { return third.Login(clustertest.AdminUser, clustertest.AdminPass) })
+	declare := func(lost string) (int, map[string]any) {
+		return third.Do("POST", "/failover/map/abandon", map[string]any{"reason": "the candidate is dead", "lostServerId": lost}, nil)
+	}
+	// a server that is alive is no lost server
+	if st, body := declare(third.Host); st != 409 || !strings.Contains(fmt.Sprint(body["detail"]), "seen dead") {
+		t.Fatalf("a live server was declared lost, or refused for another reason: %d %v", st, body)
+	}
+	var res map[string]any
+	until(t, 8*time.Minute, "the declaration to release the old leader", func() bool {
+		st, body := declare(nw.Host)
+		t.Logf("declaration: %d %v", st, body)
+		if st == 200 {
+			res = body
+			return true
+		}
+		return false
+	})
+	if res["resumedServerId"] != leader.Host {
+		t.Fatalf("the declaration resumed %v, not the old leader %s", res["resumedServerId"], leader.Host)
+	}
+	until(t, 8*time.Minute, "the cluster to serve again through the old leader", func() bool {
+		return leader.Login(clustertest.AdminUser, clustertest.AdminPass) && func() bool { s, _ := leader.Do("GET", "/cluster", nil, nil); return s == 200 }()
+	})
+	// a rerun after the release says that nothing is held back: an error that says so, not an empty success
+	if st, body := declare(nw.Host); st != 503 || !strings.Contains(fmt.Sprint(body["detail"]), "already") {
+		t.Errorf("a second declaration did not say that nothing is held back (503, \"already\"): %d %v", st, body)
 	}
 }

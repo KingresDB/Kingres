@@ -189,7 +189,7 @@ for (const o of operations) {
 
 // Audit actions: operationIds plus a small closed list of non-operation events.
 // certificateRenewed and certificateRenewalFailed are the events of the certificate renewal job (0.5.0).
-const NON_OPERATION_EVENTS = ['loginFailed', 'setupTokenRejected', 'autoFailover', 'certificateRenewed', 'certificateRenewalFailed', 'leaseLost', 'leaseFenced', 'leaseAcquired', 'standbyCreated', 'standbyRemoved', 'standbyRebuilt', 'standbyInstanceStarted', 'standbyInstanceRemoved', 'standbyInstanceRebuilt', 'synchronousStandbyNamesChanged', 'replicationSlotDropped', 'failoverGroupStarted', 'failoverGroupPromoted', 'failoverGroupFailed', 'oldPrimaryRebuilt', 'dataTransfer.completed', 'dataTransfer.purged'];
+const NON_OPERATION_EVENTS = ['releaseMapGroupHold', 'loginFailed', 'setupTokenRejected', 'autoFailover', 'certificateRenewed', 'certificateRenewalFailed', 'leaseLost', 'leaseFenced', 'leaseAcquired', 'standbyCreated', 'standbyRemoved', 'standbyRebuilt', 'standbyInstanceStarted', 'standbyInstanceRemoved', 'standbyInstanceRebuilt', 'synchronousStandbyNamesChanged', 'replicationSlotDropped', 'failoverGroupStarted', 'failoverGroupPromoted', 'failoverGroupFailed', 'oldPrimaryRebuilt', 'dataTransfer.completed', 'dataTransfer.purged'];
 // uploadDataChunk: a chunk of an upload is not an event (the creation, the completion and the use of the upload are).
 const NOT_AUDITED_MUTATIONS = ['previewRebalancePlan', 'createInclusionProof', 'checkSetupToken', 'previewConfigChange', 'planPartitionPolicy', 'uploadDataChunk'];
 const auditEnum = schemas.AuditAction?.enum;
@@ -393,6 +393,7 @@ const MUST_MENTION = {
   '0.28.0': ['failoverServer', 'unsupported_operation', 'lostServerId', 'additive'],
   '0.29.0': ['exportDatabase', 'validateDatabaseArchive', 'database.export', 'archive.validate', 'ArchiveReport', 'export_not_readable', 'archive_invalid', 'databaseArchive', 'additive'],
   '0.31.0': ['schemaName', 'kind', 'schema_pinned', 'drainServer', 'previewServerDrain', 'additive'],
+  '0.34.0': ['releaseMapGroupHold', 'kingresd -release-map-hold', 'additive'],
   '0.33.0': ['failoverServer', 'kingres_admin', 'allowDataLoss', 'forbidden'],
   '0.32.0': ['listRelatedTables', 'RelatedTablesPlan', 'relatedTables', 'TableOperation', 'Table.operation', 'related_table_missing', 'additive'],
   '0.30.0': ['importDatabase', 'database.import', 'ImportDatabaseRequest', 'archive_statement_refused', 'ledger_restart_not_acknowledged', 'acknowledgeLedgerRestart', 'private', 'extensionSkipped', 'additive'],
@@ -402,7 +403,7 @@ const MUST_MENTION = {
   '0.9.0': ['startRebalance', 'previewRebalancePlan', 'nothing_to_rebalance', 'cluster_inconsistent', 'skipped', 'ledgerSummary', 'Prefer', 'additive'],
   '0.5.0': ['renewServerCertificates', 'revokeServerCertificates', 'certificate_authority_unavailable', 'certificate_revoked', 'certificateRenewalFailed', 'partial', 'additive'],
 };
-for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.10.0', '0.11.0', '0.12.0', '0.13.0', '0.14.0', '0.15.0', '0.16.0', '0.17.0', '0.18.0', '0.19.0', '0.25.0', '0.26.0', '0.27.0', '0.28.0', '0.29.0', '0.30.0', '0.31.0', '0.32.0', '0.33.0']) {
+for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.10.0', '0.11.0', '0.12.0', '0.13.0', '0.14.0', '0.15.0', '0.16.0', '0.17.0', '0.18.0', '0.19.0', '0.25.0', '0.26.0', '0.27.0', '0.28.0', '0.29.0', '0.30.0', '0.31.0', '0.32.0', '0.33.0', '0.34.0']) {
   const changelog = changelogOf(version);
   if (!changelog) { fail('README.md', `changelog heading for ${version} is missing`); continue; }
   for (const h of ['#### Breaking', '#### Additive', '#### Documentation']) if (!changelog.includes(h)) fail('README.md', `changelog of ${version} lacks "${h}"`);
@@ -414,7 +415,7 @@ for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.
   if (!m) fail('README.md', `the changelog summary of ${version} must state "N operations added (M operations, P paths)"`);
   else if (version === doc.info?.version && (Number(m[2]) !== operations.length || Number(m[3]) !== Object.keys(doc.paths ?? {}).length)) fail('README.md', `changelog says ${m[2]} operations and ${m[3]} paths, the contract has ${operations.length} and ${Object.keys(doc.paths ?? {}).length}`);
 }
-if (doc.info?.version !== '0.33.0') fail('info.version', 'the contract is revision 0.33.0');
+if (doc.info?.version !== '0.34.0') fail('info.version', 'the contract is revision 0.34.0');
 
 
 // 0.5.0 rules: certificate operations, partial answers, additive changes only.
