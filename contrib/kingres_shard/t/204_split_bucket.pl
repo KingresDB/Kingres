@@ -10,6 +10,7 @@
 #   E. cancel; a killed session before the switch (undone), after it (finished), the recovery worker alone
 #   F. a split bucket moves, and a table made later has its layout
 #   G. the recovery worker leaves a split alone between its record and the live mark (fault point split_after_begin)
+#   G2-G5. a cancel between the record and the mark leaves no lock; a second split waits and then finds the group being split; the wait is bounded; a failing probe lets go
 
 use strict;
 use warnings FATAL => 'all';
@@ -445,6 +446,87 @@ sub kill_split
 	is(q1($n1, "SELECT kingres.internal_split_alive($sid)"), 'f', 'G: and nobody holds its mark any more');
 	q1($n1, q{SELECT kingres.cleanup_bucket_splits(true)});
 	verify_all('G');
+}
+
+
+# ---------------------------------------------------------------------------
+# G2 to G5. the locks of a split are never left behind and never waited for without a bound
+# ---------------------------------------------------------------------------
+sub split_locks
+{
+	return q1($n1, q{SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted
+	                    AND classid::int8 IN ((hashtext('kingres_split')::int8 & 4294967295), (hashtext('kingres_split_begin')::int8 & 4294967295))});
+}
+sub split_pid
+{
+	return q1($n1, q{SELECT pid FROM pg_stat_activity WHERE query LIKE '%split_bucket(%' AND pid <> pg_backend_pid() AND state = 'active' AND query NOT LIKE '%pg_stat_activity%' ORDER BY backend_start LIMIT 1});
+}
+{
+	# G2. a cancel at each point where a lock is held: between the record and the mark (the lock of the group), between the mark and the release of the lock of the group
+	# (both), and after (the mark).  Each time no lock is left, the split is undone, and the next split of the group works.
+	for my $point ('split_after_begin', 'split_after_mark', 'split_after_preparing')
+	{
+		my $name = "g2_$point";
+		my ($pid, $file) = stopped($point, "SELECT kingres.split_bucket($C, 5, 2)", $name);
+		ok(wait_for_fault_file("$file.reached", 60), "G2: a split of bucket 5 waits at $point");
+		is(split_locks(), $point eq 'split_after_begin' ? '1' : $point eq 'split_after_mark' ? '2' : '1', "G2: $point: the locks it holds");
+		q1($n1, 'SELECT pg_cancel_backend(' . split_pid() . ')');
+		release($pid, $file);
+		like(out($name), qr/canceling statement/, "G2: $point: the cancel ends the split");
+		is(split_locks(), '0', "G2: $point: no lock of the group and no mark is left");
+		ok($n1->poll_query_until('postgres', q{SELECT phase = 'failed' FROM kingres.bucket_split ORDER BY split_id DESC LIMIT 1}), "G2: $point: the record is undone");
+		is(q1($n1, "SELECT state FROM kingres.bucket_map WHERE colocation_id = $C AND bucket = 5"), 'active', "G2: $point: the bucket is active");
+	}
+	my ($rc, $out, $err) = run_sql($n1, "SELECT kingres.split_bucket($C, 5, 2)");
+	is($rc, 0, 'G2: the next split of the group works') or diag($err);
+	q1($n1, q{SELECT kingres.cleanup_bucket_splits(true)});
+	is(split_locks(), '0', 'G2: and leaves no lock');
+}
+{
+	# G3. a second split of the group waits for the lock of the first (which is between its record and its mark), then finds the group being split: it neither hangs nor splits twice
+	my ($pid, $file) = stopped('split_after_begin', "SELECT kingres.split_bucket($C, 6, 2)", 'g3a');
+	ok(wait_for_fault_file("$file.reached", 60), 'G3: a split of bucket 6 waits between its record and its live mark');
+	my ($pid2, $file2) = stopped('no_such_point', "SELECT kingres.split_bucket($C, 7, 2)", 'g3b');
+	usleep(1500000);
+	is(out('g3b'), '', 'G3: the second split waits');
+	release($pid, $file);
+	release($pid2, $file2);
+	like(out('g3b'), qr/already being split/, 'G3: and then finds the group being split');
+	like(out('g3a'), qr/split_bucket/, 'G3: the first split ends');
+	q1($n1, q{SELECT kingres.cleanup_bucket_splits(true)});
+	is(split_locks(), '0', 'G3: no lock is left');
+	verify_all('G3');
+}
+{
+	# G4. the wait is bounded: another session holds the lock of the group longer than node_timeout
+	my $pid = fork();
+	die 'fork' unless defined $pid;
+	if ($pid == 0)
+	{
+		system("psql -X -q -h " . $n1->host . " -p " . $n1->port . " -d postgres -c \"SELECT pg_advisory_lock(hashtext('kingres_split_begin'), $C); SELECT pg_sleep(120)\" > $tmp/out_g4h 2>&1");
+		POSIX::_exit(0);
+	}
+	ok($n1->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_locks WHERE locktype = 'advisory' AND granted AND pid <> pg_backend_pid()}), 'G4: another session holds the lock of the group');
+	my $t0 = time;
+	my ($rc, $out, $err) = run_sql($n1, qq{SET kingres_shard.node_timeout = 3;
+		DO \$\$ BEGIN PERFORM kingres.split_bucket($C, 7, 2); EXCEPTION WHEN object_in_use THEN RAISE NOTICE 'ks-in-use: %', SQLERRM; END \$\$});
+	like($err, qr/ks-in-use: colocation group \d+ is being split by another session/, 'G4: the wait ends with object_in_use');
+	cmp_ok(time - $t0, '<', 60, 'G4: and does not hang');
+	is(q1($n1, q{SELECT count(*) FROM kingres.bucket_split WHERE phase NOT IN ('done', 'failed', 'cancelled', 'cleaning')}), '0', 'G4: no record was written');
+	q1($n1, q{SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE query LIKE '%pg_sleep(120)%' AND pid <> pg_backend_pid()});
+	waitpid($pid, 0);
+	($rc, $out, $err) = run_sql($n1, "SELECT kingres.split_bucket($C, 7, 2)");
+	is($rc, 0, 'G4: once the other session lets go the split works') or diag($err);
+	q1($n1, q{SELECT kingres.cleanup_bucket_splits(true)});
+	is(split_locks(), '0', 'G4: no lock is left');
+}
+{
+	# G5. a probe that fails lets go of what it took (an error between its try and its unlock, as a cancel in the recovery worker would be)
+	my $sid = q1($n1, q{SELECT split_id FROM kingres.bucket_split ORDER BY split_id DESC LIMIT 1});
+	is(q1($n1, qq{SET kingres_shard.fault_injection = 'split_alive_probe:error';
+		DO \$\$ BEGIN PERFORM kingres.internal_split_alive($sid); EXCEPTION WHEN OTHERS THEN NULL; END \$\$;
+		RESET kingres_shard.fault_injection;
+		SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted AND pid = pg_backend_pid()}), '0', 'G5: a probe that fails leaves no lock');
 }
 
 done_testing();

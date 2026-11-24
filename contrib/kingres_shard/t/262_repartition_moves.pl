@@ -319,7 +319,7 @@ clean_nodes('C: at the end');
 	clean_nodes('D: after the loop');
 	# the orphan tables of the last moves are dropped by the recovery worker (every 2 s, after move_cleanup_delay), and check_cluster() reports one only when its drop is overdue by
 	# twice the sum of node_timeout and recovery_interval; a machine under load can be slower than that for the last pass, so the check waits for the worker (a leak stays)
-	$n1->poll_query_until('postgres', q{SELECT NOT EXISTS (SELECT 1 FROM kingres.check_cluster())});
+	$n1->poll_query_until('postgres', q{SELECT NOT EXISTS (SELECT 1 FROM kingres.check_cluster() WHERE check_name = 'orphan_table')});
 	is(q1($n1, q{SELECT coalesce(string_agg(check_name || ' ' || coalesce(object, ''), '; '), '') FROM kingres.check_cluster()}), '', 'D: the cluster is clean');
 }
 
