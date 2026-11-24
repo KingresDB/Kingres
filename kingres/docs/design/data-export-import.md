@@ -1595,6 +1595,22 @@ The review found one critical, three medium and six low findings. Each is answer
   in task errors go through `safeName`. **L5** the `NOT VALID` retry is built from the lexer's tokens and handles a statement that is already `NOT VALID`. **L6** is part of C1.
 - **Free space.** The request, and the check step, compare the archive's expanded size (plus half and 64 MiB) with the free space of every data node and refuse with `insufficient_disk`.
 
+### Changes made after the second review of 14c (2026-11-24)
+
+The second review found no critical, high or medium issue and four low ones. Each is answered in the code and by a test.
+
+- **L-A, a domain reached only through a composite type.** A composite type has no `pg_depend` row on the class row that holds its attributes, so the walk did not follow a composite column to a domain
+  with a function or an operator of the role in its `CHECK`. The walk now goes from a composite type to its class row (and so to the types of its attributes), from an array to its element, from a range to
+  its subtype, its operator class and its canonical and difference functions, and from a multirange to its range.
+- **L-B, the undoing of a rename on a peer.** A server that failed to take the final name (the name was a database of somebody else) was still put back, which renamed that database. The marker of the
+  task now stays on the final name until every server has taken it and the settings are recorded (a last call removes it), `Back` is refused without the marker of the task, and the undoing leaves a database
+  that does not carry the marker alone, whatever its owner or name.
+- **L-C, tables of a distributed schema that the archive does not name.** Before `distribute_schema` the transaction lists every relation of the schema, refuses one that is not an ordinary or partitioned table
+  of the archive's catalog, locks and checks every table (`lockTrusted`) and lists the schema again.
+- **L-D, `ledger_verify()`.** It runs in a transaction that has first locked and checked every table registered with the ledger (`lockTrusted`, ACCESS EXCLUSIVE: it also holds off a rename or a swap
+  with a view, and nothing else uses these tables while the import runs, so it cannot deadlock). The other catalog reads of the verify step run no code of the role.
+- **The test hook.** `ImportHook` now receives the private name of the task; the process-wide `lastPrivate` and `ImportPrivateName()` are gone.
+
 ## Increments
 
 Each increment builds and passes its own tests; the contract checker passes from A0 on. Sizes: **S** up to 2 days,

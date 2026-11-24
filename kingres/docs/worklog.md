@@ -7,6 +7,14 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-24 (branch p14c): the four low findings of the second review of 14c
+
+L-A (the walk follows composite, array, range and multirange types), L-B (the marker stays on the final name until the rename is finished and the undoing only touches a database that carries it),
+L-C (every relation of a distributed schema is listed, locked and checked; one that the archive does not name is refused) and L-D (`ledger_verify()` runs after the registered ledger tables are locked and
+checked). The test hook `lastPrivate` is gone (`ImportHook` gets the private name). See the design note, "Changes made after the second review of 14c".
+
+---
+
 ## 2026-11-24 (branch p14c): fixes after the security review of 14c
 
 Answered C1, M1 to M3, L1 to L6 and the free-space check (design note, "Changes made after the independent security review of 14c"). New files: `ops/dbimport_guard.go` (the withdrawal of every role, the importer rule, the lock and
