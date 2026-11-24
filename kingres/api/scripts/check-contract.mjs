@@ -396,12 +396,13 @@ const MUST_MENTION = {
   '0.33.0': ['failoverServer', 'kingres_admin', 'allowDataLoss', 'forbidden'],
   '0.32.0': ['listRelatedTables', 'RelatedTablesPlan', 'relatedTables', 'TableOperation', 'Table.operation', 'related_table_missing', 'additive'],
   '0.30.0': ['importDatabase', 'database.import', 'ImportDatabaseRequest', 'archive_statement_refused', 'ledger_restart_not_acknowledged', 'acknowledgeLedgerRestart', 'private', 'extensionSkipped', 'additive'],
+  '0.25.0': ['TablePartition.accessMethod', 'mixed', 'other', 'kingres_timepart', 'additive'],
   '0.19.0': ['exportTable', 'importTable', 'createDataUpload', 'uploadDataChunk', 'downloadDataExport', 'x-streams', 'dataTransfer', 'data_transfer_disabled', 'import_outcome_unknown', 'Upload-Offset', 'additive'],
   '0.12.0': ['completedWithWarnings', 'failover_needs_decision', 'plan', 'notScheduled', 'additive'],
   '0.9.0': ['startRebalance', 'previewRebalancePlan', 'nothing_to_rebalance', 'cluster_inconsistent', 'skipped', 'ledgerSummary', 'Prefer', 'additive'],
   '0.5.0': ['renewServerCertificates', 'revokeServerCertificates', 'certificate_authority_unavailable', 'certificate_revoked', 'certificateRenewalFailed', 'partial', 'additive'],
 };
-for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.10.0', '0.11.0', '0.12.0', '0.13.0', '0.14.0', '0.15.0', '0.16.0', '0.17.0', '0.18.0', '0.19.0', '0.26.0', '0.27.0', '0.28.0', '0.29.0', '0.30.0', '0.31.0', '0.32.0', '0.33.0']) {
+for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.10.0', '0.11.0', '0.12.0', '0.13.0', '0.14.0', '0.15.0', '0.16.0', '0.17.0', '0.18.0', '0.19.0', '0.25.0', '0.26.0', '0.27.0', '0.28.0', '0.29.0', '0.30.0', '0.31.0', '0.32.0', '0.33.0']) {
   const changelog = changelogOf(version);
   if (!changelog) { fail('README.md', `changelog heading for ${version} is missing`); continue; }
   for (const h of ['#### Breaking', '#### Additive', '#### Documentation']) if (!changelog.includes(h)) fail('README.md', `changelog of ${version} lacks "${h}"`);
