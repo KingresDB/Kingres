@@ -578,21 +578,29 @@ func TestADeadOnlyCandidateIsReleasedByTheLocalCommand(t *testing.T) {
 	acked := w.Stop()
 	foCheckAckedByKey(t, acked, []*clustertest.Node{leader, third}, port, pool)
 	// the release is in the audit log, with the lost server in its details
-	st, body = leader.Do("GET", "/audit?limit=200", nil, nil)
+	st, body = leader.Do("GET", "/audit?action=releaseMapGroupHold&limit=50", nil, nil)
 	if st != 200 {
 		t.Fatalf("the audit log: %d %v", st, body)
 	}
-	found := false
+	found, refusedRecorded := false, false
 	items, _ := body["items"].([]any)
 	for _, it := range items {
 		ev, _ := it.(map[string]any)
 		if ev["action"] == "releaseMapGroupHold" {
 			d, _ := ev["details"].(map[string]any)
-			found = ev["outcome"] == "success" && ev["source"] == "cli" && d["lostServerId"] == nw.Host
+			if ev["outcome"] == "success" && ev["source"] == "cli" && d["lostServerId"] == nw.Host {
+				found = true
+			}
+			if ev["outcome"] == "failure" && d["lostServerId"] == third.Host {
+				refusedRecorded = true
+			}
 		}
 	}
 	if !found {
 		t.Errorf("the release is not in the audit log: %v", body)
+	}
+	if !refusedRecorded {
+		t.Errorf("the refused release (another server named lost) is not in the audit log: %v", body)
 	}
 }
 
