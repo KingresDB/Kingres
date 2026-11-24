@@ -219,7 +219,7 @@ func (o *Ops) setupPrivateLocal(ctx context.Context, op importCreateOp) error {
 	}
 	// The whole request is checked before a connection is used: a schema or an extension that is not allowed is refused whatever else is in it.
 	for _, s := range op.Schemas {
-		if _, err := sqlx.NewIdent(s); err != nil || s == "public" || strings.HasPrefix(s, "pg_") || s == "information_schema" {
+		if _, err := sqlx.NewIdent(s); err != nil || s == "public" || strings.HasPrefix(s, "pg_") || s == "information_schema" || archive.ReservedSchema(s) {
 			return errors.New("a schema of an extension is not valid")
 		}
 	}
@@ -230,7 +230,7 @@ func (o *Ops) setupPrivateLocal(ctx context.Context, op importCreateOp) error {
 		if _, err := sqlx.NewIdent(e.Name); err != nil {
 			return errors.New("this extension cannot be installed by an import")
 		}
-		if _, err := sqlx.NewIdent(e.Schema); err != nil {
+		if _, err := sqlx.NewIdent(e.Schema); err != nil || (archive.ReservedSchema(e.Schema) && (e.Schema != "kingres" || !strings.HasPrefix(e.Name, "kingres_"))) {
 			return errors.New("a schema of an extension is not valid")
 		}
 	}
@@ -252,6 +252,10 @@ func (o *Ops) setupPrivateLocal(ctx context.Context, op importCreateOp) error {
 		if op.Role == "" {
 			return nil
 		}
+		// CREATE is never given on a schema that KingresDB keeps for itself.
+		if create && archive.ReservedSchema(schema) {
+			return errors.New("a schema of KingresDB cannot be given to the role")
+		}
 		what := sqlx.Fixed("USAGE")
 		if create {
 			what = "USAGE, CREATE"
@@ -260,7 +264,7 @@ func (o *Ops) setupPrivateLocal(ctx context.Context, op importCreateOp) error {
 	}
 	for _, s := range op.Schemas {
 		id, err := sqlx.NewIdent(s)
-		if err != nil || s == "public" || strings.HasPrefix(s, "pg_") || s == "information_schema" {
+		if err != nil || s == "public" || strings.HasPrefix(s, "pg_") || s == "information_schema" || archive.ReservedSchema(s) {
 			return errors.New("a schema of an extension is not valid")
 		}
 		if err := run(ctx, c, stmt().Text("CREATE SCHEMA IF NOT EXISTS").ID(id)); err != nil {
@@ -431,8 +435,9 @@ func (o *Ops) installShardLocal(ctx context.Context, db string) error {
 	if _, err := c.Exec(ctx, "SET search_path = pg_catalog"); err != nil {
 		return err
 	}
-	// extguard before and after: the schema that the extension is made in must not be one that somebody made in advance (the private database is made from a template that a
-	// tenant could have changed), and what the extension made must be trusted before anything in the schema kingres is read or called.
+	// extguard before and after: the private database is made from template0, so nothing of a tenant is in it when it starts, but the schema that the extension is made in
+	// must still not be one that somebody made in advance (the role that is given the database could make it before this step), and what the extension made must be
+	// trusted before anything in the schema kingres is read or called.
 	if err := extguard.PreInstallExtension(ctx, c, extguard.Shard); err != nil {
 		return errors.New("the sharding extension is not trusted")
 	}
