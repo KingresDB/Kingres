@@ -137,7 +137,11 @@ func newMapFailover(dataDir string, svc *cluster.Service, self string, log *slog
 // promoted, the standby before.
 func (m *mapFailover) sysConn(ctx context.Context) (*pgx.Conn, error) {
 	if li, ok := m.svc.PrimaryOf(0); ok && li.Role.Group == 0 {
-		return m.svc.InstanceConn(ctx, li.ID, sysdb.Database)
+		// A primary that is stopped (held back for a hand-over) falls through to the next copy: the old leader itself can then still answer from a standby or from the
+		// copy that another primary holds (phase 5 third review L4).
+		if c, err := m.svc.InstanceConn(ctx, li.ID, sysdb.Database); err == nil {
+			return c, nil
+		}
 	}
 	for _, li := range m.svc.LocalInstances() {
 		if li.Role.Group == 0 && li.Role.IsStandby() {
@@ -987,9 +991,18 @@ func (m *mapFailover) declareLost(ctx context.Context, id internalapi.ForwardIde
 	}
 	if err := m.call(ctx, old, http.MethodPost, "/failover/map/resume", body, &out); err != nil {
 		var ce *failover.CallError
-		if errors.As(err, &ce) && ce.Status >= 400 && ce.Status < 500 {
-			// The old leader refused the declaration (a proof that does not match its cached keys, a hold made for another server): retrying will not change it.
-			return failover.MapAbandonResult{}, problem.New(problem.Conflict, "The old leader of the map group ("+old+") refused the declaration: "+ce.Message+" If its cache of the administrators' keys is stale or older than admin-keys-max-age, use the local command on that server (kingresd -release-map-hold).")
+		if errors.As(err, &ce) && (ce.Status == http.StatusRequestTimeout || ce.Status == http.StatusTooManyRequests) {
+			// transient answers of the old leader or of something in front of it: retry
+			return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "The old leader of the map group ("+old+") could not take the declaration now: "+ce.Message).WithRetryAfter(5)
+		}
+		if errors.As(err, &ce) && (ce.Status == http.StatusBadRequest || ce.Status == http.StatusUnauthorized || ce.Status == http.StatusForbidden || ce.Status == http.StatusConflict || ce.Status == http.StatusUnprocessableEntity) {
+			// The old leader refused the declaration (a proof that does not match its cached keys, a hold made for another server, a cache that cannot be used): an answer, not
+			// a failure to deliver, and no Retry-After. A proof that does not match may match after the next refresh of the cache (every 30 seconds) if the password was just changed.
+			hint := ""
+			if ce.Status == http.StatusUnauthorized {
+				hint = " If the password of the administrator was changed in the last minute, try again after 30 seconds."
+			}
+			return failover.MapAbandonResult{}, problem.New(problem.Conflict, "The old leader of the map group ("+old+") refused the declaration: "+ce.Message+hint+" If its cache of the administrators' keys is stale or older than admin-keys-max-age, use the local command on that server (kingresd -release-map-hold).")
 		}
 		return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "The declaration that "+lost+" is lost did not reach the old leader of the map group ("+old+"): "+err.Error()).WithRetryAfter(5)
 	}

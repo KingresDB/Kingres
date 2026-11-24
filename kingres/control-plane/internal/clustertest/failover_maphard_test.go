@@ -730,8 +730,8 @@ func TestTheRESTDeclarationOfALostServerWorksAcrossRealServers(t *testing.T) {
 		return third.Do("POST", "/failover/map/abandon", map[string]any{"reason": "the candidate is dead", "lostServerId": lost}, nil)
 	}
 	// a server that is alive is no lost server
-	if st, body := declare(third.Host); st != 409 {
-		t.Fatalf("a live server was declared lost: %d %v", st, body)
+	if st, body := declare(third.Host); st != 409 || !strings.Contains(fmt.Sprint(body["detail"]), "seen dead") {
+		t.Fatalf("a live server was declared lost, or refused for another reason: %d %v", st, body)
 	}
 	var res map[string]any
 	until(t, 8*time.Minute, "the declaration to release the old leader", func() bool {
@@ -750,7 +750,7 @@ func TestTheRESTDeclarationOfALostServerWorksAcrossRealServers(t *testing.T) {
 		return leader.Login(clustertest.AdminUser, clustertest.AdminPass) && func() bool { s, _ := leader.Do("GET", "/cluster", nil, nil); return s == 200 }()
 	})
 	// a rerun after the release says that nothing is held back: an error that says so, not an empty success
-	if st, body := declare(nw.Host); st == 200 {
-		t.Errorf("a second declaration answered a success: %v", body)
+	if st, body := declare(nw.Host); st != 503 || !strings.Contains(fmt.Sprint(body["detail"]), "already") {
+		t.Errorf("a second declaration did not say that nothing is held back (503, \"already\"): %d %v", st, body)
 	}
 }

@@ -22,7 +22,7 @@ func keyOf(seed byte) []byte { return scram.Stored(lostKey(seed)) }
 func TestTheCacheOfTheAdministratorsKeysIsNeverEmptiedByAWrongRead(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	a := openAdminKeys(dir, nil, 0)
+	a := openAdminKeys(dir, nil, 0, nil)
 	if err := a.Replace(map[string][]byte{"alice": keyOf(1), "bob": keyOf(2)}); err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +36,7 @@ func TestTheCacheOfTheAdministratorsKeysIsNeverEmptiedByAWrongRead(t *testing.T)
 	if err := a.refresh(ctx, func(context.Context) (map[string]string, error) { return nil, errors.New("down") }); err == nil {
 		t.Fatal("a failed read was not reported")
 	}
-	reopened := openAdminKeys(dir, nil, 0)
+	reopened := openAdminKeys(dir, nil, 0, nil)
 	for _, u := range []string{"alice", "bob"} {
 		if _, err := reopened.StoredKey(ctx, u); err != nil {
 			t.Fatalf("%s is gone after the wrong reads: %v", u, err)
@@ -46,7 +46,7 @@ func TestTheCacheOfTheAdministratorsKeysIsNeverEmptiedByAWrongRead(t *testing.T)
 	if err := a.Replace(map[string][]byte{"alice": keyOf(1)}); err != nil {
 		t.Fatal(err)
 	}
-	reopened = openAdminKeys(dir, nil, 0)
+	reopened = openAdminKeys(dir, nil, 0, nil)
 	if _, err := reopened.StoredKey(ctx, "bob"); !errors.Is(err, scram.ErrNotSCRAM) {
 		t.Fatalf("a removed administrator is still in the file: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestTheCacheOfTheAdministratorsKeysHasAnAgeAndACluster(t *testing.T) {
 	dir := t.TempDir()
 	clusterID := "c1"
 	now := time.Now()
-	a := openAdminKeys(dir, func() string { return clusterID }, 72*time.Hour)
+	a := openAdminKeys(dir, func() string { return clusterID }, 72*time.Hour, nil)
 	a.now = func() time.Time { return now }
 	if err := a.Replace(map[string][]byte{"alice": keyOf(1)}); err != nil {
 		t.Fatal(err)
@@ -110,23 +110,26 @@ func TestTheCacheOfTheAdministratorsKeysHasAnAgeAndACluster(t *testing.T) {
 		t.Fatalf("a cache older than the bound was accepted: %v", err)
 	}
 	// the file keeps the time of the last write: a restart does not make it younger
-	re := openAdminKeys(dir, func() string { return clusterID }, 72*time.Hour)
+	re := openAdminKeys(dir, func() string { return clusterID }, 72*time.Hour, nil)
 	re.now = func() time.Time { return now }
 	if _, err := re.StoredKey(ctx, "alice"); err == nil {
 		t.Fatal("a restart made an old cache young")
 	}
-	// no bound
-	nb := openAdminKeys(dir, func() string { return clusterID }, 0)
+	// there is no unbounded mode: a bound of 0 is the default (72 hours), and the cache is refused beyond it
+	nb := openAdminKeys(dir, func() string { return clusterID }, 0, nil)
 	nb.now = func() time.Time { return now.Add(1000 * time.Hour) }
-	if _, err := nb.StoredKey(ctx, "alice"); err != nil {
-		t.Fatalf("a bound of 0 refused: %v", err)
+	if _, err := nb.StoredKey(ctx, "alice"); err == nil {
+		t.Fatal("a bound of 0 switched the age check off")
+	}
+	if nb.maxAge != defaultAdminKeysMaxAge {
+		t.Fatalf("the bound of 0 is %s, not the default", nb.maxAge)
 	}
 	// another cluster: refused while the server runs, dropped at the next start
 	clusterID = "c2"
 	if _, err := a.StoredKey(ctx, "alice"); err == nil {
 		t.Fatal("a cache of another cluster was accepted")
 	}
-	other := openAdminKeys(dir, func() string { return "c2" }, 0)
+	other := openAdminKeys(dir, func() string { return "c2" }, 0, nil)
 	if _, err := other.StoredKey(ctx, "alice"); err == nil {
 		t.Fatal("a file of another cluster was loaded")
 	}
@@ -141,7 +144,7 @@ func TestTheCacheFileIsNarrowedAndTheReadSkipsExpiredLogins(t *testing.T) {
 		t.Fatal("the read does not skip a login whose password expired")
 	}
 	dir := t.TempDir()
-	a := openAdminKeys(dir, nil, 0)
+	a := openAdminKeys(dir, nil, 0, nil)
 	if err := a.Replace(map[string][]byte{"alice": keyOf(1)}); err != nil {
 		t.Fatal(err)
 	}
@@ -151,8 +154,76 @@ func TestTheCacheFileIsNarrowedAndTheReadSkipsExpiredLogins(t *testing.T) {
 	if err := os.Chmod(a.path, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	openAdminKeys(dir, nil, 0)
+	openAdminKeys(dir, nil, 0, nil)
 	if fi, err := os.Stat(filepath.Join(dir, adminKeysName)); err != nil || fi.Mode().Perm() != 0o600 {
 		t.Fatalf("the mode after opening: %v %v", fi, err)
+	}
+}
+
+// Third review L2: a time in the file that is ahead of the clock is not believed; a small skew is allowed.
+func TestACacheWithATimeInTheFutureIsRefused(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	now := time.Now()
+	a := openAdminKeys(dir, nil, 0, nil)
+	a.now = func() time.Time { return now.Add(2 * time.Hour) } // written while the clock was ahead
+	if err := a.Replace(map[string][]byte{"alice": keyOf(1)}); err != nil {
+		t.Fatal(err)
+	}
+	re := openAdminKeys(dir, nil, 0, nil)
+	re.now = func() time.Time { return now }
+	if _, err := re.StoredKey(ctx, "alice"); err == nil || !strings.Contains(err.Error(), "future") {
+		t.Fatalf("a time two hours ahead was believed: %v", err)
+	}
+	re.now = func() time.Time { return now.Add(2*time.Hour - time.Minute) }
+	if _, err := re.StoredKey(ctx, "alice"); err != nil {
+		t.Fatalf("a skew of a minute was refused: %v", err)
+	}
+}
+
+// Third review L7: a file written before the server knew its cluster has no id and is kept; the cache is gone for a process that keeps running when the server is reset.
+func TestTheCacheGoesWithAResetAndKeepsAFileWithoutAClusterId(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	a := openAdminKeys(dir, nil, 0, nil) // no cluster id yet
+	if err := a.Replace(map[string][]byte{"alice": keyOf(1)}); err != nil {
+		t.Fatal(err)
+	}
+	known := openAdminKeys(dir, func() string { return "c1" }, 0, nil)
+	if _, err := known.StoredKey(ctx, "alice"); err != nil {
+		t.Fatalf("a file without a cluster id was dropped when the id became known: %v", err)
+	}
+	if err := known.Replace(map[string][]byte{"alice": keyOf(1)}); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(known.path)
+	if !strings.Contains(string(b), `"clusterId":"c1"`) {
+		t.Fatalf("the next write did not fill the cluster id: %s", b)
+	}
+	// ResetMember removes the file; the running process stops answering
+	if err := os.Remove(known.path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := known.StoredKey(ctx, "alice"); err == nil || !strings.Contains(err.Error(), "removed") {
+		t.Fatalf("a removed cache still answers: %v", err)
+	}
+}
+
+// Third review L8: a file that is readable by others and cannot be narrowed is not used (unix); a directory that is wide is narrowed.
+func TestTheCacheDirectoryIsNarrowed(t *testing.T) {
+	if os.PathSeparator != '/' {
+		t.Skip("modes are not kept on this system")
+	}
+	dir := filepath.Join(t.TempDir(), "failover")
+	a := openAdminKeys(dir, nil, 0, nil)
+	if err := a.Replace(map[string][]byte{"alice": keyOf(1)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	openAdminKeys(dir, nil, 0, nil)
+	if fi, err := os.Stat(dir); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("the directory mode: %v %v", fi, err)
 	}
 }

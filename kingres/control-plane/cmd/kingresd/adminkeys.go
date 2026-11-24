@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -60,6 +61,7 @@ type adminKeys struct {
 	clusterID func() string
 	maxAge    time.Duration
 	now       func() time.Time
+	log       *slog.Logger
 
 	mu          sync.Mutex
 	keys        map[string][]byte
@@ -75,10 +77,23 @@ type adminKeysDisk struct {
 	Admins      map[string]string `json:"admins"`
 }
 
+// defaultAdminKeysMaxAge is the bound on the age of the cache when none is given; the setting admin-keys-max-age must be positive, there is no unbounded mode.
+const defaultAdminKeysMaxAge = 72 * time.Hour
+
+// adminKeysSkew is how far the time in the file may be ahead of this server's clock before the file is not believed.
+const adminKeysSkew = 5 * time.Minute
+
 // openAdminKeys reads the file of a former run, if there is one and it belongs to this cluster. clusterID tells the cluster of this server now ("" while it has none); maxAge
-// is the bound on the age of the contents (0: no bound). The mode of an existing file is narrowed to 0600.
-func openAdminKeys(dir string, clusterID func() string, maxAge time.Duration) *adminKeys {
-	a := &adminKeys{path: filepath.Join(dir, adminKeysName), clusterID: clusterID, maxAge: maxAge, now: time.Now, keys: map[string][]byte{}}
+// is the bound on the age of the contents (zero or less: the default, 72 hours). The mode of an existing file is narrowed to 0600 and its directory to 0700; a file that
+// cannot be narrowed and is readable by others is not used.
+func openAdminKeys(dir string, clusterID func() string, maxAge time.Duration, log *slog.Logger) *adminKeys {
+	if maxAge <= 0 {
+		maxAge = defaultAdminKeysMaxAge
+	}
+	if log == nil {
+		log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	a := &adminKeys{path: filepath.Join(dir, adminKeysName), clusterID: clusterID, maxAge: maxAge, now: time.Now, log: log, keys: map[string][]byte{}}
 	if a.clusterID == nil {
 		a.clusterID = func() string { return "" }
 	}
@@ -86,13 +101,23 @@ func openAdminKeys(dir string, clusterID func() string, maxAge time.Duration) *a
 	if err != nil {
 		return a
 	}
-	_ = os.Chmod(a.path, 0o600) // a copy by a restore or a chmod of an operator may have widened it
+	// a copy by a restore or a chmod of an operator may have widened them
+	if err := os.Chmod(filepath.Dir(a.path), 0o700); err != nil {
+		log.Warn("the mode of the directory of the cache of the administrators' keys could not be narrowed", "error", err)
+	}
+	if err := os.Chmod(a.path, 0o600); err != nil {
+		log.Warn("the mode of the cache of the administrators' keys could not be narrowed", "error", err)
+		if fi, serr := os.Stat(a.path); serr == nil && os.PathSeparator == '/' && fi.Mode().Perm()&0o077 != 0 {
+			log.Error("the cache of the administrators' keys is readable by others and is not used")
+			return a
+		}
+	}
 	var d adminKeysDisk
 	if json.Unmarshal(b, &d) != nil {
 		return a
 	}
-	if cur := a.clusterID(); cur != "" && d.Cluster != cur {
-		// the file is of another cluster (the server was reset and joined another one)
+	if cur := a.clusterID(); cur != "" && d.Cluster != "" && d.Cluster != cur {
+		// the file is of another cluster (the server was reset and joined another one); a file written before the server knew its cluster has no id and is kept
 		_ = os.Remove(a.path)
 		return a
 	}
@@ -115,11 +140,21 @@ func (a *adminKeys) StoredKey(_ context.Context, username string) ([]byte, error
 	if !a.loaded {
 		return nil, errors.New("the keys of the administrators were never cached on this server")
 	}
+	if _, err := os.Stat(a.path); errors.Is(err, os.ErrNotExist) {
+		// the server was reset or left the cluster (ResetMember removes the file) while this process runs
+		a.keys, a.loaded = map[string][]byte{}, false
+		return nil, errors.New("the cache of the administrators' keys was removed (this server left its cluster)")
+	}
 	if cur := a.clusterID(); cur != "" && a.cluster != "" && cur != a.cluster {
 		return nil, errors.New("the keys of the administrators that were cached here are of another cluster")
 	}
-	if a.maxAge > 0 && a.now().Sub(a.refreshedAt) > a.maxAge {
-		return nil, fmt.Errorf("the keys of the administrators were last read %s ago, more than admin-keys-max-age (%s)", a.now().Sub(a.refreshedAt).Round(time.Minute), a.maxAge)
+	age := a.now().Sub(a.refreshedAt)
+	if age < -adminKeysSkew {
+		// a time ahead of the clock (the clock was set back, or the file was written while it was ahead) says nothing about the age
+		return nil, fmt.Errorf("the time of the last read of the administrators' keys is %s in the future of this server's clock", (-age).Round(time.Minute))
+	}
+	if age > a.maxAge {
+		return nil, fmt.Errorf("the keys of the administrators were last read %s ago, more than admin-keys-max-age (%s)", age.Round(time.Minute), a.maxAge)
 	}
 	k, ok := a.keys[username]
 	if !ok {
@@ -159,6 +194,9 @@ func (a *adminKeys) Replace(next map[string][]byte) error {
 	if err := os.MkdirAll(filepath.Dir(a.path), 0o700); err != nil {
 		return err
 	}
+	if err := os.Chmod(filepath.Dir(a.path), 0o700); err != nil {
+		a.log.Warn("the mode of the directory of the cache of the administrators' keys could not be narrowed", "error", err)
+	}
 	if err := pki.WriteFile(a.path, b, 0o600); err != nil {
 		return err
 	}
@@ -194,6 +232,23 @@ func serviceAdminVerifiers(svc *cluster.Service) func(ctx context.Context) (map[
 			return nil, err
 		}
 		defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+		// A standby counts as a read only while it streams: one that was cut off answers with roles that may be days old, and the age of the cache must measure the data, not the
+		// connection (phase 5 third review L3). The primary of the map group needs no such check.
+		isStandby := false
+		for _, li := range svc.LocalInstances() {
+			if li.ID == id && li.Role.IsStandby() {
+				isStandby = true
+			}
+		}
+		if isStandby {
+			var streaming int
+			if err := c.QueryRow(ctx, `SELECT count(*) FROM pg_catalog.pg_stat_wal_receiver WHERE status = 'streaming'`).Scan(&streaming); err != nil {
+				return nil, err
+			}
+			if streaming == 0 {
+				return nil, errors.New("the standby of the map group on this server does not stream: its roles may be old")
+			}
+		}
 		rows, err := c.Query(ctx, adminKeysSQL, pgx.QueryExecModeSimpleProtocol)
 		if err != nil {
 			return nil, err

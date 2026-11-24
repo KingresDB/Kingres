@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -181,5 +182,39 @@ func TestADeclarationThatReleasesNothingIsAnError(t *testing.T) {
 	r = newDeclareRig(t, yes, func(string, mapResumeBody) (mapResumeAnswer, error) { return mapResumeAnswer{}, nil })
 	if res, err := r.m.Abandon(ctx, "ops", opID, "x", ""); err != nil || res.ResumedServer != "" {
 		t.Errorf("without a declaration: %+v %v", res, err)
+	}
+}
+
+// Third review L1: an answer of the old leader that no retry changes (an unusable cache) is a 409 without Retry-After and points to the local command; a transient answer
+// (408, 429) is a 503 that says to retry; a 401 says that a password changed in the last minute works after the next refresh.
+func TestTheStatusOfARefusedDeclarationSaysWhetherToRetry(t *testing.T) {
+	ctx := context.Background()
+	yes := func(string) (bool, error) { return true, nil }
+	for _, c := range []struct {
+		status int
+		code   string
+		want   int
+		text   string
+	}{
+		{http.StatusConflict, "cache_unavailable", http.StatusConflict, "-release-map-hold"},
+		{http.StatusUnauthorized, "identity_unproven", http.StatusConflict, "30 seconds"},
+		{http.StatusForbidden, "forbidden", http.StatusConflict, "refused"},
+		{http.StatusRequestTimeout, "timeout", http.StatusServiceUnavailable, "could not take"},
+		{http.StatusTooManyRequests, "rate_limited", http.StatusServiceUnavailable, "could not take"},
+	} {
+		r := newDeclareRig(t, yes, func(string, mapResumeBody) (mapResumeAnswer, error) {
+			return mapResumeAnswer{}, &failover.CallError{Status: c.status, Code: c.code, Message: "the answer"}
+		})
+		_, err := r.m.Abandon(ctx, "ops", opID, "x", "s9")
+		var p *problem.Problem
+		if err == nil || !errors.As(err, &p) || p.Status != c.want || !strings.Contains(err.Error(), c.text) {
+			t.Errorf("%d %s: %v", c.status, c.code, err)
+			continue
+		}
+		rec := httptest.NewRecorder()
+		problem.Write(rec, "/x", "r", p)
+		if retry := rec.Header().Get("Retry-After") != ""; retry != (c.want == http.StatusServiceUnavailable) {
+			t.Errorf("%d %s: Retry-After %q", c.status, c.code, rec.Header().Get("Retry-After"))
+		}
 	}
 }
