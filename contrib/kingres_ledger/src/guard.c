@@ -210,11 +210,13 @@ kl_extension_oid(void)
 
 /*
  * kl_schema_trusted
- *		Whether the schema "kingres" belongs to a superuser.  The schema is shared with the other
- *		KingresDB extensions and can be made by the owner of a database before the extension is
- *		installed; the relations of the ledger are trusted only in a schema that a superuser holds.
+ *		Whether the schema "kingres" belongs to a superuser and lets nobody who is not a superuser
+ *		create objects in it (CREATE granted to PUBLIC or to a role that is not a superuser).  The
+ *		schema is shared with the other KingresDB extensions and can be made by the owner of a
+ *		database before the extension is installed; the relations of the ledger are trusted only in
+ *		a schema that a superuser holds and keeps closed.
  */
-static bool
+bool
 kl_schema_trusted(Oid nspoid)
 {
 	HeapTuple	tup = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(nspoid));
@@ -222,7 +224,26 @@ kl_schema_trusted(Oid nspoid)
 
 	if (HeapTupleIsValid(tup))
 	{
-		result = superuser_arg(((Form_pg_namespace) GETSTRUCT(tup))->nspowner);
+		Form_pg_namespace ns = (Form_pg_namespace) GETSTRUCT(tup);
+		bool		isnull;
+		Datum		d = SysCacheGetAttr(NAMESPACEOID, tup, Anum_pg_namespace_nspacl, &isnull);
+
+		result = superuser_arg(ns->nspowner);
+		if (result && !isnull)
+		{
+			Acl		   *acl = DatumGetAclP(d);
+			AclItem    *aip = ACL_DAT(acl);
+			int			i;
+
+			for (i = 0; i < ACL_NUM(acl); i++)
+			{
+				if ((ACLITEM_GET_PRIVS(aip[i]) & ACL_CREATE) &&
+					(aip[i].ai_grantee == ACL_ID_PUBLIC || !superuser_arg(aip[i].ai_grantee)))
+					result = false;
+			}
+			if ((Pointer) acl != DatumGetPointer(d))
+				pfree(acl);
+		}
 		ReleaseSysCache(tup);
 	}
 	return result;
@@ -325,7 +346,7 @@ kl_require_trusted_registry(const char *what)
 	if (kl_registry_untrusted())
 		ereport(ERROR,
 				(errcode(ERRCODE_KL_PROTECTED),
-				 errmsg("cannot %s: the schema \"%s\" is not owned by a superuser, so the registry of the ledger cannot be trusted",
+				 errmsg("cannot %s: the schema \"%s\" is not owned by a superuser or lets a role that is not a superuser create in it, so the registry of the ledger cannot be trusted",
 						what, KL_SCHEMA_NAME),
 				 errhint("A superuser must make the schema its own (ALTER SCHEMA ... OWNER TO) after looking at what is in it.")));
 }
@@ -468,6 +489,8 @@ kl_ExecutorCheckPerms(List *rangeTable, List *rtePermInfos,
 			extoid = kl_extension_oid();
 			extoid_known = true;
 		}
+		if (OidIsValid(extoid) && (writes & (ACL_UPDATE | ACL_DELETE)) && !rowlock && ereport_on_violation)
+			kl_refuse_untrusted_write(perminfo->relid, extoid, (writes & ACL_DELETE) ? "delete rows of" : "update");
 		if (!OidIsValid(extoid) || !kl_is_catalog_table(perminfo->relid, extoid))
 			continue;
 		if (kl_write_allowed(extoid))

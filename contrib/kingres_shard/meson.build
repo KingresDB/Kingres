@@ -352,6 +352,8 @@ tests += {
       't/268_merge_review_fixes.pl',
       't/252_extension_search_path.pl',
       't/253_catalog_spoof.pl',
+      't/279_old_script_schema_check.pl',
+      't/280_runtime_objects_owner.pl',
       't/278_schema_spoof.pl',
     ],
   },

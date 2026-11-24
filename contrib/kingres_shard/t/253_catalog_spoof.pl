@@ -283,6 +283,17 @@ like($err, qr/part of the partition key/, 'C: a schema that is owned by a role t
 	ROLLBACK;
 });
 like($err, qr/not supported on distributed tables/, 'C: a schema of another superuser is trusted');
+# L1: CREATE on the schema granted to PUBLIC or to a role that is not a superuser: the catalog is not trusted either
+for my $grantee ('PUBLIC', 'tenant')
+{
+	($rc, $out, $err) = as_super('postgres', qq{
+		BEGIN;
+		GRANT CREATE ON SCHEMA kingres TO $grantee;
+		ALTER TABLE public.t DROP COLUMN id;
+		ROLLBACK;
+	});
+	like($err, qr/part of the partition key/, "L1: CREATE on the schema granted to $grantee: PostgreSQL answers, the catalog is not trusted") or diag($err);
+}
 
 # a catalog table of another shape is an error, not a crash
 ($rc, $out, $err) = as_super('postgres', q{
