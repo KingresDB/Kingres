@@ -15,6 +15,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover/journal"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover/mapgroup"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fwdproof"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/lease"
 )
@@ -303,7 +304,8 @@ func TestTheOperatorsAbandonCarriesTheLostServerToTheResumeCalls(t *testing.T) {
 	ctx := context.Background()
 	m, _ := abandonRig(t)
 	m.self = "s3"
-	m.memberList = func(context.Context) ([]string, error) { return []string{"s1", "s2", "s3"}, nil }
+	m.memberList = func(context.Context) ([]string, error) { return []string{"s1", "s2", "s3", "s4"}, nil }
+	m.attest = func(fwdproof.Message) (fwdproof.Assertion, error) { return fwdproof.Assertion{}, nil }
 	m.heldBack = func() bool { return false }
 	m.liveOf = func(_ context.Context, s string) string {
 		if s == "s2" {
@@ -316,16 +318,23 @@ func TestTheOperatorsAbandonCarriesTheLostServerToTheResumeCalls(t *testing.T) {
 	}
 	var lost []string
 	m.callPeer = func(_ context.Context, server, _, path string, in, out any) error {
+		if path == "/failover/map/held" {
+			b, _ := json.Marshal(mapHeldAnswer{Held: server == "s4"}) // only s4 holds its primary back
+			return json.Unmarshal(b, out)
+		}
 		if path == "/failover/map/resume" {
+			if server != "s4" || in.(mapResumeBody).Attestation == nil {
+				t.Errorf("the declaration was sent to %s (attestation %v): only the held-back server gets it, with an attestation", server, in.(mapResumeBody).Attestation != nil)
+			}
 			lost = append(lost, in.(mapResumeBody).Lost)
-			b, _ := json.Marshal(mapResumeAnswer{Resumed: server == "s1"})
+			b, _ := json.Marshal(mapResumeAnswer{Resumed: server == "s4"})
 			return json.Unmarshal(b, out)
 		}
 		b, _ := json.Marshal(mapAbandonAnswer{})
 		return json.Unmarshal(b, out)
 	}
 	res, err := m.Abandon(ctx, "ops", opID, "x", "s9")
-	if err != nil || res.ResumedServer != "s1" || len(lost) == 0 || lost[0] != "s9" {
+	if err != nil || res.ResumedServer != "s4" || len(lost) == 0 || lost[0] != "s9" {
 		t.Fatalf("%+v %v %v", res, err, lost)
 	}
 }

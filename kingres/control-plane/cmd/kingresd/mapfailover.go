@@ -94,6 +94,9 @@ type mapFailover struct {
 	// releasePending says that the lease of a bootstrap that was given up could not be let go of: the next abandon finishes the release (F7-02).
 	releasePending atomic.Bool
 
+	// attest signs a message with the key of this server's certificate (fwdproof.Signer.Attest).
+	attest func(fwdproof.Message) (fwdproof.Assertion, error)
+
 	// heldWhy is why the hold of this server's primary of the map group cannot be resolved (empty: it can, or there is none); heldWarned is when it was last named in the log.
 	heldWhy    string
 	heldWarned time.Time
@@ -924,6 +927,7 @@ func (m *mapFailover) Abandon(ctx context.Context, actor string, id internalapi.
 	}
 	// No bootstrap is in progress: a held-back old leader that nothing owns is started again (this server too).
 	var res failover.MapAbandonResult
+	var lastErr error
 	for _, s := range members {
 		var out mapResumeAnswer
 		if s == m.self {
@@ -931,13 +935,21 @@ func (m *mapFailover) Abandon(ctx context.Context, actor string, id internalapi.
 		} else {
 			body := mapResumeBody{Strict: true, Lost: lostServer}
 			if lostServer != "" {
-				// The old leader does not take the word of a member for the declaration of an operator (phase 5 review L2): it comes with the proof
-				// of the operator's session, made for that server.
+				// The declared server is not asked: it is not heard. A proof is never sent (phase 5 review M-D), and the attestation goes only to the server
+				// that says that its primary of the map group is held back, so that no other member sees the declaration (phase 5 review H1).
+				if s == lostServer {
+					continue
+				}
+				var held mapHeldAnswer
+				if err := m.call(ctx, s, http.MethodGet, "/failover/map/held", nil, &held); err != nil || !held.Held {
+					continue
+				}
 				if err := m.signLost(id, &body, s); err != nil {
-					return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "The session cannot prove the declaration to "+s+": "+err.Error()).WithRetryAfter(5)
+					return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "The declaration cannot be attested to "+s+": "+err.Error()).WithRetryAfter(5)
 				}
 			}
 			if err := m.call(ctx, s, http.MethodPost, "/failover/map/resume", body, &out); err != nil {
+				lastErr = err
 				continue
 			}
 		}
@@ -945,6 +957,10 @@ func (m *mapFailover) Abandon(ctx context.Context, actor string, id internalapi.
 			res.ResumedServer = s
 			break
 		}
+	}
+	if res.ResumedServer == "" && lastErr != nil && lostServer != "" {
+		// the declaration was refused or could not be delivered to the held-back server: the operator must hear it
+		return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "The declaration that "+lostServer+" is lost did not reach the old leader of the map group: "+lastErr.Error()).WithRetryAfter(5)
 	}
 	return res, nil
 }

@@ -28,7 +28,9 @@
 // receiver is the candidate that becomes the leader because the leader is gone
 // (ADR 0026): that server may learn the ClientKey of the operator. A proof is bound to one
 // request, one sender, one receiver and a short time window, and a changed
-// password stops it working.
+// password stops it working. The
+// declaration that a server is lost (KindMapLost) is the other case that must reach a member that is not the leader: its receiver, the held-back old leader
+// of the map group, cannot read a verifier at all, and gets an attestation signed by the member that received the operator's request (assertion.go), never a proof.
 package fwdproof
 
 import (
@@ -69,7 +71,9 @@ const (
 	// KindMapStart is the request of an operator for the failover of the map group that a member sends to the candidate (F4-05).
 	KindMapStart Kind = "mapStart"
 	// KindMapLost is the operator's declaration that a server is lost (abandonMapGroupBootstrap with lostServerId) that the receiving member sends
-	// to the old leader of the map group, which ends its hold on it (phase 5 review L2).
+	// to the old leader of the map group, which ends its hold on it (phase 5 review L2). It is never a proof of the session: the receiving member signs
+	// an attestation of it (Signer.Attest), because the old leader cannot read a verifier while it is held back and a proof would hand the operator's
+	// ClientKey to a member that is not the leader (phase 5 review H1 and M-D).
 	KindMapLost Kind = "mapLost"
 	// KindForwardStream is the proof of the streaming relay (POST /forward-stream, contract 0.19.0): the frame carries the request
 	// headers the two streaming operations use, and the body is not part of the proof (it is raw bytes of any size, on the mutual TLS

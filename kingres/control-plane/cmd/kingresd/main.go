@@ -559,6 +559,10 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	foDeps.d = hd
 	hd.MapFailover = foDeps.mf
 	hd.IdentityCheck = newIdentityChecker(authn, serverHost)
+	hd.VerifyAttestation = (&fwdproof.AssertionVerifier{Certs: svc}).CheckAttestation
+	if foDeps.mf != nil {
+		foDeps.mf.attest = gatherSigner.Attest
+	}
 	if members != nil && foDeps.mf != nil {
 		wireEscrow(members, foDeps.mf)
 	}

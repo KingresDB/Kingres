@@ -1229,6 +1229,9 @@ func registerFailoverCallee(d *haDeps) {
 	d.Calls.Register(callMapProof, func(ctx context.Context, caller string, body []byte) (any, error) {
 		return handleMapProof(ctx, d, caller, body)
 	})
+	d.Calls.Register(callMapHeld, func(ctx context.Context, caller string, body []byte) (any, error) {
+		return handleMapHeld(ctx, d, caller, body)
+	})
 	d.Calls.Register(callMapBootstrap, func(ctx context.Context, caller string, body []byte) (any, error) {
 		return handleMapBootstrap(ctx, d, caller, body)
 	})

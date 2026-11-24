@@ -49,6 +49,8 @@ type haDeps struct {
 	OnCertificateInstalled func(func())
 	// LastLeader remembers the leader the catalog named last.
 	LastLeader *leaderMemory
+	// VerifyAttestation checks the attestation of a member for the declaration that a server is lost (nil: refused).
+	VerifyAttestation func(ctx context.Context, m fwdproof.Message, a fwdproof.Assertion) error
 	// IdentityCheck verifies the proof of an operator's session that a member sends with a request it forwards (nil: nothing can be proven and such a request is refused).
 	IdentityCheck func(ctx context.Context, kind fwdproof.Kind, peer string, req internalapi.ForwardRequest) error
 	// Fault is the fault-injection hook of the tests (nil in production); a feature
