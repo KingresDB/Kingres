@@ -529,6 +529,7 @@ func TestADeadCandidateDeclaredLostReleasesTheOldLeader(t *testing.T) {
 	}
 	until(t, 5*time.Minute, "the old leader to accept the declaration", func() bool {
 		code, err := third.InternalCall(leader, "POST", "/failover/map/resume", map[string]any{"strict": true, "lost": nw.Host}, &out)
+		t.Logf("resume call: %d %v %+v", code, err, out)
 		return err == nil && code == 200 && out.Resumed
 	})
 	t.Logf("the hold was ended: %+v", out)
