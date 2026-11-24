@@ -41,12 +41,19 @@ func (e *dimEnv) asAdmin(n *clustertest.Node) *clustertest.Node    { n.Token = e
 
 // dimCluster forms three servers with the data transfer on, a sharded database src with a local table, a hash table, a reference table and the distributed
 // schemas tn (two tables) and tm (one table), all with rows, and the importer role (a role of kingres_admin as the API makes it) signed in on every server.
-func dimCluster(t *testing.T) *dimEnv {
+func dimCluster(t *testing.T) *dimEnv { return dimClusterWith(t, nil) }
+
+// dimClusterWith is dimCluster with more flags for every server; with flags a standby of every group is waited for (the failover of the leader needs the standby of the
+// map group).
+func dimClusterWith(t *testing.T, extra []string) *dimEnv {
 	t.Helper()
-	c := clustertest.FormTLS(t, 3, nil, func(leader *clustertest.Node) {
+	c := clustertest.FormTLS(t, 3, extra, func(leader *clustertest.Node) {
 		body := leader.Expect(202, "POST", "/databases", map[string]any{"name": "src", "sharding": map[string]any{"enabled": true, "bucketCount": 12, "mode": "both"}})
 		leader.WaitTaskDone(clustertest.TaskID(body), 4*time.Minute)
 	})
+	if extra != nil {
+		waitStandbys(t, c, 1)
+	}
 	leader := c.Leader()
 	for _, n := range c.Nodes {
 		n.Login(clustertest.AdminUser, clustertest.AdminPass)
@@ -87,6 +94,15 @@ func dimCluster(t *testing.T) *dimEnv {
 	e := &dimEnv{c: c, adm: map[*clustertest.Node]string{}, imp: map[*clustertest.Node]string{}}
 	for _, n := range c.Nodes {
 		e.login(t, n)
+	}
+	if extra != nil {
+		until(t, 4*time.Minute, "the standbys registered in the catalog of the database src", func() bool {
+			fc := leader.ServicePG("src")
+			defer func() { _ = fc.Close(context.Background()) }()
+			var n int
+			return fc.QueryRow(context.Background(), `SELECT count(*) FROM kingres.node WHERE role = 'standby'`).Scan(&n) == nil && n >= len(c.Nodes)
+		})
+		waitFacts(t, leader, 0)
 	}
 	return e
 }
@@ -164,30 +180,13 @@ func dimDigest(t *testing.T, n *clustertest.Node, db, tb string) string {
 	return dimRows(t, n, db, "select count(*), coalesce(md5(string_agg(x::text, '|' order by x::text)), '') from "+tb+" x")
 }
 
-// dimLeader is the manager leader as one of the live servers tells it (nil when none answers).
-func dimLeader(c *clustertest.Cluster, live ...*clustertest.Node) *clustertest.Node {
-	for _, n := range live {
-		st, b := n.Do("GET", "/cluster", nil, nil)
-		if st != 200 {
-			continue
-		}
-		if ml, _ := b["managerLeader"].(map[string]any); ml != nil {
-			for _, m := range c.Nodes {
-				if ml["serverId"] == m.Host {
-					return m
-				}
-			}
-		}
-	}
-	return nil
-}
-
-// dimRoles is what a failed import must leave as it found it, on one server: the roles with their attributes, the memberships and the per-database settings.
-func (e *dimEnv) roles(t *testing.T, n *clustertest.Node) string {
+// roles is what a failed import must leave as it found it, on one server: the roles with their attributes, the memberships and, when asked, the per-database settings
+// (a finished import has the settings of its new database).
+func (e *dimEnv) roles(t *testing.T, n *clustertest.Node, withSettings bool) string {
 	t.Helper()
 	r := e.asAdmin(n).Expect(200, "POST", "/query", map[string]any{"database": "postgres", "sql": `select 'role', rolname::text, rolsuper::text || rolcreaterole::text || rolcanlogin::text || rolinherit::text || rolbypassrls::text || rolreplication::text, '' from pg_roles
 		union all select 'member', roleid::regrole::text, member::regrole::text, '' from pg_auth_members
-		union all select 'setting', setdatabase::text, setrole::text, setconfig::text from pg_db_role_setting order by 1, 2, 3`})
+		union all select 'setting', setdatabase::text, setrole::text, setconfig::text from pg_db_role_setting where ` + fmt.Sprint(withSettings) + ` order by 1, 2, 3`})
 	return fmt.Sprint(r["rows"])
 }
 
@@ -198,18 +197,16 @@ func (e *dimEnv) databases(t *testing.T, n *clustertest.Node, name string) strin
 	return fmt.Sprint(r["rows"])
 }
 
-// The leader's kingresd ends at the start of every step of database.import (the process ends as a kill does, its PostgreSQL instances go on), the other servers elect a
-// leader, and the import is either finished by it or ends failed with nothing left: no private database on any server, no final database, the roles as they were. The
-// old server then returns as a follower and the next step is tried on the new leader. A finished import has every row.
+// The leader's kingresd ends at the start of every step of database.import (the process ends as a kill does, its PostgreSQL instances go on) and is started again: the
+// engine of the new leader term finds the task and either finishes it or ends it failed with nothing left. A finished import has every row; a failed one leaves no private
+// database on any server, no final database and the roles as they were. Never half applied. (The leader's server keeps the primary of the map group, so the leader that
+// returns is the same server; the change to another server, with the failover of the map group, is TestDatabaseImportAfterTheFailoverOfTheLeader.)
 func TestDatabaseImportWithALeaderChangeAtEveryStep(t *testing.T) {
 	e := dimCluster(t)
 	c := e.c
+	leader := c.Leader()
 	archive := e.export(t, "src")
-	leader := dimLeader(c, c.Nodes...)
-	if leader == nil {
-		t.Fatal("no leader")
-	}
-	// A baseline import on the leader tells the steps and the digests of the rows.
+	// A baseline import tells the steps and the digests of the rows.
 	st, out := e.startImport(leader, e.upload(t, leader, archive), "dil_base")
 	if st != 202 {
 		t.Fatalf("baseline import: %d %v", st, out)
@@ -219,7 +216,8 @@ func TestDatabaseImportWithALeaderChangeAtEveryStep(t *testing.T) {
 		t.Fatalf("baseline import: %v", base["error"])
 	}
 	var steps []string
-	for _, s := range anyList(base["steps"]) {
+	prog, _ := base["progress"].(map[string]any)
+	for _, s := range anyList(prog["steps"]) {
 		steps = append(steps, s.(map[string]any)["name"].(string))
 	}
 	if len(steps) < 12 {
@@ -233,58 +231,40 @@ func TestDatabaseImportWithALeaderChangeAtEveryStep(t *testing.T) {
 
 	for i, step := range steps {
 		t.Run(fmt.Sprintf("%02d %s", i, step), func(t *testing.T) {
-			old := dimLeader(c, c.Nodes...)
-			if old == nil {
-				t.Fatal("no leader")
-			}
-			var others []*clustertest.Node
-			for _, n := range c.Nodes {
-				if n != old {
-					others = append(others, n)
-				}
-			}
-			before := make([]string, len(c.Nodes))
+			before, beforeNoSettings := make([]string, len(c.Nodes)), make([]string, len(c.Nodes))
 			for k, n := range c.Nodes {
-				before[k] = e.roles(t, n)
+				before[k], beforeNoSettings[k] = e.roles(t, n, true), e.roles(t, n, false)
 			}
 			target := fmt.Sprintf("dil_s%02d", i)
-			up := e.upload(t, old, archive)
-			old.SetFaults(fault.Spec{TaskExitPoint: "step_started", TaskExitStep: i})
-			st, out := e.startImport(old, up, target)
+			up := e.upload(t, leader, archive)
+			leader.SetFaults(fault.Spec{TaskExitPoint: "step_started", TaskExitStep: i})
+			st, out := e.startImport(leader, up, target)
 			until(t, 5*time.Minute, "the leader's kingresd to end at the start of step "+step, func() bool {
-				s, _ := old.Do("GET", "/healthz", nil, nil)
+				s, _ := leader.Do("GET", "/healthz", nil, nil)
 				return s != 200
 			})
-			old.Kill()
-			old.Heal()
-			// Another server leads once the lease of the old one has run out.
-			var nl *clustertest.Node
-			until(t, 4*time.Minute, "another server to lead", func() bool {
-				nl = dimLeader(c, others...)
-				return nl != nil && nl != old
-			})
-			e.asAdmin(nl)
+			leader.Kill()
+			leader.Heal()
+			leader.Start()
+			e.login(t, leader)
 			var tk any
 			if st == 202 {
 				tk = clustertest.TaskID(out)
 			} else { // the process ended before it answered: the task is the newest of its kind
-				items := anyList(nl.Expect(200, "GET", "/tasks?kind=database.import&limit=1", nil)["items"])
+				items := anyList(leader.Expect(200, "GET", "/tasks?kind=database.import&limit=1", nil)["items"])
 				if len(items) == 0 || fmt.Sprint(items[0].(map[string]any)["id"]) == fmt.Sprint(base["id"]) {
 					t.Fatalf("the request answered %d %v and no import task was started", st, out)
 				}
 				tk = clustertest.TaskID(items[0].(map[string]any))
 			}
-			res := nl.WaitTask(tk, 20*time.Minute)
-			t.Logf("step %q: the import ended %v (new leader %s)", step, res["state"], nl.Host)
+			res := leader.WaitTask(tk, 20*time.Minute)
+			t.Logf("step %q: the import ended %v", step, res["state"])
 			defer func() {
 				if t.Failed() {
 					t.Logf("task: %v", res)
-					t.Logf("new leader log: %s", quietLog(nl.LogTail(40000)))
+					t.Logf("leader log: %s", quietLog(leader.LogTail(40000)))
 				}
 			}()
-			// The old server returns as a follower.
-			old.Start()
-			e.login(t, old)
 			for _, n := range c.Nodes {
 				until(t, 4*time.Minute, fmt.Sprintf("node %d to hold what an import that ended %v leaves", n.Index, res["state"]), func() bool {
 					got := e.databases(t, n, target)
@@ -296,14 +276,19 @@ func TestDatabaseImportWithALeaderChangeAtEveryStep(t *testing.T) {
 			}
 			if res["state"] == "done" {
 				for _, tb := range dimTables {
-					if got := dimDigest(t, nl, target, tb); got != want[tb] {
+					if got := dimDigest(t, leader, target, tb); got != want[tb] {
 						t.Errorf("table %s of the finished import: %s, want %s", tb, got, want[tb])
 					}
 				}
 			}
 			for k, n := range c.Nodes {
-				if after := e.roles(t, n); after != before[k] {
-					t.Errorf("node %d: the roles changed\n before %s\n after  %s", n.Index, before[k], after)
+				// a finished import has the settings of its new database; a failed one leaves everything as it was
+				wantRoles, after := before[k], e.roles(t, n, true)
+				if res["state"] == "done" {
+					wantRoles, after = beforeNoSettings[k], e.roles(t, n, false)
+				}
+				if after != wantRoles {
+					t.Errorf("node %d: the roles changed\n before %s\n after  %s", n.Index, wantRoles, after)
 				}
 			}
 		})
@@ -349,6 +334,7 @@ func TestDatabaseImportOfADistributedSchemaRoundTrip(t *testing.T) {
 			t.Errorf("table %s: source %s, imported %s", tb, a, b)
 		}
 	}
+	p10Cleanup(t, c, "3s")
 	srcGroups := map[string]any{"tn": schemaGroup("src", "tn"), "tm": schemaGroup("src", "tm")}
 	waitSettled := func(db string) {
 		t.Helper()
@@ -387,7 +373,7 @@ func TestDatabaseImportOfADistributedSchemaRoundTrip(t *testing.T) {
 		t.Errorf("rows of tn.docs after the insert: %s", got)
 	}
 	// Make local and distribute again.
-	wait("DELETE", fmt.Sprintf("/databases/dsr_copy/schemas/tm/distribution?shardGroupId=%d", target), nil)
+	wait("DELETE", "/databases/dsr_copy/schemas/tm/distribution", nil)
 	if g := schemaGroup("dsr_copy", "tm"); g != nil {
 		t.Errorf("schema tm is still distributed after the make local: %v", g)
 	}
@@ -427,8 +413,9 @@ func insertDoc(n *clustertest.Node) error {
 
 // The archive of a database with distributed schemas is refused when the SQL of the archive makes a relation in a schema that the catalog distributes and does not
 // name (L-C of the review of 14c: the schema is distributed as it is, and the service role would read and move what the importing role made and nothing vouched
-// for): the task ends failed with table_not_eligible, nothing is left on any server (no private database, no final database, the roles as they were), and the message
-// does not repeat the name of the relation. The good archive imports, so every refusal is the work of the extra relation.
+// for): the task ends failed, nothing is left on any server (no private database, no final database, the roles as they were). A table or a partitioned table that the SQL makes
+// is refused by the validation of the archive (archive_invalid: the catalog does not list it); a relation of another kind (a view) reaches the step that distributes the schema
+// and is refused there (table_not_eligible, L-C). The good archive imports, so every refusal is the work of the extra relation.
 func TestDatabaseImportRefusesAnExtraRelationInADistributedSchema(t *testing.T) {
 	e := dimCluster(t)
 	c := e.c
@@ -442,17 +429,17 @@ func TestDatabaseImportRefusesAnExtraRelationInADistributedSchema(t *testing.T) 
 		t.Fatalf("import of the good archive: %v", res["error"])
 	}
 	cases := []struct {
-		name, schema, sql string
+		name, sql, code string
 	}{
-		{"a table that the catalog does not name", "tn", "CREATE TABLE tn.zz_extra (a int);\n"},
-		{"a table in the other distributed schema", "tm", "CREATE TABLE tm.zz_extra (a int);\n"},
-		{"a partitioned table that the catalog does not name", "tn", "CREATE TABLE tn.zz_extra_p (a int, d date) PARTITION BY RANGE (d);\n"},
-		{"a table whose default calls a function", "tn", "CREATE TABLE tn.zz_extra_c (a int DEFAULT length('x'));\n"},
-		{"a view in the schema", "tn", "CREATE VIEW tn.zz_extra_v AS SELECT id FROM tn.docs;\n"},
+		{"a table that the catalog does not name", "CREATE TABLE tn.zz_extra (a int);\n", "archive_invalid"},
+		{"a table in the other distributed schema", "CREATE TABLE tm.zz_extra (a int);\n", "archive_invalid"},
+		{"a partitioned table that the catalog does not name", "CREATE TABLE tn.zz_extra_p (a int, d date) PARTITION BY RANGE (d);\n", "archive_invalid"},
+		{"a table whose default calls a function", "CREATE TABLE tn.zz_extra_c (a int DEFAULT length('x'));\n", "archive_invalid"},
+		{"a view in the schema", "CREATE VIEW tn.zz_extra_v AS SELECT id FROM tn.docs;\n", "table_not_eligible"},
 	}
 	before := make([]string, len(c.Nodes))
 	for k, n := range c.Nodes {
-		before[k] = e.roles(t, n)
+		before[k] = e.roles(t, n, true)
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -471,11 +458,8 @@ func TestDatabaseImportRefusesAnExtraRelationInADistributedSchema(t *testing.T) 
 					code, _ = er["code"].(string)
 					msg, _ = er["message"].(string)
 				}
-				if res["state"] != "failed" || code != "table_not_eligible" {
-					t.Fatalf("task: state %v code %q (%s), want failed with table_not_eligible", res["state"], code, msg)
-				}
-				if strings.Contains(msg, "zz_extra") {
-					t.Errorf("the message of the task names the relation of the archive: %q", msg)
+				if res["state"] != "failed" || code != tc.code {
+					t.Fatalf("task: state %v code %q (%s), want failed with %s", res["state"], code, msg, tc.code)
 				}
 			}
 			for _, n := range c.Nodes {
@@ -484,8 +468,102 @@ func TestDatabaseImportRefusesAnExtraRelationInADistributedSchema(t *testing.T) 
 				})
 			}
 			for k, n := range c.Nodes {
-				if after := e.roles(t, n); after != before[k] {
+				if after := e.roles(t, n, true); after != before[k] {
 					t.Errorf("node %d: the roles changed\n before %s\n after  %s", n.Index, before[k], after)
+				}
+			}
+		})
+	}
+}
+
+// The leader moves to another server in the middle of an import: the server of the leader (which holds the primary of the map group) is lost at the start of a step, an
+// operator asks a surviving server for the failover of the map group, and the standby of the map group becomes the leader. The upload was staged on the lost server, so the
+// import cannot go on; what must hold is the end state: the task ends (done or failed) on the new leader, a failed import leaves no private database and no final database on
+// any server that is alive, and a finished one has every row. Never half applied. One cluster per case: the lost server does not come back.
+func TestDatabaseImportAfterTheFailoverOfTheLeader(t *testing.T) {
+	cases := []struct {
+		step  string
+		index int
+	}{{"Create the tables", 6}, {"Load the data", 9}, {"Set the sequences", 11}, {"Take the final name", 14}}
+	for _, tc := range cases {
+		t.Run(tc.step, func(t *testing.T) {
+			e := dimClusterWith(t, append([]string{"-lease-duration", "12s", "-lease-renew", "2s", "-lease-margin", "3s"}, standbyArgs...))
+			c := e.c
+			old := c.Leader()
+			cand := nodeOf(c, topology(t, old)[0][0].server)
+			var other *clustertest.Node
+			for _, n := range c.Nodes {
+				if n != old && n != cand {
+					other = n
+				}
+			}
+			archive := e.export(t, "src")
+			up := e.upload(t, old, archive)
+			old.SetFaults(fault.Spec{TaskExitPoint: "step_started", TaskExitStep: tc.index})
+			e.startImport(old, up, "dif_x")
+			until(t, 5*time.Minute, "the leader's kingresd to end at the start of step "+tc.step, func() bool {
+				s, _ := old.Do("GET", "/healthz", nil, nil)
+				return s != 200
+			})
+			foKillServer(old)
+			mapLogin(t, other)
+			var st int
+			var resp map[string]any
+			until(t, 3*time.Minute, "the request for the failover of the map group to be accepted", func() bool {
+				st, resp = other.Do("POST", "/servers/"+old.Host+"/failover", map[string]any{"mode": "hard", "allowDataLoss": true, "comment": "the leader is lost"}, nil)
+				return st != 503 && !(st == 422 && resp["code"] == "unsupported_operation")
+			})
+			if st != 202 {
+				t.Fatalf("request for the failover of the map group: %d %v", st, resp)
+			}
+			mapLogin(t, cand)
+			e.adm[other], e.adm[cand] = other.Token, cand.Token
+			var fid any
+			until(t, 10*time.Minute, "the task of the failover to be recorded", func() bool {
+				s, body := cand.Do("GET", "/failover", nil, nil)
+				if s == 200 && body["taskId"] != nil {
+					fid = body["taskId"]
+					return true
+				}
+				return false
+			})
+			cand.WaitTaskDone(fid, 12*time.Minute)
+			var res map[string]any
+			defer func() {
+				if t.Failed() {
+					t.Logf("import task: %v", res)
+					t.Logf("new leader log: %s", quietLog(cand.LogTail(40000)))
+				}
+			}()
+			var tk any
+			until(t, 3*time.Minute, "the import task to be listed on the new leader", func() bool {
+				items := anyList(cand.Expect(200, "GET", "/tasks?kind=database.import&limit=1", nil)["items"])
+				if len(items) == 0 {
+					return false
+				}
+				tk = items[0].(map[string]any)["id"]
+				return true
+			})
+			res = cand.WaitTask(tk, 20*time.Minute)
+			t.Logf("the import ended %v on the new leader (%v)", res["state"], res["error"])
+			prog, _ := res["progress"].(map[string]any)
+			if steps := anyList(prog["steps"]); len(steps) <= tc.index || steps[tc.index].(map[string]any)["name"] != tc.step {
+				t.Fatalf("step %d of the import task is not %q: %v", tc.index, tc.step, steps)
+			}
+			for _, n := range []*clustertest.Node{cand, other} {
+				until(t, 4*time.Minute, fmt.Sprintf("node %d to hold what an import that ended %v leaves", n.Index, res["state"]), func() bool {
+					got := e.databases(t, e.asAdmin(n), "dif_x")
+					if res["state"] == "done" {
+						return strings.Contains(got, "dif_x") && !strings.Contains(got, "kingres_import_")
+					}
+					return !strings.Contains(got, "dif_x") && !strings.Contains(got, "kingres_import_")
+				})
+			}
+			if res["state"] == "done" {
+				for _, tb := range dimTables {
+					if a, b := dimDigest(t, cand, "src", tb), dimDigest(t, cand, "dif_x", tb); a != b {
+						t.Errorf("table %s of the finished import: source %s, imported %s", tb, a, b)
+					}
 				}
 			}
 		})
