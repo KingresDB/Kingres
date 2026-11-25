@@ -185,7 +185,7 @@ func TestNoStepStartsOnAnExpiredLease(t *testing.T) {
 
 // extendFixture is the renew fixture with a step that lengthens its lease to two minutes and then waits, as the stop of the map group does; the store
 // becomes unreachable right after (it is the instance that is stopped).
-func newExtendFixture(t *testing.T, d time.Duration) *renewFixture {
+func newExtendFixture(t *testing.T, d time.Duration, storeStops bool) *renewFixture {
 	t.Helper()
 	f := &renewFixture{clk: newClock(), counter: &counter{n: map[string]int{}}, tick: make(chan time.Time),
 		started: make(chan struct{}), release: make(chan struct{}), sawCancel: make(chan struct{}, 1), done: make(chan error, 1)}
@@ -196,12 +196,14 @@ func newExtendFixture(t *testing.T, d time.Duration) *renewFixture {
 			return err
 		}
 		defer restore()
-		f.st.FailOn(func(op string) error {
-			if op == "renew" {
-				return errors.New("the store is stopped")
-			}
-			return nil
-		})
+		if storeStops {
+			f.st.FailOn(func(op string) error {
+				if op == "renew" {
+					return errors.New("the store is stopped")
+				}
+				return nil
+			})
+		}
 		f.started <- struct{}{}
 		select {
 		case <-f.release:
@@ -226,7 +228,7 @@ func newExtendFixture(t *testing.T, d time.Duration) *renewFixture {
 // A step that lengthened its lease is not stopped when the store cannot be reached for longer than the lease of the engine (the clean stop of the map group
 // outlasts it), and the store holds the task for that long, so no other server can take it over meanwhile.
 func TestAStepWithALengthenedLeaseSurvivesAStoreThatCannotBeReached(t *testing.T) {
-	f := newExtendFixture(t, 2*time.Minute)
+	f := newExtendFixture(t, 2*time.Minute, true)
 	f.clk.Add(40 * time.Second) // beyond lease 30 s: it would have been stopped at 20 s
 	f.tick <- f.clk.Now()
 	f.tick <- f.clk.Now()
@@ -247,7 +249,7 @@ func TestAStepWithALengthenedLeaseSurvivesAStoreThatCannotBeReached(t *testing.T
 
 // The step is stopped once the lengthened lease, less its margin, has passed without a renewal: the extension moves the end of the trust, it does not remove it.
 func TestAStepWithALengthenedLeaseStopsWhenTheLengthenedLeaseRunsOut(t *testing.T) {
-	f := newExtendFixture(t, 2*time.Minute)
+	f := newExtendFixture(t, 2*time.Minute, true)
 	f.clk.Add(111 * time.Second) // 120 s minus a margin of 10 s has passed
 	f.tick <- f.clk.Now()
 	<-f.sawCancel
@@ -262,8 +264,11 @@ func TestAStepThatCannotLengthenItsLeaseIsToldSo(t *testing.T) {
 	st := task.NewMemStoreClock(clk.Now)
 	var got error
 	var short error
+	var left time.Duration
 	def := task.Definition{Kind: "test.kind", Steps: []task.Step{{Name: "work", Run: func(ctx context.Context, env *task.Env) error {
 		_, short = env.ExtendLease(ctx, 10*time.Second)
+		cur, _ := st.Get(ctx, env.Task.ID)
+		left = cur.LeaseExpires.Sub(clk.Now())
 		st.FailOn(func(op string) error { return errors.New("the store is stopped") })
 		_, got = env.ExtendLease(ctx, time.Minute)
 		return nil
@@ -271,10 +276,30 @@ func TestAStepThatCannotLengthenItsLeaseIsToldSo(t *testing.T) {
 	e := engine(t, st, "A", clk, def)
 	e.Submit(context.Background(), "test.kind", task.Subject{Type: "x", ID: "1"}, nil, "u")
 	_, _ = e.RunOnce(context.Background())
+	if left < 25*time.Second {
+		t.Errorf("a shorter length cut the lease to %v", left)
+	}
 	if short != nil {
 		t.Errorf("a shorter length: %v", short)
 	}
 	if got == nil {
 		t.Error("a lengthening that the store refused was reported as done")
+	}
+}
+
+// A renewal that comes while the lease is lengthened keeps it as long as it was made (a renewal with the length of the engine would cut it back before the
+// stop).
+func TestARenewalDuringALengthenedLeaseKeepsItLengthened(t *testing.T) {
+	f := newExtendFixture(t, 2*time.Minute, false)
+	f.clk.Add(5 * time.Second)
+	f.tick <- f.clk.Now()
+	f.tick <- f.clk.Now() // returns once the first renewal is done
+	got, _ := f.st.Get(context.Background(), f.id)
+	if left := got.LeaseExpires.Sub(f.clk.Now()); left < 100*time.Second {
+		t.Errorf("the lease has %v left after a renewal during the extension, want about two minutes", left)
+	}
+	close(f.release)
+	if err := <-f.done; err != nil {
+		t.Fatalf("run: %v", err)
 	}
 }

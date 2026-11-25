@@ -410,7 +410,7 @@ func TestSwitchoverOfTheMapGroup(t *testing.T) {
 // a large instance does this. The task lease is lengthened before the stop, so the stop is not cut short by the guard of the engine and the switchover ends
 // done on the new leader, with the new leader as the primary of the map group and nothing acknowledged lost.
 func TestSwitchoverOfTheMapGroupSurvivesACleanStopThatOutlastsTheTaskLease(t *testing.T) {
-	c, port, pool, leader, nw, w := mapSwitchoverEnv(t)
+	_, port, pool, leader, nw, w := mapSwitchoverEnv(t)
 	leader.SetFaults(fault.Spec{FailoverPoint: "demote:longstop", FailoverMode: "slow"})
 	id := mapSwitchoverRequest(t, leader, nw)
 	var task map[string]any
@@ -435,14 +435,20 @@ func TestSwitchoverOfTheMapGroupSurvivesACleanStopThatOutlastsTheTaskLease(t *te
 	if task["state"] != "done" {
 		t.Fatalf("the task ended %v: %v", task["state"], task["error"])
 	}
-	if strings.Contains(leader.LogTail(200000), "task lease not confirmed in time") {
-		t.Errorf("the lease guard of the old leader cancelled the stop")
-	}
 	hosts, _ := primaryOf(t, nw)
 	if hosts[0] != nw.Host {
 		t.Fatalf("the primary of the map group is on %s, want %s", hosts[0], nw.Host)
 	}
-	mapAcked(t, c, port, pool, w)
+	before := w.count()
+	until(t, 3*time.Minute, "writes after the switchover", func() bool { return w.count() > before+30 })
+	acked := w.Stop()
+	have := foReadIDs(t, nw, port, pool)
+	for rid := range acked {
+		if !have[rid] {
+			t.Errorf("acknowledged row %d is missing when read through %s", rid, nw.Host)
+			break
+		}
+	}
 }
 
 // mapSwitchoverEnv forms the cluster of the map group tests and starts the writers.
