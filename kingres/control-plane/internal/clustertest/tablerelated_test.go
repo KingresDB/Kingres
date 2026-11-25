@@ -123,8 +123,8 @@ func TestTableLifecycleRelated(t *testing.T) {
 		tlSame(t, c, `SELECT count(*) FROM customers`, 200)
 		tlSame(t, c, `SELECT count(*) FROM orders`, 1000)
 		tlSame(t, c, `SELECT count(*) FROM items`, 3000)
-		if n := tlCount(t, leader, `SELECT count(*) FROM pg_constraint WHERE conname IN ('orders_customer_fk', 'items_order_fk') AND convalidated`); n != 2 {
-			t.Errorf("%d valid keys after the task", n)
+		if n := tlCount(t, leader, `SELECT count(*) FROM pg_constraint WHERE conrelid IN ('public.orders'::regclass, 'public.items'::regclass) AND conname IN ('orders_customer_fk', 'items_order_fk') AND convalidated`); n != 2 {
+			t.Errorf("%d valid keys on the distributed tables after the task", n)
 		}
 		// the keys are enforced again: an item of an order that does not exist is refused
 		if _, err := leader.ServicePG("tl").Exec(context.Background(), `INSERT INTO items VALUES (1, 999999, 424242, 1)`); err == nil {

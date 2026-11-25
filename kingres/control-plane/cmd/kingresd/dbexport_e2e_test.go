@@ -484,13 +484,15 @@ func TestDatabaseExportTooLarge(t *testing.T) {
 	if done["state"] != "failed" || done["error"].(map[string]any)["code"] != "export_too_large" {
 		t.Fatalf("the export of a database larger than the largest file: %v %v", done["state"], done["error"])
 	}
-	list := e.expect(t, 200, "GET", "/data-exports", nil)
-	for _, it := range list["items"].([]any) {
-		m := it.(map[string]any)
-		if m["database"] == "dbx_big" && m["state"] != "failed" {
-			t.Errorf("the export that was too large is %v", m["state"])
+	// The record of the file is marked failed after the task is (OnFail runs once the task is recorded as failed), so the list is read until it shows it.
+	e.waitUntil(t, "the export that was too large to be listed as failed", 30*time.Second, func() bool {
+		for _, it := range e.expect(t, 200, "GET", "/data-exports", nil)["items"].([]any) {
+			if m := it.(map[string]any); m["database"] == "dbx_big" && m["state"] != "failed" {
+				return false
+			}
 		}
-	}
+		return true
+	})
 	e.expect(t, 200, "PATCH", "/settings/cluster", map[string]any{"dataTransfer": map[string]any{"maxFileBytes": 1 << 30}})
 	id := e.exportDB(t, "dbx_big", map[string]any{})
 	_, _, body := e.download(t, id, nil)
