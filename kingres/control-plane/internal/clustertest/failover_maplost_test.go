@@ -6,6 +6,9 @@ package clustertest_test
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,7 +17,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
 )
 
-// P2, the positive case (the negative one is TestADeadOnlyCandidateDeclaredLostDoesNotReleaseTheOldLeader). The map group has two standbys, on four servers. The old
+// P2, the positive case (the one-standby case is TestADeadOnlyCandidateIsReleasedByTheLocalCommand). The map group has two standbys, on four servers. The old
 // leader hands the map group to one of them (the candidate); the candidate takes the lease and dies before it promotes. The old leader's primary is stopped and held back for
 // a server that cannot answer. The operator declares the candidate lost (abandonMapGroupBootstrap with lostServerId), to a server that is not the leader: the second
 // standby shows that nothing was promoted, the old leader ends its hold and runs its primary again, the task of the hand-over ends, and the hard failover to the other standby, which promotes (it can reach a majority
@@ -69,6 +72,11 @@ func TestADeadCandidateDeclaredLostWithASecondStandbyReleasesTheOldLeaderAndTheO
 		}
 	}()
 
+	// the old leader keeps the keys of the administrators on disk, so that it can check the operator's declaration while its system database is stopped
+	until(t, 2*time.Minute, "the cache of the administrators' keys on the old leader", func() bool {
+		b, err := os.ReadFile(filepath.Join(leader.DataDir, "failover", "admin-keys.json"))
+		return err == nil && strings.Contains(string(b), clustertest.AdminUser)
+	})
 	nw.SetFaults(fault.Spec{FailoverPoint: "promote:unavailable", FailoverMode: "unavailable"})
 	id := mapHardRequest(t, leader, nw, true)
 	mapStopped(t, leader)
@@ -76,6 +84,8 @@ func TestADeadCandidateDeclaredLostWithASecondStandbyReleasesTheOldLeaderAndTheO
 		s, b := nw.Do("GET", "/failover", nil, nil)
 		return s == 200 && b["state"] == "running"
 	})
+	// the declaration is the operator's: his session on the other standby signs it for the old leader (a member's word is not taken)
+	until(t, 3*time.Minute, "the operator to sign in on the other standby", func() bool { return third.Login(clustertest.AdminUser, clustertest.AdminPass) })
 	declare := func() (int, map[string]any) {
 		return third.Do("POST", "/failover/map/abandon", map[string]any{"reason": "the candidate is lost", "lostServerId": nw.Host}, nil)
 	}
