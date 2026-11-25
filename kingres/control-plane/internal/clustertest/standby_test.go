@@ -103,13 +103,20 @@ func until(t *testing.T, d time.Duration, what string, ok func() bool) {
 // waitStandbys waits until the leader's topology shows want streaming standbys for
 // every group, and the groups are as many as the nodes.
 func waitStandbys(t *testing.T, c *clustertest.Cluster, want int) {
+	// Six minutes: three were not enough on a machine that runs other clusters (the standby copies of every group run at
+	// once).  The bound only matters when a standby never comes, so a longer one costs nothing on a healthy run.
+	waitStandbysFor(t, c, want, 6*time.Minute)
+}
+
+// waitStandbysFor is waitStandbys with its own bound (a second standby for every group is copied on every server at once and takes longer).
+func waitStandbysFor(t *testing.T, c *clustertest.Cluster, want int, bound time.Duration) {
 	t.Helper()
 	defer func() {
 		if t.Failed() {
 			t.Log(standbyLog(c))
 		}
 	}()
-	until(t, 3*time.Minute, fmt.Sprintf("%d streaming standbys in every group", want), func() bool {
+	until(t, bound, fmt.Sprintf("%d streaming standbys in every group", want), func() bool {
 		// 503 with Retry-After is the right answer while an instance is still starting after the formation: wait for 200.
 		if st, _ := c.Leader().Do("GET", "/replication/topology", nil, nil); st == 503 {
 			return false

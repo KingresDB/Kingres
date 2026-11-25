@@ -352,7 +352,31 @@ func TestDrainOnACluster(t *testing.T) {
 	})
 	waitStandbys(t, c, 1)
 	l := c.Leader()
-	victim := c.Nodes[2]
+	// The victim is a server that is not the leader and hosts a standby: the preview and the drain below test what happens to
+	// that standby.  Which servers host standbys is the placement's decision (a standby that was placed while a server was
+	// still joining stays where it is, so one server can host two and another none); the test reads it instead of assuming it.
+	pickVictim := func() *clustertest.Node {
+		hosting := map[string]bool{}
+		for _, sbs := range topology(t, l) {
+			for _, sb := range sbs {
+				hosting[sb.server] = true
+			}
+		}
+		for _, n := range c.Nodes {
+			if n.Host != l.Host && hosting[n.Host] {
+				return n
+			}
+		}
+		return nil
+	}
+	victim := pickVictim()
+	if victim == nil {
+		t.Fatalf("no server but the leader hosts a standby: %v", topology(t, l))
+	}
+	writer := c.Nodes[1]
+	if writer == victim {
+		writer = c.Nodes[2]
+	}
 	// the standbys are in the topology before every one of them is registered in the sharding catalog
 	until(t, 2*time.Minute, "every standby to be registered in the catalog", func() bool {
 		var n int
@@ -392,7 +416,7 @@ func TestDrainOnACluster(t *testing.T) {
 	})
 
 	t.Run("a drain with writers moves the buckets and the standbys away and loses nothing", func(t *testing.T) {
-		w := p10Write(t, c.Nodes[1], "rb", 2_000_000)
+		w := p10Write(t, writer, "rb", 2_000_000)
 		body := l.Expect(202, "POST", "/servers/"+victim.Host+"/drain", map[string]any{})
 		id := clustertest.TaskID(body)
 		if st, p := l.Do("POST", "/rebalance", nil, nil); st != 409 || p["code"] != "rebalance_in_progress" {

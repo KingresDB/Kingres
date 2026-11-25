@@ -82,6 +82,8 @@ func TestInvalidConfiguration(t *testing.T) {
 		{"bad format", nil, map[string]string{"KINGRES_LOG_FORMAT": "xml"}, "log-format"},
 		{"bad duration", []string{"-session-ttl", "soon"}, nil, "duration"},
 		{"zero duration", []string{"-session-ttl", "0s"}, nil, "positive"},
+		{"no unbounded mode for the cache of the administrators' keys", []string{"-admin-keys-max-age", "0"}, nil, "positive"},
+		{"zero age of the cache of the administrators' keys by the environment", nil, map[string]string{"KINGRES_ADMIN_KEYS_MAX_AGE": "0s"}, "positive"},
 		{"bad int", []string{"-max-body-bytes", "-5"}, nil, "minimum"},
 		{"tls half", []string{"-tls-cert-file", "c.pem"}, nil, "tls-cert-file"},
 		{"unknown flag", []string{"-nope"}, nil, "nope"},

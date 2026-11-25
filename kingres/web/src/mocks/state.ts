@@ -1507,7 +1507,7 @@ export function instancesOfServer(s: MockState, serverId: string): Instance[] {
         failed || dead ? 'failed' : (s.instanceStates.get(instanceId(g.id, serverId)) ?? 'running'),
       port: portFor(g.id, serverId),
       dataDirectory: `/var/lib/kingresdb/data/g${g.id}`,
-      version: '18.1',
+      version: '18.7',
       sizeBytes: g.isMapGroup ? 48 * MiB : 700 * MiB + g.id * 40 * MiB,
       upstreamInstanceId:
         role === 'standby' && g.primaryServerId ? instanceId(g.id, g.primaryServerId) : null,

@@ -1,3 +1,6 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+--
 -- kingres_timepart--0.2--0.3.sql
 --
 -- Upgrade of kingres_timepart from 0.2 to 0.3: time partitioning policies on

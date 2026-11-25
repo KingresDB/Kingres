@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"time"
 )
 
@@ -68,13 +69,23 @@ type HAConfig struct {
 	// directory kingresd polls for fault files (package fault). Empty: off, and
 	// nothing is read.
 	FaultDir string
+
+	// AllowNoWatchdog lets kingresd start without the lease watchdog program (kingres-watchdog). Without it a hung or dead kingresd
+	// leaves a primary that lost its lease running (phase 5 review L1), so a server that runs the lease protocol refuses to start
+	// without the program. The setting is for tests and for development machines only.
+	AllowNoWatchdog bool
+	// AdminKeysMaxAge is how old the cache of the administrators' keys may be before the declaration that a server is lost refuses it. It must be positive: there is no unbounded mode. The cache is
+	// refreshed every 30 seconds while the system database runs, so its age is how long this server could not read it. 72 hours is the longest hold that the REST
+	// declaration is meant to serve: beyond it the operator is expected to act on the server of the old leader (kingresd -release-map-hold), and a revoked administrator or an
+	// old password is not accepted for longer than that.
+	AdminKeysMaxAge time.Duration
 }
 
 // DefaultHA returns the built-in HA settings.
 func DefaultHA() HAConfig {
 	return HAConfig{
 		HeartbeatInterval: time.Second, SuspectTimeout: 5 * time.Second, FailureTimeout: 10 * time.Second, LeaderLossBound: 30 * time.Second,
-		LeaseDuration: 10 * time.Second, LeaseRenew: 2 * time.Second, LeaseMargin: 3 * time.Second,
+		AdminKeysMaxAge: 72 * time.Hour, LeaseDuration: 10 * time.Second, LeaseRenew: 2 * time.Second, LeaseMargin: 3 * time.Second,
 		StandbySyncGrace: 30 * time.Second, StandbyReplaceAfter: 30 * time.Minute, SlotWarnBytes: 1 << 30, SlotLimitBytes: 4 << 30,
 		ClientMaxConnections: 1000, ClientConnectTimeout: 5 * time.Second, ClientIdleTimeout: time.Hour,
 	}
@@ -163,6 +174,17 @@ func init() {
 			apply: haInt(func(c *Config) *int { return &c.HA.StandbyPortEnd }, 1024)},
 		setting{key: "slot-retention-limit-bytes", env: "KINGRES_SLOT_RETENTION_LIMIT_BYTES", usage: "WAL a standby's slot may retain before it is dropped (default 4294967296)",
 			apply: integer(func(c *Config) *int64 { return &c.HA.SlotLimitBytes }, 1)},
+		setting{key: "admin-keys-max-age", env: "KINGRES_ADMIN_KEYS_MAX_AGE", usage: "how old the cache of the administrators' keys may be before a declaration that a server is lost refuses it (default 72h; must be positive, there is no unbounded mode)",
+			apply: dur(func(c *Config) *time.Duration { return &c.HA.AdminKeysMaxAge })},
+		setting{key: "allow-no-watchdog", env: "KINGRES_ALLOW_NO_WATCHDOG", usage: "true lets kingresd start without the lease watchdog program kingres-watchdog (default false; for tests and development only: a hung kingresd then leaves a primary that lost its lease running)",
+			apply: func(c *Config, v string) error {
+				b, err := strconv.ParseBool(v)
+				if err != nil {
+					return fmt.Errorf("invalid boolean %q", v)
+				}
+				c.HA.AllowNoWatchdog = b
+				return nil
+			}},
 		setting{key: "client-listen", env: "KINGRES_CLIENT_LISTEN", usage: "host:port of the client entry point that forwards PostgreSQL connections to the group primary (empty: off)",
 			apply: str(func(c *Config) *string { return &c.HA.ClientListen })},
 		setting{key: "client-standby-listen", env: "KINGRES_CLIENT_STANDBY_LISTEN", usage: "host:port of the entry point that forwards to a local standby for reads (empty: off)",

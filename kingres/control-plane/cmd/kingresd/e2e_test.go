@@ -90,6 +90,10 @@ func newServerWith(t testing.TB, useTLS bool) *cp {
 	e.internal = fmt.Sprintf("127.0.0.1:%d", pgtest.FreePort(t))
 	args := []string{"-listen", "127.0.0.1:0", "-data-dir", e.dataDir, "-log-format", "json",
 		"-login-rate-limit", "1000", "-internal-listen", e.internal, "-pg-bin-dir", pgtest.BinDir(), "-pg-port", fmt.Sprint(e.pgPort), "-server-host", "127.0.0.1"}
+	if findWatchdog(pgtest.BinDir()) == "" {
+		// a development machine without the program built next to the test binary
+		args = append(args, "-allow-no-watchdog")
+	}
 	if useTLS {
 		crt, key := writeSelfSigned(t, root)
 		// The cluster that serves HTTPS is the one of the data transfer tests: a cap of 24 MiB on an import keeps the limit tests quick and leaves room for a record of 15 MiB.

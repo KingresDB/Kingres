@@ -54,7 +54,7 @@ func TestSetupStateReflectsNode(t *testing.T) {
 	if m["state"] != "uninitialized" || m["setupTokenRequired"] != true || m["localhostOnly"] != true {
 		t.Errorf("fresh node: %v", m)
 	}
-	if m["address"] != "127.0.0.1:8091" || m["hostname"] != "host1" || m["version"] != "test" || m["postgresVersion"] != "18.1" {
+	if m["address"] != "127.0.0.1:8091" || m["hostname"] != "host1" || m["version"] != "test" || m["postgresVersion"] != "18.7" {
 		t.Errorf("identity fields: %v", m)
 	}
 	if m["serverId"] != nil || m["clusterId"] != nil {

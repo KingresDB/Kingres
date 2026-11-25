@@ -94,7 +94,7 @@ describe('the link to the source', () => {
     await screen.findByRole('heading', { level: 1, name: 'Servers' })
     await screen.findByTestId('running-version')
     expect(screen.getByTestId('running-version')).toHaveTextContent(
-      'KingresDB 0.1.0 on PostgreSQL 18.1',
+      'KingresDB 0.1.0 on PostgreSQL 18.7',
     )
     expect(await sourceLink()).toHaveAttribute(
       'href',

@@ -2,6 +2,9 @@
 #
 # kingres/dev/setup-ubuntu.sh
 #
+# SPDX-License-Identifier: AGPL-3.0-only
+# Portions Copyright (c) 2026, RooyeKhat Media Co
+#
 # One-time preparation of an Ubuntu 24.04 machine (or WSL2 distribution) for
 # building and testing KingresDB.  Run it as root.
 #

@@ -303,7 +303,8 @@ func TestTheOperatorsAbandonCarriesTheLostServerToTheResumeCalls(t *testing.T) {
 	ctx := context.Background()
 	m, _ := abandonRig(t)
 	m.self = "s3"
-	m.memberList = func(context.Context) ([]string, error) { return []string{"s1", "s2", "s3"}, nil }
+	m.memberList = func(context.Context) ([]string, error) { return []string{"s1", "s2", "s3", "s4"}, nil }
+	m.oldLeaderOf = func(context.Context) (string, error) { return "s4", nil } // the catalog names s4 as the primary of the map group
 	m.heldBack = func() bool { return false }
 	m.liveOf = func(_ context.Context, s string) string {
 		if s == "s2" {
@@ -316,16 +317,23 @@ func TestTheOperatorsAbandonCarriesTheLostServerToTheResumeCalls(t *testing.T) {
 	}
 	var lost []string
 	m.callPeer = func(_ context.Context, server, _, path string, in, out any) error {
+		if path == "/failover/map/held" {
+			b, _ := json.Marshal(mapHeldAnswer{Held: server == "s4"}) // only s4 holds its primary back
+			return json.Unmarshal(b, out)
+		}
 		if path == "/failover/map/resume" {
+			if server != "s4" || in.(mapResumeBody).Proof == nil {
+				t.Errorf("the declaration was sent to %s (proof %v): only the held-back server gets it, with a proof", server, in.(mapResumeBody).Proof != nil)
+			}
 			lost = append(lost, in.(mapResumeBody).Lost)
-			b, _ := json.Marshal(mapResumeAnswer{Resumed: server == "s1"})
+			b, _ := json.Marshal(mapResumeAnswer{Resumed: server == "s4"})
 			return json.Unmarshal(b, out)
 		}
 		b, _ := json.Marshal(mapAbandonAnswer{})
 		return json.Unmarshal(b, out)
 	}
 	res, err := m.Abandon(ctx, "ops", opID, "x", "s9")
-	if err != nil || res.ResumedServer != "s1" || len(lost) == 0 || lost[0] != "s9" {
+	if err != nil || res.ResumedServer != "s4" || len(lost) == 0 || lost[0] != "s9" {
 		t.Fatalf("%+v %v %v", res, err, lost)
 	}
 }

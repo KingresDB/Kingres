@@ -28,6 +28,7 @@ import (
 const (
 	callMapBootstrap = "GET /failover/map/bootstrap"
 	callMapResume    = "POST /failover/map/resume"
+	callMapHeld      = "GET /failover/map/held"
 )
 
 // mapBootstrapStatus is what a server answers about the bootstrap of the map group that names the asking server as the old leader.
@@ -128,9 +129,11 @@ func (m *mapFailover) localStandbyState(ctx context.Context) string {
 // mapResumeBody is the request of POST /failover/map/resume: Strict asks for the evidence of an operator's call (every server of the cluster must answer).
 type mapResumeBody struct {
 	Strict bool `json:"strict,omitempty"`
-	// Lost is the server that the operator declared lost (P2); the hold is ended without its word. The declaration is accepted only with the
-	// proof of the operator's session (Username, Roles, RequestID, Proof), made for the receiving server and checked against the copy of the
-	// system database that it holds; the roles must allow kingres_admin (phase 5 review L2).
+	// Lost is the server that the operator declared lost (P2); the hold is ended without its word. The receiver is the old leader of the map group that is
+	// held back, and only that server is sent the declaration. It is accepted only with the proof of the operator's session (Username, Roles, RequestID, Proof),
+	// made for the receiving server over exactly these bytes with the operator's SCRAM client key, and checked against the keys of the administrators that the old
+	// leader cached on disk while its system database ran, because its instance is stopped and no verifier can be read (phase 5 review L2, H1 and M1). A member
+	// that does not hold the session of an administrator cannot make it.
 	Lost      string          `json:"lost,omitempty"`
 	Username  string          `json:"username,omitempty"`
 	Roles     []string        `json:"clusterRoles,omitempty"`
@@ -147,8 +150,11 @@ func lostMessage(from, to string, b mapResumeBody) fwdproof.Message {
 		ContentType: "application/json", Body: raw, RequestID: b.RequestID}.ProofMessage(fwdproof.KindMapLost, from, to)
 }
 
-// signLost adds the proof of the operator's session for the old leader to.
+// signLost adds the proof of the operator's session for the old leader to. The session must hold kingres_admin.
 func (m *mapFailover) signLost(id internalapi.ForwardIdentity, b *mapResumeBody, to string) error {
+	if !auth.Allows(auth.Normalize(id.ClusterRoles), auth.RoleAdmin) {
+		return errors.New("declaring a server lost needs the role kingres_admin")
+	}
 	var nonce [8]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return err
@@ -162,13 +168,14 @@ func (m *mapFailover) signLost(id internalapi.ForwardIdentity, b *mapResumeBody,
 	return nil
 }
 
-// openLost checks the proof of a declaration that a server is lost: the operator's session must prove itself over exactly these bytes and hold
-// kingres_admin.
+// openLost checks the proof of a declaration that a server is lost: the operator's session must prove itself over exactly these bytes against the cached key of an
+// administrator (d.LostIdentityCheck reads nothing from the stopped instance) and hold kingres_admin. A member's certificate alone is not enough: the proof needs the
+// operator's client key, which only the server that holds the session has (phase 5 review M1).
 func openLost(ctx context.Context, d *haDeps, caller string, b mapResumeBody) error {
 	if b.Proof == nil || b.Username == "" {
 		return &internalapi.CallError{Status: http.StatusUnauthorized, Code: "identity_unproven", Message: "The declaration that a server is lost comes with the proof of the operator's session."}
 	}
-	if d.IdentityCheck == nil {
+	if d.LostIdentityCheck == nil {
 		return &internalapi.CallError{Status: http.StatusUnauthorized, Code: "identity_unproven", Message: "This server cannot check the proof of a session."}
 	}
 	fr := internalapi.ForwardRequest{Identity: internalapi.ForwardIdentity{Username: b.Username, ClusterRoles: b.Roles}, OperationID: "abandonMapGroupBootstrap",
@@ -176,9 +183,11 @@ func openLost(ctx context.Context, d *haDeps, caller string, b mapResumeBody) er
 	fr.Body, _ = json.Marshal(struct {
 		Lost string `json:"lost"`
 	}{b.Lost})
-	if err := d.IdentityCheck(ctx, fwdproof.KindMapLost, caller, fr); err != nil {
+	if err := d.LostIdentityCheck(ctx, fwdproof.KindMapLost, caller, fr); err != nil {
 		if errors.Is(err, fwdproof.ErrUnavailable) {
-			return &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The identity cannot be checked now."}
+			// The cache is missing, too old, of another cluster or has a time ahead of the clock: nothing that a retry changes (the cache is refreshed only while the system
+			// database runs), so it is a conflict and not a request to try again.
+			return &internalapi.CallError{Status: http.StatusConflict, Code: "cache_unavailable", Message: "The keys of the administrators are not usable on this server (never cached, older than admin-keys-max-age, of another cluster, or with a time ahead of the clock): " + err.Error() + ". Use the local command on this server (kingresd -release-map-hold)."}
 		}
 		return &internalapi.CallError{Status: http.StatusUnauthorized, Code: "identity_unproven", Message: "The identity of the declaration is not proven."}
 	}
@@ -240,8 +249,10 @@ func (m *mapFailover) resolveHeldBack(ctx context.Context, strict bool, lost str
 		if rec := m.candidateOfTheHold(); rec != "" && rec != lost {
 			return false, "the hold was made for " + rec + ", not for " + lost
 		}
-		if m.liveState(ctx, lost) == "live" {
-			return false, "the server " + lost + " is heard by this server; it is not lost"
+		// Positive evidence of silence (phase 5 review M2): "dead" is a silence of the failure timeout since the later of this server's start and the last contact; "live",
+		// "suspect" and "unknown" are not lost.
+		if st := m.liveState(ctx, lost); st != "dead" {
+			return false, "the server " + lost + " is not seen dead by this server (it is " + st + "); it must have been silent for the failure timeout"
 		}
 	}
 	members, err := m.members(ctx)
@@ -255,13 +266,27 @@ func (m *mapFailover) resolveHeldBack(ctx context.Context, strict bool, lost str
 	all := strict || cand == ""
 	proven, candidateProven := 0, false
 	for _, s := range members {
-		if s == m.self || (lost != "" && s == lost) {
+		if s == m.self {
 			continue
 		}
 		var st mapBootstrapStatus
 		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		err := m.call(cctx, s, http.MethodGet, "/failover/map/bootstrap?"+url.Values{"old": {m.self}}.Encode(), nil, &st)
 		cancel()
+		if lost != "" && s == lost {
+			// The declared server is asked as well (phase 5 review M2). No answer is what a lost server gives; an answer that says that it runs a bootstrap that names
+			// this server, or that its standby was promoted, refuses the release, and so does any other answer: it is heard.
+			if err == nil {
+				switch {
+				case st.Active:
+					return false, "a bootstrap that names this server as the old leader is active on " + s + ", the server declared lost"
+				case st.Standby == "primary":
+					return false, "the standby of the map group on " + s + ", the server declared lost, was promoted"
+				}
+				return false, "the server " + s + ", declared lost, answers"
+			}
+			continue
+		}
 		if err != nil {
 			if s == cand {
 				return false, "the server " + s + ", to which the map group was handed, does not answer"
@@ -292,6 +317,12 @@ func (m *mapFailover) resolveHeldBack(ctx context.Context, strict bool, lost str
 	}
 	if proven == 0 {
 		return false, "no standby of the map group could be shown to be in recovery"
+	}
+	if lost != "" {
+		// Looked at again right before the hold ends: the declared server may have been heard while the others were asked (phase 5 review M2).
+		if st := m.liveState(ctx, lost); st != "dead" {
+			return false, "the server " + lost + " is not seen dead by this server any more (it is " + st + ")"
+		}
 	}
 	if err := m.endTheHold(ctx); err != nil {
 		return false, err.Error()
@@ -445,4 +476,19 @@ func (m *mapFailover) controlData(ctx context.Context, id int) (map[string]strin
 		return m.controlDataOf(ctx, id)
 	}
 	return m.svc.Manager().ControlData(ctx, id)
+}
+
+// mapHeldAnswer says whether this server holds back its primary of the map group for a hand-over.
+type mapHeldAnswer struct {
+	Held bool `json:"held"`
+}
+
+// handleMapHeld answers whether the primary of the map group is held back on this server. The operator's declaration that a server is lost is sent to the
+// server that says so and to no other (phase 5 review M-D). It reveals one bit that the failover status of that server shows anyway.
+func handleMapHeld(_ context.Context, d *haDeps, _ string, _ []byte) (any, error) {
+	mf := d.MapFailover
+	if mf == nil {
+		return nil, notStarted
+	}
+	return mapHeldAnswer{Held: mf.isHeldBack()}, nil
 }

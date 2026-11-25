@@ -123,7 +123,7 @@ type Store interface {
 	// Ping checks that the local PostgreSQL instance answers.
 	Ping(ctx context.Context) error
 	// PostgresVersion returns the version of the local PostgreSQL, such as
-	// "18.1".
+	// "18.7".
 	PostgresVersion(ctx context.Context) (string, error)
 
 	// ClusterSummary summarizes servers, buckets and databases.
