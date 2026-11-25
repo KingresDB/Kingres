@@ -532,7 +532,7 @@ func (o *Ops) stepIMSequences(ctx context.Context, env *task.Env) error {
 		if o.Fanout == nil {
 			break
 		}
-		if err := o.onServer(ctx, env, s, "set the sequences", func() error { return o.Fanout.Apply(ctx, s, ApplyImportSequences, op) }); err != nil {
+		if err := o.importOnServer(ctx, env, s, "set the sequences", func() error { return o.Fanout.Apply(ctx, s, ApplyImportSequences, op) }); err != nil {
 			return err
 		}
 	}
@@ -1152,7 +1152,7 @@ func (o *Ops) importRenameFinal(ctx context.Context, env *task.Env, w renameFina
 		if o.Fanout == nil {
 			break
 		}
-		if err := o.onServer(ctx, env, s, "take the final name", func() error { return o.Fanout.Apply(ctx, s, ApplyImportRename, op) }); err != nil {
+		if err := o.importOnServer(ctx, env, s, "take the final name", func() error { return o.Fanout.Apply(ctx, s, ApplyImportRename, op) }); err != nil {
 			if leaseOrStop(ctx, err) {
 				return err
 			}
@@ -1178,21 +1178,14 @@ func (o *Ops) importRenameFinal(ctx context.Context, env *task.Env, w renameFina
 		note := revert()
 		return transfer.Errorf(transfer.CodeSQLError, false, "the settings of the database could not be recorded, so the import was undone%s", note)
 	}
-	// A cancel request that is recorded now was refused by the guard of the kind (it accepts none from the sequences on) or arrived after it was read: it must not
-	// pause the import after the commit point, where a cancel is a real request. It is dropped here, before the mark is written, so that nothing that arrives
-	// later is lost (the guard of a task that is not committed refuses a cancel, so no real request can arrive in between).
-	if err := env.ClearCancel(ctx); err != nil {
-		if leaseOrStop(ctx, err) {
-			return err
-		}
-		if o.Log != nil {
-			o.Log.Warn("a cancel request that was refused could not be cleared before the commit point of an import", "database", p.Database, "error", err)
-		}
-	}
 	// The commit point.
 	switch res, cerr := o.commitImport(ctx, env, importCommitMark(priv)); res {
 	case commitNot:
 		note := revert()
+		if errors.Is(cerr, task.ErrCancelRequested) {
+			// The store refused the mark because a cancel is recorded (the check and the write are one statement): the cancel wins, and the import is undone.
+			return transfer.Errorf(transfer.CodeCancelled, false, "the import was canceled before its commit point, so it was undone%s", note)
+		}
 		return transfer.Errorf(transfer.CodeSQLError, false, "the import could not be committed, so it was undone%s", note)
 	case commitUnknown:
 		// Whether the mark is written is not known (the store did not answer, the lease is gone): nothing is put back by the step. The hook of the task reads the mark
@@ -1222,6 +1215,10 @@ func (o *Ops) commitImport(ctx context.Context, env *task.Env, mark string) (com
 	for attempt := 0; attempt < 3; attempt++ {
 		if err = env.SetMark(ctx, mark); err == nil {
 			return commitDone, nil
+		}
+		if errors.Is(err, task.ErrCancelRequested) {
+			// Nothing was written and nothing will be: a cancel is recorded.
+			return commitNot, err
 		}
 		if leaseOrStop(ctx, err) {
 			return commitUnknown, err
@@ -1336,10 +1333,19 @@ func (o *Ops) importRollForward(ctx context.Context, env *task.Env, w renameFina
 	return nil
 }
 
+// ImportForwardHook is called by a test at the start of each try of the part of the last step that goes forward (after the commit point); an error is the error of
+// the try, which is then tried again after a pause, as for a server that cannot be reached.
+var ImportForwardHook func(ctx context.Context) error
+
 // importForwardOnce opens the database on every server and then removes the marker on every server. Every part is idempotent (a database that is opened, or
 // finished, counts as done), so it can run again after any error, after a restart or on another leader.
 // It returns the servers of the request that left the cluster and were skipped.
 func (o *Ops) importForwardOnce(ctx context.Context, env *task.Env, w renameFinal) (left []string, err error) {
+	if h := ImportForwardHook; h != nil {
+		if herr := h(ctx); herr != nil {
+			return nil, herr
+		}
+	}
 	p, priv := w.p, w.priv
 	// Every server that may hold the database: the others of the request, the starting server and the servers of the cluster now (the leader that runs this may
 	// not be the one that renamed, and it is not in the list of the request).
@@ -1756,6 +1762,9 @@ func (o *Ops) importServersLeft(ctx context.Context, p dbImportParams) (servers,
 	return servers, left
 }
 
+// importCancelNoteMax is the length that the message of a cancelled committed import is kept to (the task row keeps 500 bytes).
+const importCancelNoteMax = 500
+
 // importNoteBudget is the length that the note of a paused import is kept to (the task engine cuts a longer one at 330 bytes).
 const importNoteBudget = 330
 
@@ -1816,15 +1825,16 @@ func (o *Ops) importCancelNote(ctx context.Context, t task.Task) string {
 		return "The import was ended while it was committed; nothing was undone."
 	}
 	open, notOpen, unknown := o.importOpenness(ctx, p)
-	// The instruction comes first; the lists of servers are shortened to keep the message within the length the task row keeps.
+	// The instruction comes first and is never shortened; the three lists share what is left of the length that the task row keeps, so the message is never cut.
 	b := "Ended by a cancel after the commit point; nothing was undone. Finish or drop the database " + p.Database +
 		" by hand as the operator guide says (a database import that cannot be finished)."
-	b += " " + shortList("Open on: ", open, 85) + "."
-	b += " " + shortList("Not open on: ", notOpen, 95) + "."
-	if len(unknown) > 0 {
-		b += " " + shortList("Not reached: ", unknown, 70) + "."
+	room := importCancelNoteMax - len(b) - 6 // a space and a full stop for each list
+	if len(unknown) == 0 {
+		a := room * 85 / 180
+		return b + " " + shortList("Open on: ", open, a) + ". " + shortList("Not open on: ", notOpen, room-a) + "."
 	}
-	return b
+	share := room / 3
+	return b + " " + shortList("Open on: ", open, share) + ". " + shortList("Not open on: ", notOpen, share) + ". " + shortList("Not reached: ", unknown, room-2*share) + "."
 }
 
 // importOpenness asks every server that may hold the database whether it is open to its owner (the importing role owns it) or not (it is closed, or it is not

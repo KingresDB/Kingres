@@ -181,41 +181,77 @@ func TestAStaleReadCannotEndACommittedTaskThatPausedMeanwhile(t *testing.T) {
 	}
 }
 
-// M5: a cancel request that the guard did not honour is dropped by the step that passes the point after which no cancel is accepted; it is dropped under the lease.
-func TestAClearedCancelRequestDoesNotStay(t *testing.T) {
+// H1b: the commit mark is conditional, in the statement of the store, on no cancel request: a cancel that was accepted before wins and nothing is written; a
+// cancel that comes after the mark is a cancel of a committed task. A run without the lease gets the answer of a lost lease, not that of a cancel.
+func TestTheMarkIsNotWrittenOverACancelRequest(t *testing.T) {
 	for _, m := range storeMakers() {
 		t.Run(m.name, func(t *testing.T) {
 			clk := newClock()
 			st := m.make(t, clk)
-			var before, after, intruderCleared, stillSet bool
 			var e *task.Engine
-			d := task.Definition{Kind: "test.clear", Steps: []task.Step{{Name: "s", Run: func(ctx context.Context, env *task.Env) error {
+			var cancelled, marked, forged error
+			var markAfterCancel, markAfterOK string
+			d := task.Definition{Kind: "test.mark", Steps: []task.Step{{Name: "s", Run: func(ctx context.Context, env *task.Env) error {
+				// no request yet: the mark is written
+				marked = env.SetMark(ctx, "first")
+				markAfterOK, _ = env.ReadMark(ctx)
 				if err := e.Cancel(ctx, env.Task.ID); err != nil {
 					return err
 				}
-				before = env.CancelRequested(ctx)
-				// a run that does not hold the lease cannot clear the request, and it stays
-				intruderCleared = st.(task.CancelClearStore).ClearCancel(ctx, env.Task.ID, task.Lease{Holder: "intruder", Epoch: 99}) == nil
-				stillSet = env.CancelRequested(ctx)
-				if err := env.ClearCancel(ctx); err != nil {
-					return err
-				}
-				after = env.CancelRequested(ctx)
+				// a request is recorded: the next mark is refused and the store keeps the old one
+				cancelled = env.SetMark(ctx, "second")
+				markAfterCancel, _ = env.ReadMark(ctx)
+				forged = st.(task.MarkStore).SetMark(ctx, env.Task.ID, task.Lease{Holder: "intruder", Epoch: 99}, "forged")
 				return nil
 			}}}}
 			e = engine(t, st, "A", clk, d)
 			ctx := context.Background()
-			_, _ = e.Submit(ctx, "test.clear", task.Subject{Type: "x", ID: "1"}, nil, "u")
+			_, _ = e.Submit(ctx, "test.mark", task.Subject{Type: "x", ID: "1"}, nil, "u")
 			if ran, err := e.RunOnce(ctx); !ran || err != nil {
 				t.Fatalf("the run: %v %v", ran, err)
 			}
-			if !before || after || intruderCleared || !stillSet {
-				t.Fatalf("the request before the clear: %v, after the clear of an intruder: cleared %v and still set %v, after the clear of the run: %v", before, intruderCleared, stillSet, after)
+			if marked != nil || markAfterOK != "first" {
+				t.Errorf("a mark without a request: %v, the store holds %q", marked, markAfterOK)
 			}
-			if _, ok := st.(task.CancelClearStore); !ok {
-				t.Fatal("the store cannot clear a request")
+			if !errors.Is(cancelled, task.ErrCancelRequested) || markAfterCancel != "first" {
+				t.Errorf("a mark over a request: %v, the store holds %q", cancelled, markAfterCancel)
+			}
+			if !errors.Is(forged, task.ErrLeaseLost) {
+				t.Errorf("a mark of a run without the lease: %v", forged)
 			}
 		})
+	}
+}
+
+// H1a: a task that waits in a step (a server that is gone) is ended by a cancel as a task that fails before its point of no return: the step sees the cancel, the
+// hook runs, and a cancel that comes after the mark is written is not undone (the task is held, not ended).
+func TestACancelReachesAStepThatWaitsBeforeTheMark(t *testing.T) {
+	clk := newClock()
+	st := task.NewMemStoreClock(clk.Now)
+	var hooks atomic.Int32
+	entered := make(chan struct{})
+	d := committedDef(&hooks, func(ctx context.Context, env *task.Env) error {
+		close(entered)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	d.Steps[0].Interruptible = true
+	d.Cancellable = func(t task.Task) bool { return t.State != task.Done && t.State != task.Failed }
+	e := engine(t, st, "A", clk, d)
+	ctx := context.Background()
+	tk, _ := e.Submit(ctx, "test.committed", task.Subject{Type: "x", ID: "1"}, nil, "u")
+	done := make(chan error, 1)
+	go func() { _, err := e.RunOnce(ctx); done <- err }()
+	<-entered
+	if err := e.Cancel(ctx, tk.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	got, _ := e.Get(ctx, tk.ID)
+	if got.State != task.Failed || got.Error == nil || got.Error.Code != task.CodeCanceled || hooks.Load() != 1 {
+		t.Fatalf("after the cancel: %s %+v, hooks %d", got.State, got.Error, hooks.Load())
 	}
 }
 

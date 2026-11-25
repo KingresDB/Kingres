@@ -255,16 +255,6 @@ func (s *PGStore) RequestCancelIf(ctx context.Context, id int64, now time.Time, 
 	return ErrStateChanged
 }
 
-// ClearCancel implements CancelClearStore: the update is conditional on the lease and its row count is checked.
-func (s *PGStore) ClearCancel(ctx context.Context, id int64, l Lease) error {
-	tag, err := s.db.Exec(ctx, `UPDATE kingres_cp.task SET cancel_requested = false
-		WHERE id = $1 AND lease_holder = $2 AND lease_epoch = $3 AND state = 'running'`, id, l.Holder, l.Epoch)
-	if err != nil {
-		return err
-	}
-	return s.heldOrErr(ctx, tag, id)
-}
-
 // List implements Store.
 func (s *PGStore) List(ctx context.Context, limit int) ([]Task, error) {
 	rows, err := s.db.Query(ctx, `SELECT `+cols+` FROM kingres_cp.task ORDER BY id DESC LIMIT $1`, limit)
@@ -318,14 +308,26 @@ func (s *PGStore) Resume(ctx context.Context, id int64) error {
 	return ErrNotPaused
 }
 
-// SetMark implements MarkStore: the update is conditional on the lease and its row count is checked, so a mark that returns without error is in the table.
+// SetMark implements MarkStore: the update is conditional on the lease, the epoch and on no cancel request (one statement, so a cancel and a mark cannot both win),
+// and its row count is checked, so a mark that returns without error is in the table.
 func (s *PGStore) SetMark(ctx context.Context, id int64, l Lease, mark string) error {
 	tag, err := s.db.Exec(ctx, `UPDATE kingres_cp.task SET progress = jsonb_set(progress, '{mark}', to_jsonb($4::text))
-		WHERE id = $1 AND lease_holder = $2 AND lease_epoch = $3 AND state = 'running'`, id, l.Holder, l.Epoch, mark)
+		WHERE id = $1 AND lease_holder = $2 AND lease_epoch = $3 AND state = 'running' AND NOT cancel_requested`, id, l.Holder, l.Epoch, mark)
 	if err != nil {
 		return err
 	}
-	return s.heldOrErr(ctx, tag, id)
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	// Nothing was written: the lease is gone, or a cancel is recorded (the lease is checked first).
+	t, gerr := s.Get(ctx, id)
+	if gerr != nil {
+		return gerr
+	}
+	if t.Holder == l.Holder && t.Epoch == l.Epoch && t.State == Running && t.CancelRequested {
+		return ErrCancelRequested
+	}
+	return ErrLeaseLost
 }
 
 // SetDetail implements DetailStore.

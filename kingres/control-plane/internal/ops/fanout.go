@@ -13,6 +13,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peerclient"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/transfer"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/wire"
 )
 
@@ -213,6 +214,9 @@ func ids(s []OtherServer) []string {
 // waited for without a limit.
 var otherErrorBudget = 10 * time.Minute
 
+// unreachablePause is the wait between two tries on a server that cannot be reached.
+var unreachablePause = 2 * time.Second
+
 // otherErrorPause is the wait between two tries after an error that is not "unreachable".
 var otherErrorPause = 2 * time.Second
 
@@ -263,8 +267,40 @@ func sqlstateHealable(msg string) bool {
 // and saying which server the task waits for. An error that is not an unreachable
 // server is tried again for otherErrorBudget and logged each time it changes.
 func (o *Ops) onServer(ctx context.Context, env *task.Env, server, doing string, f func() error) error {
+	return o.onServerWithin(ctx, env, server, doing, 0, f)
+}
+
+// importOnServer is onServer for the steps of a database import that can still be undone (before the commit point of its last step): the wait for a server is
+// bounded by ImportServerWait, so that a server that is gone for good fails the step and the import is undone, and does not hold the task (and, by migration
+// 0045, the removal of that server) for ever.
+func (o *Ops) importOnServer(ctx context.Context, env *task.Env, server, doing string, f func() error) error {
+	within := o.ImportServerWait
+	if within <= 0 {
+		within = otherErrorBudget
+	}
+	err := o.onServerWithin(ctx, env, server, doing, within, f)
+	var wl *serverWaitError
+	if errors.As(err, &wl) {
+		return transfer.Errorf(transfer.CodeSessionLost, false, "server %s did not answer for %s (%s), so the import was undone. A private database that was made on that server before it was lost is left there; it keeps the server from being removed until it is dropped (the message that refuses the removal names it)", safeName(server), within.Round(time.Second), doing)
+	}
+	return err
+}
+
+// serverWaitError is the answer of onServerWithin when the time it was given is over.
+type serverWaitError struct {
+	server string
+	err    error
+}
+
+func (e *serverWaitError) Error() string { return fmt.Sprintf("on server %s: %v", e.server, e.err) }
+func (e *serverWaitError) Unwrap() error { return e.err }
+
+// onServerWithin is onServer with a limit: when within is above zero, a call that has not succeeded within it (counted from its first failure, whatever the
+// kind of failure) ends with a *serverWaitError. Zero waits for a server that cannot be reached without a limit, as onServer does.
+func (o *Ops) onServerWithin(ctx context.Context, env *task.Env, server, doing string, within time.Duration, f func() error) error {
 	announced := false
 	var firstOther time.Time
+	var began time.Time
 	lastText := ""
 	for {
 		err := f()
@@ -273,6 +309,12 @@ func (o *Ops) onServer(ctx context.Context, env *task.Env, server, doing string,
 				_ = env.SetDetail(ctx, "")
 			}
 			return nil
+		}
+		if began.IsZero() {
+			began = time.Now()
+		}
+		if within > 0 && time.Since(began) >= within {
+			return &serverWaitError{server: server, err: err}
 		}
 		if !errors.Is(err, peerclient.ErrUnreachable) {
 			if !healable(err) {
@@ -305,7 +347,7 @@ func (o *Ops) onServer(ctx context.Context, env *task.Env, server, doing string,
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(2 * time.Second):
+		case <-time.After(unreachablePause):
 		}
 	}
 }

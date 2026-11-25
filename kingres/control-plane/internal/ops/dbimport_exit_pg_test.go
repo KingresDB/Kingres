@@ -9,7 +9,6 @@ import (
 	"io"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -498,41 +497,5 @@ func TestImportRenameStepClosesTheArchiveOnTheRefusal(t *testing.T) {
 	}
 	if n := rd2.closed.Load(); n != 1 {
 		t.Errorf("the archive was closed %d times on the error path", n)
-	}
-}
-
-// M5: a cancel request that was recorded before the commit point (the guard refuses a cancel from the sequences on, and a request may arrive after it was read) does
-// not pause the import after the commit point: the step clears it before the mark is written, so the roll forward does not find it.
-func TestImportCancelRequestRecordedBeforeTheCommitDoesNotPauseTheCommittedImport(t *testing.T) {
-	r := newImportRig(t)
-	old := importCancelPoll
-	importCancelPoll = 2 * time.Millisecond
-	defer func() { importCancelPoll = old }()
-	e1, p := r.engine("A", r.mem, nil)
-	tk, _ := r.submit(e1, p)
-	var once sync.Once
-	r.recheck = func(ctx context.Context, revert func() string) error {
-		var err error
-		once.Do(func() { err = r.mem.RequestCancel(ctx, tk.ID, time.Now()) }) // as a request that was accepted on a read that is out of date
-		return err
-	}
-	// the roll forward lasts long enough for the poll of the cancel request to look at least once
-	r.fan.before = func(op importRenameOp) error {
-		if op.Open {
-			time.Sleep(100 * time.Millisecond)
-		}
-		return nil
-	}
-	if err := e1.RunNow(context.Background(), tk.ID, nil); err != nil {
-		t.Fatalf("the run: %v", err)
-	}
-	got := r.get(e1, tk.ID)
-	if got.State != task.Done || got.CancelRequested {
-		t.Fatalf("the stale request paused or changed the committed import: %s cancel %v %+v %q", got.State, got.CancelRequested, got.Error, got.Detail)
-	}
-	for i := 0; i < 2; i++ {
-		if s := r.state(i, "shop"); s != "imp/" {
-			t.Errorf("server %d: %q", i+1, s)
-		}
 	}
 }

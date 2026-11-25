@@ -153,14 +153,6 @@ func (f *FileStore) RequestCancelIf(ctx context.Context, id int64, now time.Time
 	return f.save(id) //nolint:contextcheck // saving does not depend on a request
 }
 
-// ClearCancel implements CancelClearStore.
-func (f *FileStore) ClearCancel(ctx context.Context, id int64, l Lease) error {
-	if err := f.inner.ClearCancel(ctx, id, l); err != nil {
-		return err
-	}
-	return f.save(id) //nolint:contextcheck // saving does not depend on a request
-}
-
 // List implements Store.
 func (f *FileStore) List(ctx context.Context, limit int) ([]Task, error) {
 	return f.inner.List(ctx, limit)

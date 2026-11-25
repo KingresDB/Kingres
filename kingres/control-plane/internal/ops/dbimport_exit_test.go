@@ -6,11 +6,13 @@ package ops
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peerclient"
@@ -29,8 +31,8 @@ func TestImportCancellableOfAPausedImport(t *testing.T) {
 			t.Errorf("a paused import with the mark %q is not cancellable", mark)
 		}
 	}
-	if def.Cancellable(committedTask(t, "commit", task.Pending)) {
-		t.Error("a committed import that was resumed and waits for a run is cancellable")
+	if !def.Cancellable(committedTask(t, "commit", task.Pending)) {
+		t.Error("a committed import that was resumed and waits for a run is not cancellable")
 	}
 	if !def.Cancellable(committedTask(t, "commit", task.Running)) {
 		t.Error("a running committed import is not cancellable (the cancel pauses it)")
@@ -174,4 +176,82 @@ func mustJSON(t *testing.T, v any) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// H1c: before the commit point the wait for a server is bounded. A server that cannot be reached fails the step after ImportServerWait, with a message that says
+// that the import was undone and what stays on that server; a server that answers in time is not a failure; the other kinds of task keep waiting.
+func TestImportOnServerGivesUpOnAServerThatIsGone(t *testing.T) {
+	old := unreachablePause
+	unreachablePause = time.Millisecond
+	defer func() { unreachablePause = old }()
+	o := &Ops{Log: slog.New(slog.NewTextHandler(io.Discard, nil)), ImportServerWait: 30 * time.Millisecond}
+	calls := 0
+	err := o.importOnServer(context.Background(), &task.Env{}, "s2", "take the final name", func() error {
+		calls++
+		return fmt.Errorf("%w: connection refused", peerclient.ErrUnreachable)
+	})
+	if err == nil || calls < 2 {
+		t.Fatalf("err %v after %d calls", err, calls)
+	}
+	var xe *transfer.Error
+	if !errors.As(err, &xe) || xe.Retryable {
+		t.Fatalf("the error is not a final transfer error: %#v", err)
+	}
+	for _, want := range []string{"server s2 did not answer", "the import was undone", "private database", "keeps the server from being removed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the message %q lacks %q", err.Error(), want)
+		}
+	}
+	// a server that comes back in time is not a failure
+	calls = 0
+	if err := o.importOnServer(context.Background(), &task.Env{}, "s2", "take the final name", func() error {
+		if calls++; calls < 3 {
+			return fmt.Errorf("%w: down", peerclient.ErrUnreachable)
+		}
+		return nil
+	}); err != nil || calls != 3 {
+		t.Fatalf("a server that came back: %v after %d calls", err, calls)
+	}
+	// the unbounded wait of the other kinds of task is not changed: it ends only with the context
+	ctx, stop := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer stop()
+	if err := o.onServer(ctx, &task.Env{}, "s2", "x", func() error { return peerclient.ErrUnreachable }); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("onServer gave up before its context ended: %v", err)
+	}
+}
+
+// L3: the cancel note stays within its bound whatever the names: the instruction is whole, the three lists share what is left, and nothing is cut.
+func TestImportCancelNoteWithManyLongNamesIsNotCut(t *testing.T) {
+	p := dbImportParams{Database: strings.Repeat("d", 63), Owner: transfer.Identity{Name: "imp"}, Nonce: importTestNonce}
+	tk := task.Task{ID: 7, Kind: KindDatabaseImport, State: task.Paused, Mark: task.MarkUnreadable}
+	var members []OtherServer
+	rows := map[string][][]any{}
+	errs := map[string]error{}
+	for i := 0; i < 90; i++ {
+		id := fmt.Sprintf("a-server-with-a-quite-long-host-name-%03d.example.internal", i)
+		p.Servers = append(p.Servers, id)
+		members = append(members, OtherServer{ID: id})
+		switch i % 3 {
+		case 0:
+			rows[id] = [][]any{{"imp"}}
+		case 1:
+			rows[id] = [][]any{{"postgres"}}
+		default:
+			errs[id] = fmt.Errorf("%w: down", peerclient.ErrUnreachable)
+		}
+	}
+	tk.Input = mustJSON(t, p)
+	o := &Ops{ServerHost: "s9", Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Fanout: &listFan{others: members}, Remote: fakeRemote{rows: rows, errs: errs}}
+	note := o.importCancelNote(context.Background(), tk)
+	if len(note) > importCancelNoteMax || !utf8.ValidString(note) || strings.HasSuffix(note, "...") {
+		t.Errorf("the note is %d bytes or is cut: %q", len(note), note)
+	}
+	for _, want := range []string{"Ended by a cancel after the commit point", "operator guide says (a database import that cannot be finished).", "Open on: ", "Not open on: ", "Not reached: "} {
+		if !strings.Contains(note, want) {
+			t.Errorf("the note lacks %q: %q", want, note)
+		}
+	}
+	if !strings.HasSuffix(note, ".") {
+		t.Errorf("the last list is not whole: %q", note)
+	}
 }

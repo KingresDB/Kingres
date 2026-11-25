@@ -165,7 +165,7 @@ func (r *importRig) w(p dbImportParams, priv string) renameFinal {
 func (r *importRig) engine(holder string, store task.Store, wrap func(task.Step) task.Step) (*task.Engine, dbImportParams) {
 	r.t.Helper()
 	p := r.params()
-	step := task.Step{Name: "Take the final name", Run: func(ctx context.Context, env *task.Env) error {
+	step := task.Step{Name: "Take the final name", Interruptible: true, Run: func(ctx context.Context, env *task.Env) error {
 		priv := p.private(env.Task.ID)
 		return r.o[0].importRenameFinal(ctx, env, r.w(p, priv))
 	}}

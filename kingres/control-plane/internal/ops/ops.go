@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -50,6 +51,9 @@ type RoleConnector interface {
 
 // Ops carries the dependencies of the operations.
 type Ops struct {
+	// ImportServerWait is how long a step of a database import that can still be undone waits for one server (one that cannot be reached, or one that keeps
+	// refusing a change that a moment fixes) before the step fails and the import is undone. Zero is otherErrorBudget; tests set a short time.
+	ImportServerWait time.Duration
 	// failed remembers when a partition.maintain task of a table last failed (the back-off of a failure before any run exists).
 	failed failedTasks
 	// Service opens service connections; Roles opens role connections.

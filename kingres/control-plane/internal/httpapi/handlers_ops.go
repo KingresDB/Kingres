@@ -306,6 +306,9 @@ func (s *Server) taskProblem(r *http.Request, err error) error {
 		return problem.New(problem.NotFound, "No such task.")
 	case errors.Is(err, task.ErrNotCancellable):
 		return problem.New(problem.TaskNotCancellable, "The task has finished and cannot be canceled.")
+	case errors.Is(err, task.ErrStateChanged):
+		// A cancel that lost every one of its tries to a task that changed state each time (paused, resumed, paused ...): nothing was recorded.
+		return problem.New(problem.OperationInProgress, "The state of the task changed while the cancel was being recorded, so nothing was changed. Read the task and try again.")
 	}
 	var p *problem.Problem
 	if errors.As(err, &p) {
@@ -540,6 +543,12 @@ func (s *Server) cancelTask(_ *call, w http.ResponseWriter, r *http.Request) err
 		return problem.New(problem.NotFound, "No such task.")
 	}
 	if err := eng.Cancel(r.Context(), id); err != nil {
+		if errors.Is(err, task.ErrNotCancellable) {
+			// A task that is past its point of no return is not "finished": the text says which of the two it is.
+			if cur, gerr := s.deps.Store.Task(r.Context(), id); gerr == nil && (cur.State == string(task.Pending) || cur.State == string(task.Running) || cur.State == string(task.Paused)) {
+				return problem.New(problem.TaskNotCancellable, "The task is past the point after which it cannot be canceled.")
+			}
+		}
 		return s.taskProblem(r, err)
 	}
 	t, err := s.deps.Store.Task(r.Context(), id)

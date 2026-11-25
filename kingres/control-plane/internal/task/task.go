@@ -251,8 +251,14 @@ var ErrNoMarks = errors.New("the task store cannot keep a mark")
 // MarkUnreadable is the Mark that the OnFail hook gets when the store could not be asked: a hook must read it as "possibly decided".
 const MarkUnreadable = "\x00unreadable"
 
+// ErrCancelRequested is the answer of SetMark when a cancel request is recorded for the task: a mark is a point of no return, and it is never written over a
+// request to cancel (the check and the write are one statement of the store). The caller undoes its work, as for any failure before the point.
+var ErrCancelRequested = errors.New("task: a cancel was requested")
+
 // SetMark records the mark of the task (see Task.Mark). It returns only when the store has written it under this run's lease; a store that cannot keep it is an
-// error, never ignored, because the caller relies on the mark for a decision that must survive a restart.
+// error, never ignored, because the caller relies on the mark for a decision that must survive a restart. The write is conditional on no cancel request being
+// recorded (ErrCancelRequested otherwise, nothing written), in the same statement as the lease and the epoch: a cancel that was accepted before the mark is
+// written wins, and a cancel that arrives after it is a cancel of a committed task (see Definition.Committed).
 func (e *Env) SetMark(ctx context.Context, mark string) error {
 	if e.eng == nil {
 		return ErrNoMarks
@@ -297,25 +303,6 @@ func (e *Env) CancelRequested(ctx context.Context) bool {
 	}
 	t, err := e.eng.store.Get(ctx, e.Task.ID)
 	return err == nil && t.CancelRequested
-}
-
-// CancelClearStore is implemented by stores that can drop a cancel request that the engine did not honour.
-type CancelClearStore interface {
-	// ClearCancel clears the cancel request of the task, under the lease of the run that holds it.
-	ClearCancel(ctx context.Context, id int64, l Lease) error
-}
-
-// ClearCancel drops the cancel request that is recorded for the task. A step that passes a point after which no cancel is honoured, and that has not honoured
-// the request, calls it, so that a request that the guard of the kind refused cannot act later. A store that cannot do it is an error.
-func (e *Env) ClearCancel(ctx context.Context) error {
-	if e.eng == nil {
-		return nil
-	}
-	cs, ok := e.eng.store.(CancelClearStore)
-	if !ok {
-		return errors.New("the task store cannot clear a cancel request")
-	}
-	return cs.ClearCancel(ctx, e.Task.ID, e.lease)
 }
 
 // Fence returns the fencing token of this run (the lease epoch). A step that
@@ -672,6 +659,9 @@ func (e *Engine) Run(ctx context.Context) {
 func (e *Engine) Cancel(ctx context.Context, id int64) error {
 	cs, cond := e.store.(CondCancelStore)
 	var first State
+	// The message of a committed task that is ended by a cancel asks the servers: it is built once per request, not on every pass of the loop.
+	var note string
+	haveNote := false
 	for attempt := 0; attempt < 5; attempt++ {
 		t, gerr := e.store.Get(ctx, id)
 		if gerr != nil {
@@ -688,11 +678,10 @@ func (e *Engine) Cancel(ctx context.Context, id int64) error {
 		if haveDef && def.Cancellable != nil && !def.Cancellable(t) {
 			return ErrNotCancellable // the guard of the kind: past the point of no return
 		}
-		if attempt > 0 && first == Running && t.State == Paused && haveDef && def.Committed != nil {
+		committed := haveDef && heldCommitted(def, t)
+		if attempt > 0 && first == Running && t.State == Paused && committed {
 			// The cancel of a running committed task is a pause, and the task paused meanwhile: the request is met, and the same click does not also end it.
-			if _, committed := def.Committed(t); committed {
-				return nil
-			}
+			return nil
 		}
 		if !cond {
 			if err := e.store.RequestCancel(ctx, id, e.now()); err != nil {
@@ -704,11 +693,13 @@ func (e *Engine) Cancel(ctx context.Context, id int64) error {
 		fail := &Error{Code: CodeCanceled, Message: "The task was canceled before it started."}
 		if t.State == Paused {
 			fail.Message = "The task was canceled while it was paused."
-			if haveDef && def.Committed != nil && def.CanceledNote != nil {
-				if _, committed := def.Committed(t); committed {
-					fail.Message = clip(def.CanceledNote(ctx, t))
-				}
+		}
+		if committed && (t.State == Paused || t.State == Pending) && def.CanceledNote != nil {
+			// A committed task that no run holds is not undone: it ends with the note of its kind (a pending one is a resumed one that no run has claimed yet).
+			if !haveNote {
+				note, haveNote = clip(def.CanceledNote(ctx, t)), true
 			}
+			fail.Message = note
 		}
 		err := cs.RequestCancelIf(ctx, id, e.now(), t.State, fail)
 		if errors.Is(err, ErrStateChanged) {
@@ -723,14 +714,28 @@ func (e *Engine) Cancel(ctx context.Context, id int64) error {
 	return ErrStateChanged
 }
 
-// afterCancel runs the hook of a task that the cancel ended: a paused task is not run by anybody, so its cleanup hook runs here, with the task as recorded.
+// afterCancelTimeout bounds the hook that runs after the cancel of a task that no run holds.
+const afterCancelTimeout = 10 * time.Minute
+
+// afterCancel runs the hook of a task that the cancel ended without a run: a paused task, or a pending one that ran before (a resumed one), is not run by
+// anybody, so its cleanup hook runs here, with the task as recorded. It does not depend on the request that asked: it runs under its own context (as the hook of a
+// failed run does) with its own time limit, so a client that went away does not leave the work of the task behind.
 func (e *Engine) afterCancel(ctx context.Context, was Task) {
-	if was.State != Paused {
+	// A pending task that was claimed before (the epoch of its lease grows with each claim) is a resumed one: it ran, so it has work to undo.
+	started := was.Epoch > 0
+	for _, s := range was.Steps {
+		if s.State != StepPending {
+			started = true
+		}
+	}
+	if was.State != Paused && !(was.State == Pending && started) {
 		return
 	}
+	c, stop := context.WithTimeout(context.WithoutCancel(ctx), afterCancelTimeout)
+	defer stop()
 	// Read again: the hook runs only when this request ended the task (it may have been resumed meanwhile, and then a run owns it).
-	if now, err := e.store.Get(ctx, was.ID); err == nil && now.State == Failed && now.Error != nil && now.Error.Code == CodeCanceled {
-		e.onFail(ctx, now, now.Error)
+	if now, err := e.store.Get(c, was.ID); err == nil && now.State == Failed && now.Error != nil && now.Error.Code == CodeCanceled {
+		e.onFail(c, now, now.Error)
 	}
 }
 
@@ -943,7 +948,7 @@ func (e *Engine) watchCancel(runCtx context.Context, id int64, def Definition, s
 				return
 			case <-tick.C:
 				now, err := e.store.Get(context.WithoutCancel(runCtx), id)
-				if err == nil && now.CancelRequested && def.Cancellable(now) {
+				if err == nil && now.CancelRequested && def.Cancellable(now) && !heldCommitted(def, now) {
 					interrupted.Store(true)
 					cancel()
 					return
@@ -952,6 +957,16 @@ func (e *Engine) watchCancel(runCtx context.Context, id int64, def Definition, s
 		}
 	}()
 	return stepCtx, interrupted, func() { close(done); cancel() }
+}
+
+// heldCommitted tells whether a task has passed its point of no return (Definition.Committed). A step of such a task is not interrupted by a cancel: it goes
+// forward and pauses itself.
+func heldCommitted(def Definition, t Task) bool {
+	if def.Committed == nil {
+		return false
+	}
+	_, ok := def.Committed(t)
+	return ok
 }
 
 // leaseGuard cancels a run whose lease may have expired. validUntil is the

@@ -246,18 +246,6 @@ func (m *MemStore) RequestCancelIf(_ context.Context, id int64, now time.Time, s
 	return nil
 }
 
-// ClearCancel implements CancelClearStore.
-func (m *MemStore) ClearCancel(_ context.Context, id int64, l Lease) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	t, err := m.held(id, l)
-	if err != nil {
-		return err
-	}
-	t.CancelRequested = false
-	return nil
-}
-
 // List implements Store.
 func (m *MemStore) List(_ context.Context, limit int) ([]Task, error) {
 	m.mu.Lock()
@@ -306,6 +294,9 @@ func (m *MemStore) SetMark(_ context.Context, id int64, l Lease, mark string) er
 	t, err := m.held(id, l)
 	if err != nil {
 		return err
+	}
+	if t.CancelRequested {
+		return ErrCancelRequested
 	}
 	t.Mark = mark
 	return nil

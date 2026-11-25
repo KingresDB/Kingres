@@ -413,7 +413,7 @@ func (o *Ops) stepIMInstall(ctx context.Context, env *task.Env) error {
 		}
 		for _, n := range primariesToRegister(sysNodes, p.Servers, o.ServerHost) {
 			n := n
-			if err := o.onServer(ctx, env, n.Host, "register the server", func() error {
+			if err := o.importOnServer(ctx, env, n.Host, "register the server", func() error {
 				if o.Fanout == nil {
 					return nil
 				}
