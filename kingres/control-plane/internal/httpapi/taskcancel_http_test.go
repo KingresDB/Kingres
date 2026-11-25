@@ -94,3 +94,25 @@ func TestTheTextOfTheRefusedCancelFitsTheState(t *testing.T) {
 		t.Errorf("a finished task: %d %v", code, out)
 	}
 }
+
+// L6: the read of a database.import says that every unfinished import can be cancelled, a running committed one included (the cancel then pauses it): the flag
+// does not depend on the steps or on the mark, which the API does not show.
+func TestTheReadOfADatabaseImportIsCancellableWhileItIsUnfinished(t *testing.T) {
+	o := &ops.Ops{Log: slog.New(slog.DiscardHandler)}
+	if _, err := task.NewEngine(task.NewMemStore(), o.Definitions(), task.Options{Holder: "A", Lease: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	steps := []api.TaskStep{{Name: "Set the sequences", State: task.StepDone}, {Name: "Verify", State: task.StepDone}, {Name: "Take the final name", State: task.StepRunning}}
+	for _, state := range []string{"pending", "running", "paused"} {
+		in := api.Task{Kind: "database.import", State: state, Cancellable: true, Progress: api.TaskProgress{Steps: steps}}
+		if !withCancelGuard(in).Cancellable {
+			t.Errorf("an import that is %s in its last step is not cancellable", state)
+		}
+	}
+	for _, state := range []string{"done", "failed"} {
+		in := api.Task{Kind: "database.import", State: state, Cancellable: false, Progress: api.TaskProgress{Steps: steps}}
+		if withCancelGuard(in).Cancellable {
+			t.Errorf("an import that is %s is cancellable", state)
+		}
+	}
+}
