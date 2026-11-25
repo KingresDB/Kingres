@@ -1249,7 +1249,12 @@ var _ = url.Values{}
 // catalog of each database, and the registration of a standby there needs the promotion to be recognised first, so the two wait for
 // each other and the failover never ends. An import that goes on after a failover ends by its own checks, and one that ends drops it.
 func catalogDatabases(ctx context.Context, svc *cluster.Service, withSystem bool) ([]string, error) {
-	pc, err := svc.ServiceConn(ctx, "postgres")
+	return catalogDatabasesOf(ctx, svc.ServiceConn, hasCatalog, withSystem)
+}
+
+// catalogDatabasesOf is catalogDatabases with the connection and the test of the catalog given, so that a test can run it on an instance that is not a cluster.
+func catalogDatabasesOf(ctx context.Context, conn func(ctx context.Context, db string) (*pgx.Conn, error), has func(ctx context.Context, c *pgx.Conn, db string) (bool, error), withSystem bool) ([]string, error) {
+	pc, err := conn(ctx, "postgres")
 	if err != nil {
 		return nil, err
 	}
@@ -1266,7 +1271,7 @@ func catalogDatabases(ctx context.Context, svc *cluster.Service, withSystem bool
 		if n == sysdb.Database || n == "postgres" {
 			continue
 		}
-		c, err := svc.ServiceConn(ctx, n)
+		c, err := conn(ctx, n)
 		if err != nil {
 			var pe *pgconn.PgError
 			if errors.As(err, &pe) && pe.Code == "3D000" {
@@ -1274,7 +1279,7 @@ func catalogDatabases(ctx context.Context, svc *cluster.Service, withSystem bool
 			}
 			return nil, err
 		}
-		has, err := hasCatalog(ctx, c, n)
+		have, err := has(ctx, c, n)
 		_ = c.Close(context.WithoutCancel(ctx))
 		if isUntrustedErr(err) {
 			slog.Warn("a database is left out of the catalogs: its schema kingres cannot be trusted", "database", n, "error", err)
@@ -1283,7 +1288,7 @@ func catalogDatabases(ctx context.Context, svc *cluster.Service, withSystem bool
 		if err != nil {
 			return nil, err
 		}
-		if has {
+		if have {
 			out = append(out, n)
 		}
 	}
