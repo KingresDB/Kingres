@@ -36,7 +36,7 @@ func edKeys(t *testing.T, n *clustertest.Node, table string) string {
 }
 
 func TestDatabaseExportAndDrainAtTheSameTime(t *testing.T) {
-	const itemRows = 300000 // enough that the export is still writing data when the drain is started
+	const itemRows = 1500000 // enough that the export is still writing data when the drain is started
 	const schemaRows = 20000
 	c := clustertest.FormTLS(t, 3, []string{"-rebalance-retry-backoff", "1s"}, func(leader *clustertest.Node) {
 		body := leader.Expect(202, "POST", "/databases", map[string]any{"name": "sk", "sharding": map[string]any{"enabled": true, "mode": "both", "bucketCount": 8}})
@@ -109,17 +109,23 @@ func TestDatabaseExportAndDrainAtTheSameTime(t *testing.T) {
 	// The export, through the leader; the drain is started when its data step runs.
 	exID := clustertest.TaskID(l.Expect(202, "POST", "/databases/sk/export", map[string]any{}))
 	var exBody map[string]any
-	until(t, 10*time.Minute, "the export to write its data", func() bool {
+	// Polled every 100 ms: the data step of a small export is over within a second.
+	for deadline := time.Now().Add(10 * time.Minute); ; time.Sleep(100 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for the export to write its data")
+		}
 		st, b := l.Do("GET", fmt.Sprintf("/tasks/%v", exID), nil, nil)
 		if st != 200 {
-			return false
+			continue
 		}
 		exBody = b
 		if b["state"] == "failed" {
 			t.Fatalf("the export failed before the drain: %v", b["error"])
 		}
-		return b["state"] == "done" || taskSteps(b)["Write the data"] == "running"
-	})
+		if b["state"] == "done" || taskSteps(b)["Write the data"] == "running" {
+			break
+		}
+	}
 	if exBody["state"] == "done" {
 		t.Fatalf("the export ended before the drain could start; raise itemRows")
 	}
