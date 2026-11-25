@@ -281,7 +281,7 @@ func (o *Ops) importOnServer(ctx context.Context, env *task.Env, server, doing s
 	err := o.onServerWithin(ctx, env, server, doing, within, f)
 	var wl *serverWaitError
 	if errors.As(err, &wl) {
-		return transfer.Errorf(transfer.CodeSessionLost, false, "server %s did not answer for %s (%s), so the import was undone. A private database that was made on that server before it was lost is left there; it keeps the server from being removed until it is dropped (the message that refuses the removal names it)", safeName(server), within.Round(time.Second), doing)
+		return transfer.Errorf(transfer.CodeSessionLost, false, "server %s did not answer for %s (%s), so the import was undone. A private database that was made on that server before it was lost is left there; it does not stop the removal of that server, and it is dropped by hand if the server comes back", safeName(server), within.Round(time.Second), doing)
 	}
 	return err
 }

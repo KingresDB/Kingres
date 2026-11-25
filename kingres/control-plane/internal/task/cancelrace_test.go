@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-
+// Copyright (c) 2026 RooyeKhat Media Co
 package task_test
 
 import (
@@ -156,5 +156,82 @@ func TestACancelDoesNotInterruptTheStepOfACommittedTask(t *testing.T) {
 	}
 	if got, _ := e.Get(ctx, tk.ID); got.State == task.Failed || hooks.Load() != 0 {
 		t.Errorf("the task is %s and its hook ran %d times", got.State, hooks.Load())
+	}
+}
+
+// pausedUncommitted makes a task of a kind without a point of no return that ran, paused and was resumed: it is pending again, its lease epoch is above zero.
+func pausedUncommitted(t *testing.T, st task.Store, clk *clock, hooks *atomic.Int32, kind string) (*task.Engine, task.Task) {
+	t.Helper()
+	d := task.Definition{Kind: kind, Steps: []task.Step{{Name: "s", Run: func(context.Context, *task.Env) error { return task.Pause("waiting") }}},
+		OnFail: func(context.Context, task.Task) { hooks.Add(1) }}
+	e := engine(t, st, "A", clk, d)
+	ctx := context.Background()
+	tk, err := e.Submit(ctx, kind, task.Subject{Type: "x", ID: "1"}, nil, "u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := e.RunOnce(ctx); !ran || err != nil {
+		t.Fatalf("the run: %v %v", ran, err)
+	}
+	if got, _ := e.Get(ctx, tk.ID); got.State != task.Paused {
+		t.Fatalf("the task is %s", got.State)
+	}
+	if err := e.Resume(ctx, tk.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := e.Get(ctx, tk.ID)
+	return e, got
+}
+
+// L6: a pending task that is not committed and that ran before (a resumed one) is cancelled with its hook, once; a pending task that never ran is cancelled without it.
+func TestAPendingUncommittedTaskGetsItsHookOnlyWhenItRanBefore(t *testing.T) {
+	for _, m := range storeMakers() {
+		t.Run(m.name, func(t *testing.T) {
+			clk := newClock()
+			st := m.make(t, clk)
+			var hooks atomic.Int32
+			e, tk := pausedUncommitted(t, st, clk, &hooks, "test.resumed")
+			ctx := context.Background()
+			if err := e.Cancel(ctx, tk.ID); err != nil {
+				t.Fatal(err)
+			}
+			if got, _ := e.Get(ctx, tk.ID); got.State != task.Failed || got.Error == nil || got.Error.Code != task.CodeCanceled || hooks.Load() != 1 {
+				t.Fatalf("after the cancel of the resumed task: %s %+v, hooks %d", got.State, got.Error, hooks.Load())
+			}
+			// a task that never ran
+			never, err := e.Submit(ctx, "test.resumed", task.Subject{Type: "x", ID: "2"}, nil, "u")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := e.Cancel(ctx, never.ID); err != nil {
+				t.Fatal(err)
+			}
+			if got, _ := e.Get(ctx, never.ID); got.State != task.Failed || hooks.Load() != 1 {
+				t.Fatalf("after the cancel of the task that never ran: %s, hooks %d", got.State, hooks.Load())
+			}
+		})
+	}
+}
+
+// L6 and M1: the hook of a resumed pending task does not depend on the request either.
+func TestTheHookOfACancelledPendingTaskRunsWhenTheRequestIsGone(t *testing.T) {
+	clk := newClock()
+	mem := task.NewMemStoreClock(clk.Now)
+	var hooks atomic.Int32
+	_, tk := pausedUncommitted(t, mem, clk, &hooks, "test.resumed")
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	st := &storeCancelsCtx{MemStore: mem, stop: stop}
+	d := task.Definition{Kind: "test.resumed", Steps: []task.Step{{Name: "s", Run: func(context.Context, *task.Env) error { return nil }}},
+		OnFail: func(context.Context, task.Task) { hooks.Add(1) }}
+	e2 := engine(t, st, "B", clk, d)
+	if err := e2.Cancel(ctx, tk.ID); err != nil {
+		t.Fatal(err)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("the request was not ended by the test")
+	}
+	if got, _ := mem.Get(context.Background(), tk.ID); got.State != task.Failed || hooks.Load() != 1 {
+		t.Fatalf("the task is %s and the hook ran %d times", got.State, hooks.Load())
 	}
 }

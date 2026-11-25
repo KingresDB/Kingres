@@ -426,6 +426,19 @@ func TestJanitorLeavesTheUploadOfAnActiveTask(t *testing.T) {
 	failedGone := newRec("ghost", 999999, "ready", newTask("a4", "failed"), false, false)
 	pausedOld := newRec("imp", imp, "expired", newTask("a5", "paused"), true, true)
 	failedOld := newRec("imp", imp, "expired", newTask("a6", "failed"), true, true)
+	// an upload whose row names no task (the link could not be written) is kept while the input of an unfinished import names it, and not after the import ended
+	unlinked := func(state string) int64 {
+		id, err := r.o[0].records().Create(ctx, transfer.Record{Kind: transfer.KindUpload, State: transfer.StateReady, ServerID: "s1", Owner: transfer.Identity{Name: "imp", OID: imp},
+			ExpiresAt: time.Now().Add(-time.Hour), Purpose: "databaseArchive"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.sys.Exec(ctx, `INSERT INTO kingres_cp.task (kind, state, subject_type, subject_id, input, created_by) VALUES ('database.import', $1, 'database', 'u' || $2::text, pg_catalog.jsonb_build_object('uploadId', $2::bigint), 'admin')`, state, id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	unlinkedRunning, unlinkedFailed := unlinked("running"), unlinked("failed")
 	last := newRec("imp", imp, "ready", newTask("a7", "done"), false, false)
 	_ = last
 	if _, err := r.o[0].TransferSweep(ctx); err != nil {
@@ -450,6 +463,8 @@ func TestJanitorLeavesTheUploadOfAnActiveTask(t *testing.T) {
 		is   string
 	}{
 		{"an expired upload of a paused task", pausedExpired, []string{"expired", "deleted", "pruned"}, ""},
+		{"an expired upload that only the input of a running import names", unlinkedRunning, []string{"expired", "deleted", "pruned"}, ""},
+		{"an expired upload that only the input of a failed import names", unlinkedFailed, nil, "expired"},
 		{"an upload of a role that was dropped, with a paused task", pausedGone, []string{"expired", "deleted", "pruned"}, ""},
 		{"an old expired row of a paused task", pausedOld, []string{"pruned", "deleted"}, "expired"},
 		{"an expired upload of a finished task", doneExpired, nil, "expired"},

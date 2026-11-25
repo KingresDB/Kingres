@@ -197,7 +197,7 @@ func TestImportOnServerGivesUpOnAServerThatIsGone(t *testing.T) {
 	if !errors.As(err, &xe) || xe.Retryable {
 		t.Fatalf("the error is not a final transfer error: %#v", err)
 	}
-	for _, want := range []string{"server s2 did not answer", "the import was undone", "private database", "keeps the server from being removed"} {
+	for _, want := range []string{"server s2 did not answer", "the import was undone", "private database", "does not stop the removal of that server"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the message %q lacks %q", err.Error(), want)
 		}

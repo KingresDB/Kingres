@@ -1119,7 +1119,7 @@ func (o *Ops) importRenameFinal(ctx context.Context, env *task.Env, w renameFina
 			if o.Log != nil {
 				o.Log.Warn("an import that may be committed was not put back", "database", p.Database, "private", priv, "error", rerr)
 			}
-			return "; the import may be committed, so nothing was put back"
+			return importMaybeCommittedNote
 		}
 		var failed []string
 		for _, s := range done {
@@ -1183,6 +1183,10 @@ func (o *Ops) importRenameFinal(ctx context.Context, env *task.Env, w renameFina
 	case commitNot:
 		note := revert()
 		if errors.Is(cerr, task.ErrCancelRequested) {
+			if note == importMaybeCommittedNote {
+				// The first write of the mark was made (its read-back failed) and the cancel came before the second: the mark is there, so nothing was undone.
+				return transfer.Errorf(transfer.CodeCancelled, false, "the import was canceled while its commit point was being confirmed; the commit mark is written, so it may be committed and nothing was undone")
+			}
 			// The store refused the mark because a cancel is recorded (the check and the write are one statement): the cancel wins, and the import is undone.
 			return transfer.Errorf(transfer.CodeCancelled, false, "the import was canceled before its commit point, so it was undone%s", note)
 		}
@@ -1194,6 +1198,9 @@ func (o *Ops) importRenameFinal(ctx context.Context, env *task.Env, w renameFina
 	}
 	return o.importRollForward(ctx, env, w)
 }
+
+// importMaybeCommittedNote ends the error of a step that found the commit mark in the store (or could not read it) when it meant to undo its work.
+const importMaybeCommittedNote = "; the import may be committed, so nothing was put back"
 
 // leaseOrStop tells whether an error means that this run must not do anything more in the name of the task: it was cancelled, lost its lease or was fenced.
 func leaseOrStop(ctx context.Context, err error) bool {
@@ -1707,7 +1714,7 @@ func putBackNote(failed []string, final string) string {
 	if len(failed) == 0 {
 		return ""
 	}
-	return fmt.Sprintf("; the database could not be put back to its private name on %s: it is still there under the final name %s, with the marker of this import, and the removal of the failed import tries again; if %s is still there after it, drop it with DROP DATABASE on that server",
+	return fmt.Sprintf("; the database could not be put back to its private name on %s: it is still there under the final name %s, with the marker of this import; the removal of the failed import tries once more when the task ends and does not try again later, so if %s is still there when the server is back, drop it with DROP DATABASE on that server (connected to postgres as the service role)",
 		strings.Join(failed, ", "), final, final)
 }
 

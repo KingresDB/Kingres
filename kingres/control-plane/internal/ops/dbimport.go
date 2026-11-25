@@ -325,22 +325,26 @@ func (o *Ops) StartDatabaseImport(ctx context.Context, actor string, req api.Imp
 	if bad {
 		return task.Task{}, problem.New(problem.Forbidden, importDangerousText)
 	}
+	// The lock covers the check of the limits and the start of the task, not the link of the upload that follows (a store that is failing makes that wait long).
 	o.startMu.Lock()
-	defer o.startMu.Unlock()
 	if err := o.concurrency(ctx, st, actor); err != nil {
+		o.startMu.Unlock()
 		return task.Task{}, err
 	}
 	p := dbImportParams{UploadID: up.ID, Owner: who, Database: name, ExpectedSHA256: req.ExpectedSHA256, AckLedger: req.AcknowledgeLedgerRestart, ForeignKeys: fk,
 		KeepOnFailure: req.KeepOnFailure, Servers: ids(o.others(ctx)), Origin: o.ServerHost, Nonce: nonce}
 	t, err := o.StartTask(ctx, KindDatabaseImport, "database", name, p, actor)
+	o.startMu.Unlock()
 	if err != nil {
 		return task.Task{}, err
 	}
 	if err := o.linkImportTask(ctx, up.ID, t.ID); err != nil {
-		// Without the link a paused import cannot be resumed by a repeat of the request and the janitor may expire the upload: the import does not go on. The task
-		// that was started is canceled (it has just begun, so it is undone as any import that is canceled), and the request fails: no import is left that the
-		// operator cannot reach.
-		o.cancelUnlinkedImport(t.ID)
+		// Without the link a paused import cannot be resumed by a repeat of the request: the import does not go on. The task that was started is canceled (it has
+		// just begun, so it is undone as any import that is canceled) and the request fails. The janitor does not depend on the link (it also looks at the input of
+		// the unfinished import tasks), so even a task that could not be canceled keeps its archive.
+		if cerr := o.cancelUnlinkedImport(t.ID); cerr != nil {
+			return task.Task{}, problem.New(problem.ServiceUnavailable, fmt.Sprintf("The import could not be recorded for its upload and could not be canceled either: task %d may still be running. Find it among the tasks of kind database.import, cancel it, then repeat the request.", t.ID))
+		}
 		return task.Task{}, problem.New(problem.ServiceUnavailable, "The import could not be recorded for its upload, so it was canceled before it did any work that is kept. Repeat the request.").WithRetryAfter(5)
 	}
 	return t, nil
@@ -379,15 +383,34 @@ func (o *Ops) linkImportTask(ctx context.Context, upload, id int64) error {
 	return err
 }
 
-// cancelUnlinkedImport cancels a task that was started and could not be linked to its upload.
-func (o *Ops) cancelUnlinkedImport(id int64) {
+// cancelImportHook is called by a test before each try to cancel a task that could not be linked; an error is the error of the try.
+var cancelImportHook func() error
+
+// cancelUnlinkedImport cancels a task that was started and could not be linked to its upload. The cancel is tried as often as the link; a task that has already
+// ended is as good as canceled. It returns the last error when none of the tries worked.
+func (o *Ops) cancelUnlinkedImport(id int64) error {
 	eng := o.Engine()
 	if eng == nil {
-		return
+		return errors.New("the task engine is not running")
 	}
-	if err := eng.Cancel(context.WithoutCancel(o.bg()), id); err != nil && o.Log != nil {
-		o.Log.Error("an import that could not be linked to its upload was not canceled", "task", id, "error", err)
+	var err error
+	for i := 0; i < importLinkTries; i++ {
+		if i > 0 {
+			time.Sleep(importLinkPause)
+		}
+		if h := cancelImportHook; h != nil {
+			if err = h(); err != nil {
+				continue
+			}
+		}
+		if err = eng.Cancel(context.WithoutCancel(o.bg()), id); err == nil || errors.Is(err, task.ErrNotCancellable) {
+			return nil
+		}
 	}
+	if o.Log != nil {
+		o.Log.Error("an import that could not be linked to its upload could not be canceled", "task", id, "error", err)
+	}
+	return err
 }
 
 const importDangerousText = "An import runs the statements of the archive as the signed-in role, so it is refused for a role with the SUPERUSER, REPLICATION or BYPASSRLS attribute or with access to server files, programs or logs; sign in as another role."

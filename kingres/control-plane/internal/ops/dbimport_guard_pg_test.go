@@ -714,7 +714,7 @@ func TestTheRenameCanBeRunAgainAfterARestartAndTheHookPutsItBack(t *testing.T) {
 // M3: the note of a failed putting back names the database as it is on that server (the final name) and says what happens and what the operator does.
 func TestThePutBackNoteNamesTheFinalName(t *testing.T) {
 	n := putBackNote([]string{"s2", "s3"}, "shop")
-	for _, w := range []string{"s2, s3", "under the final name shop", "tries again", "DROP DATABASE"} {
+	for _, w := range []string{"s2, s3", "under the final name shop", "tries once more when the task ends", "does not try again later", "DROP DATABASE"} {
 		if !strings.Contains(n, w) {
 			t.Errorf("the note lacks %q: %s", w, n)
 		}

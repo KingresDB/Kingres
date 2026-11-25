@@ -224,3 +224,106 @@ func TestImportStartWithoutTheLinkIsNotLeftBehind(t *testing.T) {
 	_ = e1.Cancel(context.Background(), got.ID)
 	r.o[0].wg.Wait()
 }
+
+// markThenCancel writes the mark and then fails the first read (the read-back of SetMark) while it records a cancel request, as a cancel that arrives between
+// the two tries of the commit.
+type markThenCancel struct {
+	*task.MemStore
+	mu    sync.Mutex
+	stage int
+}
+
+func (s *markThenCancel) SetMark(ctx context.Context, id int64, l task.Lease, mark string) error {
+	err := s.MemStore.SetMark(ctx, id, l, mark)
+	s.mu.Lock()
+	if err == nil && s.stage == 0 {
+		s.stage = 1
+	}
+	s.mu.Unlock()
+	return err
+}
+
+func (s *markThenCancel) Get(ctx context.Context, id int64) (task.Task, error) {
+	s.mu.Lock()
+	armed := s.stage == 1
+	if armed {
+		s.stage = 2
+	}
+	s.mu.Unlock()
+	if armed {
+		_ = s.MemStore.RequestCancel(ctx, id, time.Now())
+		return task.Task{}, errors.New("the task store cannot be read")
+	}
+	return s.MemStore.Get(ctx, id)
+}
+
+// L3: when the first write of the mark was made, its read-back failed and the second write is refused for a cancel, the import is not undone and its error does not
+// say that it was: it says that it may be committed.
+func TestImportCommitConfirmedWhileACancelArrivesIsNotCalledUndone(t *testing.T) {
+	r := newImportRig(t)
+	st := &markThenCancel{MemStore: r.mem}
+	e1, p := r.engine("A", st, nil)
+	tk, priv := r.submit(e1, p)
+	if err := e1.RunNow(context.Background(), tk.ID, nil); err != nil {
+		t.Fatalf("the run: %v", err)
+	}
+	got := r.get(e1, tk.ID)
+	if got.State != task.Paused || got.Mark != importCommitMark(priv) {
+		t.Fatalf("the task: %s mark %q %+v", got.State, got.Mark, got.Error)
+	}
+	_, reason, _ := strings.Cut(got.Detail, "Reason: ")
+	if !strings.Contains(reason, "may be committed") || strings.Contains(reason, "so it was undone") {
+		t.Errorf("the reason is not consistent: %q", got.Detail)
+	}
+	if r.state(0, "shop") == "missing" {
+		t.Error("the committed database was put back")
+	}
+}
+
+// M1 (review 9): when the link cannot be written and the cancel of the task fails as well, the request does not say that the import was canceled: it says that the
+// task may still be running and names it, and the task is not ended. A task that ended meanwhile counts as canceled.
+func TestImportStartWhenTheLinkAndTheCancelBothFailSaysSo(t *testing.T) {
+	r := newStartRig(t)
+	oldLink, oldCancel, oldTries, oldPause := linkImportHook, cancelImportHook, importLinkTries, importLinkPause
+	importLinkPause = time.Millisecond
+	defer func() {
+		linkImportHook, cancelImportHook, importLinkTries, importLinkPause = oldLink, oldCancel, oldTries, oldPause
+	}()
+	e1, _ := r.engine("A", r.mem, func(s task.Step) task.Step {
+		s.Run = func(ctx context.Context, env *task.Env) error { <-ctx.Done(); return ctx.Err() }
+		return s
+	})
+	r.o[0].SetEngine(e1)
+	linkImportHook = func() error { return errors.New("the system database does not answer") }
+	var cancels atomic.Int32
+	cancelImportHook = func() error { cancels.Add(1); return errors.New("the task store does not answer") }
+	_, err := r.o[0].StartDatabaseImport(context.Background(), "imp", r.request("shop"))
+	var pr *problem.Problem
+	if !errors.As(err, &pr) || pr.Code != problem.ServiceUnavailable {
+		t.Fatalf("the start: %v", err)
+	}
+	ts, _ := r.mem.List(context.Background(), 10)
+	if len(ts) != 1 {
+		t.Fatalf("%d tasks", len(ts))
+	}
+	id := fmt.Sprint(ts[0].ID)
+	if !strings.Contains(pr.Detail, "task "+id+" may still be running") || strings.Contains(pr.Detail, "so it was canceled") {
+		t.Errorf("the answer: %q", pr.Detail)
+	}
+	if cancels.Load() != int32(importLinkTries) {
+		t.Errorf("%d tries to cancel", cancels.Load())
+	}
+	if got := r.get(e1, ts[0].ID); got.State == task.Failed || got.State == task.Done {
+		t.Errorf("the task ended: %s", got.State)
+	}
+	// the cancel that works at last ends the task
+	cancelImportHook = nil
+	if err := r.o[0].cancelUnlinkedImport(ts[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	r.o[0].wg.Wait()
+	// a task that has ended is as good as canceled
+	if err := r.o[0].cancelUnlinkedImport(ts[0].ID); err != nil {
+		t.Errorf("the cancel of an ended task: %v", err)
+	}
+}
