@@ -1088,9 +1088,9 @@ func (e *Engine) SubmitHeld(ctx context.Context, kind string, subj Subject, inpu
 func (e *ExcludedError) Problem() *problem.Problem {
 	switch {
 	case e.Kind == "database.import":
-		return problem.New(problem.OperationInProgress, "A rebalance, a drain or the removal of a server ("+e.Other+") is unfinished; the import starts when it has ended.")
+		return problem.New(problem.OperationInProgress, "A rebalance, a drain or the addition or removal of a server ("+e.Other+") is unfinished; the import starts when it has ended.")
 	case e.Other == "database.import":
-		return problem.New(problem.OperationInProgress, "A database import is running; a rebalance, a drain and the removal of a server wait until it has ended.")
+		return problem.New(problem.OperationInProgress, "A database import is running; a rebalance, a drain and the addition or removal of a server wait until it has ended.")
 	case e.Other == "rebalance":
 		return problem.New(problem.RebalanceInProgress, "A rebalance is running; wait until it has finished.")
 	case e.Other == "server.failover" || e.Other == "replication.restorePreferredPrimaries":

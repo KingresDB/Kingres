@@ -79,35 +79,33 @@ func TestAnImportAndARebalanceOrARemovalExcludeEachOther(t *testing.T) {
 		e.clear(t)
 		e.other(t, importKind, st)
 		wantExcluded(t, "a rebalance while an import is "+st, e.candidate(t, Kind), importKind)
-		for _, k := range []string{"server.remove", "server.leave"} {
+		for _, k := range []string{"server.add", "server.remove", "server.leave"} {
 			wantExcluded(t, k+" while an import is "+st, e.candidate(t, k), importKind)
 		}
-		// the failover and the add of a server are not excluded: the check before the final name finds what a failover changed
-		for _, k := range []string{"server.add", "server.failover"} {
-			if err := e.candidate(t, k); err != nil {
-				t.Errorf("%s while an import is %s: %v", k, st, err)
-			}
+		// the failover is not excluded: the check of the catalog finds what a failover changed
+		if err := e.candidate(t, "server.failover"); err != nil {
+			t.Errorf("server.failover while an import is %s: %v", st, err)
 		}
 	}
 	// the import has ended (done or failed): nothing is refused
 	for _, st := range []string{"done", "failed"} {
 		e.clear(t)
 		e.other(t, importKind, st)
-		for _, k := range []string{Kind, "server.remove", "server.leave"} {
+		for _, k := range []string{Kind, "server.add", "server.remove", "server.leave"} {
 			if err := e.candidate(t, k); err != nil {
 				t.Errorf("%s after an import that is %s: %v", k, st, err)
 			}
 		}
 	}
 	// a rebalance that is pending or running, or an unfinished removal or leave, refuses the import; a paused rebalance does not
-	for _, k := range []string{Kind, "server.remove", "server.leave"} {
+	for _, k := range []string{Kind, "server.add", "server.remove", "server.leave"} {
 		for _, st := range []string{"pending", "running"} {
 			e.clear(t)
 			e.other(t, k, st)
 			wantExcluded(t, "an import while "+k+" is "+st, e.candidate(t, importKind), k)
 		}
 	}
-	for _, k := range []string{"server.remove", "server.leave"} {
+	for _, k := range []string{"server.add", "server.remove", "server.leave"} {
 		e.clear(t)
 		e.other(t, k, "paused")
 		wantExcluded(t, "an import while "+k+" is paused", e.candidate(t, importKind), k)

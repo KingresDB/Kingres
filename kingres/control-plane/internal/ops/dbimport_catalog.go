@@ -20,7 +20,7 @@ import (
 // of that group. The import checks it before it takes the final name, because the database that is renamed is the database of the client from then on, and nothing
 // follows its catalog afterwards but the next failover, which then expects the old primary.
 //
-// A drain, a change of the flag or the weight of a server, the removal of a server and a rebalance are refused while an import runs (the exclusion of the tasks,
+// A drain, a change of the flag or the weight of a server, the addition or the removal of a server and a rebalance are refused while an import runs (the exclusion of the tasks,
 // migration 0045, and UpdateServer), so the check is the second line: it finds the changes that those do not see (a failover, a planned switchover, a server that
 // joined).
 
@@ -132,8 +132,53 @@ const failoverUnfinishedSQL = `SELECT count(*) FROM kingres_cp.task WHERE kind I
 
 // checkImportCatalog fails the import when the catalog of its private database no longer agrees with the system catalog (catalogDifferences), or when a failover is
 // not over: a standby that is promoted before the system catalog says so would pass the comparison. The failure goes the way of every failure of the task: the
-// private database is removed and the operation is repeated.
-func (o *Ops) checkImportCatalog(ctx context.Context, priv string) error {
+// private database is removed and the operation is repeated. db is the private database, or the database at its final name when the check is made after the rename.
+func (o *Ops) checkImportCatalog(ctx context.Context, db string) error {
+	return o.compareImportCatalog(ctx, db)
+}
+
+// serverSetDifference lists, in words, the servers that joined or left the cluster since the import started (started is the list that the import was made for, now the
+// active servers that are not this one).
+func serverSetDifference(started, now []string) []string {
+	have := map[string]bool{}
+	for _, s := range started {
+		have[s] = true
+	}
+	cur := map[string]bool{}
+	var out []string
+	for _, s := range now {
+		cur[s] = true
+		if !have[s] {
+			out = append(out, "server "+s+" joined")
+		}
+	}
+	for _, s := range started {
+		if !cur[s] {
+			out = append(out, "server "+s+" is not an active member any more")
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// checkImportServers fails the import when the active servers of the cluster are not the ones that it was made for (dbImportParams.Servers): the private database exists
+// on those servers only, and a server that joined while the import ran would be in the catalog without the database. The exclusion of the tasks refuses the addition of a
+// server while an import is unfinished (migration 0045); this is the second line.
+func (o *Ops) checkImportServers(ctx context.Context, started []string) error {
+	if o.Fanout == nil {
+		return nil
+	}
+	cur, err := o.Fanout.Others(ctx)
+	if err != nil {
+		return transfer.Errorf(transfer.CodeSessionLost, true, "the servers of the cluster cannot be read now; repeat the operation")
+	}
+	if d := serverSetDifference(started, ids(cur)); len(d) > 0 {
+		return transfer.Errorf(transfer.CodeLeaderChanged, true, "the servers of the cluster changed during the import (%s); the private database is removed, repeat the operation", safeSentence(strings.Join(d, "; ")))
+	}
+	return nil
+}
+
+func (o *Ops) compareImportCatalog(ctx context.Context, priv string) error {
 	pc, err := o.Service.ServiceConn(ctx, priv)
 	if err != nil {
 		return transfer.Errorf(transfer.CodeSessionLost, true, "the service role cannot connect to the private database now; repeat the operation")

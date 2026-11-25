@@ -154,19 +154,17 @@ func TestMemStoreExcludesAnImportAndARebalanceOrARemoval(t *testing.T) {
 		if err := create(st, "database.import", "database", "shop", state); err != nil {
 			t.Fatal(err)
 		}
-		for _, k := range []string{"rebalance", "server.remove", "server.leave"} {
-			err := create(st, k, "server", "s1", task.Pending)
+		for _, k := range []string{"rebalance", "server.add", "server.remove", "server.leave"} {
+			err := create(st, k, "server", "s1-"+k, task.Pending)
 			if !errors.As(err, &x) || x.Other != "database.import" || x.Problem().Code != "operation_in_progress" {
 				t.Errorf("%s while an import is %s: %v", k, state, err)
 			}
 		}
-		for _, k := range []string{"server.add", "server.failover"} {
-			if err := create(st, k, "server", "s2-"+k, task.Pending); err != nil {
-				t.Errorf("%s while an import is %s: %v", k, state, err)
-			}
+		if err := create(st, "server.failover", "server", "s2", task.Pending); err != nil {
+			t.Errorf("server.failover while an import is %s: %v", state, err)
 		}
 	}
-	for _, k := range []string{"rebalance", "server.remove", "server.leave"} {
+	for _, k := range []string{"rebalance", "server.add", "server.remove", "server.leave"} {
 		st := task.NewMemStore()
 		if err := create(st, k, "server", "s1", task.Running); err != nil {
 			t.Fatal(err)

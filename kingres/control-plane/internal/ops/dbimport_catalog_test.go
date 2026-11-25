@@ -132,3 +132,59 @@ func TestCheckImportCatalogOnARealInstance(t *testing.T) {
 		t.Fatalf("no catalog: %v", err)
 	}
 }
+
+func TestServerSetDifference(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		started, now []string
+		want         []string
+	}{
+		{"the same servers", []string{"b", "c"}, []string{"c", "b"}, nil},
+		{"a server joined", []string{"b"}, []string{"b", "d"}, []string{"server d joined"}},
+		{"a server left", []string{"b", "c"}, []string{"b"}, []string{"server c is not an active member any more"}},
+		{"one joined and one left", []string{"b", "c"}, []string{"b", "d"}, []string{"server c is not an active member any more", "server d joined"}},
+		{"a single server", nil, nil, nil},
+		{"the first one joined", nil, []string{"b"}, []string{"server b joined"}},
+	} {
+		got := serverSetDifference(tc.started, tc.now)
+		if strings.Join(got, "|") != strings.Join(tc.want, "|") {
+			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// listFanout is a Fanout that only knows the active servers.
+type listFanout struct {
+	servers []OtherServer
+	err     error
+}
+
+func (f listFanout) Others(context.Context) ([]OtherServer, error)       { return f.servers, f.err }
+func (f listFanout) Apply(context.Context, string, string, any) error    { return nil }
+func (f listFanout) Register(context.Context, string, OtherServer) error { return nil }
+
+// A server that joined while the import ran (or one that left) fails the import before it takes the final name: the private database exists on the servers that the
+// import started with only.
+func TestCheckImportServers(t *testing.T) {
+	ctx := context.Background()
+	o := &Ops{Fanout: listFanout{servers: []OtherServer{{ID: "b"}, {ID: "c"}}}}
+	if err := o.checkImportServers(ctx, []string{"b", "c"}); err != nil {
+		t.Fatalf("the same servers: %v", err)
+	}
+	err := o.checkImportServers(ctx, []string{"b"})
+	var te *transfer.Error
+	if !errors.As(err, &te) || te.Code != transfer.CodeLeaderChanged || !te.Retryable || !strings.Contains(te.Error(), "server c joined") {
+		t.Fatalf("a server that joined: %v", err)
+	}
+	if err := o.checkImportServers(ctx, []string{"b", "c", "d"}); err == nil || !strings.Contains(err.Error(), "server d is not an active member") {
+		t.Fatalf("a server that left: %v", err)
+	}
+	o.Fanout = listFanout{err: errors.New("down")}
+	if err := o.checkImportServers(ctx, nil); !errors.As(err, &te) || te.Code != transfer.CodeSessionLost {
+		t.Fatalf("the servers cannot be read: %v", err)
+	}
+	o.Fanout = nil
+	if err := o.checkImportServers(ctx, nil); err != nil {
+		t.Fatalf("a single server: %v", err)
+	}
+}
