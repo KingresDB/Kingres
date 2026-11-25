@@ -291,7 +291,7 @@ paths:
                     address: 10.0.0.11:8091
                     hostname: db1
                     version: 1.0.0
-                    postgresVersion: '18.1'
+                    postgresVersion: '18.7'
                     setupTokenRequired: true
                     localhostOnly: true
                     serverId: null
@@ -304,7 +304,7 @@ paths:
                     address: 10.0.0.11:8091
                     hostname: db1
                     version: 1.0.0
-                    postgresVersion: '18.1'
+                    postgresVersion: '18.7'
                     setupTokenRequired: true
                     localhostOnly: true
                     serverId: null
@@ -317,7 +317,7 @@ paths:
                     address: 10.0.0.11:8091
                     hostname: db1
                     version: 1.0.0
-                    postgresVersion: '18.1'
+                    postgresVersion: '18.7'
                     setupTokenRequired: false
                     localhostOnly: false
                     serverId: 10.0.0.11
@@ -330,7 +330,7 @@ paths:
                     address: 10.0.0.11:8091
                     hostname: db1
                     version: 1.0.0
-                    postgresVersion: '18.1'
+                    postgresVersion: '18.7'
                     setupTokenRequired: true
                     localhostOnly: true
                     serverId: null
@@ -460,7 +460,7 @@ paths:
                     address: 10.0.0.11:8091
                     hostname: db1
                     version: 1.0.0
-                    postgresVersion: '18.1'
+                    postgresVersion: '18.7'
                     nodeState: clustered
                     clusterId: 7d1f2c0e-3b2a-4d58-9c51-2f6f0a1b9e11
                     uptimeSeconds: 86400

@@ -134,8 +134,8 @@ func TestEvaluateLedgerPendingTooOld(t *testing.T) {
 
 func TestEvaluateVersions(t *testing.T) {
 	same := []monitor.ServerVersions{
-		{Server: "a", KingresDB: "0.2.0", PostgreSQL: "18.1", Extensions: map[string]string{"kingres_shard": "0.4", "kingres_ledger": "0.2"}},
-		{Server: "b", KingresDB: "0.2.0", PostgreSQL: "18.1", Extensions: map[string]string{"kingres_shard": "0.4", "kingres_ledger": "0.2"}},
+		{Server: "a", KingresDB: "0.2.0", PostgreSQL: "18.7", Extensions: map[string]string{"kingres_shard": "0.4", "kingres_ledger": "0.2"}},
+		{Server: "b", KingresDB: "0.2.0", PostgreSQL: "18.7", Extensions: map[string]string{"kingres_shard": "0.4", "kingres_ledger": "0.2"}},
 	}
 	if c := monitor.EvaluateVersions(same); len(c) != 0 {
 		t.Errorf("equal versions: %v", c)
@@ -144,7 +144,7 @@ func TestEvaluateVersions(t *testing.T) {
 		t.Errorf("one server: %v", c)
 	}
 	diff := append([]monitor.ServerVersions(nil), same...)
-	diff = append(diff, monitor.ServerVersions{Server: "c", KingresDB: "0.3.0", PostgreSQL: "18.1", Extensions: map[string]string{"kingres_shard": "0.5", "kingres_ledger": "0.2"}})
+	diff = append(diff, monitor.ServerVersions{Server: "c", KingresDB: "0.3.0", PostgreSQL: "18.7", Extensions: map[string]string{"kingres_shard": "0.5", "kingres_ledger": "0.2"}})
 	conds := monitor.EvaluateVersions(diff)
 	if len(conds) != 1 || conds[0].Kind != "versionMismatch" || conds[0].Subject != "cluster" || conds[0].Severity != "warning" {
 		t.Fatalf("different versions: %+v", conds)
@@ -314,7 +314,7 @@ func TestVersionMismatchAlertLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	v := func(server, kv, shard string) monitor.ServerVersions {
-		return monitor.ServerVersions{Server: server, KingresDB: kv, PostgreSQL: "18.1", Extensions: map[string]string{"kingres_shard": shard}}
+		return monitor.ServerVersions{Server: server, KingresDB: kv, PostgreSQL: "18.7", Extensions: map[string]string{"kingres_shard": shard}}
 	}
 	b := v("b", "0.2.0", "0.4")
 	src := &fakeVersions{local: v("a", "0.2.0", "0.4"), others: map[string]*monitor.ServerVersions{"b": &b}}

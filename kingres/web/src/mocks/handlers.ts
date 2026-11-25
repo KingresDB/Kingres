@@ -1300,7 +1300,7 @@ function runQuery(ctx: Ctx): S['QueryResult'] {
   let m = /^select\s+1(\s+as\s+(\w+))?$/i.exec(sql)
   if (m) return done([{ name: m[2] ?? '?column?', type: 'int4' }], [[1]])
   if (/^select\s+version\(\)$/i.test(sql))
-    return done([{ name: 'version', type: 'text' }], [['PostgreSQL 18.1 (KingresDB 0.1.0)']])
+    return done([{ name: 'version', type: 'text' }], [['PostgreSQL 18.7 (KingresDB 0.1.0)']])
   if (/^select\s+now\(\)$/i.test(sql))
     return done([{ name: 'now', type: 'timestamptz' }], [[new Date().toISOString()]])
   m = /^select\s+(.+?)\s+from\s+([\w.]+)/i.exec(sql)
@@ -1433,7 +1433,7 @@ export function createHandlers(): HttpHandler[] {
         hostname: 'kdb-1.example.internal',
         version: '0.1.0',
         commit: mockConfig.commit,
-        postgresVersion: '18.1',
+        postgresVersion: '18.7',
         setupTokenRequired: c.s.node.state === 'uninitialized',
         localhostOnly: c.s.node.state === 'uninitialized',
         serverId: c.s.node.state === 'uninitialized' ? null : LOCAL,
@@ -1457,7 +1457,7 @@ export function createHandlers(): HttpHandler[] {
         address: c.s.servers[0]?.address ?? '',
         hostname: c.s.servers[0]?.hostname ?? '',
         version: '0.1.0',
-        postgresVersion: c.s.node.leftCluster ? null : '18.1',
+        postgresVersion: c.s.node.leftCluster ? null : '18.7',
         nodeState: c.s.node.leftCluster ? 'standalone' : 'clustered',
         clusterId: c.s.node.leftCluster ? null : c.s.clusterId,
         uptimeSeconds: Math.floor((Date.now() - (c.s.servers[0]?.startedAt ?? Date.now())) / 1000),

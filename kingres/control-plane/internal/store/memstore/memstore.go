@@ -48,7 +48,7 @@ type Store struct {
 // New returns a store with empty but valid content.
 func New() *Store {
 	return &Store{
-		PGVersion: "18.1",
+		PGVersion: "18.7",
 		Summary: store.ClusterSummary{
 			Health: "healthy", MapGroupAvailable: true, RebalanceNeeded: false,
 			RebalanceReasons: []string{},
