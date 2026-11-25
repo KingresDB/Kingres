@@ -26,6 +26,14 @@ func (s *storeCancelsCtx) RequestCancelIf(ctx context.Context, id int64, now tim
 	return err
 }
 
+// Get fails for a request that is gone, as a store of a database does.
+func (s *storeCancelsCtx) Get(ctx context.Context, id int64) (task.Task, error) {
+	if err := ctx.Err(); err != nil {
+		return task.Task{}, err
+	}
+	return s.MemStore.Get(ctx, id)
+}
+
 // M1: the hook of a task that a cancel ended without a run does not depend on the request: a request that is gone after the write does not skip it.
 func TestTheHookOfACancelledPausedTaskRunsWhenTheRequestIsGone(t *testing.T) {
 	clk := newClock()
