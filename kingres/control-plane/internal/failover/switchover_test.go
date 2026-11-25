@@ -1136,3 +1136,34 @@ func TestTheMapGroupIsNotStoppedWhenTheLeaseCannotBeLengthened(t *testing.T) {
 		t.Errorf("the task is %s, want failed:\n%s", got.State, log)
 	}
 }
+
+func TestTheRollbackOfALeaseThatCannotBeLengthenedGivesTheBootstrapUpAndResumesTheOldLeader(t *testing.T) {
+	w := mapWorld()
+	r := w.runner()
+	w.fakeClock(r)
+	st := task.NewMemStore()
+	eng, err := task.NewEngine(st, []task.Definition{r.Definition(nil)}, task.Options{Holder: "A", Lease: 30 * time.Second, StoreTries: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	tk, _ := eng.Submit(ctx, KindFailover, task.Subject{Type: "server", ID: "s1"}, mapGracefulInput(), "tester")
+	st.FailOn(func(op string) error {
+		if op == "renew" {
+			return errors.New("the store is unreachable")
+		}
+		return nil
+	})
+	_, _ = eng.RunOnce(ctx)
+	log := strings.Join(w.log, "\n")
+	got, _ := st.Get(ctx, tk.ID)
+	if got.State != task.Failed || got.Error == nil || got.Error.Code != CodeSwitchoverUnproven {
+		t.Errorf("the task: %s %+v\n%s", got.State, got.Error, log)
+	}
+	if w.count("map-abandon s2") != 1 {
+		t.Errorf("the bootstrap of the candidate was not given up exactly once:\n%s", log)
+	}
+	if w.count("resume s1") < 1 {
+		t.Errorf("the old leader was not resumed:\n%s", log)
+	}
+}

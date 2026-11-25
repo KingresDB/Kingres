@@ -835,20 +835,44 @@ func (g *leaseGuard) extend(ctx context.Context, l Lease, id int64, d time.Durat
 	}
 	g.mu.Unlock()
 	g.renewed(started, d)
-	return func() {
-		g.renewMu.Lock()
-		defer g.renewMu.Unlock()
-		g.mu.Lock()
-		g.dur = 0
-		g.mu.Unlock()
-		// One renewal with the normal length, bounded: it brings the store and the guard back to the normal margin when the store answers.
-		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
-		defer cancel()
-		started := g.e.now()
-		if g.e.store.Renew(rctx, id, l, g.e.lease) == nil {
-			g.renewed(started, g.e.lease)
+	var once sync.Once
+	return func() { once.Do(func() { g.restore(ctx, id, l) }) }, nil
+}
+
+// restore ends an extension: the renewals ask for the normal length again, the guard is tightened to the normal margin before anything is sent, and one
+// bounded renewal with the normal length follows. The tightening comes first because a renewal that the store commits but whose answer is late or lost
+// leaves the store with the short lease: a guard that still trusted the long one would then act on a lease the store has given up. A renewal that
+// succeeds only raises the guard again (to the same normal margin). The lock of the renewals is waited for no longer than the renewal itself: a renewal
+// that hangs on a store that is down must not hold the step back, and one that was sent with the long length cannot shorten the store lease.
+func (g *leaseGuard) restore(ctx context.Context, id int64, l Lease) {
+	g.mu.Lock()
+	g.dur = 0
+	g.mu.Unlock()
+	started := g.e.now()
+	g.tighten(started.Add(g.e.lease - g.e.leaseMargin()))
+	deadline := time.Now().Add(3 * time.Second)
+	for !g.renewMu.TryLock() {
+		if !time.Now().Before(deadline) {
+			return
 		}
-	}, nil
+		time.Sleep(20 * time.Millisecond)
+	}
+	defer g.renewMu.Unlock()
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	if g.e.store.Renew(rctx, id, l, g.e.lease) == nil {
+		g.renewed(started, g.e.lease)
+	}
+}
+
+// tighten brings the end of the time the run trusts its lease forward to until, when that is earlier; it never moves it back.
+func (g *leaseGuard) tighten(until time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if until.Before(g.until) {
+		g.until = until
+		g.timer.Reset(until.Sub(g.e.now()))
+	}
 }
 
 // length is the length of the lease that a renewal asks for.

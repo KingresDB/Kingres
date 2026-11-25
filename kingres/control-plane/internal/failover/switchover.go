@@ -331,6 +331,7 @@ func (r *Runner) stopClean(ctx context.Context, env *task.Env, sc *stepCtx) erro
 	} else if st, serr := r.Peers.State(ctx, sc.old(), sc.group); !IsCode(merr, "not_primary") && !(serr == nil && len(st.OutOfRecovery()) == 0) {
 		return sc.rollbackFailed(ctx, CodeStandbyBehind, true, "the position of the old primary of shard group %d could not be marked: %v", sc.group, merr)
 	}
+	restoreLease := func() {}
 	if sc.group == 0 {
 		// The lease of this task is a row of the system database, and the clean stop shuts that database down: no renewal can reach it for as long as the
 		// shutdown checkpoint lasts, and the lease guard of the engine would cancel this step (and with it the stop) after a third of the lease. The lease is
@@ -343,9 +344,11 @@ func (r *Runner) stopClean(ctx context.Context, env *task.Env, sc *stepCtx) erro
 			}
 			return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the lease of the task could not be lengthened for the stop of the map group, so nothing was stopped: %v", lerr)
 		}
-		defer restore()
+		restoreLease = restore
+		defer restore() // a safety net: the call below is the normal place, and the restore runs once
 	}
 	ans, err := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "fast", ExpectedTerm: run.ExpectedTerm, Candidate: sc.candidateOf(nw)})
+	restoreLease() // the stop is over, however it ended: the lease is brought back to its normal length at once, not after the verdict wait or the rollback
 	if err != nil {
 		if IsCode(err, "stale_term") {
 			return sc.rollbackFailed(ctx, CodeSuperseded, false, "another failover changed the catalog term of the cluster")

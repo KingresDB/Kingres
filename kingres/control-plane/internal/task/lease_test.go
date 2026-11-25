@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 package task_test
 
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -391,7 +393,11 @@ func TestARefusedExtensionLeavesTheGuardDeadlineUntouched(t *testing.T) {
 	}
 	clk.Add(25 * time.Second) // beyond the 20 s of the real lease, far inside the 95 s a refused extension would have set
 	tick <- clk.Now()
-	<-saw
+	select {
+	case <-saw:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the run was not stopped at the deadline of the lease it holds: the refused extension moved the guard")
+	}
 	if err := <-done; !errors.Is(err, task.ErrLeaseLost) {
 		t.Fatalf("ended with %v, want ErrLeaseLost", err)
 	}
@@ -422,4 +428,117 @@ func TestAnEngineLeaseLongerThanTheCoverStillCoversIt(t *testing.T) {
 	if left < 190*time.Second {
 		t.Errorf("the lease holds %v after the extension, want the full lease of the engine", left)
 	}
+}
+
+// commitThenFail is a store whose renewal is committed and then answers with an error while fail is set: the answer is lost or late.
+type commitThenFail struct {
+	task.Store
+	fail *atomic.Bool
+}
+
+func (s commitThenFail) Renew(ctx context.Context, id int64, l task.Lease, d time.Duration) error {
+	err := s.Store.Renew(ctx, id, l, d)
+	if err == nil && s.fail.Load() {
+		return errors.New("the answer was lost")
+	}
+	return err
+}
+
+// The renewal that ends an extension shortens the lease in the store. When the store commits it and the answer is lost, the guard must already trust the
+// short lease only: it stops the run at the normal deadline, not at the long one that the store no longer holds.
+func TestAnEndOfExtensionWhoseAnswerIsLostStopsTheRunAtTheNormalDeadline(t *testing.T) {
+	clk := newClock()
+	mem := task.NewMemStoreClock(clk.Now)
+	var fail atomic.Bool
+	tick := make(chan time.Time)
+	started, saw := make(chan struct{}), make(chan struct{}, 1)
+	def := task.Definition{Kind: "test.kind", Steps: []task.Step{{Name: "work", Run: func(ctx context.Context, env *task.Env) error {
+		restore, err := env.ExtendLease(ctx, 90*time.Second)
+		if err != nil {
+			return err
+		}
+		fail.Store(true)
+		restore()
+		started <- struct{}{}
+		<-ctx.Done()
+		saw <- struct{}{}
+		return ctx.Err()
+	}}}}
+	a, err := task.NewEngine(commitThenFail{mem, &fail}, []task.Definition{def}, task.Options{Holder: "A", Lease: 30 * time.Second, Now: clk.Now, StoreTries: 1, RenewEvery: tick})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	a.Submit(ctx, "test.kind", task.Subject{Type: "x", ID: "1"}, nil, "u")
+	done := make(chan error, 1)
+	go func() { _, err := a.RunOnce(ctx); done <- err }()
+	<-started
+	clk.Add(21 * time.Second) // beyond the 20 s of the normal lease, far inside the 95 s of the long one
+	tick <- clk.Now()
+	select {
+	case <-saw:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the guard still trusts the long lease after the end of the extension whose answer was lost")
+	}
+	<-done
+}
+
+// A renewal that hangs on the store holds the lock of the renewals; the end of the extension does not wait for it longer than its own bound.
+func TestTheEndOfTheExtensionDoesNotWaitForAHangingRenewal(t *testing.T) {
+	clk := newClock()
+	mem := task.NewMemStoreClock(clk.Now)
+	release := make(chan struct{})
+	var hang atomic.Bool
+	tick := make(chan time.Time)
+	took := make(chan time.Duration, 1)
+	inRenew := make(chan struct{}, 1)
+	def := task.Definition{Kind: "test.kind", Steps: []task.Step{{Name: "work", Run: func(ctx context.Context, env *task.Env) error {
+		restore, err := env.ExtendLease(ctx, 90*time.Second)
+		if err != nil {
+			return err
+		}
+		hang.Store(true)
+		tick <- clk.Now() // the renewal of the loop starts and hangs
+		<-inRenew
+		begin := time.Now()
+		restore()
+		took <- time.Since(begin)
+		close(release)
+		return nil
+	}}}}
+	st := hangingStore{Store: mem, hang: &hang, release: release, in: inRenew}
+	a, err := task.NewEngine(st, []task.Definition{def}, task.Options{Holder: "A", Lease: 30 * time.Second, Now: clk.Now, StoreTries: 1, RenewEvery: tick})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Submit(context.Background(), "test.kind", task.Subject{Type: "x", ID: "1"}, nil, "u")
+	if _, err := a.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if d := <-took; d > 6*time.Second {
+		t.Errorf("the end of the extension waited %v for a hanging renewal, want its own bound of 3 s", d)
+	}
+}
+
+type hangingStore struct {
+	task.Store
+	hang    *atomic.Bool
+	release chan struct{}
+	in      chan struct{}
+}
+
+func (s hangingStore) Renew(ctx context.Context, id int64, l task.Lease, d time.Duration) error {
+	if s.hang.Load() {
+		select {
+		case s.in <- struct{}{}:
+		default:
+		}
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+		case <-time.After(10 * time.Second):
+		}
+		return errors.New("the store did not answer")
+	}
+	return s.Store.Renew(ctx, id, l, d)
 }
