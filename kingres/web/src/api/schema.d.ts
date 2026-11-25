@@ -2472,7 +2472,7 @@ export interface paths {
          * Cancel a task
          * @description Requests cancellation of a `pending`, `running` or `paused` task. Steps already completed are not
          *     undone unless the task kind defines compensation (create database cleans up). The task ends as
-         *     `failed` with error code `cancelled`. A running task stops at its next step boundary (a rebalance stops like a stop, between moves, and its run is recorded with outcome `cancelled`, not `failed`); a paused task (a stopped rebalance) ends at once. A cancel is a person's decision: it raises no `taskFailed` alert. Returns 409 for a task that is already `done` or `failed`.
+         *     `failed` with error code `cancelled`. A running task stops at its next step boundary (a rebalance stops like a stop, between moves, and its run is recorded with outcome `cancelled`, not `failed`); a paused task (a stopped rebalance) ends at once. A cancel is a person's decision: it raises no `taskFailed` alert. A `database.import` that passed its commit point is never ended or undone by a cancel: a running one is paused (its `detail` says it is committed and not finished), a paused one is not cancellable (409; repeat the import request to resume it). Returns 409 for a task that is already `done` or `failed`.
          */
         post: operations["cancelTask"];
         delete?: never;
@@ -4155,7 +4155,7 @@ export interface paths {
          *
          *     The import works in a database with a **private name** (`kingres_import_<task id>`) that only the task uses, and renames it to its final name as its last step; the last step has one commit point (a mark of the task, written
          *     before the first server opens the database to its owner). Before it a failed or cancelled import drops the private database (unless `keepOnFailure`)
-         *     and nothing of the final name exists; after it the import always finishes, possibly after retries while a server does not answer, and the system never removes it. Order: the extensions, the tables, the distribution of the tables **while they are empty**, the views, the data (one transaction per table, the rows
+         *     and nothing of the final name exists; after it the import only goes forward, possibly after retries while a server does not answer, goes on from the mark after a restart or a change of leader (on every server, the starting server included), and the system never removes it. It does not always end `done`: when the task engine itself gives a committed task up (a server that refuses the calls of the task again and again, a task store that cannot be read, a commit whose outcome is not known) or when `cancelTask` is accepted for it, the task is **`paused`**, not `failed`, with a `detail` that says the import is committed and not finished, names the servers and tells what to do; the database is left as it is (possibly closed or marked on some servers) and nothing is undone. Repeating this request with the same `uploadId` (and `database`, if it was given) resumes the paused import from the mark and finishes it. A cancel of a running committed import is accepted and pauses it this way; a paused committed import is not cancellable. Order: the extensions, the tables, the distribution of the tables **while they are empty**, the views, the data (one transaction per table, the rows
          *     counted against the manifest), the indexes and constraints, the sequences, then the ledger and the time-partition policies. **Ledger tables are carried as data and start a new chain** (ADR 0028): the import
          *     enters their rows as the first entries of a new chain, `ledger_verify` must find nothing, and then the signature policy of the source is set again; it needs `acknowledgeLedgerRestart: true` (422
          *     `ledger_restart_not_acknowledged` otherwise). **Time-partition policies come back disabled**; the task's last detail lists them with the call that enables each.
@@ -10116,7 +10116,7 @@ export interface components {
         /**
          * @description The import was accepted and runs as the task `database.import` (added in 0.30.0). Poll `GET /tasks/{taskId}` (the `Location` header) until `state` is `done` or `failed`. When it is `done` the database
          *     exists under its final name and `detail` lists what needs a decision (the disabled time-partition policies, the ledger chains that started again); when it failed the private database was removed (or kept, with
-         *     `keepOnFailure`) and the final name was never taken (a task that passed its commit point does not fail: it keeps going until the database is open on every server).
+         *     `keepOnFailure`) and the final name was never taken (a task that passed its commit point is not failed or undone: it keeps going until the database is open on every server, and when it is stopped or given up it is `paused` with a `detail` that says it is committed and not finished; repeat the request to resume it).
          */
         AcceptedDatabaseImport: {
             headers: {
