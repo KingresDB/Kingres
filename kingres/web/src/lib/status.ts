@@ -123,6 +123,9 @@ export const EXPORT_STATE: Record<DataExport['state'], StatusMeta> = tolerant({
 export const UPLOAD_STATE: Record<DataUpload['state'], StatusMeta> = tolerant({
   receiving: { tone: 'info', icon: HALF, label: 'Receiving' },
   complete: { tone: 'ok', icon: OK, label: 'Complete' },
+  validating: { tone: 'info', icon: HALF, label: 'Being validated' },
+  valid: { tone: 'ok', icon: OK, label: 'Valid archive' },
+  invalid: { tone: 'danger', icon: BAD, label: 'Invalid archive' },
   lost: {
     tone: 'warn',
     icon: WARN,
@@ -260,6 +263,7 @@ export const ALERT_KIND_LABEL: Record<AlertKind, string> = {
   partitionPolicyFailed: 'A partitioning policy failed',
   transferStagingLow: 'The staging area of the data transfer is nearly full',
   extensionSchemaUntrusted: 'The schema of a KingresDB extension cannot be trusted',
+  extensionSkipped: 'An extension was not installed in a database on a server',
 }
 
 /** The label of an alert kind; a kind from a newer server is shown as sent (through SafeName). */
@@ -295,6 +299,9 @@ export const TASK_KIND_LABEL: Record<TaskKind, string> = {
   'partition.maintain': 'Maintain the partitions of a table',
   'table.export': 'Export a table as CSV',
   'table.import': 'Import a CSV file into a table',
+  'database.export': 'Export a database to an archive',
+  'archive.validate': 'Validate a database archive',
+  'database.import': 'Import a database from an archive',
   rebalance: 'Rebalance',
   'replication.restorePreferredPrimaries': 'Restore preferred primaries',
   'ledger.verify': 'Verify the ledger',
@@ -335,6 +342,8 @@ export function taskKindLabel(kind: string): string {
  * reaches the server, an account that was disabled, changed or dropped may still work there.
  */
 const ALERT_KIND_HINT: Partial<Record<AlertKind, string>> = {
+  extensionSkipped:
+    'A role of the database made a schema of an extension its own on this server, so its owner here differs from the owner on the leader, and the extension was left out of this database here. The operation that found it went on. Make the owner of the schema the same as on the leader, then apply the database to the server again; the alert clears when the extension is installed, or when the database is dropped.',
   leaseLost:
     'The server that runs the primary of this shard group could not renew the lease of the group in time. If the group has a standby, the primary was stopped on purpose, so that two primaries can never run for one group; it starts again when the lease is obtained again. If the group has no standby, the primary keeps running and this alert is the only effect.',
   groupWithoutSynchronousStandby:
@@ -426,6 +435,8 @@ export const AUDIT_ACTION_LABEL: Record<AuditAction, string> = {
   putPartitionPolicy: 'Set a partitioning policy',
   deletePartitionPolicy: 'Remove a partitioning policy',
   runPartitionPolicy: 'Run a partitioning policy',
+  setCaEscrow: 'Switch the escrow of the certificate authority key on or off',
+  rotateCaEscrow: 'Rotate the escrow of the certificate authority key',
   enableTableLedger: 'Enable the ledger of a table',
   restorePreferredPrimaries: 'Restore preferred primaries',
   startRebalance: 'Start a rebalance',
@@ -487,6 +498,9 @@ export const AUDIT_ACTION_LABEL: Record<AuditAction, string> = {
   acknowledgeLedgerDivergence: 'Acknowledge a diverged ledger chain',
   exportTable: 'Export a table as CSV',
   importTable: 'Import a CSV file into a table',
+  exportDatabase: 'Export a database to an archive',
+  validateDatabaseArchive: 'Validate a database archive',
+  importDatabase: 'Import a database from an archive',
   createDataUpload: 'Start an upload',
   deleteDataUpload: 'Delete an upload',
   downloadDataExport: 'Download an export file',

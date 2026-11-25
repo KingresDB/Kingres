@@ -14,6 +14,7 @@ import (
 func (s *Server) tableLifecycleHandlers() map[string]handlerFunc {
 	return map[string]handlerFunc{
 		"previewTableChange":     s.previewTableChange,
+		"listRelatedTables":      s.listRelatedTables,
 		"undistributeTable":      s.undistributeTable,
 		"alterTableDistribution": s.alterTableDistribution,
 		"listTablePartitions":    s.listTablePartitions,
@@ -31,6 +32,29 @@ func (s *Server) tablePath(r *http.Request) (db, schema, table string, err error
 		return "", "", "", p
 	}
 	return db, schema, table, nil
+}
+
+// listRelatedTables answers the plan of a distribute with related tables (contract 0.32.0).
+func (s *Server) listRelatedTables(_ *call, w http.ResponseWriter, r *http.Request) error {
+	o, err := s.needOps()
+	if err != nil {
+		return err
+	}
+	db, schema, table, err := s.tablePath(r)
+	if err != nil {
+		return err
+	}
+	pp := newParams(r)
+	column := pp.maxLen("distributionColumn", 63)
+	if p := pp.err(); p != nil {
+		return p
+	}
+	out, err := o.ListRelatedTables(r.Context(), db, schema, table, column)
+	if err != nil {
+		return err
+	}
+	s.writeJSON(w, r, http.StatusOK, out)
+	return nil
 }
 
 func (s *Server) previewTableChange(_ *call, w http.ResponseWriter, r *http.Request) error {

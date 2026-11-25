@@ -87,7 +87,7 @@
  * (S10-08).  Their texts are unchanged.  One code per reaction, not per sentence:
  *   KS009  the node cannot commit: its synchronous standbys do not confirm; fix the list or the
  *          standby, then repeat;
- *   KS010  the call went to the wrong node (not the map group primary, superseded, another port,
+ *   KS010  the call went to the wrong node (superseded, another port,
  *          not a copy of the map group); send it where the message and hint say;
  *   KS011  the node is still in recovery: promote it in PostgreSQL first, then repeat;
  *   KS012  the promotion would not be safe (a newer catalog term exists, or only a minority of the
@@ -125,6 +125,24 @@
  * table" (phase 7 step 25, internal_raise_blockers in the SQL of 0.9).  Raised by SQL; the macro documents the code.  Not a retry.
  */
 #define ERRCODE_KINGRES_LEDGER_TABLE MAKE_SQLSTATE('K','S','0','1','6')
+
+/*
+ * SQLSTATEs of the refusals that the control plane tells apart, one code per reaction (the texts are unchanged and the control plane no
+ * longer reads them).  Raised in C or in the SQL of 0.9 (kingres_shard--0.8--0.9.sql); the macros document the codes that SQL raises.
+ *   KS017  no shard group may receive buckets (no active primary that should have shards): register a node or set should_have_shards;
+ *   KS018  the sizes of the buckets of a shard group cannot be read, so a plan by disk size is not made: repeat later;
+ *   KS019  the bucket (or its colocation group) is busy: a split or a table operation runs on it, or it is not in the state active;
+ *   KS020  a schema holds a ledger table and is pinned to its shard group: it cannot move or be undistributed;
+ *   KS021  the verification of a table operation failed (the old copy is kept);
+ *   KS022  a function that changes the catalog was called on a node that is not the map group primary: send it to the map group primary (the
+ *          other wrong-node refusals keep KS010);
+ */
+#define ERRCODE_KINGRES_NO_RECEIVING_GROUP MAKE_SQLSTATE('K','S','0','1','7')
+#define ERRCODE_KINGRES_SIZES_UNREADABLE MAKE_SQLSTATE('K','S','0','1','8')
+#define ERRCODE_KINGRES_BUCKET_BUSY MAKE_SQLSTATE('K','S','0','1','9')
+#define ERRCODE_KINGRES_SCHEMA_PINNED MAKE_SQLSTATE('K','S','0','2','0')
+#define ERRCODE_KINGRES_VERIFICATION_FAILED MAKE_SQLSTATE('K','S','0','2','1')
+#define ERRCODE_KINGRES_NOT_MAP_PRIMARY MAKE_SQLSTATE('K','S','0','2','2')
 
 /*
  * The text that starts the statement of every fragment of a distributed scan

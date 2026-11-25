@@ -16,10 +16,14 @@ const emit = defineEmits<{ close: [] }>()
 <template>
   <AppDialog title="Download an export file" @close="emit('close')">
     <dl class="kv" data-testid="download-facts">
-      <dt>Table</dt>
+      <dt>{{ file.kind === 'databaseExport' ? 'Database' : 'Table' }}</dt>
       <dd class="mono">
         <SafeName
-          :value="`${file.database ?? ''}.${file.schema ?? ''}.${file.table ?? ''}`"
+          :value="
+            file.kind === 'databaseExport'
+              ? (file.database ?? '')
+              : `${file.database ?? ''}.${file.schema ?? ''}.${file.table ?? ''}`
+          "
           :max="160"
         />
       </dd>

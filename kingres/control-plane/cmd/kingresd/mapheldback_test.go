@@ -224,7 +224,7 @@ func TestTheOldLeaderEndsAHoldThatNothingOwns(t *testing.T) {
 		r.cand = c.cand
 		r.endErr = c.endErr
 		r.m.heldBack = func() bool { return c.heldBk }
-		got, why := r.m.resolveHeldBack(ctx, c.strict)
+		got, why := r.m.resolveHeldBack(ctx, c.strict, "")
 		if got != c.want || r.ended != c.ended || (!got && why == "") {
 			t.Errorf("%s: resumed %v (%q), ended %d; want %v, %d", c.name, got, why, r.ended, c.want, c.ended)
 		}
@@ -321,7 +321,7 @@ func TestTheOperatorsAbandonResumesAnOldLeaderThatNothingOwns(t *testing.T) {
 		}
 		return fmt.Errorf("unexpected %s", path)
 	}
-	res, err := m.Abandon(ctx, "ops", "stranded")
+	res, err := m.Abandon(ctx, "ops", opID, "stranded", "")
 	if err != nil || res.Abandoned || res.ResumedServer != "s1" {
 		t.Fatalf("%+v %v\n%v", res, err, calls)
 	}
@@ -334,7 +334,7 @@ func TestTheOperatorsAbandonResumesAnOldLeaderThatNothingOwns(t *testing.T) {
 		b, _ := json.Marshal(mapAbandonAnswer{})
 		return json.Unmarshal(b, out)
 	}
-	res, err = m.Abandon(ctx, "ops", "stuck")
+	res, err = m.Abandon(ctx, "ops", opID, "stuck", "")
 	if err != nil || !res.Abandoned || res.ResumedServer != "s1" {
 		t.Fatalf("%+v %v", res, err)
 	}
@@ -347,7 +347,7 @@ func TestTheOperatorsAbandonResumesAnOldLeaderThatNothingOwns(t *testing.T) {
 		b, _ := json.Marshal(mapAbandonAnswer{})
 		return json.Unmarshal(b, out)
 	}
-	if res, err = m.Abandon(ctx, "ops", "x"); err != nil || res != (failover.MapAbandonResult{}) {
+	if res, err = m.Abandon(ctx, "ops", opID, "x", ""); err != nil || res != (failover.MapAbandonResult{}) {
 		t.Fatalf("%+v %v", res, err)
 	}
 }
@@ -525,7 +525,7 @@ func TestEachRuleThatKeepsAHoldSaysItsReason(t *testing.T) {
 	for _, c := range cases {
 		r := newResolveRig(t, c.answers)
 		r.cand = c.cand
-		got, why := r.m.resolveHeldBack(ctx, false)
+		got, why := r.m.resolveHeldBack(ctx, false, "")
 		if got || !strings.Contains(why, c.reason) || r.ended != 0 {
 			t.Errorf("%s: resumed %v, reason %q, want a reason with %q", c.name, got, why, c.reason)
 		}
@@ -533,7 +533,7 @@ func TestEachRuleThatKeepsAHoldSaysItsReason(t *testing.T) {
 	// the operator's call asks every server, whatever the record says
 	r := newResolveRig(t, map[string]any{"s2": in, "s3": down})
 	r.cand = "s2"
-	if got, why := r.m.resolveHeldBack(ctx, true); got || !strings.Contains(why, "the server s3 does not answer") {
+	if got, why := r.m.resolveHeldBack(ctx, true, ""); got || !strings.Contains(why, "the server s3 does not answer") {
 		t.Errorf("the operator's call: %v %q", got, why)
 	}
 }

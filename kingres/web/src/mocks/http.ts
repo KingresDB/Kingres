@@ -27,6 +27,8 @@ export function resetMockState(options: { uninitialized?: boolean } = {}): MockS
   mockConfig.partial = null
   mockConfig.rejectCursors = false
   mockConfig.caUnavailable = false
+  mockConfig.preloadVisible = false
+  mockConfig.caEscrow = { enabled: false, generation: 0, scenario: null }
   mockConfig.internalApiDisabled = false
   mockConfig.setupFingerprintVisible = true
   mockConfig.hostileSetupText = null
@@ -148,6 +150,13 @@ const STATUS: Record<ProblemCode, number> = {
   import_too_large: 422,
   import_end_marker: 422,
   export_untrusted_code: 422,
+  export_not_readable: 422,
+  large_objects_present: 422,
+  schema_unrecognised: 422,
+  archive_invalid: 422,
+  archive_incompatible: 422,
+  archive_statement_refused: 422,
+  ledger_restart_not_acknowledged: 422,
   insufficient_disk: 409,
   no_receiving_server: 409,
   replicas_cannot_be_kept: 409,

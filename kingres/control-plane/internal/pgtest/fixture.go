@@ -83,7 +83,8 @@ func setupFixture(t testing.TB) (string, error) {
 		if fixtureErr = psql("postgres", "-f", filepath.Join(dir, "fixture_roles.sql")); fixtureErr != nil {
 			return
 		}
-		standby := in.Port + 1
+		// A port of the run's own slice (reserved, not in.Port + 1, which the next FreePort can hand to another instance of this run).
+		standby := FreePort(t)
 		if fixtureErr = psql("plain_cp", "-c", "create table public.plain_t (id int primary key, label text)"); fixtureErr != nil {
 			return
 		}

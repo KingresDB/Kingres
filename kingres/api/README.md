@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.24.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.33.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and, when it is built, the planned `kingres-cli` (it does not exist yet). Lint it and run the mechanical rule check with:
 
 ```
@@ -153,6 +153,9 @@ Each task kind has exactly one `subject.type`; `subject.id` is always a string.
 | `table.setStorage` (0.17.0) | `table` | `database/schema.table`; for one partition (`setPartitionStorage`) `database/schema.partition`. Steps of a table: `Check the table`, `Convert the storage` (the detail says that `ALTER TABLE ... SET ACCESS METHOD` takes an `ACCESS EXCLUSIVE` lock), `Analyze the table`; of a partition: `Check the partition`, `Convert the partition`, `Analyze the partition` |
 | `partition.maintain` (0.17.0) | `table` | `database/schema.table`: one run of the time-partitioning policy of the table. Steps: `Begin the run`, `Create partitions`, `Convert partitions`, `Retire partitions`, `Finish the run`. The task's `createdBy` is `system` for a scheduled run and the role for `runPartitionPolicy` |
 | `table.distribute`, `table.undistribute`, `table.alter`, `table.partition` | `table` | `database/schema.table` (0.14.0: the table the request named; one table task per colocation group) |
+| `database.export` (0.29.0) | `database` | The database name: one unfinished database task per database, and a table task of the database is refused while it runs (and the reverse). Steps: `Check the request`, `Take the structure`, `Normalise the schema`, `Write the data`, `Check the archive`, `Seal`; its `detail` is `transfer <id>` when done. Failing codes of its own: `schema_changed`, `schema_unrecognised` |
+| `database.import` (0.30.0) | `database` | The name of the new database (the final name; the work is done in `kingres_import_<task id>`): one unfinished database task per database. Steps: `Check the archive`, `Create the private database` (and `Create the private database on server <id>` for each other server), `Install the extensions`, `Check the functions`, `Create the tables`, `Distribute the tables`, `Create the views`, `Load the data`, `Create the indexes and constraints`, `Set the sequences`, `Enable the ledger and the policies`, `Verify`, `Take the final name`; its `detail` when done lists the disabled time-partition policies and the ledger chains that started again. Failing codes of its own: `archive_statement_refused`, `foreign_key_violation` |
+| `archive.validate` (0.29.0) | `upload` | `<upload id>`. Steps: `Check the upload`, `Read the archive`, `Check the plan`, `Store the report`; the report is stored with the upload and read with `getDataUpload` |
 | `table.export`, `table.import` (0.19.0) | `table` | `database/schema.table`: one unfinished task per table. `table.export` steps: `Check the request`, `Read the table class`, `Write the file`, `Seal`; its `detail` is `transfer <id>` when done. `table.import` steps: `Check the upload`, `Check the table`, `Load rows` (load and commit), `Confirm the commit`, `Clean up`; `Task.cancellable` is false once the commit was sent |
 | `rebalance` | `cluster` | `cluster` (0.9.0; one rebalance at a time, cluster-wide; the task id is the report id): steps `Check that the cluster can rebalance`, `Compute the plan`, `Move buckets`, `Write the report`; a stopped run is `paused` |
 | `schema.distribute`, `schema.move`, `schema.undistribute` (0.15.0) | `schema` | `database/schema`: steps `Check the schema`, `Set REPLICA IDENTITY FULL`, `Make the schema distributed`, `Verify on every server`; `Check the move`, `Copy the data`, `Switch`, `Clean up the old copy`; `Check the schema`, `Move first`, `Make the schema local`, `Verify on every server`; one schema task at a time per schema |
@@ -260,6 +263,33 @@ Tag `Data transfer`: export a table to a CSV file, upload a CSV file, import it 
 - **Audit.** The mutating operations, `downloadDataExport` (a read, audited because data leaves; written when the stream ends), and the system events `dataTransfer.completed` and
   `dataTransfer.purged`. An upload chunk is not an event.
 
+### Database archives (0.29.0)
+
+`exportDatabase` writes one zip archive of a database and `validateDatabaseArchive` checks an uploaded one without touching any database. Importing an archive is a later revision.
+The design is `kingres/docs/design/data-export-import.md` (phase 14b).
+
+- **The archive.** Exactly these entries: `manifest.json` (written last, read first), `catalog.json`, `schema/pre-data.sql`, `schema/views.sql`, `schema/post-data.sql` and `data/NNNNN.csv` (one per table that is a standalone table
+  or a partition root; leaves are structure only). Data is UTF-8 CSV with `NULL '\N'` and every field quoted, so an empty string and a null differ. The file is a zip file with data descriptors (the shape a streaming writer produces); the validator
+  accepts that shape and no other. The checksums find damage; they are **not** signatures. `DataExport.sha256` is the SHA-256 of the whole file.
+- **What it does not carry.** Large objects and `oid` or `reg*` columns (422 `large_objects_present` unless acknowledged), roles, tablespaces, policies, rules, event triggers, functions, triggers, publications, foreign objects, extended
+  statistics, collations, unlogged tables (422 `schema_unrecognised`, naming the kind), the placement of buckets, the history of the ledger and of the time-partition runs, and node-local sequence state other than the coordinator's.
+- **Who and what is checked.** `kingres_admin`, `dataTransfer.enabled`, TLS, and the privileges of the signed-in role on **every** table: the first 20 objects it cannot read are named in the 422 `export_not_readable`.
+- **Consistency.** `archive-single-snapshot` when every table is local, reference or on the group of the connection (one `REPEATABLE READ` transaction); otherwise one label per table as for a table export.
+  A change of the structure while the export runs fails the task with `schema_changed`. **There is no global snapshot.**
+- **The report.** `DataUpload.report` (`ArchiveReport`) after a validation: the versions, the tables by kind, the statements by kind and the ones the shape grammar refused (kind, position, fingerprint; never the text), what the
+  archive needs, warnings and `reasons`. An archive that is not valid is a finished task whose report says `valid: false`.
+
+### Database import (0.30.0)
+
+`importDatabase` (`POST /database-imports`) loads a database archive into a **new** database. The design is `kingres/docs/design/data-export-import.md` (phase 14c).
+
+- **The archive is hostile.** The task reads it again from its bytes (the validator, the shape grammar, `expectedSha256`), whatever the state of the upload says. A statement that the shape grammar does not consume completely is never run;
+  a refusal is 422 `archive_statement_refused` and names the kind, the position and a fingerprint, never the text. There is no `allowCode` and no `privileges`.
+- **As the signed-in role.** Statements run on a connection of the role, one per round trip, with `search_path = pg_catalog`; PostgreSQL's privileges are the guarantee, and a role that is a superuser, replicates, bypasses
+  row-level security or reads server files, programs or logs is refused (403 `forbidden`).
+- **A private name.** The work is done in `kingres_import_<task id>`; the last step renames it. A failed or cancelled task drops it (not with `keepOnFailure`).
+- **Ledger and policies.** Ledger tables start a new chain (`acknowledgeLedgerRestart`); time-partition policies come back disabled.
+
 ## Inclusion proofs and `kingres-verify`
 
 `POST /databases/{databaseName}/ledger/inclusion-proofs` answers with the proof document of
@@ -363,9 +393,189 @@ Where the architecture document leaves something open, the simplest option was c
 
 ## Changelog
 
+### 0.33.0
+
+Revision of the review of phase 5 (high availability). Summary for the panel:
+0 operations added (178 operations, 142 paths); **one stricter role for a request that accepts a loss of data**; nothing else changes in the contract.
+
+#### Breaking
+
+- `failoverServer`: a hard request that includes the map group of a server that is alive and carries `allowDataLoss: true` needs `kingres_admin` (403 `forbidden` otherwise). Every other request keeps `kingres_ops`.
+
+#### Additive
+
+None.
+
+#### Documentation
+
+- `failoverServer` names the role for that request. `abandonMapGroupBootstrap` is unchanged; a declaration `lostServerId` is now proven to the old leader of the map group by the operator's session (internal, no change for clients).
+
+### 0.32.0
+
+Revision written first for the two open items of phase 9 (`kingres/docs/design/shard-phase9.md`): distribute with related tables and the operation indicator of a table. Summary for the panel:
+1 operation added (178 operations, 142 paths); six objects added; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+- `listRelatedTables` (`GET .../tables/{tableName}/related-tables`, needs `kingres_readonly`): the plan of "distribute with related tables".
+- `DistributeTableRequest.relatedTables` (optional): the tables linked by foreign keys that `distributeTable` distributes together with the table, colocated with it, in one `table.distribute` task. `previewTableChange` accepts the same field and lists those tables with the role `related` (`TableChangeTable.role` has the new value `related`).
+- `Table.operation` (optional, nullable `TableOperation`: `kind`, `role`, `source`, `taskId`, `state`, `startedAt`, `percent`, `step`) in `listTables`, `getTable` and the answers that return a table: the long operation that runs on the table now.
+- Schemas: `RelatedTableChoice`, `RelatedKey`, `RelatedTable`, `RelatedTablesPlan`, `TableOperation`. The blocker code `related_table_missing` (and `related_column_unknown`, `related_table_distributed`, `related_table_busy`) comes in `TableBlocker.code`; clients tolerate codes they do not know.
+
+#### Documentation
+
+- `distributeTable` says what the task does with the keys between the tables, that no key between them is enforced from the first drop to the last add, and that only the blocking copy is used.
+
+### 0.31.0
+
+Revision written first for the schema items of the rebalance and the drain (phase 11, `kingres/docs/design/shard-phase11.md` section 9.9). Summary for the panel:
+0 operations added (177 operations, 141 paths); two optional members added; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+- The result of one move in `getRebalanceReport` (`RebalanceReport.moves[]`) has the optional `kind` (`schema` for a distributed schema, absent for a bucket) and `schemaName`, as `PlannedMove` and `BucketMove` have had since 0.15.0. The plan, the status and the drain preview fill the same two members for a schema now: a rebalance and a drain move the distributed schemas of the extension as items of the plan.
+
+#### Documentation
+
+- `drainServer` and `previewServerDrain` say that the distributed schemas of the server move with the buckets, and which blockers a schema gives (`schema_pinned`, `unprocessable`); the drain ends only when no bucket and no schema is left on the server.
+
+### 0.30.0
+
+Revision written first for the database import of phase 14c (`kingres/docs/design/data-export-import.md`). Summary for the panel:
+1 operation added (177 operations, 141 paths); one task kind, two problem codes and one object (`ImportDatabaseRequest`) added; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+- `importDatabase` (`POST /database-imports`, task kind `database.import`; needs `kingres_admin`).
+- `ProblemCode` has `archive_statement_refused` and `ledger_restart_not_acknowledged`; `foreign_key_violation` is a code of a failed task.
+- `AlertKind` has `extensionSkipped` (`warning`; subject `server:<id>|database:<name>|extension:<name>`, one alert for each skipped extension, `aspect` is `extension:<name>`): an extension of a database was not installed on a server because a role of the tenant made a schema of the extension its own, so its owner there differs from the owner on the leader. The operation that found it (adding a server, for one) goes on without that extension. The alert is cleared when a later apply of that extension on that server succeeds, or when the database is dropped; its message names the extension, the schema and the two owners.
+- `TaskKind` has `database.import`; `AuditAction` has `importDatabase`.
+- Schemas: `ImportDatabaseRequest` (closed; `acknowledgeLedgerRestart`, `onForeignKeyViolation`, `keepOnFailure`). The work is done in a private database name.
+
+#### Documentation
+
+- The section "Database import" states what the import runs, as whom, under which name, and what it does with ledger tables and time-partition policies.
+
+### 0.29.0
+
+Revision written first for the database export and the archive validation of phase 14b (`kingres/docs/design/data-export-import.md`). Summary for the panel:
+2 operations added (176 operations, 140 paths); two task kinds, five problem codes and one object (`ArchiveReport`) added; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+- `exportDatabase` (`POST /databases/{databaseName}/export`, task kind `database.export`) and `validateDatabaseArchive` (`POST /data-uploads/{uploadId}/validation`, task kind `archive.validate`). Both need `kingres_admin`.
+- `CreateDataUploadRequest.purpose` has `databaseArchive`; `DataUpload.state` has `validating`, `valid` and `invalid`, and `DataUpload.report` (optional) is the `ArchiveReport` of the last validation.
+- `DataExport.kind` has `databaseExport`, `DataExport.format` has `archive/1`, `DataExport.warnings` (optional) and `TableConsistency.level` has `archive-single-snapshot`.
+- `ProblemCode` has `export_not_readable`, `large_objects_present`, `schema_unrecognised`, `archive_invalid` and `archive_incompatible`; `schema_changed` is a code of a failed task.
+- `TaskKind` has `database.export` and `archive.validate`; `AuditAction` has `exportDatabase` and `validateDatabaseArchive`.
+- Schemas: `ExportDatabaseRequest` (closed), `ArchiveReport`.
+- `AlertKind` has `extensionSchemaUntrusted` (`critical`; subject `server:<id>|database:<name>`): the schema of a KingresDB extension in a database is owned by a role that is not a superuser, holds an object that is not a member of an extension, or lets a role that is not a superuser create objects in it. The control plane then reads and calls nothing in that schema, and the operations that need the extension, the database export among them, are refused.
+
+#### Documentation
+
+- The section "Database archives" states what the archive holds and does not carry, the consistency labels and the report. The archive is for inspection and for loading by hand; the import of an archive is a later revision.
+
+
+### 0.28.0
+
+Revision written for the hard failover of the map group while its server is alive (`kingres/docs/design/ha-phase5-part2.md`, "a hard failover of a live leader's server").
+0 operations added (174 operations, 138 paths); the text of `failoverServer` changes; **no change that is not additive**, and no schema, member, code or enum value changes.
+
+#### Breaking
+
+None.
+
+#### Additive
+
+- `AbandonMapGroupBootstrapRequest.lostServerId` (optional): the operator declares the server the map group was handed to lost, so that the old leader ends its hold without its word (`abandonMapGroupBootstrap`, audited, `kingres_admin`).
+- A request that was answered 422 `unsupported_operation` (mode `hard` for the server that runs the primary of the map group, sent to the leader while it answers) is accepted and answered 202 like any failover.
+
+#### Documentation
+
+- `failoverServer` (0.28.0 paragraph): how a hard failover of the map group of a live leader's server runs (the loss is judged before anything is stopped, the old primary is fenced in one step, the lease is handed to the standby's server only after the stop, the map group is the last group), what a pause after the stop means and where the repeated request goes.
+
+
+### 0.27.0
+
+Revision of the branch `p10-drain4`: the last two open items of phase 10. Summary for the panel:
+0 operations added (174 operations, 138 paths); no schema, no problem code and no task kind added; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+
+- `drainServer` also drains the server that runs the primary of the map group (the manager leader). The task of the drain gets the step `Hand over the map group` (between `Wait until the server owns no bucket` and
+  `Relocate the standbys hosted on the server`): it pauses the task, asks for a planned switchover of shard group 0 (`failoverServer`, mode `graceful`) to a standby on another server, and the drain goes on under the
+  new manager leader when the switchover has ended. The task keeps its id; `getRebalanceStatus` shows it `stopped` (`stoppedBy` `safetyRule`) while it waits. A switchover that is refused or rolled back fails the task with
+  the code of the refusal, or with `server_hosts_map_group` when the server still runs the map group; the server stays `draining`.
+- `RebalanceAutomatic.lastEvaluation.blockedBy` `groupDegraded` also names a group whose standby is behind its primary by more than `rebalance.maxStandbyLagBytes` (default 64 MiB) when a run is started or resumed; inside a run the lag has to be over twice the limit on three evaluations in a row (the run's own writes make the standbys lag for a while); a pause of a run by this rule
+  is the same `stoppedBy: safetyRule` as for the other rules.
+
+- `RebalanceOptions.force` (boolean, optional): a manual start (`startRebalance`) is refused with 409 `group_degraded` while a group has a standby that is behind its primary by more than `maxStandbyLagBytes` or whose lag cannot be read, unless `force` is true; it lifts only that refusal.
+
+#### Documentation
+
+- `drainServer`: 409 `server_hosts_map_group` is now only for a server that runs the primary of the map group when no other server runs a standby of it (before: always).
+
+
+### 0.26.0
+
+Revision written with the escrow of the key of the certificate authority (phase 5, `kingres/docs/design/ha-phase5-part2.md`, section 3.4). Summary for the panel:
+3 operations added (174 operations, 138 paths); two values added to an enum; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+
+- `getCaEscrow` (`GET /certificate-authority/escrow`), `setCaEscrow` (`PUT /certificate-authority/escrow`) and `rotateCaEscrow` (`POST /certificate-authority/escrow/rotations`): the escrow of the CA key, on the leader, `kingres_admin`.
+  Schemas `CaEscrowStatus`, `CaEscrowRecipient` and `CaEscrowUpdate`. The answers are immediate (no task).
+- `AuditAction` has `setCaEscrow` and `rotateCaEscrow`.
+- `CaEscrowRecipient.state` is `current`, `pending`, `refused` or `dropPending`.
+
+#### Documentation
+
+- `certificateAuthorityUnavailable` is no longer raised after a failover of the map group when the escrow was on and complete before it; the new leader adopts its sealed copy.
+
+
+### 0.25.0
+
+Revision for time partitioning of distributed tables (kingres_timepart 0.3 and kingres_shard 0.9; `kingres/docs/design/analytics-phase12-storage.md`, section 11). Descriptions only.
+0 operations added (171 operations, 136 paths); no setting, task kind or problem code added; **no change that is not additive**.
+
+#### Breaking
+
+None.
+
+#### Additive
+
+- `TablePartition.accessMethod` can be `mixed` (the leaves of a user partition of a distributed table are in both formats) or `other` (a leaf is missing or has another access method); `accessMethod`, `rangeFrom` and `rangeTo` are filled for the user partitions of a distributed table too (a free text member: no schema change).
+
+#### Documentation
+
+- The operations of the time-partitioning policy (`getPartitionPolicy`, `putPartitionPolicy`, `deletePartitionPolicy`, `planPartitionPolicy`, `runPartitionPolicy`, `listPartitionPolicyRuns`, `getPartitionPolicyRun`) say that a user-partitioned distributed table (hash on top, range partitions below) is a table of the instance of the manager leader: a run creates the partitions ahead on every server that holds a bucket, converts the leaves of the old ones to columnar storage on the servers that hold them, and drops or detaches the partitions older than the retention. `partitionColumn` and `partitionColumnType` name the key of the partitions, not the distribution column.
+- `putPartitionPolicy`: 409 `partition_policy_conflict` also when the policy would give a distributed table more leaves (buckets times partitions) than `kingres_shard.max_partition_leaves` allows.
+- `getPartitionPolicyRun`: an action of a distributed table may end `failed` with a detail that starts with `lock_timeout` and `retry_later` (the run is `partial` and comes back within five minutes) or `skipped` with a detail that starts with `conversion_refused`; an action of a distributed partition has no `bytesBefore` and `bytesAfter`.
+- kingresd keeps kingres_timepart at the version of the package on every server of every database (job `extension.update` of the leader): no operator step, no new operation or setting.
+
 ### 0.24.0
 
-Placeholder revision for the security fix of the extension schemas (`kingres/docs/reviews/2026-11-23-extension-schema-trust.md`); the number is set when the revision is merged. **No change that is not additive.**
+Revision for the security fix of the extension schemas (`kingres/docs/reviews/2026-11-23-extension-schema-trust.md`). **No change that is not additive.**
 
 #### Additive
 
@@ -691,7 +901,7 @@ for `hard` on ordinary groups; 2 problem codes, 7 alert kinds, 5 audit actions, 
 
 The meaning of `graceful` (the planned switchover), of `Task.cancellable` (false from the moment the task starts to stop the old primary of a group), of the counter's reset and
 of the task steps of `server.failover` (one block per group, `TaskStep.shardGroupId`). The task error codes of the failover are
-not an enum of the contract (clients tolerate codes they do not know): `superseded`, `lease_still_held`, `lease_held_elsewhere`,
+not an enum of the contract (clients tolerate codes they do not know): `superseded`, `lease_still_held`, `lease_held_elsewhere`, `lease_unavailable`,
 `lease_lost`, `quorum_unavailable`, `no_candidate`, `target_not_available`, `split_promotion`, `promote_timeout`,
 `promote_incomplete`, `bad_promote_target`, `standby_behind`, `prepared_transactions_pending`, `cancelled`. The failover
 statuses in `FailoverReportSummary.outcome` add `paused` (a run that waits for an operator).

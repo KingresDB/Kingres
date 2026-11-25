@@ -96,8 +96,12 @@ func (b *PG) Plan(ctx context.Context, dbs []string, o Options) ([]Move, error) 
 			if len(excl) > 0 {
 				exclArg = excl
 			}
-			rows, err := c.Query(ctx, `SELECT colocation_id, bucket, source_group, target_group, cost, size_bytes, reason
-				FROM kingres.plan_rebalance($1, $2::float8, NULL, $3, $4::jsonb, $5::int[], NULL) ORDER BY seq`,
+			// the item of a distributed schema is the one bucket of its colocation group (design 9.9); its name comes from dist_schema
+			rows, err := c.Query(ctx, `SELECT p.colocation_id, p.bucket, p.source_group, p.target_group, p.cost, p.size_bytes, p.reason, coalesce(ns.nspname::text, '')
+				FROM kingres.plan_rebalance($1, $2::float8, NULL, $3, $4::jsonb, $5::int[], NULL) p
+				LEFT JOIN kingres.dist_schema s ON s.colocation_id = p.colocation_id
+				LEFT JOIN pg_catalog.pg_namespace ns ON ns.oid = s.nsp::oid
+				ORDER BY p.seq`,
 				strategy, threshold, o.DrainOnly, extraJSON, exclArg)
 			if err != nil {
 				return err
@@ -105,7 +109,7 @@ func (b *PG) Plan(ctx context.Context, dbs []string, o Options) ([]Move, error) 
 			defer rows.Close()
 			for rows.Next() {
 				m := Move{Database: db}
-				if err := rows.Scan(&m.Colocation, &m.Bucket, &m.From, &m.To, &m.Cost, &m.Size, &m.Reason); err != nil {
+				if err := rows.Scan(&m.Colocation, &m.Bucket, &m.From, &m.To, &m.Cost, &m.Size, &m.Reason, &m.Schema); err != nil {
 					return err
 				}
 				moves = append(moves, m)
@@ -116,7 +120,7 @@ func (b *PG) Plan(ctx context.Context, dbs []string, o Options) ([]Move, error) 
 		switch {
 		case noReceivingGroup(err):
 			return nil, problem.New(problem.NoReceivingServer, "No server should hold shards in database "+db+".")
-		case errors.As(err, &pe) && pe.Code == "55000" && strings.Contains(pe.Message, "does not answer"):
+		case sizesUnreadable(err) && errors.As(err, &pe):
 			return nil, problem.New(problem.ServiceUnavailable, "The size of the buckets cannot be read: "+pe.Message).WithRetryAfter(10)
 		case err != nil:
 			return nil, err
@@ -241,12 +245,32 @@ func (b *PG) Loads(ctx context.Context, dbs []string, o Options) ([]GroupLoad, e
 	return out, nil
 }
 
-// noReceivingGroup tells the refusal of the extension for a database in which no shard group may receive buckets (SQLSTATE 55000). The
-// extension words it differently by version and function ("no shard group accepts buckets", "no shard group can receive buckets",
-// "no shard group can hold buckets"); all of them are the answer no_receiving_server, not an error of the inspection.
+// The SQLSTATEs that the extension gives to the refusals the planner tells apart (kingres_shard.h, README "Error codes"). The control plane
+// matches the code, not the wording.
+const (
+	// sqlstateNoReceivingGroup (KS017): no shard group may receive buckets.
+	sqlstateNoReceivingGroup = "KS017"
+	// sqlstateSizesUnreadable (KS018): the sizes of the buckets of a shard group cannot be read, so a plan by disk size is not made.
+	sqlstateSizesUnreadable = "KS018"
+	// sqlstateBucketBusy (KS019): a split or a table operation runs on the bucket or its group, or the bucket is not active.
+	sqlstateBucketBusy = "KS019"
+	// sqlstateNotInPrerequisiteState is what the extension 0.8 (released) answers for the refusals above, in the wordings read below.
+	sqlstateNotInPrerequisiteState = "55000"
+)
+
+// noReceivingGroup tells the refusal of the extension for a database in which no shard group may receive buckets: SQLSTATE KS017 of the
+// extension 0.9. The text is read only as a fallback for the extension 0.8, which is released and answers 55000 in three wordings by
+// function ("no shard group accepts buckets", "no shard group can receive buckets", "no shard group can hold buckets"); all of them are the
+// answer no_receiving_server, not an error of the inspection. The fallback goes when 0.8 is no longer a supported version.
 func noReceivingGroup(err error) bool {
 	var pe *pgconn.PgError
-	if !errors.As(err, &pe) || pe.Code != "55000" {
+	if !errors.As(err, &pe) {
+		return false
+	}
+	if pe.Code == sqlstateNoReceivingGroup {
+		return true
+	}
+	if pe.Code != sqlstateNotInPrerequisiteState {
 		return false
 	}
 	for _, w := range []string{"no shard group accepts", "no shard group can receive", "no shard group can hold"} {
@@ -255,4 +279,18 @@ func noReceivingGroup(err error) bool {
 		}
 	}
 	return false
+}
+
+// sizesUnreadable tells the refusal of plan_rebalance('by_disk_size') when a shard group does not answer the question for the sizes of its
+// buckets: SQLSTATE KS018 of the extension 0.9. The text is read only as a fallback for the extension 0.8 (55000, "the sizes of the buckets
+// of shard group N cannot be read"); "does not answer", which this code read before, was never the wording of the extension.
+func sizesUnreadable(err error) bool {
+	var pe *pgconn.PgError
+	if !errors.As(err, &pe) {
+		return false
+	}
+	if pe.Code == sqlstateSizesUnreadable {
+		return true
+	}
+	return pe.Code == sqlstateNotInPrerequisiteState && (strings.Contains(pe.Message, "cannot be read") || strings.Contains(pe.Message, "does not answer"))
 }

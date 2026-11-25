@@ -14,6 +14,8 @@
 #   * a slice of 200 TCP ports (20000-27999, below the range the kernel hands out to
 #     outgoing connections) exported as KINGRES_TEST_PORT_BASE/END, so that two runs
 #     never choose the same port and a killed run cannot hold the ports of the next.
+#   * a range of 100 ports for the standby instances (28000-31999, STANDBY_LO + slice * 100), exported as
+#     KINGRES_TEST_STANDBY_PORT_BASE/END and cut by the test harness into one part per node of a cluster.
 #
 # What the run started is identified by proof, never by a name pattern: the run
 # exports KINGRES_TEST_ROOT=<its root>, which is unique to the run and inherited by
@@ -43,6 +45,12 @@ SLICES="$TESTDIR/slices"
 PORT_LO=20000
 SLICE_SIZE=200
 SLICE_COUNT=40
+# The standby instances of the run's clusters get a range of their own, away from every slice of test ports and from
+# the range the kernel hands out to outgoing connections (32768 and up): STANDBY_LO + SLICE_N * STANDBY_SIZE, so that the
+# standby port of one run can never be a port another run hands out or another run's standby uses. 40 slices * 100 =
+# 28000-31999.
+STANDBY_LO=28000
+STANDBY_SIZE=100
 mkdir -p "$LEDGER" "$SLICES"
 
 # starttime PID prints field 22 of /proc/PID/stat (the start time in clock ticks since
@@ -168,13 +176,15 @@ export KINGRES_VERIFY_BIN="$BIN/kingres-verify"
 export KINGRES_TEST_ROOT="$ROOT"
 export KINGRES_TEST_PORT_BASE=$((PORT_LO + SLICE_N * SLICE_SIZE))
 export KINGRES_TEST_PORT_END=$((PORT_LO + SLICE_N * SLICE_SIZE + SLICE_SIZE - 1))
+export KINGRES_TEST_STANDBY_PORT_BASE=$((STANDBY_LO + SLICE_N * STANDBY_SIZE))
+export KINGRES_TEST_STANDBY_PORT_END=$((STANDBY_LO + SLICE_N * STANDBY_SIZE + STANDBY_SIZE - 1))
 export KINGRES_FIXTURES="$BIN/fixtures"
 export KINGRES_OPERATIONS_GEN="$BIN/operations_gen.go.txt"
 export KINGRES_CONTRACT="$BIN/openapi.yaml"
 export KINGRES_README="$BIN/README.md"
 export LD_LIBRARY_PATH="$INSTALL/lib/x86_64-linux-gnu:$INSTALL/lib:${LD_LIBRARY_PATH:-}"
 export PATH="$INSTALL/bin:$PATH"
-echo "run root $ROOT, ports $KINGRES_TEST_PORT_BASE-$KINGRES_TEST_PORT_END"
+echo "run root $ROOT, ports $KINGRES_TEST_PORT_BASE-$KINGRES_TEST_PORT_END, standby ports $KINGRES_TEST_STANDBY_PORT_BASE-$KINGRES_TEST_STANDBY_PORT_END"
 
 bins=()
 while [ $# -gt 0 ] && [ "$1" != "--" ]; do bins+=("$1"); shift; done

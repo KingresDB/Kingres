@@ -22,12 +22,13 @@ import AttachPartitionDialog from '@/components/tables/AttachPartitionDialog.vue
 import PartitionActionDialog from '@/components/tables/PartitionActionDialog.vue'
 import TableTasksPanel from '@/components/tables/TableTasksPanel.vue'
 import StorageBadge from '@/components/tables/StorageBadge.vue'
+import TableOperationBadge from '@/components/tables/TableOperationBadge.vue'
 import SetStorageDialog from '@/components/tables/SetStorageDialog.vue'
 import PartitionPolicyPanel from '@/components/tables/PartitionPolicyPanel.vue'
 import TableTransferActions from '@/components/transfers/TableTransferActions.vue'
 import { useDatabase, useTable, useTablePartitions, useTables, useTasks } from '@/api/queries'
 import { formatBytes, formatNumber } from '@/lib/format'
-import { TABLE_TASKS_LIMIT, runningTaskOfTable, tasksOfTable } from '@/lib/tables'
+import { TABLE_TASKS_LIMIT, operationReason, runningTaskOfTable, tasksOfTable } from '@/lib/tables'
 import { partitionStorageMeta, ratioText, type StorageFilter } from '@/lib/analytics'
 import type { TablePartition, TableClass } from '@/api/types'
 
@@ -108,8 +109,14 @@ const holding = computed(() =>
     partitionNames.value,
   ),
 )
+/** The operation the server reports for the table (`Table.operation`, contract 0.32.0): it also covers a table that another table's change takes along, and a change started from SQL. */
+const operation = computed(() => t.value?.operation ?? null)
 const heldReason = computed(() =>
-  holding.value ? `A change of this table is running (task ${holding.value.id}).` : '',
+  operation.value
+    ? operationReason(operation.value)
+    : holding.value
+      ? `A change of this table is running (task ${holding.value.id}).`
+      : '',
 )
 const distributeReason = computed(
   () => heldReason.value || (shardingOn.value ? '' : 'Turn on sharding for this database first.'),
@@ -238,6 +245,18 @@ const title = computed(() => `Table ${props.schema}.${props.table}`)
               >
             </span>
           </dd>
+          <template v-if="operation">
+            <dt>Running now</dt>
+            <dd data-testid="table-operation" class="row">
+              <TableOperationBadge :operation="operation" />
+              <span v-if="operation.step" class="muted" data-testid="table-operation-step">
+                <SafeName :value="operation.step" kind="text" :max="80" />
+              </span>
+              <RouterLink v-if="operation.taskId !== null" :to="{ name: 'tasks' }">
+                All tasks</RouterLink
+              >
+            </dd>
+          </template>
           <dt>Rows (estimate)</dt>
           <dd><NullableValue :value="t.estimatedRows" :format="formatNumber" /></dd>
           <dt>Size</dt>
@@ -365,6 +384,7 @@ const title = computed(() => `Table ${props.schema}.${props.table}`)
             <option value="all">All formats</option>
             <option value="heap">Row</option>
             <option value="columnar">Columnar</option>
+            <option value="mixed">Mixed</option>
           </select>
         </div>
         <QueryBoundary

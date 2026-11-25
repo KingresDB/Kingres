@@ -27,7 +27,11 @@ const size = computed(() => props.export.sizeBytes ?? 0)
 const percent = computed(() =>
   size.value > 0 ? Math.floor((dl.received.value / size.value) * 100) : 0,
 )
-const what = computed(() => `${props.export.table ?? 'export'} file`)
+const what = computed(() =>
+  props.export.kind === 'databaseExport'
+    ? `${props.export.database ?? 'database'} archive`
+    : `${props.export.table ?? 'export'} file`,
+)
 /** The text of the button; its accessible name starts with it (so that the visible text is part of the name). */
 const startText = computed(
   () =>

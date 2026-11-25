@@ -22,7 +22,9 @@ import (
 
 // The time-partitioning policy of a table (phase 12, analytics-phase12-storage.md section 13): get, put, delete and plan. The policy is a row of
 // kingres_timepart in the database of the table, written through kingres.timepart_set_policy, which does the checks of the grid, the time zone and
-// the owner. Like the storage operations, these act on the tables of this server's instance, where the leader runs.
+// the owner. Like the storage operations, these act on the tables of this server's instance, where the leader runs. A user-partitioned distributed table
+// is one of them: its policy and its runs are on the map group primary, which the leader runs, and a run creates, converts and retires its partitions on every
+// node (kingres_timepart 0.3, phase 12 section 11).
 
 // isoDurationRE is an ISO 8601 duration: P, then years, months, weeks and days, and after T hours, minutes and seconds. PostgreSQL reads it as an interval.
 var isoDurationRE = regexp.MustCompile(`^P(?:\d+Y)?(?:\d+M)?(?:\d+W)?(?:\d+D)?(?:T(?:\d+H)?(?:\d+M)?(?:\d+(?:\.\d+)?S)?)?$`)
@@ -135,7 +137,8 @@ func policySQLError(err error) error {
 		return wrap(err)
 	}
 	switch pe.Code {
-	case "0A000":
+	case "0A000", "54000":
+		// 54000: a distributed table that the policy would give more leaves (buckets times partitions) than kingres_shard.max_partition_leaves
 		return problem.New(problem.PartitionPolicyConflict, pe.Message+".")
 	case "22023", "22007", "22008", "22P02", "23514":
 		// The argument the message names first; of two names at the same place the longer one (retention_action, not retention).
@@ -259,9 +262,9 @@ func readPolicy(ctx context.Context, tx pgx.Tx, schema, table string) (api.Parti
 	if out.ColumnarSortBy == nil {
 		out.ColumnarSortBy = nil
 	}
-	err = tx.QueryRow(ctx, `SELECT a.attname::text, a.atttypid::regtype::text FROM pg_partitioned_table pt
-		JOIN pg_attribute a ON a.attrelid = pt.partrelid AND a.attnum = pt.partattrs[0]
-		WHERE pt.partrelid = $1::regclass`, qualified(schema, table)).Scan(&out.PartitionColumn, &out.PartitionColumnType)
+	// The key of the time partitioning: the column of the range partitions, which for a distributed table is the key of the partitions below the hash
+	// level and not the distribution column that pg_partitioned_table has for the table itself (kingres_timepart reads it from the right place).
+	err = tx.QueryRow(ctx, `SELECT k.r_keycol::text, k.r_keytype FROM kingres.timepart__key_info($1::regclass::oid) k`, qualified(schema, table)).Scan(&out.PartitionColumn, &out.PartitionColumnType)
 	if err != nil {
 		return out, err
 	}
@@ -288,7 +291,8 @@ func readPolicy(ctx context.Context, tx pgx.Tx, schema, table string) (api.Parti
 	}
 	// health
 	out.Health = api.PartitionPolicyHealth{Problems: []string{}}
-	if err := tx.QueryRow(ctx, `SELECT (SELECT greatest(max(p.range_to) - now(), interval '0') FROM kingres.timepart_partitions($1::regclass) p WHERE p.attached)::text`, qualified(schema, table)).Scan(&out.Health.PartitionsAhead); err != nil {
+	// the partitions of a distributed table are rows of the catalog of the sharding extension and not tables here, so they are read the way the policy reads them
+	if err := tx.QueryRow(ctx, `SELECT (SELECT greatest(max(c.hi) - now(), interval '0') FROM kingres.timepart__children($1::regclass::oid) c WHERE NOT c.is_default)::text`, qualified(schema, table)).Scan(&out.Health.PartitionsAhead); err != nil {
 		return out, err
 	}
 	rows, err := tx.Query(ctx, `SELECT c.problem FROM kingres.timepart_check() c WHERE c.schema_name = $1 AND c.table_name = $2`, schema, table)

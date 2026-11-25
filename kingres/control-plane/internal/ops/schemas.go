@@ -708,7 +708,13 @@ func (o *Ops) recoverCall(ctx context.Context, env *task.Env, wantDistributed bo
 	return took, err
 }
 
-// schemaError maps an error of the extension to a problem.
+// sqlstateSchemaPinned (KS020) is the refusal of the extension to move or undistribute a schema that holds a ledger table.
+const sqlstateSchemaPinned = "KS020"
+
+// schemaError maps an error of the extension to a problem, by SQLSTATE: KS020 (schema pinned), 0A000 (feature_not_supported: a schema that
+// cannot be distributed, or an object that a distributed schema does not support) and 42710 (duplicate_object: the schema is distributed
+// already). The extension 0.8 (released) gives the same 0A000 and 42710 for these, and 55000 with "schema_pinned" in the text for the pin;
+// that text is read only for 0.8 and goes when 0.8 is no longer a supported version.
 func schemaError(err error) error {
 	if err == nil {
 		return nil
@@ -717,11 +723,11 @@ func schemaError(err error) error {
 	if errors.As(err, &pe) {
 		msg := pe.Message
 		switch {
-		case strings.Contains(msg, "schema_pinned"):
+		case pe.Code == sqlstateSchemaPinned || pe.Code == "55000" && strings.Contains(msg, "schema_pinned"):
 			return problem.New(problem.SchemaPinned, msg)
-		case strings.Contains(msg, "not supported") || strings.Contains(msg, "cannot be distributed"):
+		case pe.Code == "0A000":
 			return problem.New(problem.SchemaNotDistributable, msg)
-		case strings.Contains(msg, "already"):
+		case pe.Code == "42710":
 			return problem.New(problem.Conflict, msg)
 		}
 		return fmt.Errorf("%s", msg)

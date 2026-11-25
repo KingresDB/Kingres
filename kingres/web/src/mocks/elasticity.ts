@@ -205,6 +205,7 @@ export function elasticityHandlers(): Partial<Record<OperationId, Handler>> {
             'Compute the plan',
             'Move buckets',
             'Wait until the server owns no bucket',
+            'Hand over the map group',
             'Relocate the standbys hosted on the server',
             'Write the report',
           ],

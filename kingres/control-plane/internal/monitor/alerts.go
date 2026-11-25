@@ -186,8 +186,8 @@ var titles = map[string]string{
 	"ledgerPendingTooOld": "Ledger entries pending for too long", "versionMismatch": "KingresDB versions differ",
 	"certificateRenewalFailed": "Certificate renewal failed", "replicationPending": "A server is behind on role and grant changes", "leaseLost": "A group lease was lost",
 	"groupWithoutSynchronousStandby": "A shard group runs without a synchronous standby", "groupUnderReplicated": "A shard group has too few standbys", "clockDifference": "A server's clock is off", "transferStagingLow": "The staging area of the data transfer is nearly full",
-	"extensionSchemaUntrusted": "The schema of a KingresDB extension cannot be trusted",
-	"oldPrimaryNotStopped":     "An old primary could not be stopped", "oldPrimaryRunning": "An old primary is running", "oldPrimaryNotRebuilt": "An old primary has not been turned into a standby",
+	"extensionSchemaUntrusted": "The schema of a KingresDB extension cannot be trusted", "extensionSkipped": "An extension was not installed in a database on a server",
+	"oldPrimaryNotStopped": "An old primary could not be stopped", "oldPrimaryRunning": "An old primary is running", "oldPrimaryNotRebuilt": "An old primary has not been turned into a standby",
 }
 
 func scanAlert(r pgx.Row) (api.Alert, error) {

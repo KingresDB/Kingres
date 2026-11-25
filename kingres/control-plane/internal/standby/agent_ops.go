@@ -65,10 +65,6 @@ func (a *Agent) createLocked(ctx context.Context, e Entry) (CreateResponse, erro
 	if err := a.ensureSlot(ctx, e, slot); err != nil {
 		return CreateResponse{}, err
 	}
-	port, err := a.freePort()
-	if err != nil {
-		return CreateResponse{}, err
-	}
 	conninfo, err := a.Svc.ReplicationConninfo(e.PrimaryServer, e.PrimaryPort, AppName(e.ID), "")
 	if err != nil {
 		return CreateResponse{}, fmt.Errorf("standby: building the replication connection: %w", err)
@@ -82,7 +78,7 @@ func (a *Agent) createLocked(ctx context.Context, e Entry) (CreateResponse, erro
 		return CreateResponse{}, fmt.Errorf("standby: reading the trust of the primary instance: %w", err)
 	}
 	s := base
-	s.Port = port
+	s.Port = 0 // chosen after the copy (StandbySpec.PickPort)
 	s.Extra = maps.Clone(base.Extra)
 	if s.Extra == nil {
 		s.Extra = map[string]string{}
@@ -93,14 +89,19 @@ func (a *Agent) createLocked(ctx context.Context, e Entry) (CreateResponse, erro
 	s.Extra["hot_standby"] = "on"
 	s.Extra["primary_conninfo"] = conninfo
 	s.Extra["primary_slot_name"] = slot
-	if err := a.mgr().InitStandby(ctx, instance.StandbySpec{ID: id, Settings: s, Trust: trust, Conninfo: conninfo, Slot: slot}); err != nil {
+	if err := a.mgr().InitStandby(ctx, instance.StandbySpec{ID: id, Settings: s, Trust: trust, Conninfo: conninfo, Slot: slot, PickPort: a.freePort}); err != nil {
 		return CreateResponse{}, fmt.Errorf("standby: creating the standby of group %d: %w", e.Group, err)
 	}
 	if _, err := a.syncAccess(ctx, id); err != nil {
 		_ = a.mgr().Remove(ctx, id)
 		return CreateResponse{}, fmt.Errorf("standby: writing the access rules of the standby: %w", err)
 	}
-	e.Port = port
+	mk, merr := a.mgr().Managed(id)
+	if merr != nil {
+		_ = a.mgr().Remove(ctx, id)
+		return CreateResponse{}, fmt.Errorf("standby: reading the port of the standby: %w", merr)
+	}
+	e.Port = mk.Port
 	if err := a.writeMeta(id, e); err != nil {
 		return CreateResponse{}, fmt.Errorf("standby: recording the standby: %w", err)
 	}
@@ -113,12 +114,15 @@ func (a *Agent) createLocked(ctx context.Context, e Entry) (CreateResponse, erro
 
 // startExisting starts the standby instance and waits for it to accept connections.
 func (a *Agent) startExisting(ctx context.Context, id int, e Entry) (CreateResponse, error) {
-	mk, err := a.mgr().Managed(id)
-	if err != nil {
+	if _, err := a.mgr().Managed(id); err != nil {
 		return CreateResponse{}, err
 	}
-	if err := a.mgr().Start(ctx, id); err != nil {
+	if err := a.startStandbyInstance(ctx, id, e); err != nil {
 		return CreateResponse{}, fmt.Errorf("standby: starting the standby instance: %w", err)
+	}
+	mk, err := a.mgr().Managed(id) // after the start: it may have chosen another port
+	if err != nil {
+		return CreateResponse{}, err
 	}
 	a.audit(ctx, "standbyInstanceStarted", strconv.FormatInt(e.ID, 10), audit.OutcomeSuccess, map[string]any{"group": e.Group, "server": a.Self, "phase": "created"})
 	return CreateResponse{Port: mk.Port}, nil
@@ -281,12 +285,18 @@ func (a *Agent) superviseStandbys(ctx context.Context) {
 			}
 			continue
 		}
+		// Running or not, the port in the meta file is the port of the instance.
+		if ne, merr := a.reconcileMetaPort(id, e); merr != nil {
+			a.Log.Warn("standby: recording the port of a standby", "group", e.Group, "error", merr)
+		} else {
+			e = ne
+		}
 		up, err := a.mgr().Running(ctx, id)
 		if err != nil {
 			continue
 		}
 		if !up {
-			if err := a.mgr().Start(ctx, id); err != nil {
+			if err := a.startStandbyInstance(ctx, id, e); err != nil {
 				a.Log.Warn("standby: starting a standby instance", "group", e.Group, "error", err)
 			}
 			continue
@@ -463,4 +473,39 @@ func (a *Agent) LockLifecycle(ctx context.Context) (unlock func(), err error) {
 		}
 	}
 	return a.opMu.Unlock, nil
+}
+
+// startStandbyInstance starts the standby instance of directory id. A standby that has never run and whose port could
+// not be bound (another program took it) is given another port once by the instance manager; the standby's meta file
+// is written with the port the instance has afterwards, whether or not the start worked, before anything reports it.
+func (a *Agent) startStandbyInstance(ctx context.Context, id int, e Entry) error {
+	err := a.mgr().StartStandby(ctx, id, a.freePort)
+	// The marker has the port the instance has: the meta file follows it, whether or not the start worked.
+	if _, werr := a.reconcileMetaPort(id, e); werr != nil && err == nil {
+		err = werr
+	}
+	return err
+}
+
+// reconcileMetaPort makes the port in the meta file of a standby the port of its marker (instance.Manager.Managed), which
+// is the authority: a re-pick of the port, a crash in the middle of it, or an older version may have left the two apart.
+// It returns the entry with the port the instance has.
+func (a *Agent) reconcileMetaPort(id int, e Entry) (Entry, error) {
+	return syncMetaPort(func() (int, bool) {
+		mk, err := a.mgr().Managed(id)
+		return mk.Port, err == nil
+	}, id, e, a.writeMeta)
+}
+
+// syncMetaPort is reconcileMetaPort with the marker's port (and whether there is a marker) given by portOf.
+func syncMetaPort(portOf func() (int, bool), id int, e Entry, write func(int, Entry) error) (Entry, error) {
+	port, ok := portOf()
+	if !ok || port == 0 || port == e.Port {
+		return e, nil
+	}
+	e.Port = port
+	if err := write(id, e); err != nil {
+		return e, fmt.Errorf("standby: recording the port %d of a standby: %w", port, err)
+	}
+	return e, nil
 }

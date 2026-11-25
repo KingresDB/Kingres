@@ -29,14 +29,17 @@ import (
 // that only a drain runs (they are skipped by a rebalance): the flag is set first, the move is the rebalance's
 // loop with drainOnly, the end waits until the server owns no bucket and has none arriving, and the removal,
 // when asked for, is made by the "server.remove" task after the drain task has ended (the two exclude each other).
-// Standby relocation and the hand-over of the map group (steps 4 and 5 of the design) are not part of this
-// increment: a server that hosts the map group primary is refused with server_hosts_map_group, and a drain that
-// would leave fewer servers than replicaCount + 1 is refused with replicas_cannot_be_kept.
+// The hand-over of the map group (step 4, handover.go) pauses the task, asks for the planned switchover of group 0 and goes on
+// under the new manager leader; the relocation of the standbys is step 5. A server that hosts the map group primary is
+// refused with server_hosts_map_group only when no other server runs a standby of the map group (or the build has no
+// planned switchover), and a drain that would leave fewer servers than replicaCount + 1 is refused with
+// replicas_cannot_be_kept.
 
 // Drain step names (shown to users); the first of a rebalance's steps is shared.
 const (
 	StepDrainFlag     = "Stop new buckets from landing on the server"
 	StepDrainEmpty    = "Wait until the server owns no bucket"
+	StepDrainMapGroup = "Hand over the map group"
 	StepDrainStandbys = "Relocate the standbys hosted on the server"
 	StepDrainEnd      = "Remove the server"
 )
@@ -85,6 +88,8 @@ type DrainFacts struct {
 	Servers       []string
 	ReplicaCount  int
 	HostsMapGroup bool
+	// MapStandbys are the other servers that run an active standby of the map group (group 0): where the hand-over can go.
+	MapStandbys []string
 	// Receivers are the other servers that hold an active primary and have the flag.
 	Receivers []string
 	// StandbyGroups are the groups whose standby runs on the server.
@@ -133,6 +138,8 @@ func (s *Service) drainFacts(ctx context.Context, id string) (DrainFacts, error)
 			}
 		case n.Host == id && n.Role == "standby":
 			f.StandbyGroups = append(f.StandbyGroups, n.Group)
+		case n.Host != id && n.Role == "standby" && n.Active && n.Group == 0:
+			f.MapStandbys = append(f.MapStandbys, n.Host)
 		case n.Host != id && n.Role == "primary" && n.Active && n.Should:
 			recv[n.Host] = true
 		}
@@ -158,7 +165,12 @@ func (s *Service) drainRefusal(ctx context.Context, id string, req DrainRequest,
 		return problem.New(problem.NoReceivingServer, "No other server should hold shards and runs a primary; the buckets of "+id+" have nowhere to go.")
 	}
 	if f.HostsMapGroup {
-		return problem.New(problem.ServerHostsMapGroup, "Server "+id+" runs the primary of the map group (the manager leader). Fail the map group over to a standby on another server first.")
+		if s.HandOverMapGroup == nil {
+			return problem.New(problem.ServerHostsMapGroup, "Server "+id+" runs the primary of the map group (the manager leader). Fail the map group over to a standby on another server first.")
+		}
+		if len(f.MapStandbys) == 0 {
+			return problem.New(problem.ServerHostsMapGroup, "Server "+id+" runs the primary of the map group (the manager leader) and no other server runs a standby of it, so the map group cannot be handed over. Give the cluster a replica first.")
+		}
 	}
 	if remaining := len(f.Servers) - 1; remaining < f.ReplicaCount+1 && !req.AcceptFewerReplicas {
 		return problem.New(problem.ReplicasCannotBeKept, fmt.Sprintf(
@@ -196,6 +208,11 @@ func (s *Service) DrainPreview(ctx context.Context, id string) (api.DrainPreview
 	out.Moves, out.MoveCount, out.TotalBytes, out.Warnings = plan.Moves, plan.Totals.MoveCount, plan.Totals.TotalBytes, plan.Warnings
 	out.Strategy = plan.Strategy
 	out.LocalData = s.localData(ctx, id)
+	schemas, serr := s.schemasOn(ctx, id)
+	if serr != nil {
+		out.Warnings = append(out.Warnings, "The distributed schemas on the server could not be read: "+serr.Error())
+	}
+	out.Blockers = append(out.Blockers, schemaBlockers(schemas)...)
 	out.CanDrain = len(out.Blockers) == 0
 	return out, nil
 }
@@ -234,6 +251,13 @@ func (s *Service) Drain(ctx context.Context, actor, id string, req DrainRequest)
 	}
 	if err := s.drainRefusal(ctx, id, req, f); err != nil {
 		return task.Task{}, err
+	}
+	schemas, err := s.schemasOn(ctx, id)
+	if err != nil {
+		return task.Task{}, err
+	}
+	if bl := schemaBlockers(schemas); len(bl) > 0 {
+		return task.Task{}, problem.New(problem.Code(bl[0].Code), bl[0].Detail)
 	}
 	if loc := s.localData(ctx, id); len(loc) > 0 && !req.AcknowledgeLocal {
 		names := make([]string, 0, len(loc))
@@ -274,9 +298,9 @@ func (s *Service) stepDrainEmpty(ctx context.Context, env *task.Env, _ *PGRows, 
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return problem.New(problem.ServerOwnsBuckets, "Server "+o.DrainServer+" still owns "+strconv.Itoa(left)+" buckets (or a move away from it has not been cleaned up) after the drain; start it again.")
+			return problem.New(problem.ServerOwnsBuckets, "Server "+o.DrainServer+" still owns "+strconv.Itoa(left)+" buckets"+s.schemaNote(ctx, o.DrainServer)+" (or a move away from it has not been cleaned up) after the drain; start it again.")
 		}
-		_ = env.SetDetail(ctx, fmt.Sprintf("%d buckets are still on %s", left, o.DrainServer))
+		_ = env.SetDetail(ctx, fmt.Sprintf("%d buckets%s are still on %s", left, s.schemaNote(ctx, o.DrainServer), o.DrainServer))
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -300,7 +324,7 @@ func (s *Service) drainWait() time.Duration {
 }
 
 // bucketsOn counts, over the databases with distributed tables, the buckets that groups with a primary on the
-// server own plus the moves that are not finished with them (a bucket in cleaning still has its old copy).
+// server own (the one bucket of a distributed schema is one of them: a server that still hosts a schema is not drained) plus the moves that are not finished with them (a bucket in cleaning still has its old copy).
 func (s *Service) bucketsOn(ctx context.Context, server string) (int, error) {
 	// Strict: a database that cannot be verified is an error here, never a database with no buckets (the drain would report done with buckets still on the server).
 	dbs, err := s.Backend.Databases(ctx, Options{Strict: true})
@@ -337,7 +361,11 @@ func (s *Service) stepDrainStandbys(ctx context.Context, env *task.Env, _ *PGRow
 	}
 	deadline := time.Now().Add(s.drainWait())
 	for {
-		left, err := s.RelocateStandbys(ctx, o.DrainServer)
+		// A server that died during the drain cannot give up its instances (they cannot be removed or rebuilt): the wait would run to its bound.
+		if s.ServerStatus != nil && s.ServerStatus(ctx, o.DrainServer) == "dead" {
+			return problem.New(problem.NodeStateInvalid, "Server "+o.DrainServer+" died during the drain, so its standbys cannot be moved. Fail it over first, then remove it.")
+		}
+		left, err := s.RelocateStandbys(ctx, o.DrainServer, false)
 		if err != nil {
 			return err
 		}
@@ -346,8 +374,12 @@ func (s *Service) stepDrainStandbys(ctx context.Context, env *task.Env, _ *PGRow
 		}
 		if time.Now().After(deadline) {
 			if o.AcceptFewerReplicas {
+				// the server leaves the ring whatever is left (a standby that is still being rebuilt is given up): the drain ends with fewer standbys
+				if _, err := s.RelocateStandbys(ctx, o.DrainServer, true); err != nil {
+					return err
+				}
 				if env != nil {
-					_ = env.SetDetail(ctx, fmt.Sprintf("%d standbys stay on %s: no other server can take them", left, o.DrainServer))
+					_ = env.SetDetail(ctx, fmt.Sprintf("acceptFewerReplicas: %d standby copies could not be moved off %s or made again elsewhere before the bound; the drain ends with fewer standbys", left, o.DrainServer))
 				}
 				return nil
 			}
@@ -408,4 +440,94 @@ func (s *Service) removeAfter(taskID int64, server, actor string) {
 		case <-time.After(time.Second):
 		}
 	}
+}
+
+// SchemaOnServer is a distributed schema (phase 11) that a shard group with its primary on the server owns, with what keeps it from
+// moving (kingres.schemas_on_group); Blocker is empty when it can move.
+type SchemaOnServer struct {
+	Database string
+	Schema   string
+	Group    int32
+	Size     *int64
+	Blocker  string
+}
+
+// schemasOn lists the distributed schemas on the groups whose primary runs on the server, in every database that has the extension function
+// for it (kingres_shard 0.9); the extension asks the owner of each group.
+func (s *Service) schemasOn(ctx context.Context, server string) ([]SchemaOnServer, error) {
+	// Strict, as in bucketsOn: a database whose schema kingres cannot be trusted is an error, never a database without schemas (a pinned schema there would not refuse the drain).
+	dbs, err := s.Backend.Databases(ctx, Options{Strict: true})
+	if err != nil {
+		return nil, err
+	}
+	var out []SchemaOnServer
+	for _, db := range dbs {
+		err := s.Backend.withShard(ctx, db, func(c *pgx.Conn) error {
+			var has bool
+			if err := c.QueryRow(ctx, `SELECT to_regprocedure('kingres.schemas_on_group(integer)') IS NOT NULL`).Scan(&has); err != nil || !has {
+				return err
+			}
+			rows, err := c.Query(ctx, `SELECT g.group_id, s.schema_name, s.size_bytes, coalesce(s.blocker, '')
+				FROM (SELECT DISTINCT group_id FROM kingres.node WHERE role = 'primary' AND is_active AND host = $1) g
+				CROSS JOIN LATERAL kingres.schemas_on_group(g.group_id) s ORDER BY g.group_id, s.schema_name`, server)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				x := SchemaOnServer{Database: db}
+				if err := rows.Scan(&x.Group, &x.Schema, &x.Size, &x.Blocker); err != nil {
+					return err
+				}
+				out = append(out, x)
+			}
+			return rows.Err()
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// schemaBlockers are the schemas that a drain could not move: a schema with a ledger table is pinned (schema_pinned), the other reasons the
+// extension gives (a table that is not logged, or has no key and no full replica identity, a group that does not answer) are unprocessable.
+// The drain is refused with them before it starts: the plan leaves a pinned schema out, so the server would never be empty.
+func schemaBlockers(schemas []SchemaOnServer) []api.DrainBlocker {
+	var out []api.DrainBlocker
+	for _, x := range schemas {
+		if x.Blocker == "" {
+			continue
+		}
+		code := problem.Unprocessable
+		if strings.HasPrefix(x.Blocker, "schema_pinned") {
+			code = problem.SchemaPinned
+		}
+		out = append(out, api.DrainBlocker{Code: string(code),
+			Detail: fmt.Sprintf("The distributed schema %q of database %s cannot be moved off the server: %s", x.Schema, x.Database, x.Blocker)})
+	}
+	return out
+}
+
+// schemaNote words how many of the buckets that remain on the server are distributed schemas ("" when none, or when it cannot be read).
+func (s *Service) schemaNote(ctx context.Context, server string) string {
+	dbs, err := s.Backend.Databases(ctx, Options{})
+	if err != nil {
+		return ""
+	}
+	n := 0
+	for _, db := range dbs {
+		var k int
+		err := s.Backend.withShard(ctx, db, func(c *pgx.Conn) error {
+			return c.QueryRow(ctx, `SELECT count(*) FROM kingres.bucket_map m JOIN kingres.colocation c ON c.colocation_id = m.colocation_id AND c.kind = 'schema'
+				JOIN kingres.node n ON n.group_id = m.group_id AND n.role = 'primary' AND n.is_active AND n.host = $1`, server).Scan(&k)
+		})
+		if err == nil {
+			n += k
+		}
+	}
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf(", %d of them distributed schemas", n)
 }

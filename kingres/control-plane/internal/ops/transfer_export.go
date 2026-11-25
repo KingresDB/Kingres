@@ -24,6 +24,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/archive"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fence"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
@@ -265,7 +266,7 @@ func (o *Ops) concurrency(ctx context.Context, st transfer.Settings, role string
 	var total, own int
 	err := wrap(o.asService(ctx, "kingres_system", func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `SELECT count(*)::int, count(*) FILTER (WHERE created_by = $1)::int FROM kingres_cp.task
-			WHERE kind IN ('table.export', 'table.import') AND state IN ('pending', 'running', 'paused')`, role).Scan(&total, &own)
+			WHERE kind IN ('table.export', 'table.import', 'database.export', 'archive.validate', 'database.import') AND state IN ('pending', 'running', 'paused')`, role).Scan(&total, &own)
 	}))
 	if err != nil {
 		return err
@@ -645,7 +646,7 @@ func (s *sealWriter) Write(p []byte) (int, error) {
 // stagingError maps the errors of the staging store of a running export to the codes of the transfer.
 func stagingError(err error) error {
 	switch {
-	case errors.Is(err, staging.ErrFileTooLarge):
+	case errors.Is(err, staging.ErrFileTooLarge), errors.Is(err, archive.ErrLimit):
 		return transfer.Errorf(transfer.CodeExportTooLarge, false, "the export is larger than the largest staged file")
 	case errors.Is(err, staging.ErrQuotaExceeded):
 		return transfer.Errorf(transfer.CodeQuotaExceeded, false, "the staging quota is full")

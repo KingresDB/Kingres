@@ -20,16 +20,19 @@ import (
 
 func (s *Server) transferHandlers() map[string]handlerFunc {
 	return map[string]handlerFunc{
-		"createDataUpload":   s.createDataUpload,
-		"getDataUpload":      s.getDataUpload,
-		"uploadDataChunk":    s.uploadDataChunk,
-		"deleteDataUpload":   s.deleteDataUpload,
-		"listDataExports":    s.listDataExports,
-		"getDataExport":      s.getDataExport,
-		"downloadDataExport": s.downloadDataExport,
-		"deleteDataExport":   s.deleteDataExport,
-		"exportTable":        s.exportTable,
-		"importTable":        s.importTable,
+		"createDataUpload":        s.createDataUpload,
+		"getDataUpload":           s.getDataUpload,
+		"uploadDataChunk":         s.uploadDataChunk,
+		"deleteDataUpload":        s.deleteDataUpload,
+		"listDataExports":         s.listDataExports,
+		"getDataExport":           s.getDataExport,
+		"downloadDataExport":      s.downloadDataExport,
+		"deleteDataExport":        s.deleteDataExport,
+		"exportTable":             s.exportTable,
+		"importTable":             s.importTable,
+		"exportDatabase":          s.exportDatabase,
+		"validateDatabaseArchive": s.validateDatabaseArchive,
+		"importDatabase":          s.importDatabase,
 	}
 }
 
@@ -204,13 +207,20 @@ var unsafeName = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
 // downloadName is the file name of a download: built by the server from the database, the table and the UTC time of the export, from the
 // characters [A-Za-z0-9._-], at most 80. A client string is never part of it.
 func downloadName(db, table string, created time.Time, format string) string {
-	base := unsafeName.ReplaceAllString(db+"_"+table, "_")
+	whole := db + "_" + table
+	if table == "" {
+		whole = db
+	}
+	base := unsafeName.ReplaceAllString(whole, "_")
 	if base == "_" || base == "" {
 		base = "export"
 	}
 	ext := ".csv"
-	if format == "csv.gz" {
+	switch format {
+	case "csv.gz":
 		ext = ".csv.gz"
+	case "archive/1":
+		ext = ".kdx.zip"
 	}
 	stamp := created.UTC().Format("20060102T150405Z")
 	name := base
@@ -250,8 +260,11 @@ func (s *Server) downloadDataExport(c *call, w http.ResponseWriter, r *http.Requ
 	if dl.Encoding == "" {
 		ct = "text/csv"
 	}
-	if dl.Rec.Format == "csv.gz" {
+	switch dl.Rec.Format {
+	case "csv.gz":
 		ct = "application/gzip"
+	case "archive/1":
+		ct = "application/zip"
 	}
 	h.Set("Content-Type", ct)
 	h.Set("Content-Length", strconv.FormatInt(length, 10))

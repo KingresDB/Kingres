@@ -255,6 +255,21 @@ export const endpoints = {
         body,
       }),
     ),
+  /** The tables linked to a plain table by foreign keys, with the column each would get (distribute with related tables, contract 0.32.0). */
+  listRelatedTables: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    distributionColumn?: string,
+  ) =>
+    j(
+      api.GET('/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/related-tables', {
+        params: {
+          path: { databaseName, schemaName, tableName },
+          query: distributionColumn ? { distributionColumn } : {},
+        },
+      }),
+    ),
   /** What a change would do, without doing it (blockers, warnings, notes, the tables it touches, an estimate). */
   previewTableChange: (
     databaseName: string,
@@ -620,8 +635,12 @@ export const endpoints = {
   getFailoverReport: (reportId: number) =>
     j(api.GET('/failover/reports/{reportId}', { params: { path: { reportId } } })),
   resetAutoFailoverCounter: () => j(api.POST('/settings/cluster/auto-failover/reset')),
-  abandonMapGroupBootstrap: (reason: string) =>
-    j(api.POST('/failover/map/abandon', { body: { reason } })),
+  abandonMapGroupBootstrap: (reason: string, lostServerId?: string) =>
+    j(
+      api.POST('/failover/map/abandon', {
+        body: lostServerId ? { reason, lostServerId } : { reason },
+      }),
+    ),
 
   // --- tasks
   listTasks: (q: Page & { state?: TaskState; kind?: TaskKind } = {}) =>
@@ -660,6 +679,11 @@ export const endpoints = {
   applyGrantTemplate: (body: S['GrantTemplateRequest']) =>
     j(api.POST('/grants/template-applications', { body })),
   getNetworkAccess: () => j(api.GET('/settings/network-access')),
+  // --- escrow of the certificate authority key (0.26.0)
+  getCaEscrow: () => j(api.GET('/certificate-authority/escrow')),
+  setCaEscrow: (enabled: boolean) =>
+    j(api.PUT('/certificate-authority/escrow', { body: { enabled } })),
+  rotateCaEscrow: () => j(api.POST('/certificate-authority/escrow/rotations')),
   /** Replaces the rules: 202 + task (the answer of the real change). */
   replaceNetworkAccess: async (body: Omit<NetworkAccess, 'applyStatus'>): Promise<Task> =>
     (await j(api.PUT('/settings/network-access', { body }))) as Task,
@@ -985,7 +1009,27 @@ export const endpoints = {
         body,
       }),
     )) as Task,
+  // --- database archives (0.29.0): export a database, validate an uploaded archive
+  /** 202 + task `database.export` (subject type `database`); when it is done its `detail` is `transfer <id>`. */
+  exportDatabase: async (
+    databaseName: string,
+    body: S['ExportDatabaseRequest'] = {},
+  ): Promise<Task> =>
+    (await j(
+      api.POST('/databases/{databaseName}/export', {
+        params: { path: { databaseName } },
+        body,
+      }),
+    )) as Task,
+  /** 202 + task `archive.validate` (subject type `upload`); the report is then `getDataUpload(id).report`. */
+  validateDatabaseArchive: async (uploadId: string): Promise<Task> =>
+    (await j(
+      api.POST('/data-uploads/{uploadId}/validation', { params: { path: { uploadId } } }),
+    )) as Task,
   // The calls of an upload keep the session in place when the answer is 401: the uploader asks for the password and goes on.
+  /** 202 + task `database.import` (subject type `database`, id the new name); contract 0.30.0. */
+  importDatabase: async (body: S['ImportDatabaseRequest']): Promise<Task> =>
+    (await j(api.POST('/database-imports', { body }))) as Task,
   createDataUpload: (body: S['CreateDataUploadRequest']) =>
     j(api.POST('/data-uploads', { body }), { keepSession: true }),
   getDataUpload: (uploadId: string) =>

@@ -99,6 +99,7 @@ try {
     New-Item -ItemType Directory (Join-Path $stage 'src') | Out-Null
     Copy-Item (Join-Path $module 'cmd/kingresd/main.go') (Join-Path $stage 'src')
     Copy-Item (Join-Path $module 'cmd/kingresd/failover.go') (Join-Path $stage 'src')
+    Copy-Item (Join-Path $PSScriptRoot 'run-wsl-tests.sh') (Join-Path $stage 'src')
     # Copy into WSL so that the binaries run from the native file system.
     $wslStage = ConvertTo-WslPath $stage
     $wslScript = ConvertTo-WslPath (Join-Path $PSScriptRoot 'run-wsl-tests.sh')

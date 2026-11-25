@@ -111,6 +111,7 @@ $node->safe_psql('postgres', q{CREATE DATABASE closeddb OWNER tenant});
 	CREATE TABLE public.w (a int);
 	SELECT kingres.ledger_enable('public.w');
 	INSERT INTO public.w VALUES (1);
+CREATE TABLE public.u (a int PRIMARY KEY, b int);	SELECT kingres.ledger_enable('public.u', 'updatable');	INSERT INTO public.u VALUES (1, 1);
 	ALTER SCHEMA kingres OWNER TO tenant;
 });
 is($rc, 0, 'B2: a ledger table, then the schema of the ledger given to the tenant') or diag($err);
@@ -120,11 +121,35 @@ like($err, qr/cannot drop schema|ledger/i, 'B2: ... the ledger refuses') or diag
 ($rc, $out, $err) = psql_as('tenant', 'closeddb', q{DROP OWNED BY tenant});
 isnt($rc, 0, 'B2: nor DROP OWNED BY the tenant (the schema is the tenant\'s)');
 is($node->safe_psql('closeddb', q{SELECT count(*) FROM pg_namespace WHERE nspname = 'kingres'}), '1', 'B2: the schema is still there');
+# L5: while the registry cannot be trusted, an UPDATE, DELETE or TRUNCATE of a table that carries the capture trigger, or has a history table, is refused
+# with an error that says why (the protection that reads the registry is off), whoever asks
+for my $stmt ('UPDATE public.w SET a = 2', 'DELETE FROM public.w', 'TRUNCATE public.w', 'UPDATE public.u SET b = 2', 'DELETE FROM public.u', 'TRUNCATE public.u')
+{
+	($rc, $out, $err) = psql_as(undef, 'closeddb', $stmt);
+	isnt($rc, 0, "L5: $stmt is refused while the registry cannot be trusted");
+	like($err, qr/registry of the ledger cannot be trusted/, 'L5: ... and the error says why') or diag($err);
+}
+($rc, $out, $err) = psql_as(undef, 'closeddb', q{INSERT INTO public.w VALUES (3); SELECT count(*) FROM public.w});
+is($rc, 0, 'L5: an INSERT is not what the guard is about') or diag($err);
 ($rc, $out, $err) = psql_as(undef, 'closeddb', q{CREATE TABLE public.w2 (a int); SELECT kingres.ledger_enable('public.w2')});
 isnt($rc, 0, 'B2: ledger_enable refuses while the registry cannot be trusted');
 like($err, qr/cannot be trusted/, 'B2: ... and says why') or diag($err);
 ($rc, $out, $err) = psql_as(undef, 'closeddb', q{ALTER SCHEMA kingres OWNER TO CURRENT_USER; SELECT kingres.ledger_enable('public.w2')});
 is($rc, 0, 'B2: a superuser repairs it, and the ledger works again') or diag($err);
+($rc, $out, $err) = psql_as(undef, 'closeddb', q{UPDATE public.u SET b = 2});
+is($rc, 0, 'L5: after the repair an updatable ledger table is updated again') or diag($err);
+# L1: CREATE granted to PUBLIC (or to a role that is not a superuser) on the schema of the extension also means that the registry cannot be trusted
+($rc, $out, $err) = psql_as(undef, 'closeddb', q{GRANT CREATE ON SCHEMA kingres TO PUBLIC});
+is($rc, 0, 'L1: a superuser grants CREATE on the schema to PUBLIC') or diag($err);
+($rc, $out, $err) = psql_as(undef, 'closeddb', q{CREATE TABLE public.w3 (a int); SELECT kingres.ledger_enable('public.w3')});
+isnt($rc, 0, 'L1: ledger_enable refuses') ;
+like($err, qr/cannot be trusted/, 'L1: ... and says why') or diag($err);
+($rc, $out, $err) = psql_as(undef, 'closeddb', q{REVOKE CREATE ON SCHEMA kingres FROM PUBLIC; GRANT CREATE ON SCHEMA kingres TO tenant});
+is($rc, 0, 'L1: and to a role that is not a superuser') or diag($err);
+($rc, $out, $err) = psql_as(undef, 'closeddb', q{SELECT kingres.ledger_enable('public.w3')});
+isnt($rc, 0, 'L1: ledger_enable refuses') ;
+($rc, $out, $err) = psql_as(undef, 'closeddb', q{REVOKE CREATE ON SCHEMA kingres FROM tenant; SELECT kingres.ledger_enable('public.w3')});
+is($rc, 0, 'L1: with the grant gone it works') or diag($err);
 
 # C
 is($node->safe_psql('postgres', q{SELECT pg_postmaster_start_time()::text}), $started, 'C: the postmaster did not restart');

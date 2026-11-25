@@ -176,8 +176,18 @@ func handleFailoverUnquiesce(ctx context.Context, d *haDeps, body []byte) (any, 
 		return nil, err
 	}
 	// The undo calls cannot carry the fence of a task run (the repair of a switchover has none): the term is what refuses a caller that is behind (F4-09).
-	if err := staleTerm(ctx, d, r.ExpectedTerm, false); err != nil {
+	err, unread := staleTermRead(ctx, d, r.ExpectedTerm, false)
+	if err != nil {
 		return nil, err
+	}
+	if unread {
+		// Held back: the term of the catalog cannot be read, and only the peers' word and the fence of a run say that the caller is the leader.
+		if err := unquiesceUnreadable(ctx, r.Group, func(g int32) (int, bool) {
+			li, ok := d.Svc.PrimaryOf(g)
+			return li.ID, ok
+		}, d.Svc.Manager().Running); err != nil {
+			return nil, err
+		}
 	}
 	// The rules first, the entry point after: a failed restore leaves the hold in place (and visible), for the repair to finish.
 	if li, ok := d.Svc.PrimaryOf(r.Group); ok {
@@ -414,4 +424,18 @@ func (p *foPeers) MapAbandon(ctx context.Context, server, reason string) error {
 // MapRefusal is the refusal of the proof that the candidate of the planned switchover of the map group reported to this server (the old leader's).
 func (p *foPeers) MapRefusal(_ context.Context, taskID int64) (string, bool) {
 	return mapPlanned.refusal(taskID)
+}
+
+// unquiesceUnreadable is the verdict on an unquiesce whose callee cannot read its catalog term: the writes are let in again only when there is nothing here
+// that they could reach, that is when this server runs no primary of the group or its instance is known not to run. A primary that runs, or one that cannot
+// be looked at, stays quiesced and the call is refused with 503 (the leader repeats it).
+func unquiesceUnreadable(ctx context.Context, group int32, primaryOf func(int32) (int, bool), running func(context.Context, int) (bool, error)) error {
+	id, ok := primaryOf(group)
+	if !ok {
+		return nil
+	}
+	if up, err := running(ctx, id); err == nil && !up {
+		return nil
+	}
+	return &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The catalog term cannot be read and the primary of the group may run; repeat the call."}
 }

@@ -26,10 +26,13 @@ const (
 	ExtSketch   = "kingres_sketch"
 	ExtColumnar = "kingres_columnar"
 	ExtTimepart = "kingres_timepart"
+	// ExtStatStatements is pg_stat_statements of PostgreSQL (contrib): its library is preloaded by every instance (instance.PreloadLibraries), and every database
+	// that kingresd makes carries the extension.
+	ExtStatStatements = "pg_stat_statements"
 )
 
 // analyticsExtensions is the closed set of extensions the operations of this file install and check on other servers.
-var analyticsExtensions = map[string]bool{ExtSketch: true, ExtColumnar: true, ExtTimepart: true}
+var analyticsExtensions = map[string]bool{ExtSketch: true, ExtColumnar: true, ExtTimepart: true, ExtStatStatements: true}
 
 // Kinds of ApplyLocal of the extensions: each acts on one database of the server that receives it, with parameters that are structured values.
 const (
@@ -166,6 +169,14 @@ func (p pgExt) Installed(ctx context.Context, db, ext string) (string, error) {
 		return "", err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	if !extguard.IsKingres(ext) { // pg_stat_statements of PostgreSQL: it lives in the schema public, which the control plane never reads (see Install)
+		var v string
+		err = c.QueryRow(ctx, "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = $1", ext).Scan(&v)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil
+		}
+		return v, err
+	}
 	// Found by extguard, not by name alone: an extension whose schema cannot be trusted is refused, never reported as installed or absent.
 	info, err := extguard.Verify(ctx, c, ext)
 	if err != nil {
@@ -189,9 +200,23 @@ func (p pgExt) Install(ctx context.Context, db, ext string) error {
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
 	var def string
-	// An extension that is there must be trusted before it is updated; one that is not there is created only when the schema it goes into is not one that a
-	// tenant made (extguard.PreInstall): the control file of an extension with "schema = ..." would use it, and the tenant would own what the service role runs.
-	info, err := extguard.Verify(ctx, c, ext)
+	var info extguard.Info
+	if extguard.IsKingres(ext) {
+		// An extension of KingresDB that is there must be trusted before it is updated; one that is not there is created only when the schema it goes into is not
+		// one that a tenant made (extguard.PreInstall): the control file of an extension with "schema = ..." would use it, and the tenant would own what the service
+		// role runs.
+		info, err = extguard.Verify(ctx, c, ext)
+	} else {
+		// pg_stat_statements of PostgreSQL (contrib): its schema is public, which a tenant owns, and the control plane never reads anything in it, so extguard
+		// (about the schema of the KingresDB extensions) does not apply.
+		info.Name = ext
+		err = c.QueryRow(ctx, "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = $1", ext).Scan(&info.Version)
+		if errors.Is(err, pgx.ErrNoRows) {
+			err = nil
+		} else if err == nil {
+			info.Present = true
+		}
+	}
 	if err != nil {
 		return extUntrusted(err)
 	}
@@ -200,7 +225,11 @@ func (p pgExt) Install(ctx context.Context, db, ext string) error {
 		if err := extguard.PreInstallExtension(ctx, c, ext); err != nil {
 			return extUntrusted(err)
 		}
-		return run(ctx, c, stmt().Text("CREATE EXTENSION IF NOT EXISTS").ID(sqlx.MustIdent(ext)))
+		b := stmt().Text("CREATE EXTENSION IF NOT EXISTS").ID(sqlx.MustIdent(ext))
+		if ext == ExtStatStatements {
+			b.Text("SCHEMA public") // the service session runs with search_path = pg_catalog: without a schema of its own the extension would be made there, and refused
+		}
+		return run(ctx, c, b)
 	}
 	if err := c.QueryRow(ctx, "SELECT default_version FROM pg_catalog.pg_available_extensions WHERE name = $1", ext).Scan(&def); err != nil {
 		return err

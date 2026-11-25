@@ -8,7 +8,7 @@ This guide is for the people who install and run KingresDB. It says what to do a
 |---|---|
 | [quickstart.md](quickstart.md) | One node, then three nodes, up in a few commands |
 | [install.md](install.md) | Install from the Debian package or from source, for PostgreSQL 18 and 19 |
-| [operator-guide.md](operator-guide.md) | The control plane and the console, servers, rebalance, failover and switchover, backups and the system database, ledger anchoring and the verifier |
+| [operator-guide.md](operator-guide.md) | The control plane and the console, servers, rebalance, failover and switchover, backups and the system database, ledger anchoring and the verifier, analytics, export and import of a table and of a database, query statistics |
 | [upgrade.md](upgrade.md) | Updating the extensions (`ALTER EXTENSION ... UPDATE`), `kingresd` and the package |
 | [limitations.md](limitations.md) | What KingresDB does not do, in the first release |
 
@@ -16,7 +16,7 @@ Also useful: [../../CHANGELOG.md](../../CHANGELOG.md) (what changed), [../../REA
 
 ## How to read the markers
 
-The guide describes the staging branch of the first release (REST contract 0.19.0, `kingres_shard` 0.9), checked against its code and documents on 2026-11-23. A part that is still being written carries the word **In progress**: it is not in the release as it stands, and the text says what is known. A boundary that the design leaves open carries the word **Open**. Do not rely on either in production.
+The guide describes the integration branch of the first release (REST contract 0.33.0, `kingres_shard` 0.9, `kingres_timepart` 0.3), checked against its code and documents on 2026-11-24. No release has been made. A part that is still being written carries the word **In progress**: it is not in the release as it stands, and the text says what is known. A boundary that the design leaves open carries the word **Open**. Do not rely on either in production.
 
 ## KingresDB in one page
 

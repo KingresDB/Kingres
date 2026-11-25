@@ -40,3 +40,10 @@ The decision stands. What changed in the mechanism, so that the ADR matches the 
 - A promotion carries a proof: the catalog term, the fence of the task run and, for a planned switchover, the shutdown checkpoint that `switchover_verify` checks on the standby before `pg_promote`.
 - The read of the topology in a renewal round is bounded by one renewal period (a catalog that does not answer does not keep the rounds from being asked), a round is decided by the first majority and never waits for the slowest grantor, and the log of a lost lease says what the rounds saw.
 - Not changed: the lease is still the proof. The stop of an instance, the term and the fence are what a task checks around it, not instead of it.
+
+## Update 2026-11-23: the clean stop keeps its lease, and the fenced stop of the map group
+
+Two more things of the lease mechanism that the code has and this ADR did not say (`internal/lease`, `cmd/kingresd/failover.go`, `docs/design/ha-phase5-part2.md`):
+
+- **`HoldBack`.** The clean stop of a planned switchover writes the `relinquished` marker and **keeps renewing the lease** until the stop is over (a fast shutdown can outlast the lease); the renewal ends with `ReleaseGroup` after a clean stop and with `Relinquish` after any other end. The authority of the primary still ends at its last renewal plus `duration - margin`; only the last renewal moves later.
+- **The fenced stop** (`fencedStop`, mode `immediate`), used by a hard failover of any group whose old primary answers and, since the hard failover of the map group of a live leader's server, by that case: the candidate server is recorded (map group only), the renewal ends and the marker is written, the instance is stopped with an immediate shutdown, and **only when it is seen stopped** is the lease handed over (`Transfer`, which also refuses while a primary runs under the lease). A primary that does not stop keeps a lease that nobody renews: its watchdog stops it when the lease file runs out, and the candidate takes the lease after that. Nothing in this path promotes without the lease.

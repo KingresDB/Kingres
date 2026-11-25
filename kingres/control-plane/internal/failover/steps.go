@@ -327,7 +327,8 @@ func runRowOf(ctx context.Context, rows Rows, in Input, group int32) (RunRow, er
 	// The term the destructive calls of this group expect is the one the run read at its start, raised by the groups of
 	// this run that were promoted before it: each promote_node raises it by one, and the run itself did it. Without this
 	// the second group of a server that hosted two primaries met its own run's term and ended "superseded".
-	for _, g := range in.Groups {
+	// The groups are taken in the order they run (the map group is last in a switchover and in a hard failover of a live leader's server).
+	for _, g := range mapLast(in) {
 		if g == group {
 			break
 		}
@@ -337,7 +338,7 @@ func runRowOf(ctx context.Context, rows Rows, in Input, group int32) (RunRow, er
 	}
 	// The map group of a planned switchover is promoted by the bootstrap of the candidate, which raised the term; the new leader's engine runs the steps
 	// that were not recorded with the term its row says (RecordPlanned).
-	if group == 0 && in.graceful() {
+	if group == 0 && (in.graceful() || in.MapLive) {
 		if gr, found, gerr := rows.Group(ctx, 0); gerr == nil && found && gr.TermAfter != nil && *gr.TermAfter > run.ExpectedTerm {
 			run.ExpectedTerm = *gr.TermAfter
 		}
@@ -395,10 +396,14 @@ func (r *Runner) Preflight(ctx context.Context, in Input) *Refusal {
 		if !have[g] {
 			return &Refusal{Code: "unprocessable", Status: 422, Message: fmt.Sprintf("Server %s does not run the primary of shard group %d.", in.oldOf(g), g), Group: &g}
 		}
-		if g == 0 && !in.graceful() {
-			// A hard failover of a server whose map group primary answers is not built (design, "the map group with a live old leader"): the bootstrap
-			// takes a server that is not heard, and a planned switchover of the map group is the task's own (mode graceful, restore).
-			return &Refusal{Code: "unsupported_operation", Status: 422, Message: "The failover of the map group while its server is alive is not supported yet; use mode graceful (a planned switchover), or the documented SQL of the sharding extension.", Group: &g}
+		if g == 0 && !in.graceful() && !in.MapLive {
+			// Only a request that was resolved here for a live leader's server (MapLive) takes the map group in mode hard; a task that is not one (an
+			// automatic failover of the leader's server, which the bootstrap handles when the server is not heard) has no way to hand the map group over.
+			return &Refusal{Code: "unsupported_operation", Status: 422, Message: "The failover of the map group while its server is alive is asked of the manager leader with mode hard or graceful; this task cannot do it.", Group: &g}
+		}
+		if g == 0 && in.MapLive && in.oldOf(0) != r.Plan.Self() {
+			return &Refusal{Code: "unsupported_operation", Status: 422, Group: &g,
+				Message: "The map group is failed over by the task that runs on the server of its primary (the manager leader); ask the leader."}
 		}
 	}
 	if len(in.Groups) == 0 {
@@ -688,6 +693,9 @@ func (r *Runner) stopOld(ctx context.Context, env *task.Env, sc *stepCtx) error 
 	if err != nil {
 		return err
 	}
+	if sc.group == 0 && sc.in.MapLive {
+		return r.stopOldMap(ctx, env, sc, run)
+	}
 	if err := sc.ensureFrozen(ctx); err != nil {
 		return err
 	}
@@ -737,12 +745,15 @@ func subjectOf(group int32, server string) string {
 // ---------------------------------------------------------------------------------
 // F3
 
+// freezeRenewEvery is how often a step that waits renews the freeze of the group.
+const freezeRenewEvery = 30 * time.Second
+
 func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) error {
 	run, err := sc.runRow(ctx)
 	if err != nil {
 		return err
 	}
-	if sc.in.graceful() && sc.group == 0 {
+	if sc.mapHandedOverByTheCandidate() {
 		if nw, _, perr := sc.pinnedStandby(ctx); perr == nil {
 			if handed, herr := sc.mapHandedOver(ctx, nw); herr != nil {
 				return herr
@@ -760,14 +771,38 @@ func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) erro
 		return err
 	}
 	quorumSince := time.Time{}
+	// errSince is when the fence lease call began to fail with an error that is not an answer about the lease; the wait for
+	// the lease is bounded for such an error as it is for an answer that says "held by the old holder" (phase 5 review M3).
+	errSince := time.Time{}
+	frozenAt := r.now()
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		// The freeze of the group lapses (default five minutes): it is kept while the step waits.
+		if r.now().Sub(frozenAt) >= freezeRenewEvery {
+			// An upkeep: the step passed the freeze at its start. In a graceful switchover the old primary is stopped by now and
+			// its freeze handler or state may answer an error or say the group is not frozen; that must not end the wait with
+			// the group stopped and no rollback (phase 5 review L-1). Only an end of the call (the context) and an answer that
+			// says a newer run of the task exists stand the step down; anything else is logged and tried again soon.
+			if err := sc.ensureFrozen(ctx); err != nil {
+				if cerr := ctx.Err(); cerr != nil {
+					return cerr
+				}
+				if errors.Is(err, fence.ErrFenced) {
+					return err
+				}
+				r.log().Warn("failover: renewing the freeze of the group while waiting for the lease", "group", sc.group, "error", err)
+				frozenAt = r.now().Add(-freezeRenewEvery + 5*time.Second)
+			} else {
+				frozenAt = r.now()
+			}
 		}
 		if !r.hearsMajority(ctx, members) {
 			if quorumSince.IsZero() {
 				quorumSince = r.now()
 			}
+			errSince = time.Time{} // errors on either side of a time without a majority are not one run (phase 5 review L-2)
 			if r.now().Sub(quorumSince) > orDur(r.QuorumWait, time.Minute) {
 				r.Plan.Alert(ctx, "failoverBlocked", "warning", subjectOf(sc.group, sc.old()), "The server that runs the failover cannot hear a majority of the servers.", true)
 				if sc.in.graceful() {
@@ -776,6 +811,7 @@ func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) erro
 					// repair of switchovers finishes what a server that cannot be reached still holds (F4-02).
 					return sc.rollbackFailed(ctx, CodeQuorumUnavailable, true, "this server cannot hear a majority of the servers; shard group %d was given back to %s", sc.group, sc.old())
 				}
+				sc.releaseFenceAdoption(ctx)
 				return &PauseError{Reason: "This server cannot hear a majority of the servers (quorum_unavailable); nothing was done. Repair the network or repeat the request from a server that can."}
 			}
 			sc.detail(ctx, "waiting for a majority of the servers to be heard")
@@ -789,6 +825,18 @@ func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) erro
 				if !errors.Is(err, ErrUnreachable) {
 					r.log().Warn("failover: asking for the fence lease", "group", sc.group, "error", err)
 				}
+				if errSince.IsZero() {
+					errSince = r.now()
+				}
+				sc.detail(ctx, "the lease of the group cannot be taken: %v", err)
+				if r.now().Sub(errSince) > orDur(r.LeaseWait, 25*time.Second) {
+					r.Plan.Alert(ctx, "failoverBlocked", "warning", subjectOf(sc.group, sc.old()), fmt.Sprintf("The lease of shard group %d could not be taken from this server: %v.", sc.group, err), true)
+					if sc.in.graceful() {
+						return sc.rollbackFailed(ctx, CodeLeaseUnavailable, true, "the lease of shard group %d could not be taken (%v); shard group %d was given back to %s", sc.group, err, sc.group, sc.old())
+					}
+					sc.releaseFenceAdoption(ctx)
+					return &PauseError{Reason: fmt.Sprintf("The lease of shard group %d could not be taken from this server (%v); nothing was promoted. Repair the cause and repeat the request.", sc.group, err)}
+				}
 			} else if ans.Held {
 				waited := int(r.now().Sub(started).Milliseconds())
 				if err := sc.rows.Set(ctx, sc.group, GroupSet{LeaseWaitMs: &waited, State: ptr("fenced")}); err != nil {
@@ -797,6 +845,7 @@ func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) erro
 				sc.event(ctx, "leaseHeld", map[string]any{"waitMs": waited})
 				return nil
 			} else {
+				errSince = time.Time{}
 				sc.detail(ctx, "waiting for the old lease: %d ms left at the grantors that refused", ans.WaitMs)
 				if r.now().Sub(started) > orDur(r.LeaseWait, 25*time.Second) {
 					stillOld := false
@@ -817,6 +866,14 @@ func (r *Runner) takeFence(ctx context.Context, env *task.Env, sc *stepCtx) erro
 			return err
 		}
 	}
+}
+
+// releaseFenceAdoption stops this server renewing the fence lease it may have adopted for the group before a pause. An adoption has no
+// lifetime of its own: left in place it is renewed for as long as the server runs, the old primary (which may be alive and cut off)
+// cannot renew its lease, and the group would stay without a primary while the task waits for an operator, although nothing was
+// promoted. The repeat of the request takes the lease again (phase 5 review L-3). Best effort; an adoption of an attached primary is never released.
+func (sc *stepCtx) releaseFenceAdoption(ctx context.Context) {
+	_, _ = sc.r.Peers.Lease(context.WithoutCancel(ctx), sc.r.Plan.Self(), LeaseRequest{Group: sc.group, Role: LeaseRelease})
 }
 
 func ptr[T any](v T) *T { return &v }
@@ -874,6 +931,17 @@ func (r *Runner) readPositions(ctx context.Context, group int32, recs []StandbyR
 }
 
 func (r *Runner) choose(ctx context.Context, env *task.Env, sc *stepCtx) error {
+	if sc.group == 0 && sc.in.MapLive {
+		// The standby of the map group of a live leader's server was ranked and pinned by the bootstrap after the stop (the row of the task has the pin since
+		// B7): this step runs on the new leader and has nothing left to choose once the standby is promoted.
+		if nw, _, perr := sc.pinnedStandby(ctx); perr == nil {
+			if handed, herr := sc.mapHandedOver(ctx, nw); herr != nil {
+				return herr
+			} else if handed {
+				return task.Skip("the map group was handed over already")
+			}
+		}
+	}
 	if err := sc.ensureFrozen(ctx); err != nil {
 		return err
 	}
@@ -1459,7 +1527,7 @@ func (r *Runner) checkCatalog(ctx context.Context, env *task.Env, sc *stepCtx) e
 			before := int64(0) // the term before is known for the system catalog only
 			if t.db == SystemDB {
 				before = run.ExpectedTerm
-				if sc.group == 0 && sc.in.graceful() {
+				if sc.mapHandedOverByTheCandidate() {
 					// The term of the map group's own promotion is what the run row says after it (runRowOf): the term before it is the one the run began with.
 					if raw, ok, rerr := sc.rows.Run(ctx); rerr == nil && ok {
 						before = raw.ExpectedTerm
@@ -1738,7 +1806,7 @@ func (r *Runner) unfreeze(ctx context.Context, env *task.Env, sc *stepCtx) error
 		r.log().Warn("failover: lifting the freeze", "group", sc.group, "server", sc.old(), "error", err)
 	}
 	old := "waitingForServer"
-	if st, err := sc.oldState(ctx); err == nil && len(st.OutOfRecovery()) == 0 {
+	if st, err := sc.oldState(ctx); err == nil && len(st.OutOfRecovery()) == 0 && !st.RunningUnknown() { // an instance that cannot be looked at may run: the rebuild waits
 		old = "rebuildScheduled" // the reconcile loop rebuilds it (oldprimary.go in internal/standby)
 	}
 	if err := sc.rows.Set(ctx, sc.group, GroupSet{State: ptr("done"), OldPrimary: &old, Finished: true}); err != nil {
@@ -1894,7 +1962,7 @@ func (r *Runner) promoteNodePastPromotion(ctx context.Context, sc *stepCtx, nw S
 // answers "not ready" and a task step would wait for it for minutes (peerclient.NotReadyBound), which stops the failover for a server that is not
 // needed any more (the case of the old leader of a planned switchover of the map group that restarted). They wait for OldServerWait and go on. Only the map group of a planned switchover is bounded: there the old leader's instance is the stopped system database.
 func (sc *stepCtx) oldCtx(ctx context.Context) (context.Context, context.CancelFunc) {
-	if sc.group != 0 || !sc.in.graceful() {
+	if sc.group != 0 || !sc.mapHandedOverByTheCandidate() {
 		// Every other group keeps the long wait of a task step: the check that stops an old primary that still runs (the fence of last resort) is reached when the old
 		// server answers late or "not ready", and the lease fences in any case, but the alert and the immediate stop are worth the wait there (F5-10).
 		return ctx, func() {}

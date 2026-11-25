@@ -7,6 +7,528 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-24 (branch rel-prep, from g2): the documentation of the first release brought up to g2
+
+### What was done
+
+- **CHANGELOG.** The database export and import entries moved from `[Unreleased]` into `[0.1.0]` (g2 holds everything planned for the first release); new entries for the security hardening of the extensions and the alert `extensionSkipped`, the split locks, drain step 4 and the standby lag rule, time partitioning of distributed tables (`kingres_timepart` 0.3), `pg_stat_statements` and `plpgsql`, the hard failover of the map group with `lostServerId`, the escrow of the CA key and the switchover fix; the contract is 0.30.0. The Pending part is rewritten item by item (done, still open, dropped); the heading stays for the release step to remove.
+- **Operator guide.** Section 6 (escrow, hard failover of the map group, the verdict, the lost candidate, the second standby), section 4 (drain hand-over, standby lag), section 10 (`extensionSkipped`), section 11 (distributed tables), new sections 13 (export and import of a database) and 14 (`pg_stat_statements`, PL/pgSQL). The guide README and the limitations follow.
+- **README.** The phase table follows g2. Nothing is claimed as released.
+
+### How it was verified
+
+Every statement was read against `kingres/api/openapi.yaml`, the design notes and the work log of g2; the relative links and anchors of the changed files resolve (a script, run on Windows). No code was changed and no test was run.
+
+### Still open
+
+See the Pending part of the CHANGELOG. Two points of the guide are from the text of the design and not from a run: what exactly repeats the apply of an extension after `extensionSkipped`, and the list of predefined roles that make an importer dangerous.
+
+---
+
+## 2026-11-24 (branch p11-cp, from g2): the distributed schemas in the rebalance and the drain
+
+### What was done
+
+What the code showed first: the extension already plans a distributed schema as an item of `plan_rebalance` (the item `(colocation_id, 0)` of its schema group; a pinned schema is left out, 9.9) and `move_bucket` dispatches to the schema mover, so the control plane planned and ran schema items as buckets without knowing it. What was missing: the item had no name or kind anywhere (plan, status, report), the run called `move_bucket` and not the extension's schema move, and a drain of a server with a schema that cannot move (a ledger table, a table that is not logged, a table with no key and no full replica identity) started, did not empty the server, and failed after the 30 minutes of its wait.
+
+- `rebalance`: `Move.Schema` (the name, read in `PG.Plan` by joining the plan with `kingres.dist_schema`; empty for a bucket), `Move.Kind()`. `RunMove` calls `kingres.move_schema(quote_ident(name)::regnamespace, target)` for a schema item, inside the same guard, fence and gate (`withShard` and `extgate`) as `move_bucket`; retries, skips, the audit and the alerts are the loop's and are unchanged. Migration `0044_rebalance_schema_move.sql` adds `rebalance_move.schema_name`, kept by `StartMove` and `AddSkipped` and read by `ScanMove`, so the status and the report name the schema after a restart or a change of leader.
+- The drain: `Service.schemasOn` reads `kingres.schemas_on_group` of every group whose primary runs on the server (extension 0.9, in every trusted database, through `withShard`). `DrainPreview` lists a schema that cannot move as a blocker (`schema_pinned` for a ledger pin, `unprocessable` for the other reasons, each naming the schema and the database) and `Drain` refuses with the first of them before a task exists. `bucketsOn` already counted the one bucket of a schema group (and a move in `cleaning`); the comment says so and the wait of the end step names how many of the remaining buckets are schemas.
+- Contract 0.31.0 (placeholder; additive only): `kind` and `schemaName` on the result of one move of `getRebalanceReport` (`PlannedMove` and `BucketMove` had them since 0.15.0 and are now filled); the descriptions of `drainServer` and `previewServerDrain`. `check-contract.mjs`, the README changelog, `schema.d.ts` and `ContractRevision` follow. Console: the report dialog shows a schema as `Schema <name>` like the plan and the progress do, the drain dialog says that schemas move and keys its blockers by code and text.
+
+### How it was verified
+
+Windows only (a full gate runs in WSL): `go build ./...`, `go vet ./...`, `go test ./...` in `kingres/control-plane` (the database tests skip), `node scripts/check-contract.mjs`, `npm run api:check`, typecheck, lint and vitest of `kingres/web`. Written and not run: the database tests of `internal/rebalance` (`schema_items_pg_test.go`, on a stand-in catalog recorded by `trustStub`) and the cluster test `TestDrainOfAServerThatHostsADistributedSchema` (`internal/clustertest/schemas_drain_test.go`: the preview and the refusal by a schema without a replica identity, a drain that moves two schemas and the buckets and ends empty, a rebalance by disk size that moves a schema).
+
+### Open
+
+- The tests that were written and not run are the list in the report of the branch; they run in WSL after the timing gate.
+- A schema that is only pinned by a ledger table keeps the drain refused until the operator decides about that data (design 9.9).
+- The drain does not offer `setReplicaIdentityFull` for the schemas; the operator sets the identity (the preview says which table).
+
+---
+
+## 2026-11-24 (branch p9-rel, from g2): distribute with related tables and `Table.operation` (phase 9, last two items)
+
+Branch `p9-rel` from `g2` (`771af7587d`). Contract **0.32.0** (a placeholder; 0.31.0 is taken by another branch): 1 operation added (178 operations, 142 paths), additive only.
+
+### What was done
+
+- **(A) Distribute with related tables.** Design choice: a control-plane task and an option of the existing operation, as `shard-phase9.md` says ("it is a control-plane feature because it is a sequence of ordinary statements"; decision 11), not a new endpoint and not a function of the extension. The extension offers `internal_fk_component` (the component of keys over tables that are already in `kingres.dist_table`, used by undistribute and alter), which cannot see ordinary tables, so the closure over ordinary tables is read from `pg_constraint` by the control plane (`Graph`, behind the extension guard for `kingres.dist_table`), and `create_distributed_table(..., colocate_with)` is what puts the related tables in the group of the table. `listRelatedTables` (new, read-only) is the plan; `previewTableChange` and `distributeTable` take `relatedTables`. The plan is a pure function (`planRelated`: breadth first order, the column of each table derived through the keys, blockers `related_column_unknown`, `related_table_missing`, `related_table_unrelated`, `related_table_busy`; warning `related_table_distributed`). The task has one step per table and resumes at the first step that is not done (`kingres.dist_table` and `pg_constraint` are looked at). The keys are captured when the request is made and kept in the input of the task.
+- **(B) The operation indicator.** `Table.operation` (nullable `TableOperation`: kind, role, source, taskId, state, startedAt, percent, step) in `listTables` and `getTable`, from the active tasks with a table subject (and the related tables of a distribute) and from `kingres.table_operation(_item)` through `extUsable`. Both reads became leader-bound (the tasks are in the leader's system database).
+- **Console.** Related tables in the Distribute dialog (the list, the columns, the keys, the warning that no key is enforced meanwhile, online off), `TableOperationBadge` on the rows of the list and a line "Running now" on the table page, the change buttons off with the reason from the operation. The mock has the plan, the related distribute and `operation`.
+- **Docs:** operator guide (section 5), limitations, control-plane README, CHANGELOG (the Pending item is gone), `api/README.md` changelog 0.32.0, `check-contract.mjs`.
+
+### How it was verified
+
+Windows only (a timing-sensitive gate runs in WSL; no WSL test was run): `go build`, `go vet`, `go test ./...` in `kingres/control-plane`, `node api/scripts/check-contract.mjs`, `npm run api:check`, `typecheck`, `lint`, `vitest run` and the new `tests/tables-related-0-32.test.ts` in `kingres/web`. The database tests (`ops/tablerelated_pg_test.go`) skip on Windows.
+
+### Open
+
+- Tests to run in WSL: see the report of the branch (`TestRelated*`, `TestTableOperations*` of `internal/ops` with `KINGRES_PG_BIN`; a cluster test `TestTableLifecycleRelated` of `internal/clustertest`; the browser tests).
+- A failed related task has no retry: the tables that are still ordinary are distributed with a new request. A distribute with related tables whose tables are in several schemas of other servers' instances is not covered.
+
+---
+
+## 2026-11-24: the integration branch g2 (nine branches merged onto g16s)
+
+Branch `g2`, from g16s (`cc5008adb2`), nine merge commits in this order: `xcat-2`, `split-fix`, `pgss`, `p12-dist-tp`, `ca-escrow`, `p10-drain4`, `p5-hard`, `p14b`, `p14c`.
+
+### What was done
+
+- **Contract numbers** (the placeholders of the branches are replaced; the next number in the order of the merges): 0.25.0 `p12-dist-tp` (descriptions only), 0.26.0 `ca-escrow` (3 operations), 0.27.0 `p10-drain4` (no operation), 0.28.0 `p5-hard` (no operation),
+  0.29.0 `p14b` (2 operations), 0.30.0 `p14c` (1 operation). The contract of g2 is **0.30.0, 177 operations, 141 paths** (g16s: 0.24.0, 171 and 136). `p12-dist-tp` had its contract text only in its work area; it is now in `openapi.yaml` and in the changelog.
+- **Migration:** `0050_archive_validation.sql` of `p14b` is `0043_archive_validation.sql` (g16s ends at 0042); `p14c` has none.
+- **Test numbers:** `contrib/kingres_shard/t/278_dist_timepart.pl` is `281_dist_timepart.pl` (278 was taken by `xcat-2`), `contrib/kingres_timepart/t/010_install_script_current.pl` is `012_install_script_current.pl` (010 and 011 are `xcat-2`'s). The console tests named after a placeholder number are renamed (`archive-*-0-29`, `import-*-0-30`, `map-hard-pause-0-28`).
+- **`kingres_shard--0.8--0.9.sql`:** the three branches (`xcat-2`, `split-fix`, `p12-dist-tp`) append to its end; the appended parts are kept in that order. `internal_begin_move` is defined by `split-fix` and by `p12-dist-tp`; the merged function has the `updated_at` touch of the first and the hint of the second. `kingres_shard--0.9.sql` is regenerated by `mk-install-script.sh`.
+  The upgrade script `kingres_timepart--0.2--0.3.sql` carries the schema check of `xcat-2` (as every script does), `kingres_timepart--0.3.sql` is regenerated, and `t/011_old_script_schema_check.pl` covers 0.3.
+- **Trust check (extguard) for the code that came from the branches:** `cluster/globals.go` (the extensions of a copied database: Verify, then PreInstall), `ops/extensions.go` (Install and Installed: extguard for the extensions of KingresDB, a plain catalog read for `pg_stat_statements`, whose schema is public),
+  `ops/tableprep.go` (the access methods of the leaves of a distributed table: `extUsable` before `kingres.partition_leaf_storage`), `ops/dbexport_facts.go` (the export's own check of the sharding extension is gone, extguard decides), `ops/dbimport_steps.go` and `ops/dbimport_service.go`
+  (the import: `PreInstallExtension` before and `Require` after `CREATE EXTENSION kingres_shard`; `requireExtensions` uses the guard for the sharding extension too). `p10-drain4`: the lag is read on the system database `kingres_system` (hardened) with a `pg_catalog` statement; the exemption is written in the comment in `rebalance/pg.go`.
+  `p5-hard` and `ca-escrow` read nothing of the schema kingres in a user database. Tests: `ops/gate_g2_test.go`, `rebalance/lagsql_test.go`.
+- `ContractRevision` of the archives of the export is 0.30.0.
+
+### How it was verified
+
+Windows only (no WSL, a full gate runs there): `go build ./...`, `go vet ./...`, `go test ./...` in `kingres/control-plane` (the database tests skip), `node scripts/check-contract.mjs` (all rules hold), `npm run api:check`, `typecheck`, `lint` and `vitest run` in `kingres/web`. The C and SQL of the extensions were only checked for consistency (the generators give no diff, the test lists have no gap or duplicate); they are built and tested later.
+
+### Open
+
+- The branches' own WSL tests were not run on the merged tree.
+- `contrib/kingres_ledger/t/040_columnar_refused.pl` is in no test list (it was not in g16s either).
+
+---
+
+## 2026-11-23 (branch pgss, from g16): pg_stat_statements and plpgsql in the first release
+
+### What was done
+
+- **Preload.** `instance.PreloadLibraries` is `kingres_shard,kingres_ledger,kingres_columnar,pg_stat_statements`. The library-exists check of columnar became a table (`optionalLibraries`): a library whose file is not in `pg_config --pkglibdir` is left out of the list. `kingres_columnar` stays sticky (marker file `columnar-preload`); `pg_stat_statements` is deliberately not sticky and has no marker: a missing file must never keep an instance from starting, and the statistics hold nothing to protect. `EnsureConfig` upgrades an existing instance as before: warning, managed file rewritten with every other setting kept, a reload of a running instance so that `shared_preload_libraries` is pending a restart, and the console's restart of pending instances puts standbys first.
+- **Install in databases.** `postgres` and `kingres_system` get the extension when the cluster is created (`installStatStatements`); every database of `database.create` gets it through `installAnalytics`, on every server; a server that is added gets it with the databases of the leader (`globals/apply`). `ExtStatStatements` joined the closed list of the extension apply kinds. **Existing databases:** an explicit `CREATE EXTENSION IF NOT EXISTS pg_stat_statements` by the administrator, not a lazy install (nothing in `kingresd` uses the view, so there is no first use to hang it on, and a superuser DDL in a user's database at an unforeseen time is not worth a view); the guide text says so.
+- **Configuration API.** `pg_stat_statements.max`, `.save`, `.track`, `.track_utility` and `.track_planning` are settable (cluster, server group, server; the three session ones also per database), not managed, not refused, not cluster-only; `shared_preload_libraries` stays managed and its reason names the library. A test pins the classification.
+- **Packaging.** meson builds every contrib module and PL/pgSQL, and the deb and the image take the whole staged tree, so both modules were already shipped for both majors (nothing in `meson_opts` leaves them out). Added: `build.sh` stops when either is missing from the staged tree; `check_postgres_modules` in `test/lib.sh` (package, image and compose tests); `test/test-modules.sh --deb|--tree|--list`; the flow checks the new preload value, the view in `postgres` and a plpgsql function.
+- **plpgsql.** In every database `kingresd` makes (checked on every server by the cluster test). `kingres_shard` does **not** propagate `CREATE FUNCTION`: the function is local to each server (the cluster test pins it, so a later change of that fact fails the test and the guide gets corrected); a plpgsql function in a filter, a read and a write against a distributed table works from every server. `t/013_dist_scan.pl`, `t/124_pushdown_closed.pl` and `t/057_scan_errors.pl` already cover plpgsql functions in distributed queries, so no new TAP was added.
+- Guide text for the integrator (a section on the statistics, their settings and PL/pgSQL) was written as a separate file, outside the repository; the branch rel-docs2 was not touched.
+
+### How it was verified
+
+See the report of the run for the counts per major; the tests are `instance` (preload, the upgrade of an existing instance, the library that the installation lacks, not sticky), `ops` (`installAnalytics`), `pgconfig` (the classification), the cluster test `TestStatStatementsAndPlpgsql` (three servers, PostgreSQL 18 and 19, lane l11) and `test/test-modules.sh`.
+
+### Still open
+
+- The shell tests of the package and the image (`test-deb.sh`, `test-image.sh`, `test-compose.sh`) were changed but not run here (they need a built package and Docker); `test-modules.sh` was run on installed trees.
+- No console page for `pg_stat_statements`; the view is SQL only.
+
+## 2026-11-23 (second entry): the leftovers of p12-dist-tp and the findings of its review
+
+Branch p12-dist-tp, on top of g16 (merged, `t/252` rerun).  Contract revision 0.25.0 (numbered when merged into g2; the text is in `api/openapi.yaml` and the changelog of `api/README.md`).
+
+### What was done
+
+- **g16 merged** into the branch (the search_path hardening and `t/252`); the branch had been made from the merge before it.
+- **Stale claims.**  `begin_leaf_conversion` takes the pid of the driver (`holder_pid`, with its start time); `check_cluster()` reports `leaf_conversion_stale` (the session is gone, or the claim was not renewed for six hours);
+  `cancel_table_operation` releases such a claim (and refuses one whose session lives); the next claim takes it over; the hints of the refusals that a claim causes name these actions (the C check of `assert_no_move`, `internal_begin_move`,
+  `begin_leaf_conversion`).
+- **`timepart__dist_convert`** takes the claim first, reads the leaves and checks the nodes inside the block that releases it on every error, ends the `CALL` that a failed or timed-out leaf left on its node before it releases the claim, and its leaf limit
+  is at most 5 hours (the lease is 6).  `partition_leaf_storage` raises an error for a bucket whose group has no active primary.  A distributed action has no sizes (the sentinel `bytes_after = 0` is gone).  `object_in_use` is `retry_later` for a
+  distributed table only.  The budget of a policy reads the configured limit (`reset_val`) and `partition_leaf_budget` has a fallback; the budget of an attach is tested; `table_change_report('create_partition' | 'attach_partition')` has the blocker `leaf_budget`.
+- **kingresd** keeps `kingres_timepart` at the version of the package on every server of every database (the job `extension.update` of the leader, through the `extension.install` apply); `listTablePartitions` says `mixed` and `other` as `timepart__dist_kinds` does.
+- **Console:** the Format filter has `Mixed`, with a badge, a mock switch (`?analytics=timeseries,mixed`) and a vitest.
+- Tests in `t/278`: stale claims (a live and a gone holder, the lease), the 6-hour takeover and the renewal, the attach budget, a multibyte name, the way back to heap, readers (one statement at a time, always complete rows), `convert_leaf` by a role that is not a
+  superuser, DDL on a server that is not the map group primary (the claim is a record of the map group primary and is not needed on the nodes: DDL and the partition functions reach them through it), an error between the claim and the first leaf, and a killed driver
+  (reported, released by `cancel_table_operation`, the leaf that was running ends).  In `distpart_test.go`: no sizes in the actions, and `TestTimepartUpdatedOnEveryServer` (a database on 0.2 is updated on three servers, then converts).
+- READMEs of the three components and section 11.7 of the design say what changed, and that a `statement_timeout` of a driver covers the whole partition.
+
+### How it was verified
+
+- PostgreSQL 18.7 and 19.0, private installs, lane l10, `-Werror`: `kingres_shard` TAP in full, 236 files (59,827 tests on 18, 59,790 on 19, with `t/046_two_majors` run separately with both installs: 30 more), regress 25 of 25; `t/252` and `t/278` twice more each (224 tests per round);
+  `kingres_timepart` regress 17 of 17 and TAP 693 tests (10 files); the cluster tests `TestPartitionPolicyOfADistributedTable`, `TestTimepartUpdatedOnEveryServer`, `TestTableStorageAndPartitionPolicies`, `TestTableLifecycle`; `go test` of `ops`, `partsched`, `httpapi`, `kingresd`; the 215 vitest tests of the analytics console,
+  `vue-tsc`, eslint and prettier.
+- Mutants, killed: the claim not released on an error (T9: also `D` and `H` fail), the budget of an attach removed (S5), the holder never gone (S6), `cancel_table_operation` not releasing (S7), the budget of `create_partition` removed (S1);
+  the job `extension.update` never run (Go, `TestTimepartUpdatedOnEveryServer`); the `Mixed` option removed (vitest).
+
+### Decisions and deviations
+
+- A reader that holds a transaction open on the table makes the swap of a leaf give way (`swap_lock_timeout`): it is the behaviour of the conversion of an ordinary table, and the next run goes on; the test of readers uses one statement at a time.
+- The listing of the partitions reads every node on each page; it is not cached (a cache would show a finished conversion as half done).
+
+### Still open
+
+- A driver that is killed outright cannot end the `CALL` that it left on a node: the leaf ends by itself, and the claim is reported and released by `cancel_table_operation`.
+- `openapi.yaml` and the generated contract files wait for the revision number.
+
+### Core patches
+
+none.
+
+---
+
+## 2026-11-23: time partition policies on distributed tables (phase 12, St-D1a and St-D1b)
+
+Covers branch p12-dist-tp (from g16), design [analytics-phase12-storage.md](design/analytics-phase12-storage.md) section 11 (new 11.7 says what was built).  These were the last two items of phase 12.
+
+### What was done
+
+- **kingres_timepart 0.3** (`kingres_timepart--0.2--0.3.sql`; `kingres_timepart--0.3.sql` is generated by the new `mk-install-script.sh`, which `t/010` checks).  A user-partitioned distributed table (hash on top, range partitions below, `kingres_shard` 0.9) has a policy like any other table:
+  `timepart__key_info` and `timepart__children` read its key and its partitions (rows of `kingres.dist_partition`, one logical object with a leaf per bucket) and the plan, the checks and the history work on them unchanged.
+  A run creates a partition with `kingres.create_partition(..., if_not_exists => true)`, retires it with `drop_partition` or `detach_partition` (on every node, one two-phase transaction), and converts the leaves of an old one
+  (`timepart__dist_convert`, `kingres.convert_leaf`).  A group that a bucket move or a conversion claims (`object_in_use`) is tried again inside the action, with a wait that doubles, and then recorded `failed` with
+  `lock_timeout: retry_later`: the run is `partial` and comes back within five minutes, by the existing rule.  The names of generated partitions are cut to 57 bytes (the leaves append `_bNNNN`).  The leaf budget is
+  checked by `timepart_set_policy` (steady state: retention, or one year, plus `create_ahead`, times the buckets; SQLSTATE 54000 with the numbers).  New: `timepart_dist_partitions`, `convert_distributed_partition`.
+  Only a superuser drives a distributed table (the partition functions of `kingres_shard` need one); an owner who is not one gets `failed` actions with the reason.
+- **Conversion of the leaves (St-D1b).**  One action converts the leaves of one logical partition.  The colocation group is claimed first, then each leaf that is not columnar is converted on its node by
+  `CALL kingres.convert_leaf(bucket_partition, leaf, ...)` through `kingres.internal_node_exec` (a session of its own, so the procedure commits): the algorithm of `convert_partition` with the bucket partition as the
+  table, `REPLICA IDENTITY FULL` on the new columnar leaf, and the swap under `kingres_shard.enable_routing = off` (requirement R4: no new authorization was needed).  A leaf that refuses leaves the partition mixed
+  (reads are right, the next run goes on).  A converted bucket moves (St-S3), tested.
+- **kingres_shard 0.9** (`kingres_shard--0.8--0.9.sql`, `kingres_shard--0.9.sql` regenerated): `create_partition` and `attach_partition` enforce `kingres_shard.max_partition_leaves` (before, only the distribution of a table did),
+  `partition_leaf_budget()`, `partition_leaf_storage()` (the access method of every leaf, read on its node), and the claim of a colocation group for a conversion (requirement R5): `begin_leaf_conversion`,
+  `renew_leaf_conversion`, `end_leaf_conversion`, a record of kind `convert_leaf` in `table_operation` (phase `done`) with a row of `table_operation_lock`, which the moves, the table operations, the partition functions and
+  every DDL statement on a table of the group already read.
+- **kingresd.**  The scheduler, `partition.maintain` and the policy operations needed no change of structure (the leader's instance holds the map group primary, so a distributed table is one of its tables).  Changed:
+  the partition column and the health of a policy are read through `kingres_timepart` (they named the distribution column), a policy over the leaf budget is `partition_policy_conflict`, and `listTablePartitions` of a
+  distributed table has `rangeFrom`, `rangeTo` and `accessMethod` (`heap`, `columnar`, `mixed`).  The contract text is in `contract.txt` of the work area (numbered 0.25.0 in g2); the console needs no change.
+- READMEs of `kingres_shard`, `kingres_timepart` and the control plane; section 11.7 of the design.
+
+### How it was verified
+
+- PostgreSQL 18.7 and 19.0 (private installs, one source, `-Werror`): `kingres_timepart` regress 17 of 17 and TAP 10 files with 693 tests on each major (`upgrade` compares the upgrade from 0.1 and from 0.2 with a new install of 0.3; `t/010` the generated install script);
+  `kingres_shard` regress 25 of 25 and the whole TAP suite, 236 files: 59812 tests on 18 and 59741 on 19, all pass (`t/046_two_majors` run with both installs, 30 tests; `t/250` holds for 0.8 and 0.9); the new `t/281_dist_timepart.pl` has 145 tests on each major
+  (creation ahead, conversion with `REPLICA IDENTITY FULL`, retention, the leaf budget, the 57-byte names, a claimed group and a held bucket move in both directions, a leaf that refuses, a move of converted buckets, detach, the owner who is not a superuser).
+- Control plane: `go test` of `internal/ops`, `internal/partsched`, `internal/api`, `internal/httpapi` and `internal/contract` pass; the cluster test `TestPartitionPolicyOfADistributedTable` (three servers, lane l10: policy, plan, a run by hand with three conversions and a drop, a busy group, the scheduler) passes on 18 and on 19;
+  `TestTableStorageAndPartitionPolicies` and `TestTableLifecycle` (the listing of partitions and the policy of an ordinary table) pass on 18.
+- Mutants (each applied alone to a copy of the extension, the real one reinstalled after each, `t/278` run): the leaf budget of `create_partition` removed (S1), the claim without its lock row (S2), `partition_leaf_storage` without
+  the access method (S3), the claim without its busy check (S4), `object_in_use` not retried (T1), `REPLICA IDENTITY FULL` not set (T2), the policy without the budget check (T3), the plan that does not read the storage of the
+  leaves (T4), the claim not released after a conversion (T5), the swap without `enable_routing = off` (T6), detach replaced by drop (T7), the 57-byte name replaced by 63 (T8); Go: the partition column from `pg_partitioned_table`
+  (G1), the listing without the storage and the budget error without its mapping (G2, G3); all killed, each by the test that names its behaviour.
+
+### Decisions and deviations
+
+- The retry is the existing loop of the extension (`lock_retries`, a doubling wait) and the action is `failed` with `retry_later`, not the 5 s to `partition_retry_window` and `skipped` of the first sketch; the run's end rule (partial, five minutes) is the one that was there.
+- The claim reuses `table_operation_lock` with a record of kind `convert_leaf` in phase `done`, instead of a lock of its own: every exclusion that exists already honours it, and the machinery that resumes unfinished table operations does not see it.
+  The claim is not renewed by a heartbeat process: the conversion renews it after each leaf, and a claim of six hours without renewal is taken over.
+- The leaf budget is `kingres_shard.max_partition_leaves` (8192), not the 20 000 of the first sketch of the design.
+
+### Still open
+
+- Closed by the leftovers entry of the same date below: the stale claim in `check_cluster()`, the update of `kingres_timepart` on every server, the Mixed filter and the leaf budget in `table_change_report`.
+- The contract text is not in `api/openapi.yaml` (the revision number is assigned at the merge).
+
+### Core patches
+
+none.
+
+## 2026-11-23: phase 10 closed in the control plane: the drain hands the map group over, and the automatic mode waits for a standby that lags
+
+### What was done
+
+Branch `p10-drain4` (from the staging branch g16). The two open items of phase 10 ([design section 23](design/shard-phase10.md)):
+
+- **Drain step 4, the hand-over of the map group** (`internal/rebalance/handover.go`, `cmd/kingresd/drain_maphandover.go`). `drainServer` no longer refuses the server that runs the map group primary when another server runs a standby of it. A planned switchover is refused while a rebalance runs
+  (migration 0009), so the new step `Hand over the map group` pauses the drain task, a goroutine asks for the planned switchover of group 0 (`failover.Service.Start`, graceful), and the job `RunDrainWatch` of the new manager leader resumes the drain when the switchover has ended (marker `drain.mapHandover`
+  in `kingres_cp.cluster_setting`). A refused or rolled-back switchover fails the task with its code; the server stays draining. The reconcile of the standbys (step 5) leaves the former primary of group 0 in the ring until it is a ready standby (`cmd/kingresd/drain_standbys.go`):
+  the first cluster run showed that a former primary that is still being rebuilt cannot be removed, and the step waited for the whole bound.
+- **The standby-lag rule of the automatic mode** (`automatic.go`, `pg.go`). The rule "group without a healthy standby" also holds for a standby behind its primary by more than `maxStandbyLagBytes` (default 64 MiB), read on the primary of each group (`pg_stat_replication`); a primary that cannot be asked counts as lagging.
+- Contract text only, revision **0.27.0**: `drainServer` description, `blockedBy` description, API README changelog, `check-contract.mjs`, the two texts in `web/src/api/schema.d.ts` (by hand).
+- Documents: `control-plane/README.md` (drain, automatic mode, tests), `docs/design/shard-phase10.md` section 23, this entry.
+- Commits: see `git log p10-drain4` (code and tests, contract, documents).
+
+### How it was verified
+
+- Unit tests (`go test ./internal/rebalance ./internal/ops ./internal/failover ./internal/contract`): `handover_test.go` (decision table, readiness of the marker, refusal of the map group server, the step with an engine over memory: pause, one request, resume, refusal code, rollback, a hook error recorded without its text, no request before the pause), `lag_test.go`.
+- With PostgreSQL (lane l8, private installs, PostgreSQL 18 and 19.0): `handover_pg_test.go` (marker in the system database with the age by the clock of the database, the watch resumes a started or refused hand-over, waits for an unfinished failover, leaves a young marker, another task, a manual rebalance and a server that is not the leader alone, resumes a marker left behind), `lag_pg_test.go` (facts, the setting, an unreadable primary, no standbys wanted, the guard).
+- Cluster tests (`internal/clustertest/phase10_drain4_test.go`, PostgreSQL 18 and 19.0): `TestDrainHandsOverTheMapGroup` (three servers, standbys, writers on another server through the whole drain of the manager leader: the drain ends done under the new leader, the step is done, group 0 is elsewhere, the drained server holds no bucket and no instance, the other servers see every row and every acknowledged write, the failover report is there),
+  `TestDrainWhoseSwitchoverOfTheMapGroupIsGivenUpFailsAndLeavesTheServerDraining` (the candidate cannot promote, the bootstrap is given up: the drain fails with `server_hosts_map_group`, the old leader holds the map group again, the flag stays false, the rebalance lock is free), `TestAutomaticRebalanceWaitsForAStandbyThatLags` (replay paused on the standby of the group that owns the buckets, 8000 rows written, limit 1 MiB: blocked by `groupDegraded`, no run for 15 s, then the replay resumes and the run completes).
+  The existing `TestDrainOnACluster` (its preview of the map group server now says it can be drained) and `TestAutomaticRebalanceOnACluster` pass on both majors.
+- `node kingres/api/scripts/check-contract.mjs`: all rules hold (171 operations, 136 paths). Not run: `npm run api:check` of the console (no `node_modules` in the worktree), so the two hand-edited texts of `schema.d.ts` are unchecked against the generator.
+- Mutants: 18 on the unit and PostgreSQL tests (lag comparison, unreadable lag, rule without the lag, rule without the replica count, a started marker that asks again, a step that does not pause, a request without waiting for the pause, a request twice, a marker that is ready at once, a refusal that ignores the standbys of the map group or the hook, a refusal that is not recorded, markers that are not cleared), all killed (two first versions did not compile and were redone); 2 at cluster level (the hook not wired: the preview and the drain refuse the map group server; the lag rule left out: no block), both killed. The wait for the former primary to be a ready standby was found by a failing cluster run (the drain stood in step 5 until the bound) and has no mutant of its own.
+
+### Decisions and deviations
+
+- The drain stays one task of kind `rebalance` (section 22); the hand-over pauses it instead of running the switchover inside the step, because the database excludes the two (see section 23).
+- The lag rule is part of the automatic mode only; a manual start does not read the lag.
+- The removal of the old leader after its drain was not tried in the cluster test: the first server holds the key of the certificate authority and `removeServer` answers `certificate_authority_unavailable` from another leader (an existing limit, unrelated to the drain).
+
+### Fixes after the review of the branch (same day)
+
+- M1: the marker has the states `requested`, `requesting` (written before the hook is called), `started` (after it, tried five times on new sessions) and `refused`; the audit event comes after the record of started; the watch also resumes `requested` or `requesting` when a failover created after the marker has ended (and turns the marker into started, so the resumed step fails if the server still runs the map group).
+- L1, L3: the marker carries an attempt (a random name; ages are by the clock of the database, so no clock of a server is compared). The goroutine acts only while the marker carries its attempt; a young marker of the same task is not overwritten, and a manual resume of the paused drain pauses again.
+- L2: the hook refuses with `failover_in_progress` while any failover task is unfinished, so `failover.Service.Start` never resumes an unrelated paused failover.
+- L4: the marker is cleared when the step ends or fails, in `onFail` (failure and cancel, also while paused) and at the end of the drain (`Write the report`).
+- L5: only `creating` and `rebuilding` standbys of group 0 on the drained server hold it in the ring; at the bound with `acceptFewerReplicas` the server is taken out of the ring anyway (hook argument `force`), and the task detail says that the drain ends with fewer standbys.
+- M2: the lag query joins `pg_stat_replication` with the physical slots, reads only senders that are catching up or streaming, and answers -1 (lagging) for a standby with no replayed position; backup and logical walsenders are ignored; cascading standbys are not seen (documented).
+- M3: inside a run the guard needs more than twice `maxStandbyLagBytes` on three evaluations in a row; the start and the resumption of a run use the limit; the groups are read in parallel under the same 15 s bound. Contract text, README and design section 23 say so.
+- L6: the console mock lists the step `Hand over the map group`; the drain dialog says that the map group is handed over for the server that runs its primary. Vitest of the touched files, `npm run api:check`, eslint, prettier and `vue-tsc` pass (the `node_modules` of another worktree were linked).
+
+Verification of the fixes: unit and PostgreSQL tests of `internal/rebalance` (whole package, PostgreSQL 18 and 19.0), `cmd/kingresd` (hook), console (vitest of the touched file and of the servers pages, `npm run api:check`, eslint, prettier, `vue-tsc`), the five cluster tests on both majors. 16 more mutants, all killed (a lagging row of one evaluation, no `requesting` record, no audit event, a young marker that asks again, the attempt ignored, readiness without the ended failover, the marker of any task cleared, no `force`, streak of one, factor of one, a hook that ignores an unfinished failover, sequential reads, a query without the physical filter, with backups, without the unreadable case, `onFail` that keeps the marker). One cluster run of `TestDrainHandsOverTheMapGroup` on PostgreSQL 19.0 ran into its 25 minute bound (the drain did not end under the new leader) and its log was not kept; six later runs on 19.0 and two on 18 passed. The test now prints the task, the rebalance status and the log of the new leader when it fails, so that the next occurrence can be read; the cause is not known.
+
+Verification of the fixes: unit and PostgreSQL tests of `internal/rebalance` (whole package, PostgreSQL 18 and 19.0), `cmd/kingresd` (hook), console (vitest of the touched file and of the servers pages, `npm run api:check`, eslint, prettier, `vue-tsc`), the five cluster tests on both majors. 16 more mutants, all killed (a lagging row of one evaluation, no `requesting` record, no audit event, a young marker that asks again, the attempt ignored, readiness without the ended failover, the marker of any task cleared, no `force`, streak of one, factor of one, a hook that ignores an unfinished failover, sequential reads, a query without the physical filter, with backups, without the unreadable case, `onFail` that keeps the marker). One cluster run of `TestDrainHandsOverTheMapGroup` on PostgreSQL 19.0 ran into its 25 minute bound (the drain did not end under the new leader) and its log was not kept; six later runs on 19.0 and two on 18 passed. The test now prints the task, the rebalance status and the log of the new leader when it fails, so that the next occurrence can be read; the cause is not known.
+
+### Closing items before gate2 (2026-11-24)
+
+- The timeout of `TestDrainHandsOverTheMapGroup` on PostgreSQL 19.0: ten more runs on 19.0 (nine passed; the tenth stopped in the formation of the cluster, where the standbys were not streaming after three minutes, before any drain began, under the load of the gate) and five on 18 (all passed); a second formation stop on 19.0 hit the death test the same way and its rerun passed. The L5 suspicion was reasoned through: the five states of the CHECK, which are written, and how the former primary of group 0 passes through them (design section 23). It does not leave a state other than the ones that are waited for; the cause of the one timeout stays unknown.
+- A manual start is refused with `group_degraded` while a standby lags by more than the limit, unless `RebalanceOptions.force` (contract 0.27.0, additive): `Service.manualLagGate`, unit and PostgreSQL tests, the cluster test `TestManualRebalanceRefusesAStandbyThatLagsUnlessForced`.
+- A drain whose server dies while the map group is handed over: cluster test `TestDrainWhoseServerDiesWhileTheMapGroupIsHandedOver` (fault point `drain:handover` holds the request after the marker says `requesting`; kingresd and the instances are killed by pid; the map group is failed over by an operator). It found that step 5 waited its whole bound (30 minutes) for a dead server: step 5 now fails at once with `node_state_invalid` when the server is dead. The drain ends failed on the new leader, the marker is gone and the rebalance lock is free.
+- The tests wait for the first rebalance to be idle before they start a drain (a report can exist before its task ends).
+
+Mutants of the closing items, all killed: the manual gate (always allows, force ignored, a lag at the limit refused, an unreadable lag taken as none: the PostgreSQL tests of `internal/rebalance`), the dead-server check of step 5 (removed: the unit test waits out its bound and fails; a wrong code: the unit test; removed with the bound cut to 3 minutes: the cluster test, which now asserts that the drain failed with `node_state_invalid`), and the hold at `drain:handover` (never cleared: the unit test of `holdAtFault` hangs on its first call and is killed by the timeout). The two cluster tests of the drain of a dying server and of a given-up switchover were rerun on both majors on the final code; the cluster of these tests now waits up to ten minutes for its standbys (three formation stops on 19.0 on a machine with a load average of 14, before any drain began).
+
+### Still open
+
+- The cause of the one timeout of the cluster test on PostgreSQL 19.0 is unknown (it did not happen again in 14 runs); the test now prints what is needed to read it.
+- The number 0.27.0 is the one the revision has in g2 (0.21.0 on the branch).
+
+## 2026-11-23: phase 5 closing: the hard failover of the map group while its server is alive, and the hardening loops (increment 9)
+
+Branch `p5-hard`, from the staging branch g16 (failover round 2 with the F7 fixes). Contract revision 0.28.0 (documentation of `failoverServer` only, see below).
+
+### What was done
+
+- **The last refusal of the failover is gone.** `failoverServer` with `mode: hard` for the leader's own server (the map group's primary answers) used to be 422 `unsupported_operation`. The design
+  ([ha-phase5-part2.md](design/ha-phase5-part2.md), "A hard failover of a live leader's server", with the fencing argument) reuses the shape of the planned switchover of the map group: the map group is the
+  last group of the task; its step `Stop the old primary` judges the loss before anything changes (a verdict the request did not accept pauses the task with the old leader running), starts the bootstrap of a
+  standby's server (`planned.hard` with the leader's facts as of the stop), fences the leader's own primary in one call (`fencedStop`: the candidate is recorded, the renewal ends and the marker is written,
+  an immediate stop, and the lease is handed over only after the stop is seen), and waits for the standby to be promoted. The candidate waits for the lease, ranks the standbys after the stop (the named
+  target as for any group), promotes without a proof, marks the old leader's task with the pin and the verdict, and its engine finishes the task. A primary that does not stop is stopped by its watchdog when the
+  unrenewed lease runs out, and the candidate takes the lease after that. A loss that shows only after the stop pauses the bootstrap, the pause names the server, and the repeated request goes there.
+- **Two defects found while building it, fixed.** The bootstrap looked for the old holder among the grantors that refused (the keys of `RefusedBy`) and not among the holders they name, so a lease that was still
+  renewed was reported as `lease_held_elsewhere` with no alert; and the term that the calls of a group expect was taken from the groups before it in the order of `Groups` and not in the order they run, which
+  put the map group of a planned switchover with other groups on the server on a stale term.
+- **Contract 0.28.0, documentation only:** the text of `failoverServer`; `info.version`, the changelog, `check-contract.mjs`, the README of the control plane and the web contract test follow.
+  The contract log of this branch lists the files so that the merge can renumber.
+- **Test faults** (`demote:nostop`, `demote:exit` for the fenced stop, `maphard:facts`, `pin:unreadable`), a sampler of the map group in the cluster tests that fails at two writable instances on two
+  readings of one asker, and the lease, fence and stop lines of every server in the failure output of a switchover test.
+- **Increment 9, hardening:** `run-failover-loops.ps1` now runs round by round with one build per round, a bound on the time (`-MaxMinutes`), a lane, and a summary per test read from the logs; the group
+  `map-hard` was added. The README and `internal-api.md` of the control plane describe the new behaviour; ADR 0021 says what `HoldBack` and the fenced stop do to the lease.
+
+### How it was verified
+
+- Unit: 33 new tests (`maplive_test.go`, `mapgroup_hard_test.go`, `maphard_test.go`, the journal; the crash test has 16 subtests) and 5 cluster tests. **Mutants:** 31 on the unit tests (the order of start and fence, the loss check, the lease hand-over, the facts as of the
+  stop, the context of the step, the order of the groups, the bound on the old server, the skips on the new leader, the preflight, the term, the lease wait, the proof, the pin, the repeated request, the
+  journal fields, the transfer while the primary runs, the order of the fenced stop, the candidate record, the target, and others) and one on the cluster; all killed. Three first attempts did not count and were redone: one used a test
+  name that did not exist, one was an equivalent mutation, one did not compile.
+- Cluster, PostgreSQL 18.7 and 19.0 (private installs, lane l9): the five `TestHardFailoverOfTheMapGroup*` tests pass on both: the live leader's server (31 to 34 s from the request to the end of the task),
+  the primary that does not stop (30 to 42 s: the watchdog and the lapse), the old leader's kingresd that ends after the fence (1 min 31 s to 1 min 34 s, the old leader away for 5 s), no readable standby
+  (nothing changed), and the pause after the stop with the repeated request. The sampler saw no instant of two writable primaries (12 to 94 readings per test). **Cluster mutant:** the fenced stop without
+  `Relinquish` fails `...WhoseOldPrimaryDoesNotStop` (the old leader keeps renewing, nothing is promoted: `promote_timeout`).
+- **The loops** (`run-failover-loops.ps1`, one round of every group: 25 tests, 28 with subtests; the machine was shared with a full gate and other lanes, so the times are those of a loaded machine; the
+  bound of two hours per major allowed one round and a few repeats): PostgreSQL 19.0: 28 of 28 passed, 113 minutes. PostgreSQL 18.7: 27 of 28 passed in 95 minutes; the failure is below. Times per test are in
+  the table of the summary; the measured ones of section 2.5 of the design: an ordinary group, request to the end of the task after a kill, 45 s (18) and 40 s (19); the hard failover of the map group
+  of a live leader's server 31 to 42 s; the planned switchover of the map group 129 to 208 s test time.
+- **The one failure of the loops** (18.7): `TestSwitchoverSurvivesACleanStopThatOutlastsTheLease` timed out after 8 minutes because the leader's own system database (the map group's primary on the
+  leader's server) was down and nothing could be read; four repeats of the test alone passed (about 3 minutes each) and the test passed in the round on 19.0. The log of the cluster was lost with the
+  test's directory, so the cause is **not found**. It is the case the review of the whole part named (items 3 and 6: a leader's own lease lost on a loaded machine, a primary stopped by its watchdog while
+  `kingresd` was late; the lease of these clusters is 12 s with a margin of 3 s); the output of a failing switchover test now has the lease, fence and stop lines of every server, so a next occurrence can be read.
+
+### 2026-11-24 (second entry): P2, the live read of the primary, the switch point, the audit of the missing row
+
+- **P2:** `abandonMapGroupBootstrap` takes an optional `lostServerId` (contract 0.28.0, additive, `kingres_admin`, audited with the server in its details). The server must not be heard by the server that answers (409 otherwise); the old leader then ends the hold of its primary without the word of that server when the hold was made for it (or has no record), it does not hear it either, every other server answers and none runs a bootstrap that names the old leader or was promoted. What the lost server promoted before it was lost is accepted with the declaration. Afterwards a new hard request may choose another standby (M1's refusal stands until the hold ends). Six mutants killed. **Console: API only** (`endpoints.abandonMapGroupBootstrap` takes the argument; the progress panel has no field for it). **Limit:** in a cluster with one standby of the map group, a dead candidate leaves no system database copy that sessions can be checked against, so every REST call is 503; the cluster test makes the old leader's resume call directly and shows that, with one standby, the declaration does not release the old leader (no other standby shows that nothing was promoted). The positive cluster test (a second standby of the map group) is not done; the unit tests show it.
+- **M2:** the primary of the map group is asked (`pg_stat_replication`, state streaming, sync or quorum, and `pg_current_wal_flush_lsn()`, within three seconds) before the bootstrap starts and again right before the fence; it replaces the recorded check, and a primary that does not answer leaves the recorded facts. Four mutants killed.
+- **Switch point:** the write probe emits a transactional WAL message on each instance (committed and acknowledged when the statement answers) and keeps the highest position; the test reads the last timeline history file of the new primary and asserts that its switch point is not before that position. The check of the old primary's WAL end with `pg_waldump` or `pg_rewind --dry-run` is not done.
+- **M3:** the missing group 0 row is audited too (one mutant killed).
+
+### 2026-11-24: review of the branch (P1, M1 to M3, P3 to P6) and the console
+
+- **P1:** a group with the hand-over marker on disk counts as enforced everywhere in the lease manager (`enforced`), so an unstopped old primary is stopped by its lapsed lease although the plan lists no standby, and the idle refresh never keeps its watchdog file alive (also after a restart of kingresd). **M1:** the record of the candidate is not overwritten by another server and a failed fence removes the record it wrote. **M2:** the loss is judged again right before the fence. **M3:** a missing group 0 row pauses the bootstrap. **P3:** a hand-over that meets another bootstrap gives up. **P4:** a repeated request with another target is refused. **P5:** the post-stop alert is bounded. **P6:** a hard request with a proof is refused at the door. Each has a unit test that fails without it; the mutants were killed (P1: two tests; M1: three; M2: two; M3, P3, P4, P6: one each).
+- **Console:** the refusal text for the map group, the hint that names the server that takes the repeated request, the generated schema for 0.28.0; vitest 1963 tests pass, `api:check` holds.
+- **Write probe** in the hard failover tests (txid_current on the map group instance of the old and of the new primary every 20 ms): the old instance's last write is 2 to 3 s before the new one's first in the fence case and about 10 s before in the no-stop case (the watchdog); all five tests pass on 18.7 and 19.0.
+- **The flake** (`TestSwitchoverSurvivesACleanStopThatOutlastsTheLease`, 18.7, 20 runs each): base 714b48be55: 14 passed, 6 failed (5 timeouts of 8 minutes, four in the step `Lift the freeze`); this tip: 19 passed, 1 failed (the same step: the old primary's server answers "waits for its group lease" and the step waits for it). It is not caused by the hard failover work; the cause (the unfreeze call to a former primary that is held back waits for minutes) is not fixed.
+- **Not done:** P2 (an operator's way to declare a dead candidate lost), the LSN stronger tests (2: the switch point against the highest acknowledged LSN), the direct `pg_stat_replication` read right before the fence (M2 re-reads the leader's facts and positions instead), reuse of an earlier attempt's candidate by `stopOldMap` (a different candidate is refused with a message).
+
+### Still open
+
+- **Not done:** the escrow of the key of the certificate authority (an alert says what the operator does); the loops were run once per group (not 30 times: one round takes about 95 to 113 minutes on this machine);
+  the independent review of the whole part after this increment (the design asks for one); the console has no text for the new pause (it shows the message of the status).
+- The unexplained failure above.
+- A hard failover of the map group when the old leader's kingresd is gone before the call of the fence is the failover of a dead leader (the bootstrap alone), as before.
+
+## 2026-11-24 (branch p14c): the four low findings of the second review of 14c
+
+L-A (the walk follows composite, array, range and multirange types), L-B (the marker stays on the final name until the rename is finished and the undoing only touches a database that carries it),
+L-C (every relation of a distributed schema is listed, locked and checked; one that the archive does not name is refused) and L-D (`ledger_verify()` runs after the registered ledger tables are locked and
+checked). The test hook `lastPrivate` is gone (`ImportHook` gets the private name). See the design note, "Changes made after the second review of 14c".
+
+---
+
+## 2026-11-24 (branch p14c): fixes after the security review of 14c
+
+Answered C1, M1 to M3, L1 to L6 and the free-space check (design note, "Changes made after the independent security review of 14c"). New files: `ops/dbimport_guard.go` (the withdrawal of every role, the importer rule, the lock and
+the catalog walk), `ops/dbimport_guard_pg_test.go` and `cmd/kingresd/dbimport_guard_e2e_test.go`. The importer may have `CREATEROLE` (a role of `kingres_admin` made through the API has it, and import works for it as it is); an importer with a member that can log in (a member with neither SET nor INHERIT, as the creator is, does not count) is refused, and `SUPERUSER`, `REPLICATION`, `BYPASSRLS` and the `pg_*` file, program and log roles stay refused. A test makes a login role as such an importer in the middle of an import.
+
+## 2026-11-24 (branch p14c): phase 14c, database import
+
+### What was done
+
+- **Contract 0.30.0**: `importDatabase` (`POST /database-imports`), the closed `ImportDatabaseRequest`, the task kind `database.import`, the codes
+  `archive_statement_refused` and `ledger_restart_not_acknowledged`, the checker rules, the README (174 operations, 139 paths), the generated types. It is its own commit (C0), and the console was built against it by a second writer.
+- **The shape grammar in execution mode** (`sqlshape.Each`): the exact text that the grammar consumed completely, lexed again alone (a text that reads differently is refused); a refusal ends the walk.
+  **`archive.OpenEntry`** reads an entry again and checks its size, CRC-32 and SHA-256 at the end of the stream; `archive.ReadManifest`; `archive.Assemble` and `archive/archivetest` for archives that lie.
+- **The task `database.import`** (`ops/dbimport*.go`): the archive is read again from its bytes (file SHA-256 against `expectedSha256`, the validator, the grammar, the plan against the catalog, versions, the
+  closed list of extensions, the ledger acknowledgement, `maxImportBytes`); a private database `kingres_import_<task id>` made strictly by the service role on every server, with a marker; the extensions; the
+  function check against `pg_proc`; the statements of the archive **as the signed-in role**, one per round trip through the extended protocol with `search_path = pg_catalog`; the distribution from the catalog
+  while the tables are empty (colocation groups, reference tables, columnar options, distributed schemas); the views; the data (one transaction per table, the rows against the manifest, reference tables through
+  the temporary table of 14a); the constraints (a violated foreign key is counted and named); the sequences on every node; the ledger (new chain, `ledger_verify`, the policy set again) and the time-partition
+  policies **disabled**; the verification; the rename on every server, the owner, the registry. The hook of a failed or cancelled task drops the private database (only one that it made).
+- **The role is kept out while the service role works** (`CONNECT` is withdrawn and its sessions are ended, on every server, before every service phase), the service role touches a table of the role only after
+  the catalog shows that it holds no code (`tableTrusted`, from the deparsed expressions: PostgreSQL records no dependency on a builtin function), and `extguard` (or the shard check of 14b) precedes every read of `kingres.*`.
+- **V8 passed**: the rename of a database works on one and on three servers with the background workers connected. The fallback of the design was not needed.
+- **Fixes of 14b that the import found**: the locale provider of a libc database was written as `builtin`; the colocation group of a distributed schema has no column type (the export failed with a 500).
+- **Console** (a second writer, merged): the *Import database* dialog, the report page with the statements the plan refuses, the acknowledgement of the ledger restart, progress, the result and the failure text, the
+  mock with the fixtures of the design, 2050 unit tests and browser and axe tests at three widths.
+
+### How it was verified
+
+PostgreSQL 18.7 and 19.0 in private installations (`~/kw-p14c/pg18` and `pg19`, the extensions built from this commit, each major built clean, deleted at the end), lane `l13`, `control-plane/scripts/run-integration.ps1`.
+
+| Test | Layer | PostgreSQL 18 | PostgreSQL 19 |
+|---|---|---|---|
+| `sqlshape` (`Each`, hidden statements, the maximum, a fuzz target of 3.5 million runs), `archive` (`OpenEntry`, `ReadManifest`, `Assemble`), `ops` unit tests of the import (revalidation from bytes, plan, verdict about functions, names, steps, cancel guard, cached report, expressions), `transfer`, `problem`, `httpapi`, `config` | Go unit | pass | pass (same files) |
+| `TestLexersAgreeWithTheServer` with 19 more scripts of the import statement kinds | PG test | pass | pass |
+| `TestImportFunctionCheckOnARealCatalog`, `TestTableTrustedOnARealCatalog`, `TestExecOneIsOneStatement`, `TestUnqualifiedNamesDoNotLandAnywhere`, `TestForeignKeyViolationsAreCounted` | PG test, private install | pass | pass |
+| `TestDatabaseImportRoundTrip`: every table kind, compared row for row, distribution, colocation sets, ledger (new chain, entries, `ledger_verify`, policy `required` back), policies disabled, sequences, owners, comments, views | cluster (one server) | pass | pass |
+| `TestDatabaseImportRefusesHostileArchives`: 45 archives (comments, `\r`, dollar quotes, `SET ROLE`, `SET SESSION AUTHORIZATION`, `ALTER DATABASE`, a grant to PUBLIC on `pg_catalog`, extensions outside the list, an oversized statement, a zip bomb, manifests that lie, dangerous functions): refused, no database, role or setting left | cluster (one server) | pass | pass |
+| `TestDatabaseImportHiddenTextIsNotRun`, `...RefusesADangerousRole`, `...WithdrawsTheAccessOfTheRole`, `...CleansUp` (failure, `keepOnFailure`, cancel), `...NeverUsesADatabaseItDidNotMake` | cluster (one server) | pass | pass |
+| `TestDatabaseImportOfAnArchiveFromAnotherMajor` (18 into 19: imported and equal to its source; 19 into 18: `archive_incompatible`, nothing made) | cluster (one server) | pass | pass |
+| `TestDatabaseImportOverThreeServers` (through followers, buckets in several groups, colocation, a distributed schema, ledger verification, the private database removed from every server after a failure) | cluster (three servers) | pass | pass |
+| 14b regression: `TestDatabaseExport*`, `TestSpikeS3`, `TestDatabaseExportOverThreeServers` | cluster | pass | pass |
+| Console: typecheck, lint, `api:check`, 114 files and 2050 vitest tests, `import-0-30` browser and axe tests at 1366, 683 and 320 px in both themes | web | pass | not applicable |
+| Contract: `check-contract.mjs`, `httpapi` and `contract` tests | contract | pass | not applicable |
+
+**Mutants** (one-line edits, each killed by the named test): the text of a statement is not lexed again alone (`TestSameTokensGuard`); the walk goes on after a refusal; a carriage return does not end a comment; the
+grammar allows `SET`; the dangerous functions are not known; an extension outside the list is installed (`TestSetupRefusesAnExtensionOutsideTheList`); the checksum of an entry is not compared; `expectedSha256` is not compared;
+the refusals of the grammar are not applied at import (both layers); a statement runs through the simple protocol (`TestExecOneIsOneStatement`); the session has the default search path; a table with a trigger of the
+role is touched; the functions of the expressions of a table are not checked; the statements run as the service role (`TestDatabaseImportRoundTrip`); a private database that exists is a success; the final rename does
+not check the name; `dblink` is in the closed list; the history rows of a ledger table are loaded; the ledger policy is not set again; time-partition policies are enabled; the failure hook drops nothing, or another
+name; the access of the role is not withdrawn; the function check is skipped; a dangerous role may import; the rows are not compared with the manifest; the ledger restart is not acknowledged (`TestDatabaseImportRoundTrip`: the first import without the acknowledgement must fail). **All 27 are killed** (the runner and the list of the mutants are in the scratch area of the writer, not in the tree).
+
+### Decisions and deviations
+
+- A request does not read the archive (it cannot, for 100 GiB inside a request); a cached report only refuses early. Every hostile archive is refused by the first step of the task, with nothing made.
+- No commit intent: a failure drops the whole database, so a table is one transaction with its count and nothing more. Statements are not grouped in a transaction per table.
+- The service role works only while the role cannot connect (a design addition, "What the service role does after the role, and how the role is kept out of it" in the design note).
+- The task drops a database only if the service role owns it and it carries its marker (a role with `CREATEDB` can make a database with a guessed private name).
+- The free space of the data nodes against `maxImportBytes` is not checked; the leader change at every step is not tested with a real failover; no archive of 2 GiB or more was imported.
+
+### Still open
+
+- The integrator renumbers the contract (0.30.0 here) and the migration is none; the console and the server agree on the detail lines of the finished task (`ledger: ...`, `policy disabled: ...`, `NOT VALID: ...`).
+
+### Core patches
+
+None.
+
+---
+
+## 2026-11-23 (branch p14b, second entry): the fixes for the security review of phase 14b
+
+### What was done
+
+- A1: `extguard` (commit 13ae51e353 of `sec-ext`, taken alone) gates every read and call of the schema `kingres` in the facts of the export; an untrusted schema is a refusal (422 `schema_unrecognised`, or the task code). B7: a schema `kingres` owned by a role that is not a superuser, one that holds objects when no extension is installed, and a schema `kingres_transfer` that the service role does not own are refused. The facts are read under `SET LOCAL search_path = pg_catalog`, `pg_dump` has `PGOPTIONS=-c search_path=pg_catalog`, a password file of mode 0600 in the staging directory, a version check and a bounded tail of its error output in the server log (A2, B8); the role's connection sets `search_path = pg_catalog` (B9).
+- B1, B2: line comments end at `\r`; dollar-quote tags may start with a high byte (`sqlshape` and `dumpnorm`). A corpus of harmless scripts is checked against a real server of PostgreSQL 18 and 19 (`TestLexersAgreeWithTheServer`) and is the seed of the fuzz targets.
+- B3, B4, B5, B6, B10, P1, P2: a failed read is never a report; a versioned cache (an import validates again); ratio and expansion limits; sequence privileges; names as pairs (a dot is refused, the console keys by the pair); the report says that rows are claimed; the check for an export and the start of a table task are one step.
+
+### How it was verified
+
+| Test | Layer | PG18 | PG19 |
+|---|---|---|---|
+| `TestLexersAgreeWithTheServer` (22 scripts, the server counts the statements) | PG test | pass | pass |
+| `TestLexerAgreesWithTheCorpus`, `TestCarriageReturnAndHighByteTags`, `TestSplitterAgreesWithTheCorpus` | Go unit | pass | pass |
+| `TestFactsIgnoreTheSearchPathOfTheDatabase` (a shadowing schema first in the path of the database) | PG test | pass | pass |
+| `TestExportRefusesAFakeKingresSchema` (a fake schema with a marker function, a full one and an empty one), `TestExportRefusesAFakeTransferSchema`, `TestExportIgnoresASearchPathOfTheDatabase`, `TestExportRefusesASequenceTheRoleCannotRead` | cluster | pass | pass |
+| `TestAFailedReadIsNotAReport`, `TestArchiveLimitsFollowTheFile`, `TestCachedReportIsByTheChecksum` (version), `TestPasswordFileOfPgDump`, `TestRatioCap`, `TestDottedNamesAreRefused`, the keys of the console (`archive-keys-0-40`) | Go and web unit | pass | not applicable |
+| the sweep of the first entry (export, spike, three servers, facts and dump) | cluster and PG | pass | pass |
+
+Mutants of the review, all killed: the lexer of `sqlshape` or the splitter of `dumpnorm` ends a comment only at a line feed (`TestLexerAgreesWithTheCorpus`, `TestSplitterAgreesWithTheCorpus`); a tag may not start with a high byte (same tests); a failed read is made a report (`TestAFailedReadIsNotAReport`); a report of another validator version is used (`TestCachedReportIsByTheChecksum`); no ratio cap (`TestRatioCap`); a dot accepted (`TestDottedNamesAreRefused`); the guard and the check of the fixed schemas removed, and the owner of the schema `kingres` not checked (`TestExportRefusesAFakeKingresSchema`; the owner mutant needed the empty schema that was added); the sequence privilege not checked (`TestExportRefusesASequenceTheRoleCannotRead`); the search path of the facts not pinned (`TestFactsIgnoreTheSearchPathOfTheDatabase`; the end-to-end test could not show it, because the service connection already pins the path in its startup parameters); the schema `kingres_transfer` not checked (`TestExportRefusesAFakeTransferSchema`).
+
+### Decisions and deviations
+
+- The commit of `sec-ext` was cherry-picked alone; the contract text of its alert kind moved into 0.29.0.
+- The tail of the error output of `pg_dump` goes to the server log (the reviewer asked for it); it can name objects.
+
+### Still open
+
+- 14c validates the archive again at import time and never trusts `archive_state` (design note above).
+
+### Core patches
+
+None.
+
+---
+
+## 2026-11-23 (branch p14b): phase 14b, database export and archive validation
+
+### What was done
+
+- **Contract 0.29.0** (the number it has in g2; 0.40.0 on the branch): `exportDatabase` and `validateDatabaseArchive`, `ExportDatabaseRequest` (closed), `ArchiveReport`, the upload purpose `databaseArchive`, the task kinds `database.export` and `archive.validate` (subject type `upload` is new), five problem codes, the audit actions, `DataExport.warnings`. The checker has the rules of 0.29.0, the README has the section "Database archives" and the changelog; `web/src/api/schema.d.ts` and the operation table are generated (`npm run api:check` and `go generate` agree). Migration `0050_archive_validation.sql` (a placeholder number) adds the purpose of an upload and the state of an archive validation.
+- **Spike S3** was **not done before**; it was done first, on PostgreSQL 18.7 and 19.0, and its result is written into the design ("Results of the spikes and changes made by the code (phase 14b)"). The dump of the two majors is the same except for the version comments and the `\restrict` token. The golden files are `internal/dumpnorm/testdata/pg18` and `pg19`.
+- **Package `dumpnorm`**: the normaliser of the dump (removals and a closed set of rewrites, views moved, the user's partitioning of a distributed table synthesised from the catalog).
+- **Package `archive`** (writer, validator, manifest and catalog decoders, version rules, report; by a second writer) and **package `sqlshape`** (the lexer and the shape grammar in validate-only mode; by a third); both were merged into `p14b`.
+- **The task `database.export`** (`ops/dbexport*.go`): the request checks (unsupported objects, large objects, the privileges of the role on every table, code of other roles), the structure in one `REPEATABLE READ READ ONLY` transaction of the service role with `pg_dump` in its snapshot, the normalisation and the run of the shape grammar over the result, the data written to the streaming zip writer as the role (one transaction when the archive can be one snapshot), the check of the file by the validator and of the fingerprint, the seal. **The task `archive.validate`** (`ops/archivevalidate.go`): the report stored with the upload, cached by the SHA-256 of the file.
+- **Console** (`kingres/web`; a fourth writer): the export dialog, the validation dialog and the report page, the Transfers panel for archives, the mock with the fixtures of the design, 2009 unit tests, and browser and axe tests at three widths.
+
+### How it was verified
+
+The test table is below. PostgreSQL 18.7 and 19.0 in private installations (`~/kw-p14b/pg18` and `pg19`, built from this commit, deleted at the end), lane `l13`, with `control-plane/scripts/run-integration.ps1`.
+
+| Test | Layer | PostgreSQL 18 | PostgreSQL 19 |
+|---|---|---|---|
+| `dumpnorm`: goldens of both majors (`TestGoldenNormalisation`, `TestMajorsAgree`, `TestRefusals`, `TestOtherStatementsAreKept`, `TestSplitter`) | Go unit | pass | pass (same files) |
+| `archive` (19 tests, the hostile corpus of 66 archives, 3 fuzz targets) and `sqlshape` (tables of 47 accepted and 110 refused statements, 2 fuzz targets) | Go unit | pass | pass |
+| `ops`: facts, catalog, normaliser facts, labels, entries, fingerprint, exporter output accepted by the validator, warnings, refusals, dump arguments, cache | Go unit | pass | pass |
+| `TestReadFactsAndDumpOfARealDatabase`: the catalog read, `pg_dump` of the build, the normaliser and the grammar, on a real instance | PG test, private install | pass | pass |
+| `TestSpikeS3DumpOfEveryTableKind` | cluster (one server) | pass | pass |
+| `TestDatabaseExportOfEveryTableKindAndItsValidation` (local, reference, hash, user-partitioned, columnar, updatable and append-only ledger, time-partitioned, inheritance, partitioned, views; download; validation of the upload; a damaged archive) | cluster (one server) | pass | pass |
+| `TestDatabaseExportRefusals` (unknown database, bad options, a function, large objects and their acknowledgement, a role that cannot read: 20 of 25 named, excluded table, data mode none) | cluster (one server) | pass | pass |
+| `TestDatabaseExportBlocksTableTasksAndNoticesChanges` (a table task refused during an export, a cancel leaves no file, a column added fails with `schema_changed`) | cluster (one server) | pass | pass |
+| `TestDatabaseExportTooLarge` (`export_too_large`, no file, then the same database under a larger limit) | cluster (one server) | pass | pass |
+| `TestDatabaseExportOverThreeServers` (per-group labels, a follower makes it, three servers serve the download, an upload through a follower validated through another) | cluster (three servers) | pass | pass |
+| Console: typecheck, lint, 2009 vitest tests (111 files), `archive-0-29` browser and axe tests at 1366, 683 and 320 px in both themes | web | pass | not applicable |
+| Contract: `check-contract.mjs`, `api:check`, `httpapi` and `contract` tests | contract | pass | not applicable |
+
+Mutants (one-line edits, each killed by the named test; the script is not part of the tree): see the report of the unit of work; the list is in "Mutants" below.
+
+### Mutants
+
+| Mutant | Killed by |
+|---|---|
+| the normaliser keeps ONLY on the constraint or ON ONLY on the index of a distributed table | `TestGoldenNormalisation` |
+| the capture triggers of ledger tables are not removed; a trigger of that name on any table is removed | `TestGoldenNormalisation`; `TestOtherStatementsAreKept` |
+| PARTITION BY HASH on another column is accepted; every SET is accepted; another table access method is accepted | `TestRefusals` (three cases) |
+| USING columnar is not added; views stay in pre-data; a bucket partition is not removed | `TestGoldenNormalisation` |
+| a GRANT is dropped instead of kept for the grammar to refuse | `TestOtherStatementsAreKept` |
+| a partition leaf is exported (rows twice) | `TestDataEntriesAndLabels` |
+| the history entry names the history table | `TestExporterOutputIsAcceptedByTheValidator` |
+| the fingerprint ignores the columns | `TestFingerprintChangesWithTheStructure` |
+| large objects are not counted; objects that the archive does not carry are not refused | `TestCheckExportableRefusesWhatTheArchiveDoesNotCarry` |
+| the label is always single-snapshot; the archive is always one snapshot | `TestDataEntriesAndLabels` |
+| the cache of a validation ignores the checksum | `TestCachedReportIsByTheChecksum` |
+| the LIKE escape is a no-op; a columnar table is estimated like a heap table | `TestSplitPartKeyAndEstimates` |
+| the warning for a table read per group is not written | `TestWarningsSayWhatTheArchiveDoesNotCarry` |
+| pg_dump takes no snapshot; pg_dump keeps PGPASSFILE and PGSERVICE of the process | `TestDumpArgumentsAndEnvironment` |
+| the privilege check of the role is removed | `TestDatabaseExportRefusals` (cluster) |
+| the fingerprint is not compared at the end; a table task is not refused while an export runs | `TestDatabaseExportBlocksTableTasksAndNoticesChanges` (cluster) |
+| the limit of the largest file is not applied | `TestDatabaseExportTooLarge` (cluster) |
+| every table is labelled by its own statement although one transaction is used | `TestDatabaseExportOfEveryTableKindAndItsValidation` (cluster) |
+| data mode none still writes the data; an excluded table keeps its data | `TestDatabaseExportRefusals` (cluster) |
+
+All 31 mutants of this list were killed (11 of the normaliser, 13 of the unit tests of the export, 7 in the cluster). The writer of the archive package killed 15 (the writer omits a descriptor; the validator ignores the local name, the local extra field or the descriptor flag; the overlap, hidden-byte, compressed-extent, CRC-32, SHA-256 and entry-count checks removed; the declared-size reader is +1000; the PostgreSQL major compare reversed; the extension version compare is `>`; a symbolic link accepted; a comment in the end record accepted); the overlap-check mutant survived the hostile archives and is killed by `TestExtentsRefuseAMovedOffset`, which calls the check directly. The writer of the shape grammar killed 16 of 17 (the survivor, `CREATE TABLE ... AS` accepted, is equivalent: a second guard refuses it).
+
+### Needs-verification items
+
+- S3 / V1 / V2: done (above). V8 (rename of a database) and the rest of 14c: not checked, as the phase says. V9: a read reaches virtual generated columns only, because policies are refused.
+
+### Decisions and deviations
+
+See "Changes made by the code" in the design: the strictness of the archive shape, the progress in the task detail, a restart of the whole data step, the decision of the single snapshot by the catalog, the refusal of row-level security, the history entry naming its table, the exclusion of table tasks.
+
+### Still open
+
+- Phase 14c: the import (the private database, the shape grammar's import steps, the distribution before the data, the ledger and the policies), `expectedSha256`, the console import dialogs. Not covered by tests: a leader change at every step of the export, a distributed schema, a columnar distributed table, an archive above 2 GiB.
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-22 (staging branch g15): cp-1011, p13-fix and web-15b merged, contract revisions renumbered
 
 The staging branch g15 (from kingres-18) merges cp-1011, p13-fix and web-15b. The contract revisions are renumbered in merge order so that they follow kingres-18's 0.14.0: the control plane of phases 10 and 11 (written as 0.16.0 in cp-1011) is 0.15.0, and the closing of phase 13 (written as 0.17.0 in p13-fix) is 0.16.0. Entries of this log and the review files that were written on those branches still say 0.16.0 and 0.17.0; read them as 0.15.0 and 0.16.0. The failover branch, which carries an older 0.15.0, is renumbered when it merges. Generated files were regenerated; no migration numbers collide (cp-1011 has 0040 and 0041, p13-fix has none).
@@ -622,6 +1144,66 @@ The independent review (docs/reviews/2026-11-22-console-phase9-7.md, no critical
 
 ---
 
+
+
+
+## 2026-11-23: the review of the CA key escrow and its fixes (branch ca-escrow)
+
+The independent review (`docs/reviews/2026-11-22-ca-key-escrow.md`) found the cryptography sound and eight findings about state and failover (one high, four medium, three low).
+
+### What was done
+
+- **CAE-4 (high)**: a revocation list never shrinks. Holders refuse a list that takes a revocation back (409 `stale_revocations`); a server that holds `ca.key` merges the lists it receives into its CA; a leader that takes over or distributes merges the lists of its files, its sealed copy and every server first; the list number is at least the time in seconds.
+- **CAE-1**: copies are ordered by (epoch, generation, seq); a new leader takes a higher epoch; recipients refuse a blob and a drop of an older epoch.
+- **CAE-2, CAE-3, CAE-6**: records stay (`dropPending`) until a drop succeeded; the operator's choice, the epoch and the holders are mirrored to `kingres_cp.cluster_setting` (`caEscrow`); a standby missing for less than three rounds keeps its copy; switching off tells every active member.
+- **CAE-5, CAE-7, CAE-8**: durable write of `ca.key`, a truncated key is put aside, the list in a blob is parsed on store, length-prefixed additional data, key file mode check, clearing of secrets where Go allows.
+- The cluster test of CAE-4 found that every revocation task on the new leader failed after a failover of the map group (the row of the server that created the cluster has no address); the task now takes the ids of the active members and leaves the address to the peer client.
+- Contract 0.26.0 gets the value `dropPending` of `CaEscrowRecipient.state`; the internal calls get `epoch`, `heldEpoch` and `heldGeneration`.
+
+### How it was verified
+
+Unit tests of pki, membership, httpapi, internalapi and kingresd; mutants for each fix (listed in the Fixes section of the report); cluster tests on PostgreSQL 18 and 19 (lane l7), among them `TestCAEscrowARevocationAfterTheFailoverHoldsWhenTheOldLeaderReturns`.
+
+### Still open
+
+The `ca.key` of a returning former leader stays on its disk; a removed server that cannot be reached keeps its copy (`dropPending`); a console panel; an alert for a recipient that stays out of date; the rotation of the CA itself.
+
+---
+
+## 2026-11-22: phase 5, the escrow of the key of the certificate authority (branch ca-escrow)
+
+The last open item of phase 5: after a failover of the leader's server, the new leader raised a critical alert until the operator restored `pki/ca.key` by hand.
+
+### What was done
+
+- **The design** is in `docs/design/ha-phase5-part2.md`, section 3.4.1: the alternatives (a copy wrapped to each server that may become leader; a key from an operator passphrase;
+  split shares; a blob in the system database), the choice of the first, the construction (X25519 key agreement, HKDF-SHA256, AES-256-GCM, additional data that bind the recipient,
+  key id, CA fingerprint, generation and time), the checks of a recipient and of the adoption, and the threat model. The first design (a key derived from the cluster secret) was
+  not buildable: the secret lives in the extension, not in `kingresd`.
+- **The control plane**: `internal/pki/escrow.go` (escrow keys, seal, open, store, drop, adopt, the leader's bookkeeping), `internal/membership/escrow.go` (recipients from the standbys of group 0,
+  the minute-by-minute reconcile and the resend after every revocation, the three internal calls `POST /pki/escrow/offer`, `store` and `drop`, all `LeaderOnly`), the adoption at B8 through the
+  port `CheckAuthority` (`cmd/kingresd/mapfailover.go`), the text of the alert.
+- **The operator path**: contract 0.26.0: `getCaEscrow`, `setCaEscrow`, `rotateCaEscrow`, the schemas `CaEscrowStatus`, `CaEscrowRecipient`,
+  `CaEscrowUpdate`, two audit actions. The escrow is off until switched on. The shapes are in the scratch file `ca-escrow/contract.txt` for the integrator. No console part (the operations are REST only).
+
+### How it was verified
+
+- Unit tests: `internal/pki/escrow_test.go`, `internal/membership/escrow_test.go`, `internal/httpapi/handlers_caescrow_test.go`; the contract check (`node api/scripts/check-contract.mjs`), the generated operation table and the
+  README table test. Cluster tests (`internal/clustertest/caescrow_test.go`): the failover of the leader's server with the escrow on, and with a tampered copy. Results: both cluster tests pass on PostgreSQL 18 and 19 (lane l7, private installs of the extensions of 908518fa05).
+  Mutants killed: a recipient or the adoption that skips the check against `ca.crt`, no replay check, no label check, no merge of the revocation list, an adoption over a held key, no pruning of old escrow keys,
+  a content hash that ignores the revocation list, no drop of a server that is no longer a member, a recipient outside the standbys, no resend after a revocation, a non-leader that sends, escrow calls not `LeaderOnly`
+  or not dispatched, and (cluster, 18) a `CheckAuthority` that does not adopt. The cluster test found one defect that no unit test had: the three calls were missing from `internalapi.handled` and answered an empty body.
+
+### Decisions and deviations
+
+- Off by default, because every recipient's disk then can hold the CA key (threat model, 3.4.1). Recipients: only the servers that host a ready standby of group 0.
+- The alert `certificateAuthorityUnavailable` stays for a failover without a copy; no new alert kind was added.
+
+### Still open
+
+- A console panel for the three operations; an alert for a recipient that stays out of date; the removal of `ca.key` from an old leader that returns; the rotation of the CA itself.
+
+---
 
 ## 2026-11-22: phase 11 (distributed schemas), the extension: the scale work (step 12), the review fixes and the documentation (step 15)
 

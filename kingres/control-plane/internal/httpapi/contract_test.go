@@ -37,8 +37,8 @@ func TestRoutingMatchesContract(t *testing.T) {
 	for _, op := range doc.Operations {
 		want[op.Method+" /api/v1"+op.Path] = op.ID
 	}
-	if len(want) != 171 {
-		t.Errorf("contract has %d operations, this test was written for 171", len(want))
+	if len(want) != 178 {
+		t.Errorf("contract has %d operations, this test was written for 178", len(want))
 	}
 	got := map[string]string{}
 	for _, r := range e.srv.Routes() {

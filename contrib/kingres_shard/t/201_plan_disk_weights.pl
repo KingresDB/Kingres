@@ -193,9 +193,10 @@ is($rc, 0, 'F: but drain_status() reads what it needs') or diag($err);
 # E. a group that does not answer (group 1 still holds buckets; group 2 was drained)
 # ---------------------------------------------------------------------------
 $n2->stop('immediate');
-($rc, $out, $err) = run_sql($n1, q{SET kingres_shard.node_connect_timeout = 2; SELECT count(*) FROM kingres.plan_rebalance('by_disk_size')});
+($rc, $out, $err) = run_sql($n1, "\\set VERBOSITY verbose\n" . q{SET kingres_shard.node_connect_timeout = 2; SELECT count(*) FROM kingres.plan_rebalance('by_disk_size')});
 isnt($rc, 0, 'E: a plan by disk size with a group that does not answer fails');
 like($err, qr/shard group 1 cannot be read/, 'E: and names the group');
+like($err, qr/\bKS018\b/, 'E: with its own SQLSTATE KS018, which the control plane maps to service_unavailable instead of reading the text');
 ($rc, $out, $err) = run_sql($n1, q{SELECT count(*) FROM kingres.plan_rebalance('by_bucket_count')});
 is($rc, 0, 'E: a plan by bucket count does not need the nodes') or diag($err);
 

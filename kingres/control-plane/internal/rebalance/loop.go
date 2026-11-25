@@ -54,6 +54,8 @@ type Options struct {
 	Strict bool `json:"-"`
 	// CleanupDelaySeconds overrides the delay before the source orphan is dropped, for this run.
 	CleanupDelaySeconds int `json:"cleanupDelaySeconds,omitempty"`
+	// Force lets a manual start go on although a standby lags by more than maxStandbyLagBytes; never stored (a resumed run asks again).
+	Force bool `json:"-"`
 	// ExcludeServers plans as if these servers should not hold shards (a preview of a drain); never stored.
 	ExcludeServers []string `json:"-"`
 	// Trigger is manual, automatic or drain.
@@ -77,6 +79,18 @@ type Move struct {
 	Cost int64
 	// Reason is balance or drain; empty when unknown.
 	Reason string
+	// Schema is the name of the distributed schema when the item is one (the single bucket of the schema's colocation group, moved by
+	// move_schema); empty for a bucket of a hash group.
+	Schema string
+}
+
+// Kind is what the move moves, as the contract names it: "schema" with the schema's name for a distributed schema, "move" and nil for a bucket.
+func (m Move) Kind() (string, *string) {
+	if m.Schema == "" {
+		return "move", nil
+	}
+	n := m.Schema
+	return "schema", &n
 }
 
 // Key identifies the bucket, whatever the groups.

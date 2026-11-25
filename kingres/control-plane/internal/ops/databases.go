@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -78,7 +77,10 @@ func (o *Ops) baseDefinitions() []task.Definition {
 		o.storageDefinition(),
 		o.maintainDefinition(),
 		o.exportDefinition(),
+		o.dbExportDefinition(),
+		o.archiveValidateDefinition(),
 		o.importDefinition(),
+		o.dbImportDefinition(),
 		{Kind: KindDatabaseCreate, Dynamic: func(in json.RawMessage) ([]task.Step, error) {
 			p, err := rawInput[createParams](in)
 			if err != nil {
@@ -144,6 +146,15 @@ func (o *Ops) StartTask(ctx context.Context, kind, subjType, subjID string, inpu
 	eng := o.Engine()
 	if eng == nil {
 		return task.Task{}, problem.New(problem.ServiceUnavailable, "The task engine is not running yet.").WithRetryAfter(5)
+	}
+	// A table task waits while a database export runs in its database (the catalog, the schema and the data must not be taken at different structural states).
+	if tableTaskKind(kind) {
+		// The check and the start are one step: an export that starts between them would find no table task.
+		o.dbTaskMu.Lock()
+		defer o.dbTaskMu.Unlock()
+		if err := o.exportRunning(ctx, subjType, subjID); err != nil {
+			return task.Task{}, err
+		}
 	}
 	t, err := eng.Submit(ctx, kind, task.Subject{Type: subjType, ID: subjID}, input, actor)
 	if err != nil {
@@ -332,13 +343,13 @@ func (o *Ops) installExtensions(ctx context.Context, db string, sharding, ledger
 	return o.installAnalytics(ctx, db)
 }
 
-// installAnalytics installs the storage and partitioning extensions of phase 12, kingres_columnar and kingres_timepart, in a database that is made
+// installAnalytics installs the storage and partitioning extensions of phase 12, kingres_columnar and kingres_timepart, and pg_stat_statements, in a database that is made
 // on this server (the other servers do it in the same step of their own, and a server that is added later gets every extension of the database
 // from the leader). An extension that the package of this server does not contain is left out: a database must still be made with an older package.
 // kingres_sketch is not installed here; the task database.approximateAggregates does it.
 func (o *Ops) installAnalytics(ctx context.Context, db string) error {
 	b := o.ext()
-	for _, e := range []string{ExtColumnar, ExtTimepart} {
+	for _, e := range []string{ExtColumnar, ExtTimepart, ExtStatStatements} {
 		v, err := b.Available(ctx, db, e)
 		if err != nil {
 			return fmt.Errorf("looking for %s: %w", e, err)
@@ -478,12 +489,18 @@ func (o *Ops) dropDB(ctx context.Context, p dropParams) error {
 		return err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	// DROP DATABASE makes an immediate checkpoint first, so it takes as long as the checkpointer needs to write the dirty data of the instance (seconds after a load).
 	// WITH (FORCE) ends the sessions that are there, but a session that connects in the moment between that and the drop (the collector of the
 	// ledger reads every database) makes the drop fail with 55006: that is tried again a few times before the step fails.
 	var err2 error
 	for attempt := 0; attempt < 6; attempt++ {
 		err2 = run(ctx, c, stmt().Text("DROP DATABASE IF EXISTS").ID(sqlx.MustIdent(p.Name)).Text("WITH (FORCE)"))
-		if err2 == nil || !strings.Contains(err2.Error(), "55006") {
+		if err2 == nil {
+			o.clearSkippedExtensionAlerts(ctx, p.Name)
+			return nil
+		}
+		var pe *pgconn.PgError // object_in_use is told by its code, not by the text of the error
+		if !errors.As(err2, &pe) || pe.Code != "55006" {
 			return err2
 		}
 		select {
@@ -661,4 +678,15 @@ func (o *Ops) stepDropOn(ctx context.Context, env *task.Env, server string) erro
 		return err
 	}
 	return o.Fanout.Apply(ctx, server, ApplyDatabaseDrop, p)
+}
+
+// clearSkippedExtensionAlerts clears the alerts extensionSkipped of a database that is gone, on this server (every server drops the database and clears its own).
+func (o *Ops) clearSkippedExtensionAlerts(ctx context.Context, database string) {
+	err := o.asService(ctx, sysdb.Database, func(tx pgx.Tx) error {
+		_, e := tx.Exec(ctx, `UPDATE kingres_cp.alert SET cleared_at = now() WHERE kind = $1 AND cleared_at IS NULL AND split_part(split_part(subject, '|database:', 2), '|', 1) = $2`, sysdb.AlertExtensionSkipped, database)
+		return e
+	})
+	if err != nil && o.Log != nil {
+		o.Log.Warn("the alerts of the skipped extensions of a dropped database could not be cleared", "database", database, "error", err)
+	}
 }

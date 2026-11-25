@@ -226,6 +226,7 @@ export const ROUTES = [
   '/configuration',
   '/configuration?tab=changes',
   '/configuration?tab=time',
+  '/configuration?tab=extensions',
   '/this-server',
   '/this-server/logs',
 ]
@@ -237,7 +238,13 @@ export const ROUTES = [
 export const HA_SWITCHES =
   'lease=lost:1&silent=10.0.0.13:dead&standby=stalled:3@10.0.0.11:past&client=standby'
 
-export const SECURITY_TABS = ['Roles', 'Access', 'Network access', 'Audit log']
+export const SECURITY_TABS = [
+  'Roles',
+  'Access',
+  'Network access',
+  'Certificate authority',
+  'Audit log',
+]
 
 /** A page state that needs more than a visit: a dialog opened, a result shown, a special state reached. */
 export interface PageState {
@@ -1803,8 +1810,318 @@ export const ANALYTICS_STATES: PageState[] = [
       await sleep(250)
     },
   },
+  {
+    name: 'escrow of the CA key: the switch-on dialog (0.26.0)',
+    route: '/security',
+    open: async (page) => {
+      await clickText(page, 'Certificate authority', '[role="tab"]')
+      await clickWhenThere(page, '[data-testid="ca-escrow-on"]')
+      await dialogOpen(page)
+    },
+    close: cancel,
+  },
 ]
 /** The states of the data transfer (contract 0.19.0): they are run apart from the older ones, so that each run stays inside the time of one test. */
 export const TRANSFER_STATES = STATES.filter((s) => s.name.includes('(0.19.0)'))
 /** Every state that is not one of the data transfer. */
 export const OLDER_STATES = STATES.filter((s) => !s.name.includes('(0.19.0)'))
+
+/** Chooses an archive in the dialog Validate an archive; the mock reacts to the file name. */
+async function chooseArchive(page: Page, name: string): Promise<void> {
+  await page.evaluate((n) => {
+    const input = document.querySelector<HTMLInputElement>('[data-testid="archive-file"]')
+    if (!input) throw new Error('No file input')
+    const transfer = new DataTransfer()
+    transfer.items.add(
+      new File([new Uint8Array(70_000)], n, { type: 'application/zip', lastModified: 1 }),
+    )
+    input.files = transfer.files
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+  }, name)
+  await page.waitForSelector('[data-testid="archive-chosen"]', { timeout: 20_000 })
+  await sleep(250)
+}
+
+/** Opens Validate an archive, sends a fixture archive and waits for its report. */
+async function validateArchive(page: Page, name: string): Promise<void> {
+  await fastTasks(page)
+  await page.click('[data-testid="validate-archive"]')
+  await page.waitForSelector('[data-testid="archive-file"]', { timeout: 20_000 })
+  await chooseArchive(page, name)
+  await page.click('[data-testid="start-validation"]')
+  await page.waitForSelector('[data-testid="archive-report"]', { timeout: 30_000 })
+  await sleep(250)
+}
+
+/** The states of the database export and the archive validation (contract 0.29.0, a placeholder revision). */
+export const ARCHIVE_STATES: PageState[] = [
+  {
+    name: 'database page with the archive actions (0.29.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await page.waitForSelector('[data-testid="export-database"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+  },
+  {
+    name: 'export database dialog (0.29.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await page.click('[data-testid="export-database"]')
+      await page.waitForSelector('[data-testid="export-db-consistency-before"]', {
+        timeout: 20_000,
+      })
+      await page.waitForSelector('[data-testid="export-db-tables"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: cancel,
+  },
+  {
+    name: 'export database result with the download (0.29.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await fastTasks(page)
+      await page.click('[data-testid="export-database"]')
+      await page.waitForSelector('[data-testid="export-db-consistency-before"]', {
+        timeout: 20_000,
+      })
+      await clickText(page, 'Export database', '[role="dialog"] button')
+      await page.waitForSelector('[data-testid="download-start"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await closeDialogs(page)
+      await slowTasks(page)
+    },
+  },
+  {
+    name: 'export database, the role cannot read every table (0.29.0)',
+    needsMock: true,
+    route: '/databases/reports',
+    open: async (page) => {
+      await page.click('[data-testid="export-database"]')
+      await page.waitForSelector('[data-testid="export-db-consistency-before"]', {
+        timeout: 20_000,
+      })
+      await clickText(page, 'Export database', '[role="dialog"] button')
+      await page.waitForSelector('[data-testid="unreadable-objects"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: cancel,
+  },
+  {
+    name: 'export database failed (0.29.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await fastTasks(page)
+      await urlSwitch(page, 'transfer', 'dbfail')
+      await page.click('[data-testid="export-database"]')
+      await page.waitForSelector('[data-testid="export-db-consistency-before"]', {
+        timeout: 20_000,
+      })
+      await clickText(page, 'Export database', '[role="dialog"] button')
+      await page.waitForSelector('[role="dialog"] [role="alert"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await closeDialogs(page)
+      await slowTasks(page)
+    },
+  },
+  {
+    name: 'validate an archive, file chosen (0.29.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: async (page) => {
+      await page.click('[data-testid="validate-archive"]')
+      await page.waitForSelector('[data-testid="archive-file"]', { timeout: 20_000 })
+      await chooseArchive(page, 'shop.kdx.zip')
+    },
+    close: cancel,
+  },
+  {
+    name: 'archive report, valid (0.29.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: (page) => validateArchive(page, 'shop.kdx.zip'),
+    close: async (page) => {
+      await closeDialogs(page)
+      await slowTasks(page)
+    },
+  },
+  {
+    name: 'archive report, refused statements (0.29.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: (page) => validateArchive(page, 'code.kdx.zip'),
+    close: async (page) => {
+      await closeDialogs(page)
+      await slowTasks(page)
+    },
+  },
+  {
+    name: 'archive report, not compatible (0.29.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: (page) => validateArchive(page, 'old.kdx.zip'),
+    close: async (page) => {
+      await closeDialogs(page)
+      await slowTasks(page)
+    },
+  },
+  {
+    name: 'archive report, ledger tables (0.29.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: (page) => validateArchive(page, 'ledger.kdx.zip'),
+    close: async (page) => {
+      await closeDialogs(page)
+      await slowTasks(page)
+    },
+  },
+  {
+    name: 'archive report, invalid (0.29.0)',
+    needsMock: true,
+    route: '/databases/shop',
+    open: (page) => validateArchive(page, 'hostile.kdx.zip'),
+    close: async (page) => {
+      await closeDialogs(page)
+      await slowTasks(page)
+    },
+  },
+]
+
+/** Chooses an archive in the Import database dialog; the mock reacts to the file name. */
+async function chooseImportArchive(page: Page, name: string): Promise<void> {
+  await page.evaluate((n) => {
+    const input = document.querySelector<HTMLInputElement>('[data-testid="import-file"]')
+    if (!input) throw new Error('No file input')
+    const transfer = new DataTransfer()
+    transfer.items.add(
+      new File([new Uint8Array(70_000)], n, { type: 'application/zip', lastModified: 1 }),
+    )
+    input.files = transfer.files
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+  }, name)
+  await page.waitForSelector('[data-testid="import-chosen"]', { timeout: 20_000 })
+  await sleep(250)
+}
+
+/** Opens Import database, sends a fixture archive and waits for its report and options (or the reasons). */
+async function validateForImport(page: Page, name: string, ready: string): Promise<void> {
+  await fastTasks(page)
+  await page.click('[data-testid="import-database"]')
+  await page.waitForSelector('[data-testid="import-file"]', { timeout: 20_000 })
+  await chooseImportArchive(page, name)
+  await page.click('[data-testid="import-start"]')
+  await page.waitForSelector(ready, { timeout: 30_000 })
+  await sleep(250)
+}
+
+const importClose = async (page: Page): Promise<void> => {
+  await closeDialogs(page)
+  await slowTasks(page)
+}
+
+/** Each run of the finished import makes a database of its own, so a second run finds its name free. */
+let importRuns = 0
+
+/** The states of the database import (contract 0.30.0, a placeholder revision). */
+export const IMPORT_STATES: PageState[] = [
+  {
+    name: 'databases page with the import action (0.30.0)',
+    needsMock: true,
+    route: '/databases',
+    open: async (page) => {
+      await page.waitForSelector('[data-testid="import-database"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+  },
+  {
+    name: 'import database, file chosen (0.30.0)',
+    needsMock: true,
+    route: '/databases',
+    open: async (page) => {
+      await page.click('[data-testid="import-database"]')
+      await page.waitForSelector('[data-testid="import-file"]', { timeout: 20_000 })
+      await chooseImportArchive(page, 'shop_copy.kdx.zip')
+    },
+    close: cancel,
+  },
+  {
+    name: 'import database, report and options (0.30.0)',
+    needsMock: true,
+    route: '/databases',
+    open: (page) => validateForImport(page, 'shop_copy.kdx.zip', '[data-testid="import-options"]'),
+    close: importClose,
+  },
+  {
+    name: 'import database, ledger acknowledgement (0.30.0)',
+    needsMock: true,
+    route: '/databases',
+    open: (page) => validateForImport(page, 'ledger.kdx.zip', '[data-testid="import-ledger"]'),
+    close: importClose,
+  },
+  {
+    name: 'import database, refused statements (0.30.0)',
+    needsMock: true,
+    route: '/databases',
+    open: (page) => validateForImport(page, 'code.kdx.zip', '[data-testid="import-cannot"]'),
+    close: importClose,
+  },
+  {
+    name: 'import database, not compatible (0.30.0)',
+    needsMock: true,
+    route: '/databases',
+    open: (page) => validateForImport(page, 'old.kdx.zip', '[data-testid="import-cannot"]'),
+    close: importClose,
+  },
+  {
+    name: 'import database, done (0.30.0)',
+    needsMock: true,
+    route: '/databases',
+    open: async (page) => {
+      await validateForImport(
+        page,
+        `browser_copy_${(importRuns += 1)}.kdx.zip`,
+        '[data-testid="import-options"]',
+      )
+      await page.click('[data-testid="import-confirm"]')
+      await page.waitForSelector('[data-testid="import-done"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: importClose,
+  },
+  {
+    name: 'import database, failed (0.30.0)',
+    needsMock: true,
+    route: '/databases',
+    open: async (page) => {
+      await validateForImport(page, 'failload.kdx.zip', '[data-testid="import-options"]')
+      await page.click('[data-testid="import-confirm"]')
+      await page.waitForSelector('[data-testid="import-failed"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: importClose,
+  },
+  {
+    name: 'import database, dangerous role (0.30.0)',
+    needsMock: true,
+    route: '/databases',
+    open: async (page) => {
+      await urlSwitch(page, 'transfer', 'superuser')
+      await validateForImport(page, 'danger.kdx.zip', '[data-testid="import-options"]')
+      await page.click('[data-testid="import-confirm"]')
+      await page.waitForSelector('[data-testid="import-dangerous"]', { timeout: 30_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await importClose(page)
+      await urlSwitch(page, 'transfer', 'ordinaryrole')
+    },
+  },
+]

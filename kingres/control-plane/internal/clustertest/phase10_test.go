@@ -94,6 +94,12 @@ type p10Writer struct {
 }
 
 func p10Write(t *testing.T, n *clustertest.Node, db string, base int64) *p10Writer {
+	return p10WriteTries(t, n, db, base, 60)
+}
+
+// p10WriteTries is p10Write with the number of tries (100 ms apart) that one insert gets before the writer gives up: a hand-over of the
+// map group stops the writes of its group for longer than the default allows.
+func p10WriteTries(t *testing.T, n *clustertest.Node, db string, base int64, tries int) *p10Writer {
 	w := &p10Writer{stop: make(chan struct{})}
 	// A test that fails before it stops the writer must not leave it running: it shares the connection of the node with the next steps.
 	t.Cleanup(func() { w.halt() })
@@ -109,7 +115,7 @@ func p10Write(t *testing.T, n *clustertest.Node, db string, base int64) *p10Writ
 			}
 			id := base + i
 			ok := false
-			for try := 0; try < 60 && !ok; try++ {
+			for try := 0; try < tries && !ok; try++ {
 				_, err := conn.Exec(context.Background(), `INSERT INTO items VALUES ($1, 'live')`, id)
 				ok = err == nil || strings.Contains(err.Error(), "duplicate key")
 				if !ok {
@@ -365,7 +371,7 @@ func TestDrainOnACluster(t *testing.T) {
 		t.Fatalf("the victim owns no bucket: %v", primaryBuckets(t, l))
 	}
 
-	t.Run("the preview lists the moves, the standbys and no blocker; the map group server is refused", func(t *testing.T) {
+	t.Run("the preview lists the moves, the standbys and no blocker; the map group server can be drained now (it is handed over)", func(t *testing.T) {
 		pv := l.Expect(200, "GET", "/servers/"+victim.Host+"/drain-preview", nil)
 		if pv["canDrain"] != true || pv["moveCount"].(float64) == 0 || len(anyList(pv["standbyShardGroupIds"])) == 0 || pv["canKeepReplicas"] != true {
 			t.Fatalf("preview: %v", pv)
@@ -376,11 +382,9 @@ func TestDrainOnACluster(t *testing.T) {
 			}
 		}
 		lp := l.Expect(200, "GET", "/servers/"+l.Host+"/drain-preview", nil)
-		if lp["canDrain"] != false {
-			t.Errorf("the map group server can be drained: %v", lp)
-		}
-		if st, p := l.Do("POST", "/servers/"+l.Host+"/drain", map[string]any{}, nil); st != 409 || p["code"] != "server_hosts_map_group" {
-			t.Errorf("drain of the map group server: %d %v", st, p)
+		// a standby of the map group runs on another server, so the planned switchover can hand it over (TestDrainHandsOverTheMapGroup drains it)
+		if lp["canDrain"] != true || len(anyList(lp["blockers"])) != 0 {
+			t.Errorf("the map group server cannot be drained: %v", lp)
 		}
 		if st, _ := l.Do("GET", "/servers/no-such-server/drain-preview", nil, nil); st != 404 {
 			t.Errorf("unknown server: %d", st)

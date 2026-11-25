@@ -1,9 +1,9 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
 --
--- upgrade: pg_regress test of kingres_timepart 0.2 (purpose below).
--- ALTER EXTENSION kingres_timepart UPDATE from 0.1 to 0.2 must give exactly the
--- catalog that installing 0.2 gives (also for a role that was given the right
+-- upgrade: pg_regress test of kingres_timepart 0.3 (purpose below).
+-- ALTER EXTENSION kingres_timepart UPDATE from 0.1 and from 0.2 to 0.3 must give exactly the
+-- catalog that installing 0.3 gives (also for a role that was given the right
 -- to drive its own maintenance before), keep the policies, the history and the
 -- identity of the installation, and leave the conversion working.
 SET search_path = public, pg_temp;
@@ -135,7 +135,7 @@ DROP ROLE IF EXISTS upg_driver;
 RESET client_min_messages;
 CREATE ROLE upg_driver NOLOGIN;
 
--- Install 0.2 directly.
+-- Install 0.3 directly.
 DROP EXTENSION kingres_timepart;
 CREATE EXTENSION kingres_timepart;
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_timepart';
@@ -204,10 +204,48 @@ SELECT state FROM kingres.timepart_run ORDER BY run_id DESC LIMIT 1;
 SELECT a.kind, a.partition_name, a.state FROM kingres.timepart_run_action a
  WHERE a.run_id = (SELECT max(run_id) FROM kingres.timepart_run) AND a.kind = 'convert' ORDER BY a.seq;
 
+-- 0.2 to 0.3 on its own, without kingres_columnar like the direct install above: a table with its policy and history is
+-- kept, and the catalog is that of a direct install
 SET client_min_messages = warning;
 DROP TABLE public.upg_t;
 DROP EXTENSION kingres_columnar;
-DROP TABLE public.upg_direct, public.upg_upgraded;
+DROP EXTENSION kingres_timepart;
+CREATE EXTENSION kingres_timepart VERSION '0.2';
+RESET client_min_messages;
+SELECT extversion FROM pg_extension WHERE extname = 'kingres_timepart';
+SELECT kingres.timepart_grant_driver('upg_driver');
+CREATE TABLE public.upg_t (ts timestamptz NOT NULL, v int) PARTITION BY RANGE (ts);
+SELECT kingres.timepart_set_policy('public.upg_t', '1 day', create_ahead => '1 day');
+\o /dev/null
+CALL kingres.timepart_run('public.upg_t', '2026-03-05 12:00 UTC');
+\o
+CREATE TEMP TABLE upg_before2 AS
+SELECT kingres.timepart__stamp() AS stamp,
+       (SELECT count(*) FROM kingres.timepart_policy) AS policies,
+       (SELECT count(*) FROM kingres.timepart_run) AS runs;
+ALTER EXTENSION kingres_timepart UPDATE;
+SELECT extversion FROM pg_extension WHERE extname = 'kingres_timepart';
+CREATE TABLE public.upg_upgraded2 AS SELECT line FROM public.upg_snapshot() line;
+SELECT 'only in direct install' AS side, line FROM
+  (SELECT line FROM public.upg_direct EXCEPT SELECT line FROM public.upg_upgraded2) x
+UNION ALL
+SELECT 'only in upgrade from 0.2', line FROM
+  (SELECT line FROM public.upg_upgraded2 EXCEPT SELECT line FROM public.upg_direct) y
+ORDER BY 1, 2;
+SELECT b.stamp = kingres.timepart__stamp() AS same_stamp,
+       b.policies = (SELECT count(*) FROM kingres.timepart_policy) AS same_policies,
+       b.runs = (SELECT count(*) FROM kingres.timepart_run) AS same_runs
+  FROM upg_before2 b;
+-- the table of 0.2 is not a distributed one, and its policy runs as before
+SELECT d.r_dist FROM kingres.timepart__dist('public.upg_t'::regclass::oid) d;
+\o /dev/null
+CALL kingres.timepart_run('public.upg_t', '2026-03-06 12:00 UTC');
+\o
+SELECT state FROM kingres.timepart_run ORDER BY run_id DESC LIMIT 1;
+
+SET client_min_messages = warning;
+DROP TABLE public.upg_t;
+DROP TABLE public.upg_direct, public.upg_upgraded, public.upg_upgraded2;
 DROP FUNCTION public.upg_snapshot();
 DROP OWNED BY upg_driver;
 DROP ROLE upg_driver;

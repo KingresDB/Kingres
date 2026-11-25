@@ -9,7 +9,7 @@ implemented. The phase number (14) is a proposal; the integrator assigns it.
 Builds on the control plane of phase 3 ([control-plane-3.md](control-plane-3.md)), the table lifecycle of phase 9
 ([shard-phase9.md](shard-phase9.md)), the configuration of phase 13 ([config-phase13.md](config-phase13.md)) and the
 row router of phase 2b ([shard-phase2b.md](shard-phase2b.md)). It revises the REST contract in three additive steps,
-**0.19.0** (14a), **0.20.0** (14b) and **0.21.0** (14c); the numbers are placeholders and the integrator renumbers
+**0.19.0** (14a), **0.20.0** (14b) and **0.21.0** (14c); the numbers are those of the branches; in g2 they are 0.29.0 (14b) and 0.30.0 (14c)
 (none of the steps changes the meaning of an operation, field or enum value of 0.14.0). Decisions that deserve a
 record are in [ADR 0027](../adr/0027-transfers-are-staged-encrypted-files-run-as-the-requesting-role.md) and
 [ADR 0028](../adr/0028-ledger-tables-are-carried-as-data-and-restart-their-chain.md).
@@ -1177,7 +1177,7 @@ Files, keys and role connections are the leader's (F3, F6, F4). Rules:
 
 All additions are optional properties, new operations, new enum values and new problem codes (the contract's rule:
 clients tolerate codes they do not know). Operations go from 140 to **150** (14a), **152** (14b) and **153** (14c). The
-numbers are placeholders. Each revision is **its own commit, written before the code that uses it**, so a second
+numbers are those of the design (see the top of the file for g2). Each revision is **its own commit, written before the code that uses it**, so a second
 writer can start from it (section "Increments", A0, B0, C0).
 
 ### New tag and operations
@@ -1563,6 +1563,54 @@ required; `ledger_enable` is called before the load; history rows are loaded; th
 time-partition policies are imported enabled; the `OnFail` drop takes a name other than the private one; step 4 treats an
 existing database as success; the final rename does not check the name; views are created before distribution.
 
+**14c after the review:** the withdrawal ends only the sessions of the importing role, or does not revoke `CONNECT` from `PUBLIC`, or does not end every backend but its own, or does not loop and re-check; a service step touches a
+table without the lock and the check in one transaction; the verification scans a table as the service role; the importer check (members that can log in) is removed at the request, at a step or per
+connection; a prepared transaction is not rolled back before a step, before the rename or before the drop; a catalog sequence is raised in `kingres`, in a schema of the ledger or of the system, for a sequence that the
+importer does not own or that is not linked to the named column; the catalog walk is skipped; the rename is not undone when a later statement fails; the private name has no random part.
+
+## Changes made after the independent security review of 14c (2026-11-24)
+
+The review found one critical, three medium and six low findings. Each is answered in the code and by a test that fails without the fix.
+
+- **C1, a session of a member of the importing role.** The withdrawal revoked `CONNECT` from the role and ended the sessions of the role only, so a login role that is a member of it kept its session and could swap a table
+  for a view that calls a function of the role while the service role verified. Four layers now stand, any one of which defeats the attack. (1) The service role never touches a relation that the role made outside
+  one transaction that first locks it (`ACCESS EXCLUSIVE`, with a lock timeout), then checks that the lock is held on the table by that name, its kind, owner and trust, then acts; a view cannot take the place of a locked table.
+  This holds for every service step (distribution, columnar options, ledger, policies). (2) Row counts run as the importing role, before its connection is closed; the service role scans no table of the role.
+  (3) The withdrawal revokes `CONNECT` from `PUBLIC`, from the role and from every non-superuser that holds it, ends every backend of the database except its own, loops with a bound (60 rounds, two quiet rounds)
+  and fails if sessions remain, and checks again. (4) A role that has a member that can log in and can act as it (directly or through other roles, with `SET` or `INHERIT`; the creator of a role is a member with `ADMIN OPTION` only, which adds no path) is
+  refused as an importer, at the request, at every step and for every connection of the role. `CREATEROLE` is **not** refused (a decision of the design): a role of `kingres_admin` made through the API has it, and an import
+  must work for it with no manual `ALTER ROLE`. Layers 1 to 3 close the attack for such a role: it cannot grant `CONNECT` on a database that the service role owns, the withdrawal ends every session including the
+  one of a login role that it makes during the import, and the lock, check and act of each service step run in one transaction. `SUPERUSER`, `REPLICATION`, `BYPASSRLS` and the `pg_*` file, program and log roles stay refused.
+  `CREATEDB` and `pg_signal_backend` are allowed. The role gets a database without `CREATEDB` of its own on purpose: `kingres_admin`
+  authorised the import, and the database is made by the service role under a name that the role cannot guess.
+- **M1, a prepared transaction pins the database.** Before each service phase, before the rename and before the drop of a failed import, the service role rolls back every row of `pg_prepared_xacts` that belongs to the
+  private database (`ROLLBACK PREPARED` from a connection to that database).
+- **M2, sequences.** A sequence of the archive's catalog is raised only if it is in no schema of `kingres`, `kingres_*`, `pg_*` or `information_schema`, is owned by the importer, is linked to the named column
+  (`OWNED BY`, from `pg_depend`), and the plan created it; the plan check refuses the rest as `archive_invalid`. The raise is one statement with these conditions.
+- **M3, the trust check follows the catalog.** `tableTrusted` walks `pg_depend` from the table, its partitions, columns, constraints, indexes, defaults, types (a domain and its constraints), statistics, rules, policies
+  and triggers, and refuses any object that carries code (a function, an operator, an operator class or family, a language, a base type, a cast, a text-search object, a view) unless a superuser owns it or it is a member of
+  an extension of the closed list. Builtin functions have no dependency record, so the deparsed text and the deny list stay for them.
+- **L1** the rename is undone on any later failure (name, owner, marker and `CONNECT` restored), `done` is written before the follow-up statements, and a revert error is logged and surfaced on peers. **L2** the private
+  name is `kingres_import_<task id>_<12 hex>`. **L3** with `keepOnFailure` the role's access to the kept database is withdrawn, and the marker holds a task-unique random value that the hook must match. **L4** archive names
+  in task errors go through `safeName`. **L5** the `NOT VALID` retry is built from the lexer's tokens and handles a statement that is already `NOT VALID`. **L6** is part of C1.
+- **Free space.** The request, and the check step, compare the archive's expanded size (plus half and 64 MiB) with the free space of every data node and refuse with `insufficient_disk`.
+
+### Changes made after the second review of 14c (2026-11-24)
+
+The second review found no critical, high or medium issue and four low ones. Each is answered in the code and by a test.
+
+- **L-A, a domain reached only through a composite type.** A composite type has no `pg_depend` row on the class row that holds its attributes, so the walk did not follow a composite column to a domain
+  with a function or an operator of the role in its `CHECK`. The walk now goes from a composite type to its class row (and so to the types of its attributes), from an array to its element, from a range to
+  its subtype, its operator class and its canonical and difference functions, and from a multirange to its range.
+- **L-B, the undoing of a rename on a peer.** A server that failed to take the final name (the name was a database of somebody else) was still put back, which renamed that database. The marker of the
+  task now stays on the final name until every server has taken it and the settings are recorded (a last call removes it), `Back` is refused without the marker of the task, and the undoing leaves a database
+  that does not carry the marker alone, whatever its owner or name.
+- **L-C, tables of a distributed schema that the archive does not name.** Before `distribute_schema` the transaction lists every relation of the schema, refuses one that is not an ordinary or partitioned table
+  of the archive's catalog, locks and checks every table (`lockTrusted`) and lists the schema again.
+- **L-D, `ledger_verify()`.** It runs in a transaction that has first locked and checked every table registered with the ledger (`lockTrusted`, ACCESS EXCLUSIVE: it also holds off a rename or a swap
+  with a view, and nothing else uses these tables while the import runs, so it cannot deadlock). The other catalog reads of the verify step run no code of the role.
+- **The test hook.** `ImportHook` now receives the private name of the task; the process-wide `lastPrivate` and `ImportPrivateName()` are gone.
+
 ## Increments
 
 Each increment builds and passes its own tests; the contract checker passes from A0 on. Sizes: **S** up to 2 days,
@@ -1861,3 +1909,155 @@ section differ, this section is right.
   after reading the first two bytes of the staged file (a gzip file is not capped by its compressed size). `skipBom` is for UTF-8 only; for another encoding it is refused
   (400) when named and ignored by default. One transfer per role is race free (a lock from the check to the start of the task); a refused request leaves no record; the
   first step of a task reads `dataTransfer.enabled` again (a task that is moving data is cancelled with `cancelTask`).
+
+## Results of the spikes and changes made by the code (phase 14b)
+
+This section is written by the writer of 14b. The text above is left as the design was reviewed; where the two disagree, this section is right. The contract revision
+of 14b is **0.29.0** in the integration branch g2 (the sections above name it 0.20.0); the migration is `0043_archive_validation.sql` (0050 on the branch).
+
+### Spike S3: `pg_dump` for every table kind (2026-11-23)
+
+**Result: passed, with the rewrites that the design expected and one it did not (the user's partitioning of a distributed table is synthesised).** The test is
+`TestSpikeS3DumpOfEveryTableKind` (`cmd/kingresd/spike_s3_e2e_test.go`): the database of the export fixture (`buildExportFixture`) is built through the API on a real cluster,
+and `pg_dump` of the build of this tree is run as the service role with the arguments of the exporter (`--schema-only --no-owner --no-tablespaces --no-publications
+--no-subscriptions --no-security-labels --no-privileges`, the two sections, `--exclude-schema=kingres`, `--exclude-schema=kingres_transfer`). It was run on PostgreSQL **18.7 and
+19.0**; **the two outputs are identical except for the two version comments and the `\restrict` token** (the golden files are in `internal/dumpnorm/testdata/pg18` and `pg19`,
+and a test says that the normalised schema is the same on both). The cluster test of 14b (`TestDatabaseExportOverThreeServers`) repeats the check on three servers, where the
+coordinator holds only some of the buckets and the dump holds only those. What the dump looks like for each kind (the answers to V1 and V2):
+
+| Kind | What `pg_dump` writes | What the normaliser does |
+|---|---|---|
+| Preamble | `\restrict <token>` and `\unrestrict <token>` on both majors (V2: yes); eleven `SET` lines and `SELECT pg_catalog.set_config('search_path', '', false)` | removed (a closed list of `SET` names; any other `SET` is a refusal) |
+| Extensions | `CREATE EXTENSION IF NOT EXISTS <name> WITH SCHEMA <schema>` and `COMMENT ON EXTENSION` for each, `kingres_shard` in `pg_catalog` | removed; the extensions and their schemas are in the manifest, from the catalog |
+| Hash-distributed table | the parent `CREATE TABLE ... PARTITION BY HASH (<column>)`, then every bucket partition `<table>_bNNNN` as a table of its own with `NOT NULL` constraints named `<table>_<column>_not_null`, and `ALTER TABLE ONLY parent ATTACH PARTITION bucket FOR VALUES WITH (modulus N, remainder R)` | the bucket partitions and their attaches are removed (the set is **read from the catalog as the descendants of every hash table**, so it is exact on a coordinator that holds some of the buckets); `PARTITION BY HASH (<column>)` is removed only when the column is the catalog's |
+| User-partitioned distributed table | the parent is `PARTITION BY HASH`; each bucket partition is itself `PARTITION BY RANGE (<key>)`; the user's leaves exist only as `<partition>_bNNNN` under the bucket partitions, with the bound written with explicit time-zone offsets, and `DEFAULT` | the user's partitioning is **synthesised from the catalog**: the parent gets `PARTITION BY <method> (<key>)` (from `pg_get_partkeydef` of a bucket partition) and one `CREATE TABLE <leaf> PARTITION OF <parent> FOR VALUES <bound>` or `DEFAULT` per user partition, the bound taken from the leaf `<partition>_bNNNN` of the first bucket the coordinator holds (`pg_get_expr`), so that a time zone is exact (the text in `kingres.dist_partition.bound` is what the user typed) |
+| Constraints and indexes of a distributed table | `ALTER TABLE ONLY parent ADD CONSTRAINT`, `CREATE INDEX ... ON ONLY parent`, the same for every bucket partition with names `<bucket>_pkey` and `<bucket>_<column>_idx`, `ALTER INDEX parent ATTACH PARTITION child` | `ONLY` is removed for a distributed parent; everything about a bucket partition, and every attach of one of their indexes (names **read from the catalog**), is removed |
+| Reference table | an ordinary table | kept |
+| Columnar table | `SET default_table_access_method = columnar;` before its `CREATE TABLE` (and `= heap` after it; the setting stays on over the partitioned parent that follows) | `USING columnar` is added to the `CREATE TABLE` of a table that is not partitioned while the setting is on; the options are in the catalog document (`kingres.columnar_options`) |
+| Updatable and append-only ledger table | the table, the history table `<table>_ledger_history` as an ordinary table, and four trigger names `kingres_ledger_block_insert`, `_block_modify`, `_block_truncate`, `_capture` with `ALTER TABLE ... ENABLE ALWAYS TRIGGER` | the history table (with everything about it) and the triggers of those names on the ledger tables are removed; **a trigger of that name on another table, and every other trigger, is kept and refused by the grammar** |
+| Time-partitioned table | an ordinary partitioned table (the policy is in `kingres.timepart_policy_data`, not in the dump) | kept; the policy is in the catalog document and is imported disabled |
+| Identity column | `ALTER TABLE ... ALTER COLUMN ... ADD GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME ...)` after the table | kept |
+| Local partitioned table | the leaves as tables of their own and `ALTER TABLE ONLY parent ATTACH PARTITION leaf FOR VALUES ...` | kept; the leaves are `leaf` in the catalog and have no data entry |
+| Inheritance | `INHERITS (parent)` | kept; the shape grammar accepts it for the tables that the catalog names |
+| Views and materialized views | in pre-data, in dependency order among the tables; `CREATE MATERIALIZED VIEW ... WITH NO DATA`; comments on their columns and indexes of a materialized view are in post-data | moved, with their comments and indexes, to `schema/views.sql`, in the order of the dump |
+| Sequences | `CREATE SEQUENCE` and `ALTER SEQUENCE ... OWNED BY`, or the identity form above | kept; the state of each is in the catalog document |
+
+What the dump does not show for the tables of the extensions, and is therefore in the catalog document: the access method of a distributed table, the colocation group, the
+bucket count, the ledger mode, head and policy, the time-partition policy. **What the importer would refuse** (functions, triggers other than the ledger's, policies, rules,
+event triggers, collations, extended statistics, foreign objects, unlogged tables, row-level security) is found twice: by queries on the catalog **at the request** (422
+`schema_unrecognised`, naming the kinds), and by the shape grammar on the normalised files in the step *Normalise the schema* (the task code `schema_unrecognised`). V8 (the
+rename of a database) belongs to 14c and was not checked. V9, for what 14b does: a read reaches only the expressions of virtual generated columns (checked as in 14a), because
+every table with a policy is refused.
+
+### Changes made by the code
+
+- **Contract.** `TaskSubject` has the type `upload` (for `archive.validate`); `export_not_readable` names its objects in the problem's `reasons` (code `no_usage` or
+  `no_privilege`, `object` the name, at most 20) and in the detail after a colon; `DataExport.warnings` is new and optional; `DataUpload.state` is `valid` or `invalid` after a
+  validation and `report` holds the `ArchiveReport`. An archive that is not valid is a **finished** task whose report says `valid: false` with reasons, not a failed task.
+- **Archive writer and validator (package `archive`)** are stricter than the text above in four ways: the end record has no comment and is the last 22 bytes (a comment can
+  hide bytes); the flags of every entry are exactly 0x0008 and a descriptor is always present (the writer's shape is the only accepted one); the entries are in a fixed physical
+  order (catalog, the three SQL files, the data, the manifest) and the central directory has the same order; an extension outside the closed list of the import (plus
+  `plpgsql`) is `archive_invalid`. The catalog document gained `columns` of each table (the header of its data entry) and `historyColumns` of a ledger table; the manifest
+  gained `options.excludedTables`, so that "the data entries are the tables that have data" can be decided from the file alone.
+- **The progress of the data step is the task's `detail`** (`schema.table (n of m), N bytes so far`); the task engine has no item counters today, so `itemsDone` is not set. A
+  task that is done has the detail `transfer <id>`.
+- **A failed read restarts the whole data step, not one table** (up to 3 times, as in 14a): the archive writer is sequential and cannot rewind an entry.
+- **Single snapshot** is decided by the catalog: when no hash table has buckets in more than one group, every table is read in one `REPEATABLE READ READ ONLY` transaction of the
+  role and labelled `archive-single-snapshot`, and the independent count of every table is made in the same transaction (a difference fails the task `row_count_mismatch`).
+  Otherwise each table is one `READ COMMITTED` statement with the label of 14a, and the counts are taken at the end and are a **warning** only.
+- **A table with row-level security is refused** at the request (`schema_unrecognised`, "row-level security"): policies are not carried, and an archive of such a table would be
+  shorter than the table or refused at import.
+- **The history of an updatable ledger table** is a data entry with `ledgerHistory: true` whose `table` is the ledger table; it needs `SELECT` on the history table like any table.
+- **Table tasks wait for an export:** `StartTask` refuses a table task (`table.distribute`, `.undistribute`, `.alter`, `.partition`, `.setStorage`, `.import`, `partition.maintain`)
+  of a database in which a `database.export` is unfinished, and the export refuses to start while one of those is (one query each, 409 `operation_in_progress`).
+- **Not covered by tests:** a leader change at every step of the export (the codes come from the helpers of 14a); a database with distributed schemas (`kingres.dist_schema`) is
+  read into `distributedSchemas` but no test builds one; a columnar **distributed** table; an upload of an archive above 2 GiB.
+- **Not in 14b, by the design's own scope:** the import, `expectedSha256`, the private database; `ArchiveReport.statements` is filled by the shape grammar already, so the
+  validation says which statements a 14c importer would refuse.
+
+### Changes made after the security review of 14b (2026-11-23)
+
+- **The service role reads and calls nothing in the schema `kingres` before `extguard` has shown that it is an extension's** (A1). Every read of the catalog of the shard, ledger, timepart and
+  columnar extensions, and the call of `kingres.columnar_options`, are gated by `extguard.Guard` for the extension that owns the object; an untrusted schema is 422
+  `schema_unrecognised` at the request and the task code `schema_unrecognised` in a step. A database whose schema `kingres` is not owned by a superuser, or that holds objects when no
+  extension of KingresDB is installed, and a schema `kingres_transfer` that the service role does not own, are refused the same way (B7). `readDBFacts` runs `SET LOCAL search_path =
+  pg_catalog`, so a `search_path` set with `ALTER DATABASE` finds nothing of the tenant's; `pg_dump` gets `PGOPTIONS=-c search_path=pg_catalog`, its password in a file of mode 0600 in the
+  staging directory (removed afterwards), a version check (the major of the server, at least 18) and a bounded tail of its error output in the log of the server only (A2, B8). The role's
+  connection of an export sets `search_path = pg_catalog` (B9).
+- **The lexers agree with PostgreSQL** (B1, B2): a `--` comment ends at a carriage return as well as at a line feed, and a dollar-quote tag may start with a byte above 0x7f, in `sqlshape` and
+  in `dumpnorm`. The corpus `internal/sqlshape/testdata/lexcorpus.json` (comments that end at `\r`, tags of high bytes, nested comments, `E''`, `U&''`, dollar quotes in strings and comments)
+  holds only harmless `SELECT` scripts; `TestLexersAgreeWithTheServer` sends each to a real server (PostgreSQL 18 and 19) with the simple protocol and counts the results, and the two lexers and
+  the corpus must give the same count. The corpus is also the seed of the fuzz targets.
+- **A validation is made from a whole read of the bytes or not at all** (B3): a failure that is not a verdict about the archive (the key, the file, a cancel, a read error) fails the task and
+  nothing is cached. The cached report carries `ValidatorVersion` and the SHA-256 of the file; a report of another version is stale (the upload is `complete` again). **The cache is per upload
+  row and tells what a validation found once. The import of 14c validates again at import time, whatever `archive_state` says, and never trusts it** (B4). The report says that the row counts
+  are the manifest's claims (P1). A validation is limited to `min(maxImportBytes, 200 times the staged file)`, an entry to 500 times its compressed size plus 1 MiB (B5).
+- **Sequences** (B6): the role needs `SELECT` or `USAGE` on every sequence of the database, or the export is refused with `export_not_readable`.
+- **Names are pairs** (B10): a schema or a table with a dot in its name is refused at the export and by the validator; the console keys the tables to leave out as the pair. The number of data
+  entries is checked at the request (at most 19 992).
+- **The check for an export and the start of a table task are one step** (P2): `StartTask` for a table kind and the start of `database.export` take `dbTaskMu` around check and submit.
+
+## Results of the spikes and changes made by the code (phase 14c)
+
+This section is written by the writer of 14c. The text above is left as the design was reviewed; where the two disagree, this section is right. The contract revision of 14c is
+**0.30.0** in g2 (the sections above name it 0.21.0); the contract has 177 operations (the design counted from 140). The packages are `sqlshape` (the execution mode, `Each`),
+`archive` (`OpenEntry`, `ReadManifest`, `Assemble`, and `archivetest` for tests) and `ops/dbimport*.go`.
+
+### V8: the rename of a database (passed)
+
+`ALTER DATABASE ... RENAME` works, on one server and on three, with the background workers of the extensions connected: the sessions of the database (workers included) are ended with
+`pg_terminate_backend` and the rename is tried again on `55006` (up to 40 times, 250 ms apart); nothing in the shard catalog keeps the name of the database (the extension reads
+`current_database()` when it opens a connection), so a registered node, the colocation groups and the buckets follow the rename. `TestDatabaseImportOverThreeServers` renames on every
+server, then puts the name back if a later server fails. **The fallback of the design (the final name from the start with a marker) was not needed.** The private database carries a
+comment `kingres-import:<task id>`; the failure hook drops a database only if it is owned by the service role and carries the marker of its task, so a database that a role with
+`CREATEDB` made under a guessed private name is left alone (`TestDatabaseImportNeverUsesADatabaseItDidNotMake`).
+
+### What the service role does after the role, and how the role is kept out of it
+
+The role has `CREATEDB`, may connect to every database and has sessions of its own. The design says that the guarantee is PostgreSQL's privileges; what remains is that the service
+role (a superuser) must never act on what the role made while the role can change it. The import therefore works in **phases**:
+
+| Phase | Who | Can the role connect? |
+|---|---|---|
+| Create the database, the extensions, the check of the functions | service role | no (`REVOKE ALL ... FROM PUBLIC` at creation; the role has no grant yet) |
+| Tables | the role | yes (`CONNECT`, `CREATE` and `TEMPORARY` on the database, `USAGE, CREATE` on `public`, `USAGE` on the schemas of the extensions) |
+| Distribute | service role | **no**: `CONNECT` is withdrawn and the sessions of the role in the database are ended, on every server |
+| Views, load, constraints | the role | yes |
+| Sequences (the maximum of the column is read **as the role**), ledger, policies, verification, rename | service role | **no** |
+
+The database is owned by the service role until the last step (an owner can change `ALTER DATABASE ... SET` from any database); the role becomes the owner when the name is taken. Before
+a service call into a table of the role, `tableTrusted` reads the catalog: an ordinary or partitioned table owned by the role, no trigger of its own (the triggers of `kingres_ledger` are
+fine), no rule, no policy, no row-level security, and every function that its defaults, generated columns, constraints and indexes call is allowed in an expression. **PostgreSQL records
+no dependency on a builtin function** (pinned objects), so the functions are read from the deparsed text of the expressions (`pg_get_expr`, `pg_get_constraintdef`,
+`pg_get_indexdef`) under `search_path = pg_catalog`, and not from `pg_depend`. Every read of `kingres.*` on a service session is preceded by `extguard` (the three KingresDB extensions)
+or by the shard check of 14b (`shardUsable`, because `kingres_shard` is created in `pg_catalog`).
+
+### The function check
+
+The plan of the grammar collects the names that an expression calls. In the new database (the builtin functions and the extensions of the manifest, and nothing else: the role has not been
+able to connect) every name is looked up in `pg_proc`: it must exist where the role's search path finds it (`pg_catalog`, or the schema it names); a function of `pg_catalog` must not
+be a member of an extension of KingresDB and must not be one of the dangerous ones (prefixes: `pg_sleep`, `pg_read_`, `pg_ls_`, `lo_`, `set_config`, `setval`, `pg_terminate`, `pg_advisory_`,
+`query_to_xml`, `dblink`, and the other file, signal, setting and replication functions); a function of another schema must be a member of a contrib extension of the manifest (or
+`kingres_sketch`) installed in that schema; never of `kingres_shard`, `kingres_ledger`, `kingres_timepart` or `kingres_columnar`; none may be `SECURITY DEFINER`. The list is a floor: the
+privileges of the role still decide.
+
+### Changes made by the code
+
+- **A request does not read the archive.** An archive of 100 GiB cannot be read inside a request (`RequestTimeout` is 30 s). The request checks the role, the upload, the name and the
+  database, and uses a cached report **only to refuse early** (`archive_invalid`, `archive_incompatible`, `archive_statement_refused`, `ledger_restart_not_acknowledged`); everything else
+  is a code of the failed first step. Every hostile archive is therefore refused by the task, with nothing made.
+- **No commit intent.** A table is loaded in one transaction (the rows the server counted must equal the scanner's and the manifest's), but there is no marker and no `import_outcome_unknown`: a failure
+  of any kind drops the whole database, so there is nothing to decide. Statements of the pre-data and post-data files are not grouped in a transaction per table; each runs on its own.
+- **Reference tables** are loaded through the temporary table of 14a (`loadReference`), with its cap of 256 MiB; a reference table with a column of an array type is refused.
+- **Foreign keys.** With `fail`, a violated key is counted by adding `NOT VALID` (a suffix of the control plane) inside a transaction that is rolled back, and the task fails with
+  `foreign_key_violation`, the constraint and the count; with `keepNotValid` the key stays `NOT VALID` and the task's detail lists the keys with their counts.
+- **Materialized views** are made `WITH NO DATA` and refreshed after the constraints (a refresh, not a copy: the content is the one of a refresh at import time).
+- **Extension schemas** that the manifest names (not `public`, not `pg_catalog`) are made by the control plane before the role runs, so the `CREATE SCHEMA` and `COMMENT ON SCHEMA` of the
+  archive for them are skipped (the role could not own them).
+- **Distributed schemas** are distributed after the tables exist (`distribute_schema` takes a schema that already has tables) with the sharding mode `both`; the placement group is not carried.
+- **The detail** of the finished task is the lines that the console shows: `ledger: <table> starts a new chain ...`, `policy disabled: <table> ...`, `NOT VALID: ...`.
+- **The manifest of 14b wrote the locale provider of a libc database as `builtin`** (`datlocprovider` `c` is libc, `b` is builtin); fixed in the facts. An archive made by the first 14b
+  build says `builtin` and is refused as incompatible.
+- **Not done:** the free space of the data nodes against `maxImportBytes` (the sum of the sizes is checked, the disk is not asked), a leader change at every step (the codes are those of 14a; a
+  step that finds the upload on another server fails `transfer_leader_changed` and the hook drops the private database; a leader that is gone leaves its private database until someone drops it, and
+  its name says whose it is), and a distributed-schema database in the round trip (the call is made and the catalog is read; no test builds one).

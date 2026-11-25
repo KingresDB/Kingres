@@ -114,6 +114,11 @@ function stateOf(cfg: ConfigState, serverId: string, srv: ServerCfg, def: ParamD
   return 'applied'
 }
 
+/** PostgreSQL hides `shared_preload_libraries` from an ordinary user; `?preload=visible` shows it, as a server that reads it as a superuser would. */
+function isHidden(def: ParamDef): boolean {
+  return def.hidden && !(mockConfig.preloadVisible && def.name === 'shared_preload_libraries')
+}
+
 function serverValue(
   cfg: ConfigState,
   def: ParamDef,
@@ -136,11 +141,12 @@ function serverValue(
   const state = stateOf(cfg, serverId, srv, def)
   return {
     serverId,
-    value: def.hidden ? null : (run?.value ?? null),
+    value: isHidden(def) ? null : (run?.value ?? null),
     source: run?.source ?? 'default',
     level: wantedValue(cfg, serverId, def.name).level,
     state,
-    pendingValue: def.hidden || state !== 'pendingRestart' ? null : (srv.pending[def.name] ?? null),
+    pendingValue:
+      isHidden(def) || state !== 'pendingRestart' ? null : (srv.pending[def.name] ?? null),
     error: state === 'failed' ? (srv.failed[def.name] ?? null) : null,
   }
 }
@@ -151,7 +157,7 @@ function parameterView(s: MockState, def: ParamDef): ConfigParameter {
   const servers = s.servers.map((x) => serverValue(cfg, def, x.id, missing))
   const known = servers.filter((x) => x.state !== 'unknown')
   const values = new Set(known.map((x) => x.value))
-  const differs = !def.hidden && values.size > 1
+  const differs = !isHidden(def) && values.size > 1
   const overrides = cfg.overrides
     .filter((o) => lowerName(o.name) === lowerName(def.name))
     .map((o) => ({
@@ -173,13 +179,13 @@ function parameterView(s: MockState, def: ParamDef): ConfigParameter {
     enumValues: def.enumValues,
     context: def.context,
     restartRequired: def.context === 'postmaster',
-    defaultValue: def.hidden ? null : bootText(def),
+    defaultValue: isHidden(def) ? null : bootText(def),
     kind: def.kind,
     reason: def.reason,
-    hidden: def.hidden,
+    hidden: isHidden(def),
     allowedLevels: def.allowedLevels,
     clusterOnly: def.clusterOnly,
-    overrides: def.hidden ? [] : overrides,
+    overrides: isHidden(def) ? [] : overrides,
     servers,
     differs,
     differsInGroup: differs && differsInGroup(cfg, def, s),

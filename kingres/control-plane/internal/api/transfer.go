@@ -55,6 +55,8 @@ type DataUpload struct {
 	ChunkAlign    int       `json:"chunkAlign"`
 	SHA256        *string   `json:"sha256"`
 	ExpiresAt     time.Time `json:"expiresAt"`
+	// Report is the archive report of the last validation (contract 0.29.0); null before one.
+	Report *ArchiveReport `json:"report"`
 }
 
 // TableConsistency is what a file guarantees for one table.
@@ -84,10 +86,94 @@ type DataExport struct {
 	CreatedAt       time.Time  `json:"createdAt"`
 	ExpiresAt       time.Time  `json:"expiresAt"`
 	DownloadedAt    *time.Time `json:"downloadedAt"`
+	// Warnings are the warnings of the manifest of a database archive (contract 0.29.0).
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // DataExportPage is a page of exports.
 type DataExportPage struct {
 	Items      []DataExport `json:"items"`
 	NextCursor *string      `json:"nextCursor"`
+}
+
+// The types of the database export and the archive validation (contract 0.29.0).
+
+// ExportDatabaseRequest is the body of exportDatabase.
+type ExportDatabaseRequest struct {
+	ExcludeTables               []TableRef `json:"excludeTables,omitempty"`
+	DataMode                    string     `json:"dataMode,omitempty"`
+	AcknowledgeLargeObjectsLost bool       `json:"acknowledgeLargeObjectsLost,omitempty"`
+	RetentionHours              *int       `json:"retentionHours,omitempty"`
+}
+
+// ArchiveExtension is an extension of an archive and the version installed here.
+type ArchiveExtension struct {
+	Name      string  `json:"name"`
+	Version   string  `json:"version"`
+	Schema    string  `json:"schema"`
+	Installed *string `json:"installed"`
+}
+
+// ArchiveVersions are the versions and the locale of the source of an archive.
+type ArchiveVersions struct {
+	PostgresMajor  int                `json:"postgresMajor"`
+	KingresVersion string             `json:"kingresVersion"`
+	Extensions     []ArchiveExtension `json:"extensions"`
+	Encoding       string             `json:"encoding"`
+	LcCollate      string             `json:"lcCollate"`
+	LcCtype        string             `json:"lcCtype"`
+}
+
+// ArchiveTables counts the tables of an archive by kind.
+type ArchiveTables struct {
+	Local     int   `json:"local"`
+	Hash      int   `json:"hash"`
+	Reference int   `json:"reference"`
+	Ledger    int   `json:"ledger"`
+	Columnar  int   `json:"columnar"`
+	Rows      int64 `json:"rows"`
+	Bytes     int64 `json:"bytes"`
+}
+
+// RefusedStatement is a statement the shape grammar refused: its kind, where it is and a fingerprint, never its text.
+type RefusedStatement struct {
+	Kind        string `json:"kind"`
+	Position    string `json:"position"`
+	Fingerprint string `json:"fingerprint"`
+	Reason      string `json:"reason"`
+}
+
+// ArchiveStatements is what the shape grammar found in the SQL files of an archive.
+type ArchiveStatements struct {
+	ByKind  map[string]int     `json:"byKind"`
+	Refused []RefusedStatement `json:"refused"`
+}
+
+// ArchiveNeeds says what an import of the archive needs from the user.
+type ArchiveNeeds struct {
+	LedgerRestart    bool `json:"ledgerRestart"`
+	LargeObjectsLost bool `json:"largeObjectsLost"`
+}
+
+// ArchiveReport is the result of the validation of an archive.
+type ArchiveReport struct {
+	Valid      bool               `json:"valid"`
+	Format     string             `json:"format"`
+	SHA256     string             `json:"sha256,omitempty"`
+	Versions   ArchiveVersions    `json:"versions"`
+	Tables     ArchiveTables      `json:"tables"`
+	Statements *ArchiveStatements `json:"statements,omitempty"`
+	Needs      *ArchiveNeeds      `json:"needs,omitempty"`
+	Warnings   []string           `json:"warnings,omitempty"`
+	Reasons    []TableBlocker     `json:"reasons"`
+}
+
+// ImportDatabaseRequest is the body of importDatabase (contract 0.30.0). It is a closed schema: there is no privileges, no allowCode and no bucketCount.
+type ImportDatabaseRequest struct {
+	UploadID                 string `json:"uploadId"`
+	Database                 string `json:"database,omitempty"`
+	ExpectedSHA256           string `json:"expectedSha256,omitempty"`
+	AcknowledgeLedgerRestart bool   `json:"acknowledgeLedgerRestart,omitempty"`
+	OnForeignKeyViolation    string `json:"onForeignKeyViolation,omitempty"`
+	KeepOnFailure            bool   `json:"keepOnFailure,omitempty"`
 }

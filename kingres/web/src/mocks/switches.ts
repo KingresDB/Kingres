@@ -13,6 +13,11 @@
 //   ?workbench=busy               every workbench statement answers 429 workbench_busy with Retry-After.
 //   ?leader=lost                  this server has not heard the manager leader: 503 leader_unavailable for requests
 //                                 that need a session check.
+//   ?escrow=<a>,<b>,...           0.26.0 (the escrow of the CA key; combinable with a comma): on | refused (the recipient refused the send) | pending
+//                                 | standbys (two recipients, one pending) | dropping (off, one copy is still to be deleted)
+//                                 | unavailable (the leader holds no CA key: 503 certificate_authority_unavailable)
+//   ?preload=visible              the value of shared_preload_libraries is shown (PostgreSQL hides it), so the Extensions tab of Configuration
+//                                 can say which libraries are preloaded; without it the tab says that the API does not report it
 //   ?client=on | ?client=standby  the client entry point is on (and the standby entry point too): its metrics exist.
 //   ?ledger=all | ?ledger=absent  the ledger status covers every shard group / carries no coverage (older server).
 //   ?config=failed:<server>       0.8.0: the next configuration change fails on that server (a retry works).
@@ -56,7 +61,8 @@
 //                                 (a WORM target "archive-worm" exists, with the newest aggregate anchored in time, late or not)
 //   ?analytics=<a>,<b>,...        0.18.0 (phase 12; combinable with a comma): on (approximate aggregates are on in shop) | timeseries (in shop: the table
 //                                 clicks that can be converted, and metrics, partitioned by day, with a policy, its runs and columnar partitions)
-//                                 | ahead-low (the same, with one day ahead and the alert partitionsAheadLow) | sketch:missing|mismatch|hash
+//                                 | ahead-low (the same, with one day ahead and the alert partitionsAheadLow) | mixed (after timeseries: one partition of metrics is
+//                                 half converted, accessMethod mixed, contract 0.25.0) | sketch:missing|mismatch|hash
 //                                 | columnar:missing | timepart:missing | convert:fail | run:lock|name|fail | publication
 //                                 | old (the 11 new operations answer 422 unsupported_operation)
 //   ?transfer=<a>,<b>,...         0.19.0 (the data transfer; combinable with a comma):
@@ -70,9 +76,14 @@
 //                                 cut400       the next chunk is cut and answered 400 with Upload-Offset
 //                                 short        the next download ends early, without an error
 //                                 exports      three exports exist: ready, building and expired
+//                                 lobs         0.29.0: the database has large objects (export_database: 422 large_objects_present)
+//                                 unreadable   0.29.0: the role cannot read some tables (422 export_not_readable)
+//                                 dbfail       0.29.0: the next database export fails in its data step
+//                                 changed      0.29.0: the next database export fails with schema_changed
+//                                 superuser    0.30.0: the signed-in role is dangerous (importDatabase: 403 forbidden)
 //   ?clock=off:<server>:<ms>      the clock of that server is that many milliseconds ahead (negative: behind).
 //   ?clock=unreachable:<server>   the clock of that server cannot be read.
-import { seedPartitioned } from './tables'
+import { seedPartitioned, startDistribute } from './tables'
 import { applyAnalyticsSwitch } from './analytics'
 import type { MockState } from './state'
 import { applyTransferSwitch } from './transfer-switches'
@@ -101,9 +112,13 @@ import {
  * `busy` says that another operation holds the colocation groups; `blockme` makes the next change wait (paused) at its switch for a
  * transaction that holds the table, `diffme` makes it end with `verification_failed`, `pending` leaves it `pending`, and `undo:<ms>` or
  * `undo:fail` set how long the undo of a cancelled task takes to be reported and whether one server could not be reached; `fk:<table>` gives a table a foreign key to an ordinary table.
+ * 0.32.0: `related` makes `orders` and `customers` of `shop` ordinary tables, which a foreign key links (distribute with related tables), and
+ * `related:running` also starts that distribute, slowly, so that the tables show their operation.
  */
 function applyTablesSwitch(entry: string, s: MockState): void {
   if (entry === 'partitions') seedPartitioned(s)
+  if (entry === 'related' || entry === 'related:running')
+    seedRelated(s, entry === 'related:running')
   if (entry === 'fail:space') mockConfig.tableFail = 'space'
   if (entry === 'fail:copy') mockConfig.tableFail = 'copy'
   if (entry === 'slow') mockConfig.tableSlow = true
@@ -116,6 +131,28 @@ function applyTablesSwitch(entry: string, s: MockState): void {
   if (undo) mockConfig.tableUndoMs = Number(undo[1])
   const fk = /^fk:(.+)$/.exec(entry)
   if (fk) mockConfig.tableForeignKeys.push(fk[1] as string)
+}
+
+/** `orders` and `customers` of `shop` as two ordinary tables linked by a foreign key; with `running` their distribute with related tables is under way. */
+function seedRelated(s: MockState, running: boolean): void {
+  const rec = s.databases.find((d) => d.info.name === 'shop')
+  if (!rec) return
+  for (const name of ['orders', 'customers']) {
+    const t = rec.tables.find((x) => x.name === name)
+    if (!t) continue
+    t.classes = ['plain']
+    t.distribution = null
+    t.ledger = null
+    t.homeShardGroupId = 0
+  }
+  const orders = rec.tables.find((x) => x.name === 'orders')
+  if (!running || !orders) return
+  mockConfig.tableSlow = true
+  startDistribute(s, rec, orders, {
+    method: 'hash',
+    distributionColumn: 'customer_id',
+    relatedTables: [{ schema: 'public', table: 'customers', distributionColumn: 'customer_id' }],
+  })
 }
 
 function applyFailoverSwitch(entry: string, s: MockState): void {
@@ -251,6 +288,19 @@ export function applySwitches(params: URLSearchParams, s: MockState): void {
   else if (commit) mockConfig.commit = commit
   if (params.get('workbench') === 'busy') mockConfig.workbenchBusy = true
   if (params.get('leader') === 'lost') mockConfig.leaderLost = true
+  if (params.get('preload') === 'visible') mockConfig.preloadVisible = true
+  const escrow = (params.get('escrow') ?? '').split(',')
+  for (const e of escrow) {
+    if (e === 'on') mockConfig.caEscrow.enabled = true
+    if (e === 'refused' || e === 'pending' || e === 'standbys') {
+      mockConfig.caEscrow.enabled = true
+      mockConfig.caEscrow.scenario = e
+    }
+    if (e === 'dropping') mockConfig.caEscrow.scenario = 'dropping'
+    if (e === 'unavailable') mockConfig.caUnavailable = true
+  }
+  if (mockConfig.caEscrow.enabled && mockConfig.caEscrow.generation === 0)
+    mockConfig.caEscrow.generation = 1
   const client = params.get('client')
   if (client === 'on' || client === 'standby') mockConfig.clientEntryPoint = client
   const ledger = params.get('ledger')

@@ -284,6 +284,9 @@ func TestTransferWithoutAMajorityKeepsTheLease(t *testing.T) {
 	if !r.m.Holds(1) || r.m.Relinquished(1) {
 		t.Fatal("a failed transfer must leave the lease and the renewal as they were")
 	}
+	if markerExists(r.m.c.Dir, RelinquishedMarker, 1) {
+		t.Fatal("a failed transfer left the relinquished marker on disk")
+	}
 }
 
 // Relinquish stops renewing but keeps judging: the lease that was held still ends
@@ -437,5 +440,34 @@ func TestTheCandidateOfAHandOverIsRecordedAndGoesWithTheHold(t *testing.T) {
 	}
 	if got := r.m.Candidate(1); got != "" {
 		t.Fatalf("the record outlived the instance being a primary: %q", got)
+	}
+}
+
+// Phase 5 review L6: the marker of a transfer is on disk before the first request, as for a release, so a restart of kingresd between the answer
+// of a majority and the end of the call does not renew a group that was handed over.
+func TestTheMarkerOfATransferIsOnDiskBeforeTheGrantorsAreAsked(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t, []string{"a", "b", "c"}, false)
+	r.m.Renew(ctx)
+	_ = r.inst.StopImmediate(ctx)
+	r.voter.mu.Lock()
+	r.voter.gate = make(chan struct{})
+	gate := r.voter.gate
+	r.voter.mu.Unlock()
+	done := make(chan error, 1)
+	go func() { _, err := r.m.Transfer(ctx, 1, "b"); done <- err }()
+	deadline := time.Now().Add(5 * time.Second)
+	for !markerExists(r.m.c.Dir, RelinquishedMarker, 1) {
+		if time.Now().After(deadline) {
+			t.Fatal("the marker was not written while the grantors were being asked")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if r.m.Relinquished(1) {
+		t.Fatal("the group counts as handed over before a majority answered")
+	}
+	close(gate)
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }

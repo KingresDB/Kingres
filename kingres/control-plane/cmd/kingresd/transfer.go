@@ -10,6 +10,7 @@ import (
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/audit"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/auth"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/config"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/monitor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
@@ -20,6 +21,7 @@ import (
 // the check of the role between two steps. The staging directory is opened at the first use, so a directory that is not acceptable does not
 // keep kingresd from starting; it refuses the transfers, with a message in the log.
 func transferConfig(cfg config.Config, authn auth.Authenticator, write func(context.Context, audit.Event)) *ops.TransferConfig {
+	bin, _, _ := cluster.ResolveBinDir(cfg.PGBinDir)
 	abs := func(p string) string {
 		if a, err := filepath.Abs(p); err == nil {
 			return a
@@ -30,7 +32,7 @@ func transferConfig(cfg config.Config, authn auth.Authenticator, write func(cont
 		Dir: abs(cfg.TransferDir), KeyFile: abs(cfg.TransferKeyFile),
 		// The staging directory may not be or hold the data directory of kingresd (the instances, the keys, the audit log live there).
 		Forbidden:   []string{abs(cfg.DataDir), abs(filepath.Join(cfg.DataDir, "instances"))},
-		MaxDuration: cfg.TransferMaxDuration, MaxAtomicBytes: cfg.MaxAtomicBytes,
+		MaxDuration: cfg.TransferMaxDuration, MaxAtomicBytes: cfg.MaxAtomicBytes, MaxImportBytes: cfg.MaxImportBytes, PGBinDir: bin, KingresVersion: version,
 		CurrentRoles: func(ctx context.Context, role string) ([]string, error) { return authn.CurrentRoles(ctx, role) },
 		Audit: func(ctx context.Context, action string, details map[string]any) {
 			write(ctx, audit.Event{Actor: "system", Source: "system", Action: action, ResourceType: "transfer", Outcome: audit.OutcomeSuccess, Details: details})

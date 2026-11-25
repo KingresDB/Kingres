@@ -9,6 +9,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/auth"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
@@ -67,6 +68,7 @@ func (s *Server) failoverServer(c *call, w http.ResponseWriter, r *http.Request)
 	if err := s.body(w, r, &req); err != nil {
 		return err
 	}
+	req.ActorIsAdmin = auth.Allows(c.session.ClusterRoles, auth.RoleAdmin)
 	t, plan, err := fo.Start(r.Context(), c.session.Username, server, req)
 	if err != nil {
 		return s.failoverProblem(r, err)
@@ -167,7 +169,8 @@ type MapFailoverer interface {
 	TaskZero() (task.Task, bool)
 	Status() (failover.Status, bool)
 	// Abandon gives up the bootstrap of the map group that is in progress on this server or on a standby's server (F4-06): false when none is.
-	Abandon(ctx context.Context, actor, reason string) (failover.MapAbandonResult, error)
+	// id is the identity of the operator's session: a declaration that a server is lost travels to the old leader with its proof.
+	Abandon(ctx context.Context, actor string, id internalapi.ForwardIdentity, reason, lostServer string) (failover.MapAbandonResult, error)
 }
 
 // mapFailoverIntercept answers the operations of the bootstrap of the map group on this server. It returns true when it answered.
@@ -218,7 +221,8 @@ func (s *Server) mapFailoverIntercept(c *call, w http.ResponseWriter, r *http.Re
 // abandonMapGroupBootstrap gives up a stuck bootstrap of the map group (0.18.0). Any server answers it: the leader may be the server that is gone.
 func (s *Server) abandonMapGroupBootstrap(c *call, w http.ResponseWriter, r *http.Request) error {
 	var req struct {
-		Reason string `json:"reason"`
+		Reason       string `json:"reason"`
+		LostServerID string `json:"lostServerId"`
 	}
 	if err := s.bodyClosed(w, r, &req); err != nil {
 		return err
@@ -231,11 +235,11 @@ func (s *Server) abandonMapGroupBootstrap(c *call, w http.ResponseWriter, r *htt
 	if mf == nil {
 		return problem.New(problem.UnsupportedOp, "This server cannot give up a bootstrap of the map group (no managed instance or no internal API).")
 	}
-	res, err := mf.Abandon(r.Context(), c.session.Username, reason)
+	res, err := mf.Abandon(r.Context(), c.session.Username, identityOf(c.session), reason, strings.TrimSpace(req.LostServerID))
 	if err != nil {
 		return s.failoverProblem(r, err)
 	}
-	c.addDetails(map[string]any{"reason": reason, "abandoned": res.Abandoned, "resumedServerId": res.ResumedServer})
+	c.addDetails(map[string]any{"reason": reason, "lostServerId": strings.TrimSpace(req.LostServerID), "abandoned": res.Abandoned, "resumedServerId": res.ResumedServer})
 	s.writeJSON(w, r, http.StatusOK, res)
 	return nil
 }

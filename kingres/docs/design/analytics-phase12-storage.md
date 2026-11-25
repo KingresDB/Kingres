@@ -1982,6 +1982,36 @@ leaf. The target must have `kingres_columnar` installed, which the move checks i
 A moved columnar leaf is filled by the table-sync `COPY` (bulk, full stripes) and then
 by decoded inserts (C7). Before C7 the move is refused (9.3, 9.7).
 
+### 11.7 What was built (increments St-D1a and St-D1b, 2026-11-23)
+
+`kingres_timepart` 0.3 and `kingres_shard` 0.9 implement 11.2 and 11.4; the control plane needed two reads and a mapping (the partition column and the health of a
+policy, the leaf budget as a conflict, the storage of the partitions in the listing). How the requirements and the open points came out:
+
+- **R4 (DDL on a leaf from another extension).** `kingres.convert_leaf` runs on the node as a superuser and sets `kingres_shard.enable_routing = off` for the transaction of the
+  swap, which the hook and the drop guard already honour (the setting is `SUSET`). No new authorization was added to `kingres_shard`.
+- **R5 (exclusion from moves).** The claim is a record of kind `convert_leaf` in `kingres.table_operation` (phase `done`, so that no table-operation machinery resumes it) and a
+  row of `kingres.table_operation_lock`, which a bucket move, the online table operations, the partition functions and `kingres.internal_assert_no_move` (every DDL statement on a
+  table of the group) already read. It is taken by `begin_leaf_conversion` through a session of its own (committed at once), renewed after each leaf, released at the end and in the
+  error path, and taken over after six hours without renewal. The check inside the swap transaction of 11.4 step 4 is not made: the claim is held for the whole conversion,
+  which the move's own check against the claim covers in both directions (a move that is running refuses the claim, a claim refuses a move).
+- **R6 (a statement on the node that holds the leaf).** The run does it from the map group primary with `kingres.internal_node_exec`, one `CALL kingres.convert_leaf(...)` per leaf
+  (the procedure commits, in a session of its own), so the control plane needs no per-node step: the action of a run converts the leaves of one logical partition.
+- **Retry (11.2).** `object_in_use` from the partition functions is retried inside the action with the settings of the extension (`lock_retries`, a wait that doubles from
+  `retry_sleep_min_ms`..`retry_sleep_max_ms`, at most a minute) and not with the 5 s to `partition_retry_window` of the first sketch; the action is `failed` with `retry_later`
+  (not `skipped`), so that the existing rule of `timepart__finish_run` makes the run `partial` and `next_run_at` five minutes ahead. A conversion is tried once per run.
+- **Leaf budget.** `timepart_set_policy` computes the steady state itself (`timepart__dist_budget`) instead of asking `table_change_report`, and `create_partition` and
+  `attach_partition` enforce `kingres_shard.max_partition_leaves` (8192, not the 20 000 of the first sketch): before 9.5 only the distribution of the table checked it.
+- **The listing** of the partitions of a distributed table has the bounds and `accessMethod` `heap`, `columnar` or `mixed` (the value `mixed` is new; the counts are in
+  `kingres.timepart_dist_partitions`).
+- **A claim that is left behind** is reported by `check_cluster()` (`leaf_conversion_stale`: its session is gone, or it was not renewed for six hours) and released by
+  `cancel_table_operation` or `end_leaf_conversion`; the driver gives its backend pid when it takes the claim, and ends the `CALL` that it left on a node before it releases the
+  claim after an error. The claim is taken before the leaves are read and the nodes are checked, so that those are true until it is released. The limit of a leaf
+  (`dist_leaf_timeout_ms`) is below the lease. The history of a distributed action has no sizes. The control plane brings `kingres_timepart` to the packaged version on every
+  server (a job of the leader, `extension.update`, ten intervals of the partition scheduler), so that no operator step is needed.
+- **Not built:** the conversion of a leaf of a table with a foreign key or a trigger of its own is refused as for any table (the action is `skipped`); the leaf budget is
+  not part of `table_change_report` for a policy (the policy and the partition functions check it); a copy of the claim on the other nodes is not needed (DDL and the partition functions
+  reach them only through the map group primary).
+
 ## 12. Security
 
 - **Who may change storage and policies.** In SQL: `kingres.columnar_set_options`,

@@ -68,6 +68,8 @@ type Agent struct {
 	SlotLimit int64
 	// PortBase is the first port tried for a standby instance (0: pg-port plus 1000).
 	PortBase int
+	// PortEnd is the last port tried for a standby instance (0: 499 ports from the first).
+	PortEnd int
 	// Tick is the period of the supervision loop (default 3 s).
 	Tick time.Duration
 
@@ -142,9 +144,19 @@ func (a *Agent) List(context.Context) ([]ha.Standby, error) {
 	return out, nil
 }
 
-// HasStandby implements ha.Standbys from the local copy of the list.
+// HasStandby implements ha.Standbys from the local copy of the list. It is true when a standby exists that a failover
+// may use: an entry that is Ready, or one that was ready once and is being rebuilt (generation above 0: the old primary
+// of a failover, or a standby in a rebuild, keep the fence of the group). A standby that is still being created is not
+// counted: nothing can be promoted to it, so a lost lease would stop the only copy for no gain. The leader makes a
+// record ready only after this server took a list with the entry Ready (Leader.markReady), so the fence is armed
+// before a failover can choose the standby.
 func (a *Agent) HasStandby(group int32) bool {
-	return len(a.local.snapshot().entriesOfGroup(group)) > 0
+	for _, e := range a.local.snapshot().entriesOfGroup(group) {
+		if e.Ready || e.Generation > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Agent) mgr() *instance.Manager { return a.Svc.Manager() }
@@ -276,15 +288,28 @@ func (a *Agent) freePort() (int, error) {
 	if base == 0 {
 		base = a.Svc.PGPort() + 1000
 	}
-	for p := base; p < base+500 && p < 65535; p++ {
-		if used[p] {
+	return pickPort(base, a.PortEnd, used, tcpFree)
+}
+
+// tcpFree says whether the port can be bound on every address now.
+func tcpFree(p int) bool {
+	l, err := net.Listen("tcp", ":"+strconv.Itoa(p))
+	if err != nil {
+		return false
+	}
+	_ = l.Close()
+	return true
+}
+
+// pickPort returns the first port from base to end (0: 499 ports from base) that is not in used and that free accepts.
+func pickPort(base, end int, used map[int]bool, free func(int) bool) (int, error) {
+	if end == 0 {
+		end = base + 499
+	}
+	for p := base; p <= end && p < 65535; p++ {
+		if used[p] || !free(p) {
 			continue
 		}
-		l, err := net.Listen("tcp", ":"+strconv.Itoa(p))
-		if err != nil {
-			continue
-		}
-		_ = l.Close()
 		return p, nil
 	}
 	return 0, errors.New("standby: no free port for the standby instance")

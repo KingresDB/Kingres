@@ -18,6 +18,7 @@ const (
 	StateCatalogBusy     = "KS008"
 	StateCannotCommit    = "KS009"
 	StateWrongNode       = "KS010"
+	StateNotMapPrimary   = "KS022"
 	StateInRecovery      = "KS011"
 	StateNotSafe         = "KS012"
 	StateInDoubt         = "KS013"
@@ -253,10 +254,12 @@ func classifyPromoteError(err error, o PromoteOptions) (action, error) {
 			"): this is not a retry; rebuild that standby from a node that has the current secret, or promote another standby of the group, then repeat the request"}
 	case se.Code == StateNotSafe:
 		return action{actAsk, "KS012"}, &PauseError{Reason: "promoting is not safe: " + se.Text + ". This is a decision of the operator; nothing was changed"}
+	case se.Code == StateNotMapPrimary,
+		// A library of the extension 0.8 (released) answers this refusal with KS010 and the text; the text is read only under KS010 and
+		// goes when 0.8 is no longer a supported version.
+		se.Code == StateWrongNode && strings.Contains(se.Text, "only run on the map group primary"):
+		return action{actFail, "wrong node"}, fail(CodeNotMapPrimary, true, "the connection of the leader is not to the map group primary: %s", se.Text)
 	case se.Code == StateWrongNode:
-		if strings.Contains(se.Text, "only run on the map group primary") {
-			return action{actFail, "wrong node"}, fail(CodeNotMapPrimary, true, "the connection of the leader is not to the map group primary: %s", se.Text)
-		}
 		return action{actWait, "the map group promotion is not finished"}, nil
 	case se.Code == StateNoSuchNode:
 		return action{actFail, "no such node"}, fail(CodeBadPromoteTarget, false, "the catalog has no node %d: %s", o.NewNode, se.Text)

@@ -139,6 +139,7 @@ func serveInternal(ctx context.Context, d internalDeps) {
 		Self:       me,
 		Gather:     d.gather,
 		Revoked:    d.svc.RevokedSerials,
+		CRLNumber:  func() int64 { return pki.HeldCRLNumber(d.svc.PKIDir()) },
 		Handle:     handleCall(d),
 		Bootstrap:  d.receiver.Bootstrap,
 		Joining:    d.svc.Joining,
@@ -303,6 +304,10 @@ func leaderOf(d internalDeps) func() string {
 		if d.ops != nil && d.ops.LocalInstanceDown() {
 			return d.lastLeader.get()
 		}
+		if d.fault.FailoverInjection("leader:forget") == "forget" {
+			// A test: the server has forgotten the leader it last verified, as it does once remembered (60 s) has passed since its instance stopped.
+			return ""
+		}
 		return d.lastLeader.recent()
 	}
 }
@@ -461,54 +466,5 @@ func internalCertificate(dir string, names func() pki.Names, state func() setup.
 		}
 		onBootstrap(fp)
 		return &pair, nil
-	}
-}
-
-// peerLeaderOf asks the other servers of the peer directory who the manager leader is (GET /leader, which any peer may
-// ask), for the calls of policy LeaderOrHeldBack on a server that cannot read its own catalog: the old primary of a
-// failover is rebuilt while its instance is stopped. The answer counts only when every server that answered names the
-// same leader; it is kept for three seconds.
-func peerLeaderOf(d internalDeps) func(ctx context.Context) string {
-	var mu sync.Mutex
-	var cached string
-	var at time.Time
-	return func(ctx context.Context) string {
-		mu.Lock()
-		if cached != "" && time.Since(at) < 3*time.Second {
-			c := cached
-			mu.Unlock()
-			return c
-		}
-		mu.Unlock()
-		if d.members == nil || d.members.Peers == nil || d.members.Client == nil {
-			return ""
-		}
-		var named []string
-		for _, p := range d.members.Peers.All() {
-			if p.ServerID == d.serverHost {
-				continue
-			}
-			cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			var out struct {
-				Leader string `json:"leader"`
-			}
-			err := d.members.Client.Do(cctx, p.ServerID, http.MethodGet, "/leader", nil, &out)
-			cancel()
-			if err == nil && out.Leader != "" {
-				named = append(named, out.Leader)
-			}
-		}
-		if len(named) == 0 {
-			return ""
-		}
-		for _, n := range named {
-			if n != named[0] {
-				return ""
-			}
-		}
-		mu.Lock()
-		cached, at = named[0], time.Now()
-		mu.Unlock()
-		return named[0]
 	}
 }

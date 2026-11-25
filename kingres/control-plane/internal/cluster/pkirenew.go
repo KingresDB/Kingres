@@ -88,11 +88,16 @@ func (s *Service) InstallRenewed(ctx context.Context, caPEM, certPEM, crlPEM str
 		if err := checkCRL([]byte(crlPEM), ca); err != nil {
 			return err
 		}
-		if err := pki.WriteFile(filepath.Join(dir, pki.CRLFile), []byte(crlPEM), 0o644); err != nil { //nolint:gosec // a revocation list is public
-			return err
-		}
-		if err := pki.SaveRevokedList(dir, revoked); err != nil {
-			return err
+		// A list that goes back on the one held is not written (the certificate is still installed); the leader sends the current one.
+		held, _ := os.ReadFile(filepath.Join(dir, pki.CRLFile)) //nolint:gosec // fixed name below the pki directory
+		if pki.CheckNotStale(held, []byte(crlPEM)) == nil {
+			if err := pki.WriteFile(filepath.Join(dir, pki.CRLFile), []byte(crlPEM), 0o644); err != nil { //nolint:gosec // a revocation list is public
+				return err
+			}
+			heldList, _ := pki.LoadRevokedList(dir)
+			if err := pki.SaveRevokedList(dir, pki.UnionSerials(revoked, heldList)); err != nil {
+				return err
+			}
 		}
 	}
 	if err := pki.WriteFile(filepath.Join(dir, pki.ServerCertFile), []byte(certPEM), 0o644); err != nil { //nolint:gosec // a certificate is public

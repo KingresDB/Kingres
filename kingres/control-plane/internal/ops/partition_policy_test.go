@@ -96,6 +96,11 @@ func TestPolicySQLErrorNamesTheFirstArgument(t *testing.T) {
 	if !errors.As(err, &p) || p.Code != problem.PartitionPolicyConflict || !strings.Contains(p.Detail, "default partition") {
 		t.Errorf("0A000: %v", err)
 	}
+	// a distributed table whose policy would need more leaves than kingres_shard.max_partition_leaves allows is a conflict with the table, with the numbers
+	err = policySQLError(&pgconn.PgError{Code: "54000", Message: "the policy needs about 54 leaves in a steady state (6 buckets, 9 partitions); kingres_shard.max_partition_leaves is 18"})
+	if !errors.As(err, &p) || p.Code != problem.PartitionPolicyConflict || !strings.Contains(p.Detail, "54 leaves") || !strings.Contains(p.Detail, "max_partition_leaves is 18") {
+		t.Errorf("54000: %v", err)
+	}
 	err = policySQLError(&pgconn.PgError{Code: "42704", Message: "table public.ev has no time partitioning policy"})
 	if !errors.As(err, &p) || p.Code != problem.NotFound {
 		t.Errorf("42704: %v", err)
@@ -114,5 +119,29 @@ func TestStorageSQLErrorGivesARefusalItsCode(t *testing.T) {
 	}
 	if e := storageSQLError(&pgconn.PgError{Code: "57014", Message: "canceled"}); errors.As(e, &ee) {
 		t.Error("a cancel is not a refusal")
+	}
+}
+
+// The bound of a partition of a distributed table is the text that was given to create_partition; a range of two quoted values gives its limits, any other
+// bound (a list, a value that is not quoted, MINVALUE) none.
+func TestDistBoundRE(t *testing.T) {
+	for bound, want := range map[string][2]string{
+		"FROM ('2026-03-01') TO ('2026-03-02')":                                       {"2026-03-01", "2026-03-02"},
+		"from ( '2026-03-01T00:00:00.000000Z' ) to ( '2026-03-02T00:00:00.000000Z' )": {"2026-03-01T00:00:00.000000Z", "2026-03-02T00:00:00.000000Z"},
+		" FROM ('a') TO ('b') ":                                                       {"a", "b"},
+		"IN ('a', 'b')":                                                               {},
+		"FROM (MINVALUE) TO ('2026-03-02')":                                           {},
+		"DEFAULT":                                                                     {},
+	} {
+		m := distBoundRE.FindStringSubmatch(bound)
+		if want[0] == "" {
+			if m != nil {
+				t.Errorf("%q: matched %v", bound, m)
+			}
+			continue
+		}
+		if m == nil || m[1] != want[0] || m[2] != want[1] {
+			t.Errorf("%q: %v, want %v", bound, m, want)
+		}
 	}
 }

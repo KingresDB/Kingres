@@ -189,7 +189,7 @@ func TestMajorOfVersionNum(t *testing.T) {
 // as out of date (EnsureConfig rewrites it): without the library columnar writes and every
 // kingres_timepart conversion are refused.
 func TestPreloadListNamesColumnar(t *testing.T) {
-	if PreloadLibraries != "kingres_shard,kingres_ledger,kingres_columnar" {
+	if PreloadLibraries != "kingres_shard,kingres_ledger,kingres_columnar,pg_stat_statements" {
 		t.Fatalf("PreloadLibraries = %q", PreloadLibraries)
 	}
 	got, err := RenderManaged(ManagedSettings{Port: 5432})
@@ -262,8 +262,14 @@ func TestEnsureConfigBringsThePreloadUpToDate(t *testing.T) {
 	}
 }
 
-// fakeInstallation is a PostgreSQL binary directory with a pg_config that names a library directory; the library of kingres_columnar is in it or not.
-func fakeInstallation(t *testing.T, withColumnar bool) (bin string) {
+// fakeInstallation is a PostgreSQL binary directory with a pg_config that names a library directory; the libraries of kingres_columnar and pg_stat_statements are in it or not (both or neither).
+func fakeInstallation(t *testing.T, withOptional bool) (bin string) {
+	t.Helper()
+	return fakeInstallationLibs(t, withOptional, withOptional)
+}
+
+// fakeInstallationLibs is fakeInstallation with each optional library chosen.
+func fakeInstallationLibs(t *testing.T, withColumnar, withStatements bool) (bin string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("the fake pg_config is a shell script")
@@ -283,6 +289,11 @@ func fakeInstallation(t *testing.T, withColumnar bool) (bin string) {
 	}
 	if withColumnar {
 		if err := os.WriteFile(filepath.Join(lib, "kingres_columnar.so"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if withStatements {
+		if err := os.WriteFile(filepath.Join(lib, "pg_stat_statements.so"), []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -355,17 +366,18 @@ func TestPreloadLeavesOutALibraryThatTheInstallationLacks(t *testing.T) {
 	// An instance whose file names the library has had it: it may have columnar tables, and a package upgrade that removes the old library file for a moment
 	// must not take the library out of its list (the next restart would start without the resource manager and the tables could not be read). The list stays,
 	// the marker is written, and every later write keeps it.
-	m2, path2 := managedInstance(t, bin, PreloadLibraries)
+	const columnarOnly = "kingres_shard,kingres_ledger,kingres_columnar" // pg_stat_statements is not in the installation either, and is not kept
+	m2, path2 := managedInstance(t, bin, columnarOnly)
 	if changed, err := m2.EnsureConfig(1); err != nil || changed {
 		t.Fatalf("EnsureConfig on a list that names a library that is missing now: %v %v", changed, err)
 	}
 	if err := m2.WriteManaged(1, ManagedSettings{Port: 5432}); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := os.ReadFile(path2); preloadOf(string(got)) != PreloadLibraries {
+	if got, _ := os.ReadFile(path2); preloadOf(string(got)) != columnarOnly {
 		t.Errorf("a later write took the library out: %q", preloadOf(string(got)))
 	}
-	if m2.preloadListFor(1) != PreloadLibraries || m2.preloadListFor(2) != "kingres_shard,kingres_ledger" {
+	if m2.preloadListFor(1) != columnarOnly || m2.preloadListFor(2) != "kingres_shard,kingres_ledger" {
 		t.Errorf("an instance that had the library keeps it (%q), a new one does not (%q)", m2.preloadListFor(1), m2.preloadListFor(2))
 	}
 	// the saved settings do not keep the list the manager chose
@@ -415,4 +427,79 @@ func TestEnsureConfigReloadsARunningInstanceOnlyWhenTheListChanged(t *testing.T)
 	if changed, err := m2.EnsureConfig(1); err != nil || changed || reloads() != 1 {
 		t.Errorf("a list that did not change: %v %v, %d reloads", changed, err, reloads())
 	}
+}
+
+// pg_stat_statements is in the preload list of every instance, after kingres_columnar.
+func TestPreloadListNamesStatStatements(t *testing.T) {
+	if !libraryIn(PreloadLibraries, "pg_stat_statements") || !strings.HasPrefix(PreloadLibraries, "kingres_shard,") {
+		t.Fatalf("PreloadLibraries = %q", PreloadLibraries)
+	}
+	bin := fakeInstallation(t, true)
+	m, _ := managedInstance(t, bin, PreloadLibraries)
+	if got := m.preloadListFor(1); got != PreloadLibraries {
+		t.Errorf("a full installation: %q", got)
+	}
+}
+
+// An instance made before pg_stat_statements was preloaded has the list with kingres_columnar only (and its marker). EnsureConfig adds the new library,
+// keeps the other settings, reloads a running instance so that PostgreSQL shows the setting as pending a restart, and does not touch a list that is current.
+func TestEnsureConfigUpgradesAnExistingInstanceToStatStatements(t *testing.T) {
+	bin := fakeInstallation(t, true)
+	dir := filepath.Dir(bin)
+	m, path := managedInstance(t, bin, "kingres_shard,kingres_ledger,kingres_columnar")
+	if err := os.WriteFile(filepath.Join(dir, "running"), []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := m.EnsureConfig(1)
+	if err != nil || !changed {
+		t.Fatalf("EnsureConfig = %v, %v", changed, err)
+	}
+	got, _ := os.ReadFile(path)
+	if preloadOf(string(got)) != PreloadLibraries || !strings.Contains(string(got), "work_mem = '8MB'") {
+		t.Errorf("the file after EnsureConfig:\n%s", got)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "pg_ctl.log")); strings.Count(string(b), "reload") != 1 {
+		t.Errorf("a running instance was not reloaded once: %q", b)
+	}
+	if changed, err := m.EnsureConfig(1); err != nil || changed {
+		t.Errorf("a current file was rewritten: %v %v", changed, err)
+	}
+}
+
+// An installation that has kingres_columnar but not pg_stat_statements (a package that was not upgraded) gives a list without pg_stat_statements, an
+// instance that already has the columnar list is left as it is, and the library is not sticky: an instance whose list names it while the file is missing
+// loses it from the list, so that the next restart cannot fail on it. When the file is back, the next EnsureConfig adds it again.
+func TestStatStatementsIsLeftOutWhenTheInstallationLacksIt(t *testing.T) {
+	bin := fakeInstallationLibs(t, true, false)
+	const columnarOnly = "kingres_shard,kingres_ledger,kingres_columnar"
+	m, path := managedInstance(t, bin, columnarOnly)
+	if got := m.preloadListFor(1); got != columnarOnly {
+		t.Fatalf("preloadListFor = %q", got)
+	}
+	if changed, err := m.EnsureConfig(1); err != nil || changed {
+		t.Fatalf("EnsureConfig on a list that is right for the installation: %v %v", changed, err)
+	}
+	m2, path2 := managedInstance(t, bin, PreloadLibraries)
+	if changed, err := m2.EnsureConfig(1); err != nil || !changed {
+		t.Fatalf("EnsureConfig on a list that names a missing library: %v %v", changed, err)
+	}
+	if got, _ := os.ReadFile(path2); preloadOf(string(got)) != columnarOnly {
+		t.Errorf("the list is %q", preloadOf(string(got)))
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(filepath.Dir(path2)), "pg_stat_statements")); err == nil {
+		t.Error("pg_stat_statements left a marker")
+	}
+	// the package is repaired
+	lib, _ := os.ReadFile(filepath.Join(bin, "pg_config"))
+	libDir := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(lib)), "#!/bin/sh\necho "))
+	if err := os.WriteFile(filepath.Join(libDir, "pg_stat_statements.so"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := m2.EnsureConfig(1); err != nil || !changed {
+		t.Fatalf("EnsureConfig after the library came back: %v %v", changed, err)
+	}
+	if got, _ := os.ReadFile(path2); preloadOf(string(got)) != PreloadLibraries {
+		t.Errorf("the list is %q", preloadOf(string(got)))
+	}
+	_ = path
 }

@@ -74,6 +74,12 @@ fails($n1, q{SELECT kingres.move_schema('ls', 2)}, qr/schema_pinned: schema "ls"
 is(q1($n1, q{SELECT group_id || ':' || state FROM kingres.schemas WHERE schema_name = 'ls'}), '1:active', '... the schema is where it was');
 is(q1($n1, q{SELECT count(*) FROM kingres.bucket_move}), 0, '... and no move was recorded');
 fails($n1, q{SELECT kingres.undistribute_schema('ls')}, qr/schema_pinned: schema "ls" holds the ledger table\(s\) t/, 'undistribute_schema of a schema with a ledger table');
+# the pin has its own SQLSTATE (KS020), which the control plane matches instead of the text; the move and the undistribute carry it
+foreach my $call (q{SELECT kingres.undistribute_schema('ls')}, q{SELECT kingres.move_schema('ls', 2)})
+{
+	my ($rc, $out, $err) = run_sql($n1, "\\set VERBOSITY verbose\n" . $call);
+	like($err, qr/\bKS020\b/, "... SQLSTATE KS020: $call");
+}
 {
 	my ($rc, $out, $err) = run_sql($n1, q{SELECT kingres.undistribute_schema('ls')});
 	like($err, qr/Only the per-shard ledger of a later phase/, '... the hint says what would make it possible') or diag($err);

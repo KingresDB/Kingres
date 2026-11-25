@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
 )
 
 // PeerInfo is another server as the members know it. The server id is also
@@ -178,6 +179,9 @@ type DatabaseSpec struct {
 	ConnectionLimit int      `json:"connectionLimit"`
 	Settings        []string `json:"settings"` // name=value pairs of database-wide settings
 	Extensions      []string `json:"extensions"`
+	// ExtensionPlaces says in which schema, and owned by which role, each extension of Extensions is installed on the sender, so that the receiver
+	// installs it in the same place (a service session has search_path = pg_catalog, so an extension without a schema of its own cannot be made without one).
+	ExtensionPlaces map[string]ExtensionPlace `json:"extensionPlaces,omitempty"`
 	// Sharded says the database uses kingres_shard; the extension is then
 	// installed by kingres.add_node, not here.
 	Sharded bool `json:"sharded"`
@@ -191,4 +195,37 @@ type Globals struct {
 	// are not in it (other than its own service role) are left alone anyway;
 	// reserved for later use, always false now.
 	Exact bool `json:"exact,omitempty"`
+}
+
+// ExtensionPlace is the schema an extension is installed in, and the owner of that schema.
+type ExtensionPlace struct {
+	Schema string `json:"schema"`
+	Owner  string `json:"owner"`
+}
+
+// EscrowOfferRequest asks a server for the public key of its escrow key (POST /pki/escrow/offer); Rotate makes a new one.
+type EscrowOfferRequest struct {
+	Rotate bool `json:"rotate"`
+	// Epoch is the epoch of the leader that asks (a rotation from a leader older than the copy held is refused).
+	Epoch int64 `json:"epoch"`
+}
+
+// EscrowDropRequest asks a server to delete its copy and escrow keys (POST /pki/escrow/drop); a leader older than the copy held is refused.
+type EscrowDropRequest struct {
+	Epoch int64 `json:"epoch"`
+}
+
+// EscrowOfferResponse is a server's escrow public key (X25519, base64) and its identifier.
+type EscrowOfferResponse struct {
+	KeyID     string `json:"keyId"`
+	PublicKey string `json:"publicKey"`
+	// HeldEpoch and HeldGeneration are the position of the copy the server holds (0 when none): a leader that finds a higher epoch
+	// than its own takes one above it.
+	HeldEpoch      int64 `json:"heldEpoch,omitempty"`
+	HeldGeneration int64 `json:"heldGeneration,omitempty"`
+}
+
+// EscrowStoreRequest hands a server its sealed copy of the CA key (POST /pki/escrow/store).
+type EscrowStoreRequest struct {
+	Blob pki.EscrowBlob `json:"blob"`
 }

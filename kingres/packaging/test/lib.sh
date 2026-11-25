@@ -101,6 +101,28 @@ check_extension_files() {
         kingres_columnar--0.1--0.2 kingres_columnar--0.1 kingres_ledger--0.2--0.3; do
         check "${p}: ${e}.sql is installed" "$@" test -f "${share}/${e}.sql"
     done
+    check_postgres_modules "${p}" "$@"
+}
+
+# The modules of PostgreSQL that the product relies on, besides its own
+# extensions: pg_stat_statements (its library is preloaded by every instance and
+# every database that kingresd makes carries the extension) and plpgsql (in
+# template1 of every cluster; kingres_timepart and user functions are written in
+# it).  Both must be in every package and image, for both majors; build.sh stops
+# when one is not in the staged tree, and test-modules.sh checks a package file.
+POSTGRES_MODULES="pg_stat_statements plpgsql"
+
+# check_postgres_modules PREFIX COMMAND...: control file, install script and
+# library of each module are in the tree under /opt/kingres that COMMAND... looks into.
+check_postgres_modules() {
+    local p="$1" m
+    shift
+    local share=/opt/kingres/share/postgresql/extension lib=/opt/kingres/lib/postgresql
+    for m in ${POSTGRES_MODULES}; do
+        check "${p}: ${m} control file" "$@" test -f "${share}/${m}.control"
+        check "${p}: ${m} install script" "$@" sh -c "ls ${share}/${m}--*.sql"
+        check "${p}: ${m} library" "$@" test -f "${lib}/${m}.so"
+    done
 }
 
 # check_smoke_output PREFIX MAJOR OUTPUT: what test/pg-smoke.sh printed for the

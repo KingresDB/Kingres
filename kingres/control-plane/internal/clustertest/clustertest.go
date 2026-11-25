@@ -53,9 +53,11 @@ type Node struct {
 	// IntPort is the internal API port (APIPort+1).
 	IntPort int
 	PGPort  int
-	Dir     string
-	DataDir string
-	LogFile string
+	// StandbyBase and StandbyEnd are the ports this node may use for its standby instances (0: kingresd's default).
+	StandbyBase, StandbyEnd int
+	Dir                     string
+	DataDir                 string
+	LogFile                 string
 	// Extra are further command-line flags of kingresd (a test that needs a
 	// setting, for example a short certificate lifetime); they apply from the next Start.
 	Extra []string
@@ -113,6 +115,11 @@ func New(t testing.TB, n int) *Cluster {
 			Dir: dir, DataDir: filepath.Join(dir, "data"), LogFile: filepath.Join(dir, "kingresd.log"),
 			client: &http.Client{Timeout: 3 * time.Minute, Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}} //nolint:gosec // the node under test, on loopback
 		nd.IntPort = nd.APIPort + 1
+		var rangeOK bool
+		nd.StandbyBase, nd.StandbyEnd, rangeOK = pgtest.StandbyPortRange(i, n)
+		if !rangeOK && (os.Getenv("KINGRES_TEST_STANDBY_PORT_BASE") != "" || os.Getenv("KINGRES_TEST_STANDBY_PORT_END") != "") {
+			t.Logf("WARNING: node %d: the standby port range %s-%s of this run cannot be split into %d parts; kingresd's default (pg-port plus 1000) is used and can collide with another run", i, os.Getenv("KINGRES_TEST_STANDBY_PORT_BASE"), os.Getenv("KINGRES_TEST_STANDBY_PORT_END"), n)
+		}
 		if err := os.MkdirAll(dir, 0o700); err != nil { //nolint:gosec // a directory of the test root
 			t.Fatal(err)
 		}
@@ -149,6 +156,10 @@ func (n *Node) args() []string {
 	args := []string{"-listen", n.Host + ":" + strconv.Itoa(n.APIPort), "-internal-listen", n.Host + ":" + strconv.Itoa(n.IntPort),
 		"-data-dir", n.DataDir, "-socket-dir", filepath.Join(n.Dir, "s"), "-log-format", "json", "-login-rate-limit", "1000",
 		"-pg-bin-dir", pgtest.BinDir(), "-pg-port", strconv.Itoa(n.PGPort), "-pg-listen", "127.0.0.1," + n.Host, "-server-host", n.Host, "-fault-dir", n.FaultDir()}
+	if n.StandbyBase > 0 {
+		// Before n.Extra, so that a test can still choose its own.
+		args = append(args, "-standby-port-base", strconv.Itoa(n.StandbyBase), "-standby-port-end", strconv.Itoa(n.StandbyEnd))
+	}
 	return append(args, n.Extra...)
 }
 
@@ -699,4 +710,15 @@ func (n *Node) DoRaw(method, path string, body []byte) (int, []byte) {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, raw
+}
+
+// PGAt is PG on another port of the loopback address (an instance of this server that is not the first one, for example the standby of a group).
+func (n *Node) PGAt(ctx context.Context, port int, user, pass, db string) (*pgx.Conn, error) {
+	cfg, err := pgx.ParseConfig("")
+	if err != nil {
+		return nil, err
+	}
+	cfg.Host, cfg.Port, cfg.Database, cfg.User, cfg.Password = "127.0.0.1", uint16(port), db, user, pass //nolint:gosec // test ports
+	cfg.TLSConfig, cfg.Fallbacks, cfg.ConnectTimeout = nil, nil, 10*time.Second
+	return pgx.ConnectConfig(ctx, cfg)
 }

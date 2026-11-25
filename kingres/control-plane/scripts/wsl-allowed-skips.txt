@@ -22,3 +22,9 @@ TestPutCheckpointGivesUpAfterTheDefaultRetry a long test of the log library (KIN
 TestNoPackageLevelState_SkipsWithoutSources the sources of the anchoring packages are not beside a test binary that runs outside the source tree
 TestPayloadLimitsEqualTheVerifiers_SkipsWithoutVerifierSource the sources of the verifier module are not beside a test binary that runs outside the source tree
 TestCorpusCopiesAreIdentical the verifier module is not beside a test binary that runs outside the source tree
+TestDatabaseImportOfAnArchiveFromAnotherMajor the archives of the other major are made by TestDatabaseImportRoundTrip of that major and kept in KINGRES_ARCHIVE_DIR; without the directory the test has nothing to read
+TestGoldenNormalisation the golden files of the dump normaliser are not beside a test binary that runs outside the source tree
+TestGoldenNormalisation/pg18 the golden files of the dump normaliser are not beside a test binary that runs outside the source tree
+TestGoldenNormalisation/pg19 the golden files of the dump normaliser are not beside a test binary that runs outside the source tree
+TestMajorsAgree the golden files of the dump normaliser are not beside a test binary that runs outside the source tree
+TestDistPartitionStorageIsReadAfterTheTrustCheck the sources of the ops package are not beside a test binary that runs outside the source tree

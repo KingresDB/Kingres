@@ -39,10 +39,30 @@ export const FIXTURE_FILES = {
   header: 'header.csv',
 } as const
 
+/** The archives (contract 0.29.0) that make a validation answer in a fixed way, by their file name. */
+export const FIXTURE_ARCHIVES = {
+  /** The structure of the zip file is wrong: `archive_invalid`. */
+  hostile: 'hostile.kdx.zip',
+  /** The versions do not fit this cluster: `reasons` lists them. */
+  old: 'old.kdx.zip',
+  /** The archive has ledger tables: `needs.ledgerRestart`. */
+  ledger: 'ledger.kdx.zip',
+  /** A statement of the SQL is refused by the shape grammar: kind, position and fingerprint, never its text. */
+  code: 'code.kdx.zip',
+  /** The load fails at the table `public.orders` (`row_count_mismatch`): the private database is removed. */
+  failload: 'failload.kdx.zip',
+  /** The loaded rows violate a foreign key: `foreign_key_violation`, or with `keepNotValid` a finished import that lists the violations. */
+  fkviolation: 'fkviolation.kdx.zip',
+} as const
+
 export interface UploadRec {
   upload: S['DataUpload']
   creator: string
   fileName: string | null
+  /** What the upload is for (contract 0.29.0). */
+  purpose: 'tableImport' | 'databaseArchive'
+  /** The report of the last validation of an archive. */
+  report: S['ArchiveReport'] | null
   /** The bytes held, when the file is small enough to keep (a mock does not store gigabytes). */
   data: Uint8Array[] | null
   /** The task that uses the upload (an import), or null. */
@@ -100,6 +120,16 @@ export const transferSwitches = {
   changeEtagOnResume: false,
   /** The number of `downloadDataExport` requests since the reset. */
   downloadRequests: 0,
+  /** The database export finds large objects (422 `large_objects_present`) unless it is acknowledged. */
+  largeObjects: false,
+  /** The role cannot read some tables: 422 `export_not_readable`. */
+  unreadable: false,
+  /** The next database export fails in its data step. */
+  dbExportFails: false,
+  /** The next database export fails with `schema_changed` (the fingerprint differs at the end). */
+  schemaChanges: false,
+  /** The signed-in role is a superuser (or can read server files): 403 `forbidden` for an import of a database. */
+  dangerousRole: false,
 }
 
 export function resetTransferSwitches(): void {
@@ -116,6 +146,11 @@ export function resetTransferSwitches(): void {
   transferSwitches.ignoreRange = false
   transferSwitches.changeEtagOnResume = false
   transferSwitches.downloadRequests = 0
+  transferSwitches.largeObjects = false
+  transferSwitches.unreadable = false
+  transferSwitches.dbExportFails = false
+  transferSwitches.schemaChanges = false
+  transferSwitches.dangerousRole = false
 }
 
 /** The default `dataTransfer` setting of the mock: on, so that the console can be tried; tests turn it off. */

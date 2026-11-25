@@ -21,6 +21,8 @@ export interface StoredUpload {
   schema: string
   table: string
   savedAt: number
+  /** What the upload is for; absent means a CSV for an import. A database archive has empty schema and table. */
+  purpose?: 'tableImport' | 'databaseArchive'
   /** `unknown`: an import of this upload ended with `import_outcome_unknown`; `done`: it was imported and kept. */
   imported?: 'unknown' | 'done'
 }

@@ -259,3 +259,27 @@ func Major(t testing.TB, c *pgx.Conn) int {
 	}
 	return instance.MajorOfVersionNum(n)
 }
+
+// SplitPortRange gives the i-th of n equal parts of the ports lo..hi (the first and the last port of the part). The
+// parts do not overlap and each has at least one port; ok is false when the range is too small for n parts or the
+// arguments are not valid.
+func SplitPortRange(lo, hi, i, n int) (first, last int, ok bool) {
+	if n < 1 || i < 0 || i >= n || lo < 1 || hi < lo || (hi-lo+1)/n < 1 {
+		return 0, 0, false
+	}
+	w := (hi - lo + 1) / n
+	return lo + i*w, lo + (i+1)*w - 1, true
+}
+
+// StandbyPortRange is the range of ports for the standby instances of node i of an n-node cluster in this run:
+// KINGRES_TEST_STANDBY_PORT_BASE..KINGRES_TEST_STANDBY_PORT_END (set by scripts/run-wsl-tests.sh, a range of the
+// run's own that no other run and no slice of test ports overlaps), cut into n parts, one per node, so that two
+// nodes of the cluster never choose the same port either. ok is false when the run has no such range (a test binary
+// started by hand): the standby port is then the default of kingresd, the port of the server plus 1000.
+func StandbyPortRange(i, n int) (first, last int, ok bool) {
+	lo, hi := envInt("KINGRES_TEST_STANDBY_PORT_BASE", 0), envInt("KINGRES_TEST_STANDBY_PORT_END", 0)
+	if lo == 0 || hi == 0 {
+		return 0, 0, false
+	}
+	return SplitPortRange(lo, hi, i, n)
+}

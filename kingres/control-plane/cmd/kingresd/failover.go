@@ -750,6 +750,45 @@ func (p *foPlanner) Audit(ctx context.Context, action string, group int32, detai
 		ResourceID: strconv.Itoa(int(group)), Outcome: audit.OutcomeSuccess, Details: details})
 }
 
+// LiveReplication asks the primary of the map group (the system database of this server, the leader's) for its standbys and its flush position, within three seconds.
+func (p *foPlanner) LiveReplication(ctx context.Context) (failover.LiveReplication, error) {
+	var out failover.LiveReplication
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	err := p.sys(ctx, func(c *pgx.Conn) error {
+		if err := c.QueryRow(ctx, `SELECT pg_current_wal_flush_lsn()::text`).Scan(&out.FlushLsn); err != nil {
+			return err
+		}
+		rows, err := c.Query(ctx, `SELECT state, sync_state, coalesce(sent_lsn::text, ''), coalesce(replay_lsn::text, '') FROM pg_stat_replication WHERE state = 'streaming'`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var st, sync, sent, replay string
+			if err := rows.Scan(&st, &sync, &sent, &replay); err != nil {
+				return err
+			}
+			out.Streaming++
+			if sync == "sync" || sync == "quorum" {
+				out.SyncStreaming = true
+			}
+			if a, ok := failover.ParseLSN(sent); ok {
+				if b, _ := failover.ParseLSN(out.SentLsn); a > b {
+					out.SentLsn = sent
+				}
+			}
+			if a, ok := failover.ParseLSN(replay); ok {
+				if b, _ := failover.ParseLSN(out.ReplayLsn); a > b {
+					out.ReplayLsn = replay
+				}
+			}
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
 // busyGroups are the groups of an unfinished failover run.
 func (p *foPlanner) busyGroups(ctx context.Context) map[int32]bool {
 	out := map[int32]bool{}
@@ -782,25 +821,33 @@ var _ = monitor.Condition{}
 // The callee side: what a server does on its own instances when the leader asks.
 
 func staleTerm(ctx context.Context, d *haDeps, expected int64, strict bool) error {
+	err, unread := staleTermRead(ctx, d, expected, strict)
+	_ = unread
+	return err
+}
+
+// staleTermRead is staleTerm that also says whether the term could not be read (the server is held back): a call that is not strict then went
+// unjudged, and the caller decides what is safe without it.
+func staleTermRead(ctx context.Context, d *haDeps, expected int64, strict bool) (err error, unread bool) {
 	if expected < 0 {
-		return nil // the caller does not know the term (a negative value says so); 0 is the term of a cluster that never failed over
+		return nil, false // the caller does not know the term (a negative value says so); 0 is the term of a cluster that never failed over
 	}
-	c, err := d.Svc.SystemConn(ctx)
-	if err != nil {
-		d.Log.Warn("failover: the catalog term of this server cannot be read; the call is not judged by it", "error", err)
-		return unreadableTerm(strict)
+	c, cerr := d.Svc.SystemConn(ctx)
+	if cerr != nil {
+		d.Log.Warn("failover: the catalog term of this server cannot be read; the call is not judged by it", "error", cerr)
+		return unreadableTerm(strict), true
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
 	var term int64
-	if err := c.QueryRow(ctx, `SELECT term FROM kingres.catalog_status`).Scan(&term); err != nil {
-		d.Log.Warn("failover: the catalog term of this server cannot be read; the call is not judged by it", "error", err)
-		return unreadableTerm(strict)
+	if qerr := c.QueryRow(ctx, `SELECT term FROM kingres.catalog_status`).Scan(&term); qerr != nil {
+		d.Log.Warn("failover: the catalog term of this server cannot be read; the call is not judged by it", "error", qerr)
+		return unreadableTerm(strict), true
 	}
 	d.Log.Debug("failover: the catalog term of this server", "term", term, "expected", expected)
 	if term > expected {
-		return &internalapi.CallError{Status: http.StatusConflict, Code: "stale_term", Message: "The catalog has a newer term than the failover knows."}
+		return &internalapi.CallError{Status: http.StatusConflict, Code: "stale_term", Message: "The catalog has a newer term than the failover knows."}, false
 	}
-	return nil
+	return nil, false
 }
 
 func badBody(what string) error {
@@ -885,23 +932,62 @@ func handleFailoverDemote(ctx context.Context, d *haDeps, body []byte) (any, err
 	if !ok {
 		return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "not_primary", Message: "This server runs no primary of the shard group."}
 	}
-	// No more renewals, and the marker that keeps the primary from starting here again, before anything is stopped.
-	if err := d.LeaseMgr.Relinquish(r.Group); err != nil {
+	return fencedStop(ctx, d.Svc.Manager(), d.LeaseMgr, d.Fault, d.Log, li.ID, r)
+}
+
+// The parts of the instance manager and of the lease manager that the fenced stop uses, so that a test can stand in for them.
+type immediateManager interface {
+	StopImmediate(ctx context.Context, id int) error
+	Running(ctx context.Context, id int) (bool, error)
+}
+
+type fenceLeases interface {
+	RecordCandidate(group int32, server string) error
+	Candidate(group int32) string
+	ForgetCandidate(group int32)
+	Relinquish(group int32) error
+	Transfer(ctx context.Context, group int32, to string) (lease.TransferResult, error)
+}
+
+// fencedStop is the immediate stop of a failover (mode immediate): the old primary is fenced in this order, each part before the next. (1) A hard failover of the
+// map group of a live leader's server names the server the group is handed to (as the clean stop does, F7-01), so that the hold the marker makes is ended later only on
+// that server's word. (2) The renewal of the lease ends and the marker that keeps the primary from starting here again is written, before anything is stopped. (3) The
+// instance is stopped with an immediate shutdown. (4) Only when it is seen stopped is the lease handed to the server the call names: a primary that is still running
+// keeps a lease that is no longer renewed, which runs out and takes the primary with it (the watchdog), and nobody else holds it before that.
+func fencedStop(ctx context.Context, mgr immediateManager, lm fenceLeases, fh *fault.Hook, log *slog.Logger, id int, r failover.DemoteRequest) (any, error) {
+	wrote := false
+	if r.Group == 0 && r.Candidate != "" {
+		wrote = lm.Candidate(0) == ""
+		if err := lm.RecordCandidate(0, r.Candidate); err != nil {
+			return nil, err
+		}
+	}
+	if err := lm.Relinquish(r.Group); err != nil {
+		if wrote {
+			lm.ForgetCandidate(0) // nothing was changed: the record must not outlive the call that made it
+		}
 		return nil, err
 	}
 	out := failover.DemoteAnswer{}
 	stopCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
-	if err := d.Svc.Manager().StopImmediate(stopCtx, li.ID); err != nil {
-		d.Log.Warn("failover: stopping the old primary", "group", r.Group, "instance", li.ID, "error", err)
+	if fh.FailoverInjection("demote:nostop") == "skip" {
+		// A test: the instance does not stop (a postmaster that hangs); nothing is handed over, the lease runs out and the watchdog stops it.
+		log.Warn("failover: the old primary is not stopped (test fault demote:nostop)", "group", r.Group, "instance", id)
+	} else if err := mgr.StopImmediate(stopCtx, id); err != nil {
+		log.Warn("failover: stopping the old primary", "group", r.Group, "instance", id, "error", err)
 	}
-	running, err := d.Svc.Manager().Running(ctx, li.ID)
+	running, err := mgr.Running(ctx, id)
 	out.Stopped = err == nil && !running
 	if out.Stopped && r.TransferTo != "" {
-		res, terr := d.LeaseMgr.Transfer(ctx, r.Group, r.TransferTo)
+		res, terr := lm.Transfer(ctx, r.Group, r.TransferTo)
 		out.Transferred = terr == nil && res.Granted >= res.Need
 		if terr != nil {
-			d.Log.Warn("failover: the lease was not handed over; it runs out by itself", "group", r.Group, "error", terr)
+			log.Warn("failover: the lease was not handed over; it runs out by itself", "group", r.Group, "error", terr)
+		}
+		// A test: kingresd ends right after it fenced its primary and handed the lease over (the leader changes at the stop).
+		if fh.FailoverInjection("demote:exit") == "exit" {
+			os.Exit(137)
 		}
 	}
 	return out, nil

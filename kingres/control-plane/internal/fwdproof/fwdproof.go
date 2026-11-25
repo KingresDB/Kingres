@@ -68,6 +68,9 @@ const (
 	KindGather  Kind = "gather"
 	// KindMapStart is the request of an operator for the failover of the map group that a member sends to the candidate (F4-05).
 	KindMapStart Kind = "mapStart"
+	// KindMapLost is the operator's declaration that a server is lost (abandonMapGroupBootstrap with lostServerId) that the receiving member sends
+	// to the old leader of the map group, which ends its hold on it (phase 5 review L2).
+	KindMapLost Kind = "mapLost"
 	// KindForwardStream is the proof of the streaming relay (POST /forward-stream, contract 0.19.0): the frame carries the request
 	// headers the two streaming operations use, and the body is not part of the proof (it is raw bytes of any size, on the mutual TLS
 	// connection between two servers of the cluster).

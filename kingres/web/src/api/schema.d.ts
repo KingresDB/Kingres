@@ -716,6 +716,10 @@ export interface paths {
          *     part of the design, the request answers 422 `unsupported_operation`: this revision's server implements
          *     `hard` and `graceful` for ordinary groups.
          *
+         *     **0.33.0, the role for a loss of data.** A hard request that includes the map group of a server that is alive (see 0.28.0) and carries
+         *     `allowDataLoss: true` is refused with 403 `forbidden` unless the session has `kingres_admin`; the operation otherwise needs `kingres_ops`, and the
+         *     same request for an ordinary group, or for the map group without `allowDataLoss`, stays with `kingres_ops`.
+         *
          *     **0.13.0, the planned switchover (`graceful`).** For each group, in this order: the writes of the group stop on the old primary
          *     (new connections go elsewhere, the other sessions are ended), the distributed transactions end, the old primary stops with a fast
          *     shutdown and releases its lease, the standby that streams from it is proven to hold everything the old primary wrote, and only then
@@ -724,7 +728,7 @@ export interface paths {
          *     that does not succeed in two minutes ends it with `cannot_quiesce`, and prepared transactions that do not end with
          *     `prepared_transactions_pending`. The task can be cancelled until the promotion has begun (`Task.cancellable`). Refused with 409
          *     `group_degraded` when no standby of a group streams from its primary (or the named target does not), and with 422
-         *     `unsupported_operation` for a hard failover of a server whose map group primary answers (see 0.18.0 below).
+         *     `unsupported_operation` for a request that cannot run on this server (see 0.28.0 below for the map group).
          *
          *     **0.13.0, the map group.** The failover of the server that runs the primary of the map group (and the manager
          *     leader) is accepted by any server that does not hear it, in mode `hard` only (`dryRun` and `graceful` answer 422
@@ -739,9 +743,20 @@ export interface paths {
          *     standby's server, stops the old leader cleanly and sends it the proof, the standby's server promotes on the proof and becomes the manager
          *     leader, and its task engine finishes the task (the task is read from the new leader once the old leader's system database is stopped). The
          *     steps of the map group that the old leader could not record are the ones before `Verify the new primary`. A hard failover of a server whose
-         *     map group primary answers is still 422 `unsupported_operation`.
+         *     map group primary answers (mode `hard`) is the subject of 0.28.0 below.
          *     When the manager leader is gone and the request is answered by a server that is not the candidate, the request travels to the candidate with the proof of the
          *     operator's session (ADR 0026); a session of the token kind has no proof key and gets 503 `service_unavailable` for this case.
+         *
+         *     **0.28.0, a hard failover of the map group while its server is alive.** `mode: hard` for the server that runs the primary of the map group, sent
+         *     to the leader (that server) while it answers, is accepted (it was 422 `unsupported_operation`); the map group is the last group of the task. The
+         *     leader judges the loss before it changes anything (a loss that the request did not accept with `allowDataLoss` is 409 `failover_needs_decision`, as for any group),
+         *     starts the bootstrap of a standby's server, which waits for the lease, and then fences its own primary of the map group in one step: its lease is no
+         *     longer renewed, a marker keeps the primary from starting, it is stopped with an immediate shutdown, and only when it is seen stopped is the lease
+         *     handed to the standby's server, which then promotes (ranking all the standbys after the stop) and becomes the manager leader. A primary that
+         *     cannot be stopped is stopped by the watchdog when its lease runs out, and the standby's server takes the lease after that. Nothing is promoted without
+         *     the lease, so two writable primaries are impossible. The task is read from the new leader (id and report as for a planned switchover). A loss that
+         *     shows only after the stop (a standby that cannot be read any more) pauses the bootstrap with `failoverNeedsDecision`; the repeated request, sent to
+         *     the server of the standby, carries the decision. `dryRun` for this case is answered by the leader as for any group.
          *
          *     The task is `server.failover`, one block of steps per group (`TaskStep.shardGroupId`). A task that
          *     waits for an operator is `paused`; a repeat of this request for the same server resumes it. From the moment
@@ -781,15 +796,19 @@ export interface paths {
          *     task, and no other rebalance or change of the servers can run meanwhile.
          *
          *     Refused before a task exists: 404 for an unknown server; 409 `last_server`; 409 `no_receiving_server` (no other server runs a
-         *     primary and should hold shards); 409 `server_hosts_map_group` (this revision does not hand the map group over: fail it over first, "not built yet");
+         *     primary and should hold shards); 409 `server_hosts_map_group` (the server runs the primary of the map group and no other server runs a standby of it, so the map group cannot be handed over);
          *     409 `replicas_cannot_be_kept` (fewer servers than `replicaCount + 1` would remain; `acceptFewerReplicas` overrides); 409
          *     `group_degraded` (a group of the server has fewer healthy standbys than the replica count); 409 `rebalance_in_progress` and
          *     `operation_in_progress`; 422 `node_state_invalid` for a `dead` server; 422 `unprocessable` when the server holds ordinary
-         *     (not distributed) tables that leave with it and `acknowledgeLocalData` is not true. The standbys that the server hosts are
+         *     (not distributed) tables that leave with it and `acknowledgeLocalData` is not true. Changed in 0.31.0 (additive; no member changes): the distributed schemas (phase 11) of the server's groups move off it with the buckets, as items of the plan with `kind` `schema`, and the drain is refused with 409 `schema_pinned` (a schema holds a ledger table) or 422 `unprocessable` (a table of a schema is not logged or has neither a key nor a full replica identity, or its group does not answer) when a schema cannot be moved, naming the schema; the task ends only when no bucket and no schema is left on the server. The standbys that the server hosts are
          *     relocated by the step `Relocate the standbys hosted on the server`: the server is taken out of the ring of the standbys, the reconcile of the standbys
          *     places the replacements on the other servers before it removes the old ones, and the step waits until none is left (the groups are listed by
          *     `previewServerDrain`, `standbyShardGroupIds`); when another server cannot take them the task fails with `replicas_cannot_be_kept` unless `acceptFewerReplicas`.
-         *     A server that runs the primary of the map group is refused (this revision has no hand-over of the map group). Needs `kingres_ops`.
+         *     A server that runs the primary of the map group (the manager leader) is drained too (0.27.0): once the buckets have moved, the step `Hand over the map group`
+         *     pauses the task, asks for a planned switchover of shard group 0 (`failoverServer`, mode `graceful`) to a standby on another server, and the drain goes on under the
+         *     new manager leader when the switchover has ended. The task is paused meanwhile (`getRebalanceStatus` shows `stopped`, `stoppedBy` `safetyRule`) and keeps its id. A switchover
+         *     that is refused or rolled back fails the task with the code of the refusal, or `server_hosts_map_group` when the server still runs the map group; the server stays `draining`
+         *     and the drain can be started again. Needs `kingres_ops`.
          */
         post: operations["drainServer"];
         delete?: never;
@@ -813,7 +832,7 @@ export interface paths {
          * @description Added in 0.15.0. What `drainServer` would do now and what stands in its way, without changing anything: the moves (the plan
          *     of `previewRebalancePlan` with the server excluded and `drainOnly`), their bytes, the groups whose standby runs on the server,
          *     whether the replica count can be kept on the servers that remain, the databases in which the server holds ordinary tables that
-         *     leave with it, and the blockers (each with the problem code `drainServer` would answer). 404 for an unknown server.
+         *     leave with it, and the blockers (each with the problem code `drainServer` would answer). From 0.31.0 the moves include the distributed schemas of the server (`kind` `schema`, `schemaName`), and a schema that cannot move is a blocker (`schema_pinned`, `unprocessable`). 404 for an unknown server.
          */
         get: operations["previewServerDrain"];
         put?: never;
@@ -902,6 +921,75 @@ export interface paths {
          *     server; 409 `certificate_revoked` when they are revoked already; 409 `operation_in_progress`.
          */
         post: operations["revokeServerCertificates"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/certificate-authority/escrow": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the escrow of the certificate authority key
+         * @description Added in 0.26.0. Whether the escrow of the key of the cluster certificate authority is on, which servers hold
+         *     a sealed copy of the key and whether each copy is the newest. The escrow lets a new manager leader (after the
+         *     failover of the map group) issue, renew and revoke certificates without the old leader: it opens its own copy
+         *     and goes on. Without it the new leader raises the alert `certificateAuthorityUnavailable` until an operator
+         *     restores `pki/ca.key` and `pki/revoked.json` by hand. The answer is the leader's (the request is forwarded).
+         *     Needs `kingres_admin`. The key itself is never in an answer, in a task, in an audit event or in the
+         *     PostgreSQL instances.
+         */
+        get: operations["getCaEscrow"];
+        /**
+         * Switch the escrow of the certificate authority key on or off
+         * @description Added in 0.26.0. `enabled: true` makes the leader seal the CA key and the revocation list to every server that
+         *     hosts a ready standby of the map group (the servers that can become leader) and send each its copy over the
+         *     internal API; the leader then keeps the copies current (after every revocation, when the standbys change, and at
+         *     least every 6 hours). `enabled: false` takes every copy and every escrow key away from the servers; a server that
+         *     cannot be reached is asked again every minute and stays listed until it has deleted its copy. The answer is the
+         *     status after the first round; a recipient that could not be reached is `pending` and the leader sends again.
+         *
+         *     Each copy is encrypted so that only the escrow key of its server opens it (X25519 and AES-256-GCM); that key
+         *     is a file of the server and is not its TLS key. **A server that holds a copy can become the CA: its disk is as
+         *     sensitive as the leader's.** Switch the escrow on only when the servers that host standbys of the map group are
+         *     as trusted as the leader. A server that is removed while it holds a copy, and that cannot be reached to delete
+         *     it, must be treated as knowing the CA key (the rotation of the CA itself is not part of this contract).
+         *
+         *     The operation needs the CA key on the leader: 503 `certificate_authority_unavailable` when it does not. It is
+         *     audited under `setCaEscrow`.
+         */
+        put: operations["setCaEscrow"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/certificate-authority/escrow/rotations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rotate the escrow keys and reseal the copies
+         * @description Added in 0.26.0. Every recipient makes a new escrow key, the leader seals a new generation of the copy to it,
+         *     and the recipient deletes its old key and old copy when the new copy is stored. Use it when the escrow keys
+         *     may have been exposed without the CA key being known to be (a copy of an old disk image, a retired server).
+         *     It does not change the CA key: a copy that an attacker already took together with the escrow key that opens it
+         *     still opens. 409 `conflict` while the escrow is off; 503 `certificate_authority_unavailable` when the leader
+         *     has no CA key. Audited under `rotateCaEscrow`.
+         */
+        post: operations["rotateCaEscrow"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1285,6 +1373,15 @@ export interface paths {
          *     a materialized view that uses it). The free space of every destination server is checked first (step *Check free space*). A RANGE or LIST partitioned table
          *     becomes a user-partitioned distributed table (blocking only). The text below, that the table must be empty, holds for contract versions before 0.14.0.
          *
+         *     **0.32.0: distribute with related tables.** `relatedTables` lists the ordinary tables that are linked to the table by foreign keys, directly or through
+         *     each other (`listRelatedTables` gives the list). They are distributed together with the table, in one task, colocated with it (the table joins the group
+         *     of `colocateWith` or opens a new one; the related tables join the group of the table). The task drops the keys between the tables, distributes the table
+         *     and then each related table (one step each; a repeated run goes on with the tables that are not distributed yet), adds the keys back `NOT VALID` and
+         *     validates them. No key between these tables is enforced from the first drop to the last add; the task says so on its detail, and it takes the blocking
+         *     copy only (`mode` `online` is refused with 400 `validation_failed`). The list must be the whole set (a missing table is the blocker `related_table_missing`),
+         *     and every related table needs a distribution column (`distributionColumn`, or the one that follows from the keys). A failure puts the keys back where it
+         *     can and says in the task error which keys were not restored.
+         *
          *     **What the sharding extension can do, and what this operation refuses (0.9.0 states exactly that).**
          *     *Hash* (`kingres.create_distributed_table`): the table must be **empty** (422 `unprocessable`: distributing a
          *     table that has rows is a later phase; create an empty copy, distribute it and insert the rows), have a primary
@@ -1348,6 +1445,37 @@ export interface paths {
          *     Synchronous; reads only.
          */
         post: operations["previewTableChange"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/related-tables": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List the tables linked to a table by foreign keys
+         * @description Added in 0.32.0. The plan of "distribute with related tables": the ordinary tables that are linked to the table by foreign keys, directly or through
+         *     each other, with the distribution column each of them would get (the column that the keys tie to `distributionColumn`), the keys that the task would drop
+         *     and add again, and what would stop the change (`blockers`, for example a related table that is already distributed, a key that does not use a column
+         *     that follows from the distribution column, a table with an unfinished table task). The related tables join the colocation group of the table.
+         *     Synchronous; reads only. A table without links has an empty `tables` list.
+         */
+        get: operations["listRelatedTables"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1564,24 +1692,24 @@ export interface paths {
         /**
          * Get the time-partitioning policy of a table
          * @description Added in 0.17.0. The policy, when it runs next, the last run and the health of the partitions ahead. 404 `not_found` when the table has no policy, and the same code when the table does not exist
-         *     or `kingres_timepart` is not installed in the database; the `detail` says which. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so. A read never installs an extension.
+         *     or `kingres_timepart` is not installed in the database; the `detail` says which. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so. A user-partitioned distributed table (hash on top, range partitions below) is a table of that instance, so its policy and its runs are kept on the map group primary, which the manager leader runs. From 0.25.0 a run creates its partitions ahead on every server that holds a bucket, converts the leaves of the old ones to columnar storage on the servers that hold them (`columnarAfter`), and drops or detaches the partitions older than the retention (a partition that is detached becomes a distributed table of the same colocation group). `partitionColumn` and `partitionColumnType` name the key of the partitions, not the distribution column. A read never installs an extension.
          */
         get: operations["getPartitionPolicy"];
         /**
          * Set the time-partitioning policy of a table
          * @description Added in 0.17.0. Creates or replaces the policy. Synchronous: it writes the policy and creates no partition; `nextRunAt` of the answer is now, so the
          *     scheduler takes the table at its next tick. Durations are ISO 8601 (`P1D`, `P1M`, `PT6H`). 400 `validation_failed` with the JSON pointer of the field;
-         *     409 `partition_policy_conflict` when the table is not range-partitioned on a `date`, `timestamp` or `timestamptz` column; 409 `extension_missing`
+         *     409 `partition_policy_conflict` when the table is not range-partitioned on a `date`, `timestamp` or `timestamptz` column, and also for a distributed table whose policy would give it more leaves (buckets times partitions, in the steady state of the retention and `createAhead`) than `kingres_shard.max_partition_leaves` allows (the `detail` has the numbers); 409 `extension_missing`
          *     when `kingres_timepart` is not installed in the database and cannot be installed (the package of the server lacks it). 409 `operation_in_progress` while a run of the policy is going (its end would
          *     move the schedule). The conversion and the runs of a policy drive the DDL of `kingres_timepart` with its setting `trust_table_owners` on: the code of the owner of a table (an index expression, a check, a default) runs **as that owner, inside the session of the service role (a superuser)**, and what it leaves behind in that session (a deferred trigger, a temporary object, a changed setting) would run later with the rights of the service role; the session is closed when the call ends, and the extension refuses the known ways to leave such residue, but the guarantee is the trust in the owner. A policy is also repeated by the scheduler without a person in the loop. Therefore a table whose owner is not a superuser is refused (`conversion_refused` with the blocker `owner_not_trusted`, `partition_policy_conflict` for a policy and a run) unless the cluster setting `analytics.allowNonSuperuserOwners` is on (default off). The answer shows the owner (`tableOwner`) and whether it is trusted now (`ownerTrusted`). `createdBy` of the answer is the service role.
-         *     The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so.
+         *     The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so. A user-partitioned distributed table (hash on top, range partitions below) is a table of that instance, so its policy and its runs are kept on the map group primary, which the manager leader runs. From 0.25.0 a run creates its partitions ahead on every server that holds a bucket, converts the leaves of the old ones to columnar storage on the servers that hold them (`columnarAfter`), and drops or detaches the partitions older than the retention (a partition that is detached becomes a distributed table of the same colocation group). `partitionColumn` and `partitionColumnType` name the key of the partitions, not the distribution column.
          */
         put: operations["putPartitionPolicy"];
         post?: never;
         /**
          * Remove the time-partitioning policy of a table
          * @description Added in 0.17.0. Removes the policy; the partitions stay as they are. 404 `not_found` when the table has no policy; 409 `operation_in_progress`
-         *     while a `partition.maintain` task runs for the table. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so.
+         *     while a `partition.maintain` task runs for the table. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so. A user-partitioned distributed table (hash on top, range partitions below) is a table of that instance, so its policy and its runs are kept on the map group primary, which the manager leader runs. From 0.25.0 a run creates its partitions ahead on every server that holds a bucket, converts the leaves of the old ones to columnar storage on the servers that hold them (`columnarAfter`), and drops or detaches the partitions older than the retention (a partition that is detached becomes a distributed table of the same colocation group). `partitionColumn` and `partitionColumnType` name the key of the partitions, not the distribution column.
          */
         delete: operations["deletePartitionPolicy"];
         options?: never;
@@ -1605,7 +1733,7 @@ export interface paths {
         };
         /**
          * List the runs of a time-partitioning policy
-         * @description Added in 0.17.0. The runs of the policy, newest first, with the trigger, the state and the error of each (the `actions` of a listed run are empty). Empty when `kingres_timepart` is not installed. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so.
+         * @description Added in 0.17.0. The runs of the policy, newest first, with the trigger, the state and the error of each (the `actions` of a listed run are empty). Empty when `kingres_timepart` is not installed. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so. A user-partitioned distributed table (hash on top, range partitions below) is a table of that instance, so its policy and its runs are kept on the map group primary, which the manager leader runs. From 0.25.0 a run creates its partitions ahead on every server that holds a bucket, converts the leaves of the old ones to columnar storage on the servers that hold them (`columnarAfter`), and drops or detaches the partitions older than the retention (a partition that is detached becomes a distributed table of the same colocation group). `partitionColumn` and `partitionColumnType` name the key of the partitions, not the distribution column.
          */
         get: operations["listPartitionPolicyRuns"];
         put?: never;
@@ -1614,7 +1742,7 @@ export interface paths {
          * @description Added in 0.17.0. Starts a task of kind `partition.maintain` for the table (the console's "Run now"); the run's `trigger` is `manual`.
          *     `asOf`, when given, must be within five minutes of the time of the instance that runs the policy, otherwise 400 `validation_failed` on `/asOf` (a run with a time far from now would retire
          *     or create the partitions of that time and park the schedule there; use `planPartitionPolicy` with `asOf` for a dry replay). 404 `not_found` when the table has no policy; 409 `operation_in_progress`
-         *     while a run is going. 409 `extension_missing` when the policy converts to columnar and the library is not preloaded. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so.
+         *     while a run is going. 409 `extension_missing` when the policy converts to columnar and the library is not preloaded. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so. A user-partitioned distributed table (hash on top, range partitions below) is a table of that instance, so its policy and its runs are kept on the map group primary, which the manager leader runs. From 0.25.0 a run creates its partitions ahead on every server that holds a bucket, converts the leaves of the old ones to columnar storage on the servers that hold them (`columnarAfter`), and drops or detaches the partitions older than the retention (a partition that is detached becomes a distributed table of the same colocation group). `partitionColumn` and `partitionColumnType` name the key of the partitions, not the distribution column.
          */
         post: operations["runPartitionPolicy"];
         delete?: never;
@@ -1641,7 +1769,7 @@ export interface paths {
         };
         /**
          * Get one run of a time-partitioning policy
-         * @description Added in 0.17.0. A run with its actions, in the order they were taken. 404 `not_found` for a run that does not exist. The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so.
+         * @description Added in 0.17.0. A run with its actions, in the order they were taken. 404 `not_found` for a run that does not exist. For a distributed table an action may end `failed` with a `detail` that starts with `lock_timeout` followed by `retry_later` when a bucket move, a table operation or another conversion holds the colocation group; the run is then `partial` and comes back within five minutes (the same rule as a lock timeout of an ordinary table). An action `convert` ends `skipped` with a `detail` that starts with `conversion_refused` when a leaf or a server cannot do it; the partition then stays `mixed` and the next run goes on. The action of a distributed partition (`convert`, `drop`, `detach`) has no `bytesBefore` and `bytesAfter` (null, because the leaves are on other servers). The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so. A user-partitioned distributed table (hash on top, range partitions below) is a table of that instance, so its policy and its runs are kept on the map group primary, which the manager leader runs. From 0.25.0 a run creates its partitions ahead on every server that holds a bucket, converts the leaves of the old ones to columnar storage on the servers that hold them (`columnarAfter`), and drops or detaches the partitions older than the retention (a partition that is detached becomes a distributed table of the same colocation group). `partitionColumn` and `partitionColumnType` name the key of the partitions, not the distribution column.
          */
         get: operations["getPartitionPolicyRun"];
         put?: never;
@@ -1671,7 +1799,7 @@ export interface paths {
         /**
          * Preview the actions of a time-partitioning policy
          * @description Added in 0.17.0. A dry run: the actions a run would take now (or at `asOf`), with the stored policy or with the policy in the request.
-         *     Nothing changes. It is a read, so a `kingres_readonly` role may call it, and it is not audited. `asOf` is free here (a dry replay). The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so.
+         *     Nothing changes. It is a read, so a `kingres_readonly` role may call it, and it is not audited. `asOf` is free here (a dry replay). The operation acts on the tables of the instance that the manager leader runs; a table that lives on another shard group's instance is answered with 404 `not_found` whose `detail` says so. A user-partitioned distributed table (hash on top, range partitions below) is a table of that instance, so its policy and its runs are kept on the map group primary, which the manager leader runs. From 0.25.0 a run creates its partitions ahead on every server that holds a bucket, converts the leaves of the old ones to columnar storage on the servers that hold them (`columnarAfter`), and drops or detaches the partitions older than the retention (a partition that is detached becomes a distributed table of the same colocation group). `partitionColumn` and `partitionColumnType` name the key of the partitions, not the distribution column.
          */
         post: operations["planPartitionPolicy"];
         delete?: never;
@@ -2167,7 +2295,7 @@ export interface paths {
          *     removes or detaches a server); `failover_in_progress` (these two also when the other task is created at the same moment: the check and the creation are one step in the system database, so a rebalance and a server operation are never both created); `version_mismatch` (the servers do not run the same
          *     version of the sharding extension and the same PostgreSQL major); `cluster_inconsistent` (`kingres.check_cluster()`
          *     reports something that makes moving unsafe; the detail names it); `no_receiving_server` (no server should hold
-         *     shards); `nothing_to_rebalance` (the plan is empty). The same conditions are checked again before every move; one
+         *     shards); `nothing_to_rebalance` (the plan is empty); `group_degraded` (0.27.0: a group has a standby that is behind its primary by more than `maxStandbyLagBytes`, or whose lag cannot be read; `force: true` overrides this and only this). The same conditions are checked again before every move; one
          *     that stops holding stops the run (`stopped`, `stoppedBy` `safetyRule`) instead of failing it. Returns 503
          *     (`map_group_unavailable`) while the map group is failing over.
          */
@@ -3844,6 +3972,53 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/databases/{databaseName}/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Export a database to one archive
+         * @description Added in 0.29.0 (data transfer, phase 14b). Starts the task `database.export` (subject type `database`, id the database name): the structure, the KingresDB
+         *     catalog (how every table is distributed, its access method, ledger and time-partition policies, sequences) and the data of every table are written to one **zip archive**
+         *     that is staged on the manager leader, sealed (encrypted at rest) and kept for `retentionHours`. The answer is the task; when it is `done` its `detail` is `transfer <id>` and
+         *     `getDataExport` (kind `databaseExport`, format `archive/1`) says size, rows, SHA-256 and the consistency label of every table; `downloadDataExport` serves the file as `application/zip`.
+         *     Nothing is imported by this version: the archive is for inspection (`validateDatabaseArchive`) and for loading by hand. Importing an archive is a later revision.
+         *
+         *     The archive holds exactly these entries and no others: `manifest.json` (written last: versions, locale, extensions, the SHA-256 and the columns of every entry, warnings), `catalog.json`,
+         *     `schema/pre-data.sql`, `schema/views.sql`, `schema/post-data.sql` and `data/NNNNN.csv`, one per table (a partition tree is one entry, its root; leaves are structure only). The structure is the
+         *     schema-only output of `pg_dump` of the same PostgreSQL build, taken by the service role in a read-only transaction and rewritten by a closed set of rules; data is read as the signed-in role
+         *     through `COPY (SELECT ...)` as UTF-8 CSV with a distinct null marker (an empty string and a null differ). **What the archive does not carry** is listed in the manifest's `warnings` and refused
+         *     where it would make the archive misleading: large objects and `oid` or `reg*` columns (422 `large_objects_present`, unless `acknowledgeLargeObjectsLost` is true); roles, tablespaces,
+         *     policies, rules, event triggers, functions, triggers, publications, foreign objects, extended statistics, collations and unlogged tables (422 `schema_unrecognised`, naming the kind).
+         *     Ledger tables are carried as data and restart their chain when imported (ADR 0028); the history of an updatable ledger table is exported for the record.
+         *
+         *     Needs `kingres_admin`, the cluster setting `dataTransfer.enabled` (403 `data_transfer_disabled`), a request over TLS (403 `insecure_transport`), and the PostgreSQL privileges `USAGE` on every
+         *     schema and `SELECT` on every table (and column) of the database for the signed-in role: otherwise 422 `export_not_readable`, whose `reasons` name the first 20 objects the role cannot read (the detail says how many more), and nothing is written.
+         *     404: the database does not exist. 409 `operation_in_progress`: a table task or another database export or import is unfinished in this database, or the transfer limit is reached;
+         *     409 `transfer_quota_exceeded` and `insufficient_disk` as for `exportTable`. While the task runs, table tasks of the database are refused with 409 `operation_in_progress`.
+         *
+         *     Consistency: when every table is local, reference or on the group of the connection, the data is read in one `REPEATABLE READ` read-only transaction (`archive-single-snapshot`); otherwise each table is one
+         *     statement and the label of each table is as for `exportTable` (`single-snapshot` or `per-group`). **There is no global snapshot.** The structure is fingerprinted at the start and at the end: a table or a
+         *     column that changed in between fails the task with the code `schema_changed` and no file is kept.
+         *     Steps of the task: *Check the request*, *Take the structure*, *Normalise the schema*, *Write the data*, *Check the archive*, *Seal*.
+         *     Task codes: `schema_changed`, `schema_unrecognised`, `export_too_large`, `insufficient_disk`, `transfer_quota_exceeded`, `transfer_timeout`, `transfer_leader_changed` (retryable), `transfer_session_lost` (retryable),
+         *     `transfer_key_lost`, `copy_interrupted` (retryable), `forbidden`, `cancelled`. The error of a task never carries a value, a row or text of the server.
+         */
+        post: operations["exportDatabase"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/data-uploads": {
         parameters: {
             query?: never;
@@ -3910,6 +4085,79 @@ export interface paths {
          *     the upload is deleted) and the upload is `complete`. Two chunks at one offset: one wins, the other gets 409. Needs `kingres_admin`, `dataTransfer.enabled` and a request over TLS. A chunk is not an audit event.
          */
         patch: operations["uploadDataChunk"];
+        trace?: never;
+    };
+    "/data-uploads/{uploadId}/validation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifier of an upload (added in 0.19.0), a decimal string. An upload of another role is 404. */
+                uploadId: components["parameters"]["UploadId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Validate an uploaded database archive
+         * @description Added in 0.29.0 (data transfer, phase 14b). Starts the task `archive.validate` (subject type `upload`, id the upload id) for a complete upload whose purpose is
+         *     `databaseArchive`. It reads the archive once from end to end and **touches no database**: the shape of the zip file (the local headers against the central directory, the descriptors, that the extents
+         *     account for every byte, the names, the sizes counted while reading), the SHA-256 and the CRC-32 of every entry against the manifest, the manifest and the catalog document (strict JSON, closed members, identifiers),
+         *     that the columns of each data entry equal the columns of the schema, the versions (format, PostgreSQL major, extensions, locale) and, with the shape grammar in its validate-only mode, every statement of the three SQL files
+         *     (`statements` of the report; nothing is run). The result is the **archive report** (`ArchiveReport`), stored with the upload (`getDataUpload` returns it as `report`, the state is `valid` or `invalid`)
+         *     and cached by the SHA-256 of the file. An archive that is not valid is not an error of the request: the task is `done` and the report says `valid: false` with the `reasons`.
+         *     The text of a statement of the archive is never shown: the report names the kind, the position and a fingerprint (the length and a hash prefix).
+         *
+         *     Needs `kingres_admin`, `dataTransfer.enabled` and a request over TLS. 404: the upload does not exist or is another role's. 409 `upload_incomplete`: bytes are missing; 409 `operation_in_progress`: a task uses the upload or the
+         *     transfer limit is reached. 422 `validation_failed`: the purpose of the upload is not `databaseArchive`.
+         *     Steps: *Check the upload*, *Read the archive*, *Check the plan*, *Store the report*. The task cannot change the archive, so it is always safe to repeat.
+         */
+        post: operations["validateDatabaseArchive"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/database-imports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Import a database archive as a new database
+         * @description Added in 0.30.0 (data transfer, phase 14c). Starts the task `database.import` (subject type `database`, id the name of the new database): the archive of a complete upload
+         *     (purpose `databaseArchive`, made by `exportDatabase`) is loaded into a **new** database. The archive is **hostile input**: the task reads it again from its bytes (the whole validator and the shape grammar, then
+         *     the SHA-256 against `expectedSha256`), whatever `validateDatabaseArchive` said before. The SQL of the archive is never run as it is: a **shape grammar** accepts only the statements `pg_dump` writes for
+         *     schemas, tables, sequences, types, domains, indexes, constraints, views and comments, and **refuses** functions, triggers, policies, rules, `GRANT`, `SET`, `ALTER DATABASE`, `COPY`, `DO` and everything else
+         *     (422 `archive_statement_refused`; `reasons` name the kind, the position and a fingerprint, never the text). There is no `allowCode` and no `privileges: restore`: every object is owned by the importing role.
+         *     The statements run **as the signed-in role**, one per round trip, never as the service role, so PostgreSQL's privileges are the guarantee; a role with `SUPERUSER`, `REPLICATION` or `BYPASSRLS`, or with access to
+         *     server files, programs or logs, is refused with 403 `forbidden` and must sign in as another role. The extensions of the archive are installed from a closed list.
+         *
+         *     The import works in a database with a **private name** (`kingres_import_<task id>`) that only the task uses, and renames it to its final name as its last step; a failed or cancelled import drops the private database
+         *     (unless `keepOnFailure`), and nothing of the final name exists. Order: the extensions, the tables, the distribution of the tables **while they are empty**, the views, the data (one transaction per table, the rows
+         *     counted against the manifest), the indexes and constraints, the sequences, then the ledger and the time-partition policies. **Ledger tables are carried as data and start a new chain** (ADR 0028): the import
+         *     enters their rows as the first entries of a new chain, `ledger_verify` must find nothing, and then the signature policy of the source is set again; it needs `acknowledgeLedgerRestart: true` (422
+         *     `ledger_restart_not_acknowledged` otherwise). **Time-partition policies come back disabled**; the task's last detail lists them with the call that enables each.
+         *
+         *     Needs `kingres_admin`, `dataTransfer.enabled` (403 `data_transfer_disabled`) and a request over TLS (403 `insecure_transport`). 404: the upload does not exist or is another role's. 409 `upload_incomplete`;
+         *     409 `already_exists`: the database exists; 409 `operation_in_progress`: a task uses the upload or the transfer limit is reached. 422 `archive_invalid`, `archive_incompatible` (the PostgreSQL major of the
+         *     target must be at least the source's), `archive_statement_refused`, `import_too_large` (more than `maxImportBytes`, a statement or a count above its limit) and `ledger_restart_not_acknowledged`.
+         *     Steps: *Check the archive*, *Create the private database* (and one step for each other server), *Install the extensions*, *Check the functions*, *Create the tables*, *Distribute the tables*, *Create the views*,
+         *     *Load the data*, *Create the indexes and constraints*, *Set the sequences*, *Enable the ledger and the policies*, *Verify*, *Take the final name*. A task is cancellable until *Set the sequences* starts.
+         *     Task codes: `archive_invalid`, `archive_incompatible`, `archive_statement_refused`, `foreign_key_violation` (the constraint's name and the count), `table_not_eligible`, `row_count_mismatch`, `verification_failed`,
+         *     `transfer_leader_changed` (retryable), `transfer_session_lost` (retryable), `forbidden`, `cancelled`. The error of a task never carries a value, a row, the text of a statement or text of the server.
+         */
+        post: operations["importDatabase"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/data-exports": {
@@ -4042,7 +4290,7 @@ export interface components {
          *     system database was stopped on purpose; start it with `startThisServerInstance`).
          * @enum {string}
          */
-        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled" | "workbench_busy" | "config_parameter_unknown" | "config_parameter_managed" | "config_parameter_refused" | "config_level_not_allowed" | "config_value_below_floor" | "config_change_superseded" | "config_restart_order_conflict" | "nothing_pending" | "nothing_to_rebalance" | "rebalance_not_running" | "cluster_inconsistent" | "version_mismatch" | "failover_in_progress" | "group_degraded" | "insufficient_disk" | "no_receiving_server" | "replicas_cannot_be_kept" | "sharding_mode_in_use" | "schema_not_distributable" | "schema_pinned" | "schema_move_in_progress" | "bucket_busy" | "split_unsupported" | "failover_needs_decision" | "lease_settings_differ" | "ledger_not_published" | "origin_prefix_locked" | "signing_key_missing" | "last_signing_key" | "chain_not_diverged" | "table_not_eligible" | "extension_unavailable" | "extension_version_mismatch" | "sketch_hash_mismatch" | "extension_missing" | "conversion_refused" | "partition_policy_conflict" | "data_transfer_disabled" | "insecure_transport" | "transfer_quota_exceeded" | "upload_incomplete" | "upload_offset_mismatch" | "chunk_too_large" | "upload_checksum_mismatch" | "import_header_mismatch" | "import_ledger_policy" | "import_too_large" | "import_end_marker" | "export_untrusted_code";
+        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled" | "workbench_busy" | "config_parameter_unknown" | "config_parameter_managed" | "config_parameter_refused" | "config_level_not_allowed" | "config_value_below_floor" | "config_change_superseded" | "config_restart_order_conflict" | "nothing_pending" | "nothing_to_rebalance" | "rebalance_not_running" | "cluster_inconsistent" | "version_mismatch" | "failover_in_progress" | "group_degraded" | "insufficient_disk" | "no_receiving_server" | "replicas_cannot_be_kept" | "sharding_mode_in_use" | "schema_not_distributable" | "schema_pinned" | "schema_move_in_progress" | "bucket_busy" | "split_unsupported" | "failover_needs_decision" | "lease_settings_differ" | "ledger_not_published" | "origin_prefix_locked" | "signing_key_missing" | "last_signing_key" | "chain_not_diverged" | "table_not_eligible" | "extension_unavailable" | "extension_version_mismatch" | "sketch_hash_mismatch" | "extension_missing" | "conversion_refused" | "partition_policy_conflict" | "data_transfer_disabled" | "insecure_transport" | "transfer_quota_exceeded" | "upload_incomplete" | "upload_offset_mismatch" | "chunk_too_large" | "upload_checksum_mismatch" | "import_header_mismatch" | "import_ledger_policy" | "import_too_large" | "import_end_marker" | "export_untrusted_code" | "export_not_readable" | "large_objects_present" | "schema_unrecognised" | "archive_invalid" | "archive_incompatible" | "archive_statement_refused" | "ledger_restart_not_acknowledged";
         /** @description One invalid field of a request. */
         ValidationIssue: {
             /** @description JSON Pointer (RFC 6901) to the invalid property of the request body, or the name of the invalid query or path parameter. */
@@ -4081,7 +4329,7 @@ export interface components {
             sqlPosition?: number;
             /** @description Added in 0.14.0. The lines of the report of the sharding extension that make a table not eligible; present for `table_not_eligible` and, from 0.17.0, for `conversion_refused` (the reasons of the refusal, one entry each). */
             blockers?: components["schemas"]["TableBlocker"][];
-            /** @description Added in 0.19.0, optional. Further reasons in the shape of `blockers`; reserved for the archive codes of later revisions, empty or absent for the codes of 0.19.0. */
+            /** @description Added in 0.19.0, optional. Further reasons in the shape of `blockers`. From 0.29.0: for `export_not_readable` one entry per object the role cannot read (at most 20; `code` is `no_privilege` or `no_usage`, `object` the name), and for `archive_incompatible` the reasons the archive does not fit. */
             reasons?: components["schemas"]["TableBlocker"][];
             /** @description Added in 0.12.0, optional. The whole plan of the request (the same body as `dryRun` answers), present only when `code` is `failover_needs_decision`: the console shows the groups, the candidates and the verdict without asking again. */
             plan?: components["schemas"]["FailoverPlan"];
@@ -5055,6 +5303,14 @@ export interface components {
         AbandonMapGroupBootstrapRequest: {
             /** @description Why the bootstrap is given up; it is kept in the journal of the bootstrap and in the audit event. */
             reason: string;
+            /**
+             * @description Added in 0.28.0. The operator declares that this server, to which the map group was handed (a hard failover of a live leader's server or a planned
+             *     switchover), is lost. It must not be heard by the cluster (409 `conflict` otherwise). The old leader then ends the hold of its primary without the word of that
+             *     server, when the hold was made for it (or has no record), every other server answers, none runs a bootstrap that names the old leader and none was promoted;
+             *     what the lost server may have promoted and acknowledged before it was lost is accepted with the declaration. A new request for the failover may then choose
+             *     another standby. It is part of the audit event.
+             */
+            lostServerId?: components["schemas"]["ServerId"];
         };
         AbandonMapGroupBootstrapResult: {
             /** @description True when a bootstrap was in progress and is given up; false when none was. */
@@ -5615,6 +5871,8 @@ export interface components {
              * @description Table size over all shards (primary copies); null when not available.
              */
             sizeBytes: number | null;
+            /** @description Added in 0.32.0, optional. The long operation that runs on the table now; null when there is none. */
+            operation?: components["schemas"]["TableOperation"] | null;
             /** @description Added in 0.14.0, optional. How the user partitioned the table (a user-partitioned distributed table is also `distributed`); null when it is not partitioned. */
             partitioning?: {
                 /** @enum {string} */
@@ -5701,6 +5959,8 @@ export interface components {
             bucketCount?: number;
             mode?: components["schemas"]["TableChangeMode"];
             dependentViews?: components["schemas"]["DependentViews"];
+            /** @description Added in 0.32.0, optional, for method `hash` only. The tables linked to this one by foreign keys that are distributed together with it (see `listRelatedTables`); an empty or missing list distributes the table alone. */
+            relatedTables?: components["schemas"]["RelatedTableChoice"][];
         };
         /**
          * @description Added in 0.14.0. How a table operation copies the rows. `auto` (the default): online when the table has a usable key and more than 100000 estimated rows, otherwise blocking.
@@ -5761,12 +6021,81 @@ export interface components {
                 table?: components["schemas"]["TableRef"];
             };
         };
+        /** @description Added in 0.32.0. A table that is distributed together with the table of the request. */
+        RelatedTableChoice: {
+            schema: string;
+            table: string;
+            /** @description The column to hash; when left out, the column that follows from the foreign keys is used (a table whose column does not follow from them is refused). */
+            distributionColumn?: string;
+        };
+        /** @description Added in 0.32.0. A foreign key between two tables of the set, which the task drops and adds again. */
+        RelatedKey: {
+            name: string;
+            /** @description The schema of the table that has the key. */
+            schema: string;
+            /** @description The table that has the key. */
+            table: string;
+            referencesSchema: string;
+            referencesTable: string;
+            /** @description The definition of the key as PostgreSQL prints it (`FOREIGN KEY (...) REFERENCES ...`). */
+            definition: string;
+        };
+        /** @description Added in 0.32.0. A table of the foreign key closure of the table. */
+        RelatedTable: {
+            schema: string;
+            table: string;
+            /** @description The column the table would be distributed by; null when it does not follow from the keys and was not given. */
+            distributionColumn: string | null;
+            /** Format: int64 */
+            estimatedRows: number | null;
+            /** Format: int64 */
+            sizeBytes: number | null;
+        };
+        /** @description Added in 0.32.0. The answer of `listRelatedTables`. */
+        RelatedTablesPlan: {
+            /** @description The related tables (not the table itself), in the order the task distributes them. */
+            tables: components["schemas"]["RelatedTable"][];
+            keys: components["schemas"]["RelatedKey"][];
+            blockers: components["schemas"]["TableBlocker"][];
+            warnings: components["schemas"]["TableBlocker"][];
+            colocateWith: components["schemas"]["TableRef"];
+        };
+        /**
+         * @description Added in 0.32.0. The long operation that is running on a table: a task of the control plane that has the table as its subject or among its related tables, or
+         *     an unfinished operation that the sharding extension recorded for it (one that was started from SQL). Clients tolerate kinds they do not know. While it is
+         *     set, the changes of the table (distribute, undistribute, alter, the partition operations, the storage format, the ledger) conflict with it and the
+         *     console does not offer them.
+         */
+        TableOperation: {
+            /** @description The change: `distribute`, `undistribute`, `alter`, `partition`, `convertStorage`, `maintain` (time partitions), `export`, `import`, or `other`. */
+            kind: string;
+            /**
+             * @description `related` when the table is one of the related tables of a distribute with related tables whose subject is another table.
+             * @enum {string}
+             */
+            role: "subject" | "related";
+            /** @enum {string} */
+            source: "task" | "extension";
+            /**
+             * Format: int64
+             * @description The task, when the control plane runs it; null for an operation that was started from SQL.
+             */
+            taskId: number | null;
+            /** @description The state of the task (`pending`, `running`, `paused`), or the phase that the extension recorded (`preparing`, `shadow`, `copying`, `catching_up`, `switching`, `cleaning`). */
+            state: string;
+            /** Format: date-time */
+            startedAt: string | null;
+            /** @description Progress when known. */
+            percent: number | null;
+            /** @description The name of the step that runs. */
+            step: string | null;
+        };
         /** @description Added in 0.14.0. A table that a change would touch. */
         TableChangeTable: {
             schema: string;
             name: string;
             /** @enum {string} */
-            role: "source" | "colocated" | "linked";
+            role: "source" | "colocated" | "linked" | "related";
             /** Format: int64 */
             sizeBytes: number | null;
             /** Format: int64 */
@@ -5815,11 +6144,11 @@ export interface components {
              * @description Size of the leaves that this server holds; null when not available.
              */
             sizeBytes: number | null;
-            /** @description Added in 0.17.0, optional. The storage format of the partition (`heap`, `columnar`). */
+            /** @description Added in 0.17.0, optional. The storage format of the partition (`heap`, `columnar`). From 0.25.0 a user partition of a distributed table has it too: `heap` when every leaf is, `columnar` when every leaf is, `mixed` while the leaves are in both formats (a conversion that stopped half way) and `other` when a leaf is missing or has another access method; it is read on the servers that hold the leaves and is left out when a server does not answer or the sharding extension is older than 0.9. */
             accessMethod?: string | null;
-            /** @description Added in 0.17.0, optional. The lower bound of a range partition, as text. */
+            /** @description Added in 0.17.0, optional. The lower bound of a range partition, as text (a user partition of a distributed table has it from 0.25.0). */
             rangeFrom?: string | null;
-            /** @description Added in 0.17.0, optional. The upper bound of a range partition, as text. */
+            /** @description Added in 0.17.0, optional. The upper bound of a range partition, as text (a user partition of a distributed table has it from 0.25.0). */
             rangeTo?: string | null;
             /**
              * Format: int64
@@ -6239,6 +6568,8 @@ export interface components {
             acknowledgeFailures?: boolean;
             /** @description Added in 0.15.0. Overrides, for this run, the delay before the source copy of a moved bucket is dropped. */
             cleanupDelaySeconds?: number;
+            /** @description Added in 0.27.0. Starts a manual run although a group has a standby that is behind its primary by more than `maxStandbyLagBytes` (409 `group_degraded` without it). It lifts only that refusal, and only for this start; the guard of a run that is going on and the automatic mode do not read it. */
+            force?: boolean;
         };
         /** @description Added in 0.15.0. Body of `drainServer`; every member is optional. */
         DrainRequest: {
@@ -6592,6 +6923,10 @@ export interface components {
                 attempts?: number;
                 /** @description Added in 0.15.0, optional. `balance` or `drain`. */
                 reason?: string;
+                /** @description Added in 0.31.0, optional. `schema` when the move was a distributed schema (the one bucket of its colocation group, moved by the extension's schema move); absent for a bucket. Clients must tolerate other values. */
+                kind?: string;
+                /** @description Added in 0.31.0, optional. The schema, for kind `schema`; a name can be any text, so show it as text. */
+                schemaName?: string | null;
                 /** @description Added in 0.9.0, optional. For outcome `skipped`: `stopped` (cancelled by a stop), `targetDiskLow`, `groupDegraded` or `groupLeaseLost`. Clients must tolerate other values. */
                 skipReason?: string | null;
                 /**
@@ -6857,10 +7192,10 @@ export interface components {
         };
         /**
          * @description Kind of task. Each kind has one fixed `subject.type`; the table is in the README
-         *     (section "Task kinds and subjects"). `standby.reconcile` is added in 0.7.0; the `ledger.key.*`, `ledger.bundle.create`, `ledger.epoch.start` and `ledger.upgrade` kinds in 0.11.0; `table.export` and `table.import` (subject `database/schema.table`) in 0.19.0.
+         *     (section "Task kinds and subjects"). `standby.reconcile` is added in 0.7.0; the `ledger.key.*`, `ledger.bundle.create`, `ledger.epoch.start` and `ledger.upgrade` kinds in 0.11.0; `table.export` and `table.import` (subject `database/schema.table`) in 0.19.0; `database.export` (subject type `database`) and `archive.validate` (subject type `upload`) in 0.29.0.
          * @enum {string}
          */
-        TaskKind: "cluster.init" | "cluster.join" | "server.add" | "server.remove" | "server.failover" | "server.leave" | "instance.start" | "instance.stop" | "instance.restart" | "database.create" | "database.update" | "database.drop" | "table.distribute" | "rebalance" | "bucket.split" | "schema.distribute" | "schema.move" | "schema.undistribute" | "replication.restorePreferredPrimaries" | "ledger.verify" | "networkAccess.apply" | "replicate.apply" | "certificate.renew" | "certificate.revoke" | "standby.reconcile" | "config.apply" | "config.restart" | "ledger.key.create" | "ledger.key.rotate" | "ledger.key.retire" | "ledger.key.revoke" | "ledger.key.distribute" | "ledger.bundle.create" | "ledger.epoch.start" | "ledger.upgrade" | "table.undistribute" | "table.alter" | "table.partition" | "database.approximateAggregates" | "table.setStorage" | "partition.maintain" | "table.export" | "table.import";
+        TaskKind: "cluster.init" | "cluster.join" | "server.add" | "server.remove" | "server.failover" | "server.leave" | "instance.start" | "instance.stop" | "instance.restart" | "database.create" | "database.update" | "database.drop" | "table.distribute" | "rebalance" | "bucket.split" | "schema.distribute" | "schema.move" | "schema.undistribute" | "replication.restorePreferredPrimaries" | "ledger.verify" | "networkAccess.apply" | "replicate.apply" | "certificate.renew" | "certificate.revoke" | "standby.reconcile" | "config.apply" | "config.restart" | "ledger.key.create" | "ledger.key.rotate" | "ledger.key.retire" | "ledger.key.revoke" | "ledger.key.distribute" | "ledger.bundle.create" | "ledger.epoch.start" | "ledger.upgrade" | "table.undistribute" | "table.alter" | "table.partition" | "database.approximateAggregates" | "table.setStorage" | "partition.maintain" | "table.export" | "table.import" | "database.export" | "archive.validate" | "database.import";
         /** @description One step of a task. */
         TaskStep: {
             /** @description Step name. */
@@ -6918,11 +7253,11 @@ export interface components {
              * @description Resource type.
              * @enum {string}
              */
-            type: "cluster" | "server" | "instance" | "database" | "table" | "rebalance" | "replication" | "ledgerVerification" | "networkAccess" | "config" | "ledgerKey" | "bucket" | "schema";
+            type: "cluster" | "server" | "instance" | "database" | "table" | "rebalance" | "replication" | "ledgerVerification" | "networkAccess" | "config" | "ledgerKey" | "bucket" | "schema" | "upload";
             /**
              * @description Resource identifier: database name; server id (`ServerId`); instance id (`node_id`) as a decimal
              *     string; `database/schema.table` for a table; the verification id; the task id for a rebalance;
-             *     the literal `cluster`, `preferred-primaries`, `network-access` or (0.11.0, type `ledgerKey`) `signing` for the singleton subjects.
+             *     the literal `cluster`, `preferred-primaries`, `network-access` or (0.11.0, type `ledgerKey`) `signing` for the singleton subjects; the upload id for type `upload` (0.29.0).
              *     See the README table "Task kinds and subjects".
              */
             id: string;
@@ -7216,7 +7551,46 @@ export interface components {
          *     `failure`. Read-only operations are not audited except `executeQuery` and (0.19.0) `downloadDataExport`, because it is where data leaves. From 0.19.0 also `dataTransfer.completed` (a data transfer task ended, written by the task) and `dataTransfer.purged` (the janitor deleted staged files), actor `system`. An upload chunk is not an event.
          * @enum {string}
          */
-        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "abandonMapGroupBootstrap" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped" | "applyConfigChange" | "revertConfigChange" | "restartPendingInstances" | "resetAutoFailoverCounter" | "failoverGroupStarted" | "failoverGroupPromoted" | "failoverGroupFailed" | "oldPrimaryRebuilt" | "updateLedgerSettings" | "createLedgerSigningKey" | "retireLedgerSigningKey" | "revokeLedgerSigningKey" | "createLedgerAnchorTarget" | "updateLedgerAnchorTarget" | "deleteLedgerAnchorTarget" | "testLedgerAnchorTarget" | "anchorLedgerNow" | "retryLedgerAnchor" | "createLedgerBundle" | "registerLedgerClientKey" | "revokeLedgerClientKey" | "setTableSignaturePolicy" | "upgradeLedgerExtension" | "acknowledgeLedgerDivergence" | "previewTableChange" | "undistributeTable" | "alterTableDistribution" | "createTablePartition" | "attachTablePartition" | "detachTablePartition" | "dropTablePartition" | "drainServer" | "splitBucket" | "previewBucketSplit" | "distributeSchema" | "undistributeSchema" | "moveSchema" | "configureApproximateAggregates" | "setTableStorage" | "setPartitionStorage" | "putPartitionPolicy" | "deletePartitionPolicy" | "runPartitionPolicy" | "exportTable" | "importTable" | "createDataUpload" | "deleteDataUpload" | "downloadDataExport" | "deleteDataExport" | "dataTransfer.completed" | "dataTransfer.purged";
+        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "abandonMapGroupBootstrap" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped" | "applyConfigChange" | "revertConfigChange" | "restartPendingInstances" | "resetAutoFailoverCounter" | "failoverGroupStarted" | "failoverGroupPromoted" | "failoverGroupFailed" | "oldPrimaryRebuilt" | "updateLedgerSettings" | "createLedgerSigningKey" | "retireLedgerSigningKey" | "revokeLedgerSigningKey" | "createLedgerAnchorTarget" | "updateLedgerAnchorTarget" | "deleteLedgerAnchorTarget" | "testLedgerAnchorTarget" | "anchorLedgerNow" | "retryLedgerAnchor" | "createLedgerBundle" | "registerLedgerClientKey" | "revokeLedgerClientKey" | "setTableSignaturePolicy" | "upgradeLedgerExtension" | "acknowledgeLedgerDivergence" | "previewTableChange" | "undistributeTable" | "alterTableDistribution" | "createTablePartition" | "attachTablePartition" | "detachTablePartition" | "dropTablePartition" | "drainServer" | "splitBucket" | "previewBucketSplit" | "distributeSchema" | "undistributeSchema" | "moveSchema" | "configureApproximateAggregates" | "setTableStorage" | "setPartitionStorage" | "putPartitionPolicy" | "deletePartitionPolicy" | "runPartitionPolicy" | "exportTable" | "importTable" | "createDataUpload" | "deleteDataUpload" | "downloadDataExport" | "deleteDataExport" | "exportDatabase" | "validateDatabaseArchive" | "importDatabase" | "dataTransfer.completed" | "dataTransfer.purged" | "setCaEscrow" | "rotateCaEscrow";
+        /** @description The escrow of the key of the cluster certificate authority (0.26.0). */
+        CaEscrowStatus: {
+            /** @description Whether the leader keeps sealed copies of the CA key on the servers that can become leader. */
+            enabled: boolean;
+            /** @description Whether the server that answers holds the CA key (the manager leader does). */
+            holdsKey: boolean;
+            /**
+             * Format: int64
+             * @description Rises when the escrow is switched on again and at every rotation.
+             */
+            generation: number;
+            /** @description The servers that hold, or should hold, a copy. */
+            recipients: components["schemas"]["CaEscrowRecipient"][];
+            /** @description Whether at least one recipient exists and every recipient holds the newest copy. */
+            complete: boolean;
+            /** @description What the state means for the operator. */
+            message: string;
+        };
+        /** @description One server of the escrow. */
+        CaEscrowRecipient: {
+            serverId: string;
+            /**
+             * @description `current`: the copy is the newest. `pending`: not delivered yet or out of date (the leader sends again). `refused`: the server answered the last send with an error, see `error`. `dropPending`: the server no longer qualifies (or the escrow is off) and its copy has not been deleted yet; the leader asks again every minute, and until it succeeds the server must be treated as knowing the CA key.
+             * @enum {string}
+             */
+            state: "current" | "pending" | "refused" | "dropPending";
+            /** @description Identifier of the escrow public key the copy is sealed to. */
+            keyId: string | null;
+            /** Format: int64 */
+            generation: number | null;
+            /** Format: date-time */
+            sealedAt: string | null;
+            /** @description The last error of a send. */
+            error: string | null;
+        };
+        /** @description Request of setCaEscrow. */
+        CaEscrowUpdate: {
+            enabled: boolean;
+        };
         /** @description One audit log entry. */
         AuditEvent: {
             /**
@@ -7455,7 +7829,7 @@ export interface components {
                 at: string;
                 /** @description `started` a run was started; `nothingToDo` the placement is balanced or a run is under way; `blocked` a rule stopped it (see `blockedBy`); `settling` the imbalance is too young or too soon after a change. Clients must tolerate other values. */
                 outcome: string;
-                /** @description The rules that held it back: `window`, `failover`, `groupDegraded`, `groupUnavailable`, `servers`, `moveFailed`, `consistency`, `operatorStopped`, `running`. */
+                /** @description The rules that held it back: `window`, `failover`, `groupDegraded` (a group has fewer healthy standbys than the replica count, or a standby is behind its primary by more than `maxStandbyLagBytes` when a run is started or resumed, and by more than twice that on three evaluations in a row inside a run, 0.27.0), `groupUnavailable`, `servers`, `moveFailed`, `consistency`, `operatorStopped`, `running`. */
                 blockedBy: string[];
             } | null;
         };
@@ -9011,7 +9385,7 @@ export interface components {
             confirm: string;
         };
         /**
-         * @description Alert type. Clients must tolerate kinds they do not know. Added in 0.24.0 (placeholder revision): `extensionSchemaUntrusted` (the schema of a KingresDB extension in a database is not owned by a superuser, or an object in it is not a member of an extension, or a role that is not a superuser can create objects in it, so the service role does not read or call anything in it; the monitor raises it for the database and the readings of that database that depend on the extension are not available; subject `server` and `database`; `critical`). Added in 0.19.0: `transferStagingLow` (the reservations of the staged files of the data transfer hold 90 percent of `dataTransfer.stagingQuotaBytes`, `critical` at 98 percent; subject `server`; raised by the server that holds the files, the manager leader). Added in 0.15.0: `rebalanceFailed` (the last automatic rebalance failed and the mode is suspended until an operator starts a rebalance; subject `cluster`; `warning`). Added in 0.13.0: `certificateAuthorityUnavailable` (the map group was failed over and the new manager leader holds no key of the certificate authority, so no certificate can be issued, renewed or revoked until the operator restores `pki/ca.key` and `pki/revoked.json` from the backup of the old leader; subject `cluster`; `critical`). Added in 0.11.0 (ledger phase 7; subjects at `AlertSubject`): `ledgerNotAnchored` (a database has ledger tables and no anchor target is enabled; `info`, `warning` when the setting `anchor.required` is on), `ledgerAnchorBehind` (`warning`, `critical`), `ledgerAnchorFailed` (an anchor record is `failed` or `expired`; `critical`), `ledgerAnchorConflict` (the store holds a different object under the name of an anchor; `critical`), `ledgerChainDiverged` (a chain no longer extends its published log; `critical`), `ledgerGroupUnread` (a shard group's chain could not be read; `warning`, `critical`), `ledgerPublicationBehind` (the newest signed checkpoint of a chain is older than five publication intervals while its head advanced; `warning`), `ledgerSignerUnavailable` (no checkpoint could be signed for two rounds, or the key set is damaged, or the key file is missing on the leader; `critical`) and `ledgerDigestOverdue` (no digest within twice `digestIntervalSeconds`; `warning`). Added in 0.8.0: `clockDifference` (a server's clock differs from the manager leader's by more than `ClusterSettings.clock.maxDifferenceMs`, less the uncertainty of the measurement; `warning`, `critical` at ten times the threshold; `kingresd` does not set the system clock, run NTP or chrony). Added in 0.7.0: `leaseLost` (the `kingresd` that
+         * @description Alert type. Clients must tolerate kinds they do not know. Added in 0.30.0: `extensionSkipped` (an extension of a database was not installed on a server because a role of the tenant made a schema of the extension its own, so its owner there differs from the owner on the leader; the operation that found it, adding a server among them, went on without that extension; `kingresd` raises it when it applies the database to the server, and clears it when a later apply of that extension on that server succeeds or when the database is dropped; the message names the extension, the schema and the two owners; one alert for each skipped extension; subject `server` and `database`, and `aspect` is `extension:<name>`; `warning`). Added in 0.24.0: `extensionSchemaUntrusted` (the schema of a KingresDB extension in a database is not owned by a superuser, or an object in it is not a member of an extension, or a role that is not a superuser can create objects in it, so the service role does not read or call anything in it; the monitor raises it for the database and the readings of that database that depend on the extension are not available; subject `server` and `database`; `critical`). Added in 0.19.0: `transferStagingLow` (the reservations of the staged files of the data transfer hold 90 percent of `dataTransfer.stagingQuotaBytes`, `critical` at 98 percent; subject `server`; raised by the server that holds the files, the manager leader). Added in 0.15.0: `rebalanceFailed` (the last automatic rebalance failed and the mode is suspended until an operator starts a rebalance; subject `cluster`; `warning`). Added in 0.13.0: `certificateAuthorityUnavailable` (the map group was failed over and the new manager leader holds no key of the certificate authority, so no certificate can be issued, renewed or revoked until the operator restores `pki/ca.key` and `pki/revoked.json` from the backup of the old leader; subject `cluster`; `critical`). Added in 0.11.0 (ledger phase 7; subjects at `AlertSubject`): `ledgerNotAnchored` (a database has ledger tables and no anchor target is enabled; `info`, `warning` when the setting `anchor.required` is on), `ledgerAnchorBehind` (`warning`, `critical`), `ledgerAnchorFailed` (an anchor record is `failed` or `expired`; `critical`), `ledgerAnchorConflict` (the store holds a different object under the name of an anchor; `critical`), `ledgerChainDiverged` (a chain no longer extends its published log; `critical`), `ledgerGroupUnread` (a shard group's chain could not be read; `warning`, `critical`), `ledgerPublicationBehind` (the newest signed checkpoint of a chain is older than five publication intervals while its head advanced; `warning`), `ledgerSignerUnavailable` (no checkpoint could be signed for two rounds, or the key set is damaged, or the key file is missing on the leader; `critical`) and `ledgerDigestOverdue` (no digest within twice `digestIntervalSeconds`; `warning`). Added in 0.8.0: `clockDifference` (a server's clock differs from the manager leader's by more than `ClusterSettings.clock.maxDifferenceMs`, less the uncertainty of the measurement; `warning`, `critical` at ten times the threshold; `kingresd` does not set the system clock, run NTP or chrony). Added in 0.7.0: `leaseLost` (the `kingresd` that
          *     runs the primary of a shard group could not renew the group's lease in time; for a group with a standby the
          *     instance was stopped (fenced), for a group without one it keeps running and this alert is the only effect;
          *     `critical`), `groupWithoutSynchronousStandby` (the group's standby has been unreachable for longer than the
@@ -9025,7 +9399,7 @@ export interface components {
          *     `server:<leader>|behind:<server>`, `warning` after a minute, `critical` after ten).
          * @enum {string}
          */
-        AlertKind: "serverDown" | "serverSuspect" | "underReplicatedBuckets" | "unavailableBuckets" | "replicationLagHigh" | "diskSpaceLow" | "memoryPressure" | "rebalanceNeeded" | "autoFailoverTriggered" | "autoFailoverLimitReached" | "mapGroupUnavailable" | "ledgerVerificationFailed" | "ledgerPendingTooOld" | "versionMismatch" | "certificateExpiring" | "certificateRenewalFailed" | "replicationPending" | "taskFailed" | "rebalanceFailed" | "leaseLost" | "groupWithoutSynchronousStandby" | "groupUnderReplicated" | "clockDifference" | "failoverNeedsDecision" | "failoverBlocked" | "failoverDataLoss" | "splitPromotion" | "oldPrimaryRunning" | "oldPrimaryNotStopped" | "oldPrimaryNotRebuilt" | "ledgerNotAnchored" | "ledgerAnchorBehind" | "ledgerAnchorFailed" | "ledgerAnchorConflict" | "ledgerChainDiverged" | "ledgerGroupUnread" | "ledgerPublicationBehind" | "ledgerSignerUnavailable" | "ledgerDigestOverdue" | "certificateAuthorityUnavailable" | "partitionsAheadLow" | "partitionPolicyFailed" | "transferStagingLow" | "extensionSchemaUntrusted";
+        AlertKind: "serverDown" | "serverSuspect" | "underReplicatedBuckets" | "unavailableBuckets" | "replicationLagHigh" | "diskSpaceLow" | "memoryPressure" | "rebalanceNeeded" | "autoFailoverTriggered" | "autoFailoverLimitReached" | "mapGroupUnavailable" | "ledgerVerificationFailed" | "ledgerPendingTooOld" | "versionMismatch" | "certificateExpiring" | "certificateRenewalFailed" | "replicationPending" | "taskFailed" | "rebalanceFailed" | "leaseLost" | "groupWithoutSynchronousStandby" | "groupUnderReplicated" | "clockDifference" | "failoverNeedsDecision" | "failoverBlocked" | "failoverDataLoss" | "splitPromotion" | "oldPrimaryRunning" | "oldPrimaryNotStopped" | "oldPrimaryNotRebuilt" | "ledgerNotAnchored" | "ledgerAnchorBehind" | "ledgerAnchorFailed" | "ledgerAnchorConflict" | "ledgerChainDiverged" | "ledgerGroupUnread" | "ledgerPublicationBehind" | "ledgerSignerUnavailable" | "ledgerDigestOverdue" | "certificateAuthorityUnavailable" | "partitionsAheadLow" | "partitionPolicyFailed" | "transferStagingLow" | "extensionSchemaUntrusted" | "extensionSkipped";
         /** @description An alert. */
         Alert: {
             /**
@@ -9281,10 +9655,10 @@ export interface components {
         /** @description Added in 0.19.0. A new resumable upload. */
         CreateDataUploadRequest: {
             /**
-             * @description What the file is for. 0.20.0 adds `databaseArchive`.
+             * @description What the file is for. `databaseArchive` (0.29.0) is a zip archive made by `exportDatabase`; it is used by `validateDatabaseArchive`.
              * @enum {string}
              */
-            purpose: "tableImport";
+            purpose: "tableImport" | "databaseArchive";
             /**
              * Format: int64
              * @description The size of the file in bytes; at most `dataTransfer.maxFileBytes`. The staging quota for this size is reserved.
@@ -9300,10 +9674,10 @@ export interface components {
             /** @description Identifier, a decimal string. */
             uploadId: string;
             /**
-             * @description `receiving`: bytes are missing. `complete`: all bytes are in and the SHA-256 is known. `lost`: the staged file is gone (404 is the usual answer). 0.20.0 adds `validating`, `valid` and `invalid`.
+             * @description `receiving`: bytes are missing. `complete`: all bytes are in and the SHA-256 is known. `validating`: an `archive.validate` task reads it (0.29.0). `valid`, `invalid`: the result of the validation of an archive (0.29.0); the report is in `report`. `lost`: the staged file is gone (404 is the usual answer).
              * @enum {string}
              */
-            state: "receiving" | "complete" | "lost" | "deleted";
+            state: "receiving" | "complete" | "validating" | "valid" | "invalid" | "lost" | "deleted";
             /**
              * Format: int64
              * @description The declared size.
@@ -9331,6 +9705,8 @@ export interface components {
              * @description When the server deletes the upload if nothing happens (48 hours without data, 24 hours when complete and unused).
              */
             expiresAt: string;
+            /** @description The archive report of the last validation (0.29.0); null before one and for an upload whose purpose is not `databaseArchive`. */
+            report?: components["schemas"]["ArchiveReport"] | null;
         };
         /**
          * @description Added in 0.19.0. What the file guarantees for one table. Every row in a file was committed. `single-snapshot`: one snapshot (a local table, a reference table, or a distributed table whose buckets are all on one
@@ -9341,19 +9717,121 @@ export interface components {
             /** @description `schema.table`. */
             table: string;
             /** @enum {string} */
-            level: "single-snapshot" | "per-group" | "per-group-and-partition";
+            level: "single-snapshot" | "per-group" | "per-group-and-partition" | "archive-single-snapshot";
             /** @description Number of groups that hold buckets of the table. */
             groups: number;
+        };
+        /** @description Added in 0.29.0. Options of a database export. Every member is optional; the server never accepts SQL of any kind. */
+        ExportDatabaseRequest: {
+            /** @description Tables whose rows are left out of the archive (their structure stays). A name that is not a table of the database is 400 `validation_failed`. */
+            excludeTables?: components["schemas"]["TableRef"][];
+            /**
+             * @description `none` writes the structure and the catalog without any data entry.
+             * @default all
+             * @enum {string}
+             */
+            dataMode?: "all" | "none";
+            /**
+             * @description Accept that large objects and `oid` or `reg*` columns are not carried (422 `large_objects_present` otherwise); the archive's warnings say it.
+             * @default false
+             */
+            acknowledgeLargeObjectsLost?: boolean;
+            /** @description How long the archive is kept; default the cluster setting. */
+            retentionHours?: number;
+        };
+        /**
+         * @description Added in 0.30.0. The request of `importDatabase`. A closed schema: there is no `privileges`, no `allowCode` and no `bucketCount` (owners and grants are not restored, functions and triggers are always refused, the
+         *     bucket counts of the archive are kept), so that a later revision can add them without changing what a request means.
+         */
+        ImportDatabaseRequest: {
+            /** @description A complete upload of the caller whose purpose is `databaseArchive`. It need not have been validated: the import reads the archive again. */
+            uploadId: string;
+            /** @description The name of the new database; default the name in the manifest. 409 `already_exists` when it exists at the request, and the task fails when it exists when the final name is taken. */
+            database?: string;
+            /** @description Binds the import to a checksum the operator got elsewhere (the export's SHA-256 as the console shows it); a different file is 422 `archive_invalid`. */
+            expectedSha256?: string;
+            /**
+             * @description Required `true` when the archive has a ledger table; the imported table is a new chain (ADR 0028). 422 `ledger_restart_not_acknowledged` otherwise.
+             * @default false
+             */
+            acknowledgeLedgerRestart?: boolean;
+            /**
+             * @description `fail`: a foreign key that the loaded rows violate fails the task (the code `foreign_key_violation` names the constraint and the count) and the database is removed. `keepNotValid`: the constraint stays `NOT VALID`, the database is kept and the violations are reported by constraint name and count.
+             * @default fail
+             * @enum {string}
+             */
+            onForeignKeyViolation?: "fail" | "keepNotValid";
+            /**
+             * @description Keep the private database if the import fails, to look at it. It stays under its private name until it is dropped.
+             * @default false
+             */
+            keepOnFailure?: boolean;
+        };
+        /** @description Added in 0.29.0. The result of the validation of a database archive (`validateDatabaseArchive`, stored with the upload). Nothing in it is a value of the data or the text of a statement. */
+        ArchiveReport: {
+            valid: boolean;
+            /** @description The `format` of the manifest, for example `kingres-export/1`; empty when the manifest could not be read. */
+            format: string;
+            /** @description The SHA-256 of the archive file. */
+            sha256?: string;
+            versions: {
+                postgresMajor: number;
+                kingresVersion: string;
+                extensions: {
+                    name: string;
+                    version: string;
+                    schema: string;
+                    /** @description The version installed on this cluster, or null when it is not installed. */
+                    installed?: string | null;
+                }[];
+                encoding: string;
+                lcCollate: string;
+                lcCtype: string;
+            };
+            tables: {
+                local: number;
+                hash: number;
+                reference: number;
+                ledger: number;
+                columnar: number;
+                /** Format: int64 */
+                rows: number;
+                /** Format: int64 */
+                bytes: number;
+            };
+            /** @description What the shape grammar found in the three SQL files; nothing was run. */
+            statements?: {
+                byKind: {
+                    [key: string]: number;
+                };
+                refused: {
+                    kind: string;
+                    /** @description The file and the statement number, for example `schema/pre-data.sql#12`. */
+                    position: string;
+                    /** @description The length and a hash prefix of the statement; never its text. */
+                    fingerprint: string;
+                    reason: string;
+                }[];
+            };
+            needs?: {
+                /** @description The archive has ledger tables; an import restarts their chain. */
+                ledgerRestart: boolean;
+                /** @description The source had large objects that the archive does not carry (acknowledged at export). */
+                largeObjectsLost: boolean;
+            };
+            warnings?: string[];
+            /** @description Why the archive is not valid or not importable here, in the shape of the blockers of `table_not_eligible`; empty when valid. */
+            reasons: components["schemas"]["TableBlocker"][];
         };
         /** @description Added in 0.19.0. A staged export file and what is known about it. */
         DataExport: {
             /** @description Identifier, a decimal string. */
             exportId: string;
             /**
-             * @description 0.20.0 adds `databaseExport`.
+             * @description `databaseExport` (0.29.0) is a zip archive of a database; `table` is then null and `consistency` has one entry per table.
              * @enum {string}
              */
-            kind: "tableExport";
+            kind: "tableExport" | "databaseExport";
             /**
              * @description `building`: the task writes it. `ready`: it can be downloaded. `failed`: the task failed and the partial file was removed. `expired`: its time has passed. `lost`: the file or the key is gone.
              * @enum {string}
@@ -9374,17 +9852,17 @@ export interface components {
              * @description Rows in the file; null while it is built.
              */
             rows?: number | null;
-            /** @description One entry for the table; null while it is built. */
+            /** @description One entry for the table (one per table for a database archive; `archive-single-snapshot` when all were read in one transaction); null while it is built. */
             consistency?: components["schemas"]["TableConsistency"][] | null;
             /** @description Whether the file was written with the spreadsheet guard (`spreadsheetSafe` of the request); null while it is built. Added to 0.19.0 before its release. */
             spreadsheetSafe?: boolean | null;
             /** @description Whether row-level security shortened the file. Always false: a table with row-level security is exported only with `row_security = off`, so a policy that hides rows fails the export. */
             rlsApplied?: boolean;
             /**
-             * @description 0.20.0 adds `archive/1`.
+             * @description `archive/1` (0.29.0): the zip archive of `exportDatabase`, served as `application/zip`.
              * @enum {string}
              */
-            format?: "csv" | "csv.gz";
+            format?: "csv" | "csv.gz" | "archive/1";
             /**
              * Format: int64
              * @description The task that builds the file.
@@ -9402,6 +9880,8 @@ export interface components {
              * @description When the last byte was served; null when no download has finished.
              */
             downloadedAt?: string | null;
+            /** @description What the file does not carry or how it was read (0.29.0; the warnings of the manifest of a database archive). Absent for a table export. */
+            warnings?: string[];
         };
         /** @description Added in 0.19.0. A page of the caller's exports, newest first. */
         DataExportPage: {
@@ -9595,6 +10075,46 @@ export interface components {
          *     `detail` is `transfer <id>`, the id to give to `getDataExport` and `downloadDataExport`.
          */
         AcceptedTableExport: {
+            headers: {
+                /** @description URL of the task, `/api/v1/tasks/{taskId}`. */
+                Location?: string;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Task"];
+            };
+        };
+        /**
+         * @description The export was accepted and runs as the task `database.export` (added in 0.29.0). Poll `GET /tasks/{taskId}` (the `Location` header) until `state` is `done` or `failed`; when it is `done`,
+         *     `detail` is `transfer <id>`, the id to give to `getDataExport` and `downloadDataExport`.
+         */
+        AcceptedDatabaseExport: {
+            headers: {
+                /** @description URL of the task, `/api/v1/tasks/{taskId}`. */
+                Location?: string;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Task"];
+            };
+        };
+        /**
+         * @description The import was accepted and runs as the task `database.import` (added in 0.30.0). Poll `GET /tasks/{taskId}` (the `Location` header) until `state` is `done` or `failed`. When it is `done` the database
+         *     exists under its final name and `detail` lists what needs a decision (the disabled time-partition policies, the ledger chains that started again); when it failed the private database was removed (or kept, with
+         *     `keepOnFailure`) and the final name was never taken.
+         */
+        AcceptedDatabaseImport: {
+            headers: {
+                /** @description URL of the task, `/api/v1/tasks/{taskId}`. */
+                Location?: string;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Task"];
+            };
+        };
+        /** @description The validation was accepted and runs as the task `archive.validate` (added in 0.29.0). Poll `GET /tasks/{taskId}` until it is `done`, then read the report with `getDataUpload`. */
+        AcceptedArchiveValidation: {
             headers: {
                 /** @description URL of the task, `/api/v1/tasks/{taskId}`. */
                 Location?: string;
@@ -10608,6 +11128,87 @@ export interface operations {
             503: components["responses"]["ServiceUnavailable"];
         };
     };
+    getCaEscrow: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The escrow of the CA key. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CaEscrowStatus"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    setCaEscrow: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CaEscrowUpdate"];
+            };
+        };
+        responses: {
+            /** @description The escrow after the operation. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CaEscrowStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    rotateCaEscrow: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The escrow after the rotation. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CaEscrowStatus"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
     listServerGroups: {
         parameters: {
             query?: never;
@@ -11267,6 +11868,43 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TableChangePreview"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listRelatedTables: {
+        parameters: {
+            query?: {
+                /** @description The distribution column of the table; without it the columns of the related tables are left empty. */
+                distributionColumn?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The plan. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelatedTablesPlan"];
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -14724,6 +15362,33 @@ export interface operations {
             503: components["responses"]["ServiceUnavailable"];
         };
     };
+    exportDatabase: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExportDatabaseRequest"];
+            };
+        };
+        responses: {
+            202: components["responses"]["AcceptedDatabaseExport"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["DataTransferForbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["DataTransferConflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
     createDataUpload: {
         parameters: {
             query?: never;
@@ -14850,6 +15515,53 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             409: components["responses"]["UploadOffsetMismatch"];
             413: components["responses"]["ChunkTooLarge"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    validateDatabaseArchive: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifier of an upload (added in 0.19.0), a decimal string. An upload of another role is 404. */
+                uploadId: components["parameters"]["UploadId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: components["responses"]["AcceptedArchiveValidation"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["DataTransferForbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["DataTransferConflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    importDatabase: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ImportDatabaseRequest"];
+            };
+        };
+        responses: {
+            202: components["responses"]["AcceptedDatabaseImport"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["DataTransferForbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["DataTransferConflict"];
             422: components["responses"]["UnprocessableEntity"];
             503: components["responses"]["ServiceUnavailable"];
         };

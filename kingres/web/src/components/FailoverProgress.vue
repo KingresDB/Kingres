@@ -27,6 +27,7 @@ import {
   groupStateMeta,
   groupTitle,
   KIND_LABEL,
+  mapGroupPauseHint,
   phaseLabel,
   runStateMeta,
   TRIGGER_LABEL,
@@ -124,10 +125,16 @@ const cancel = useMutation({
 // Giving up the bootstrap of the map group (contract 0.18.0). The candidate lets go of its lease, and for a planned switchover the old leader rolls back; a
 // bootstrap that promoted the standby cannot be given up (the server answers a conflict), and none in progress answers abandoned: false.
 const abandonAsked = ref(false)
+// Contract 0.28.0: the operator may declare that the candidate server is lost. Off by default; the dialog's warning says what it means.
+const declareLost = ref(false)
 const abandonNote = ref('')
 const abandonError = ref<unknown>(null)
 const abandon = useMutation({
-  mutationFn: () => endpoints.abandonMapGroupBootstrap('given up from the console'),
+  mutationFn: () =>
+    endpoints.abandonMapGroupBootstrap(
+      'given up from the console',
+      declareLost.value && movingTo.value ? movingTo.value : undefined,
+    ),
   onSuccess: (r) => {
     abandonError.value = null
     const resumed = r.resumedServerId
@@ -142,6 +149,7 @@ const abandon = useMutation({
   },
   onSettled: () => {
     abandonAsked.value = false
+    declareLost.value = false
     return Promise.all([
       client.invalidateQueries({ queryKey: keys.failover }),
       client.invalidateQueries({ queryKey: keys.topology }),
@@ -149,6 +157,14 @@ const abandon = useMutation({
   },
 })
 const abandoning = computed(() => abandon.isPending.value)
+function openAbandon(): void {
+  declareLost.value = false
+  abandonAsked.value = true
+}
+function closeAbandon(): void {
+  declareLost.value = false
+  abandonAsked.value = false
+}
 
 const resumeError = ref<unknown>(null)
 const resuming = ref(false)
@@ -253,7 +269,7 @@ watch(
         op="abandonMapGroupBootstrap"
         data-testid="abandon-bootstrap"
         :blocked-reason="abandoning ? 'Giving up ...' : ''"
-        @click="abandonAsked = true"
+        @click="openAbandon"
       >
         Give up the move of the manager
       </GateButton>
@@ -291,6 +307,12 @@ watch(
         </p>
         <p v-else-if="g.phase === 'waitingForLease'" class="muted" data-testid="group-message">
           Waiting for the old primary's lease to run out.
+        </p>
+        <p v-if="mapGroupPauseHint(g.message)" data-testid="map-pause-hint">
+          The old leader was stopped and cannot take the request. Repeat the failover request on
+          server
+          <SafeName :value="mapGroupPauseHint(g.message)!.server" kind="text" :max="80" />, which
+          runs the bootstrap; or give the bootstrap up to start the old leader again.
         </p>
       </li>
     </ul>
@@ -424,13 +446,34 @@ watch(
     danger
     :busy="abandoning"
     @confirm="abandon.mutate()"
-    @cancel="abandonAsked = false"
+    @cancel="closeAbandon"
   >
     <p>
       The standby that was to become the manager lets go of the lease, and the old manager takes
       over again. A move that has promoted the standby already cannot be given up: it goes on to its
       end.
     </p>
+    <div v-if="movingTo" class="stack" data-testid="declare-lost">
+      <label class="row">
+        <input v-model="declareLost" type="checkbox" data-testid="declare-lost-check" />
+        <span>Declare this server lost: <SafeName :value="movingTo" kind="text" :max="60" /></span>
+      </label>
+      <p
+        v-if="declareLost"
+        class="notice tone-danger"
+        role="alert"
+        data-testid="declare-lost-warning"
+      >
+        <span aria-hidden="true">&#10006;</span>
+        <span>
+          <strong>Only for a server that is really gone.</strong> The cluster then goes on without
+          the word of this server. Whatever it promoted and acknowledged before it was lost is
+          accepted as lost with this declaration, and it must never come back as a manager. If the
+          server is only slow or cut off, do not declare it: wait, or give the move up without it.
+          The server must not be heard by the cluster; otherwise the request is refused.
+        </span>
+      </p>
+    </div>
   </ConfirmDialog>
   <FailoverReportDialog
     v-if="reportOpen && taskId !== null"

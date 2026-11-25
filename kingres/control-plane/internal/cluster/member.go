@@ -148,6 +148,12 @@ func (s *Service) InstallPKI(ctx context.Context, req wire.PKIRequest) error {
 	if err := checkCRL([]byte(req.CRL), ca); err != nil {
 		return err
 	}
+	// A revocation list never goes back: a list that lacks a revocation this server holds, or has a lower number, is refused and
+	// the sender (a leader that was away) merges what the servers hold and sends again. This is checked before anything is written.
+	held, _ := os.ReadFile(filepath.Join(dir, pki.CRLFile)) //nolint:gosec // fixed name below the pki directory
+	if err := pki.CheckNotStale(held, []byte(req.CRL)); err != nil {
+		return err
+	}
 	if req.ServerCert != "" {
 		key, err := os.ReadFile(filepath.Join(dir, pki.ServerKeyFile)) //nolint:gosec // fixed name below the pki directory
 		if err != nil {
@@ -163,8 +169,16 @@ func (s *Service) InstallPKI(ctx context.Context, req wire.PKIRequest) error {
 	if err := pki.WriteFile(filepath.Join(dir, pki.CRLFile), []byte(req.CRL), 0o644); err != nil { //nolint:gosec // a revocation list is public
 		return err
 	}
-	if err := pki.SaveRevokedList(dir, req.Revoked); err != nil {
+	heldList, _ := pki.LoadRevokedList(dir)
+	if err := pki.SaveRevokedList(dir, pki.UnionSerials(req.Revoked, heldList)); err != nil {
 		return err
+	}
+	// A server that holds the CA key (a former leader) takes the revocations into its own list as well: it verifies peers with it
+	// and would distribute it if it became the leader again.
+	if ca, err := s.CA(); err == nil {
+		if _, err := ca.MergeRevoked(req.Revoked, time.Now()); err != nil {
+			return err
+		}
 	}
 	if s.mgr != nil && s.mgr.Exists(NodeID) {
 		return s.reloadAll(ctx)

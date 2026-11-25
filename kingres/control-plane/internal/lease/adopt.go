@@ -212,9 +212,36 @@ func (m *Manager) loadRelinquished() {
 	for _, f := range files {
 		var g int32
 		if _, err := fmt.Sscanf(strings.TrimPrefix(filepath.Base(f), RelinquishedMarker+"."), "%d", &g); err == nil {
+			if m.staleTransferMarker(f, g) {
+				// kingresd ended between the marker and the answer of the grantors, and this server's own grantor never moved the
+				// lease: the transfer did not take effect here and a majority of the others cannot have the lease of a server that
+				// keeps its own grant (phase 5 review L-4). The marker is dropped; otherwise the group would never be renewed again.
+				if err := os.Remove(f); err == nil || errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+			}
 			m.relinq[g] = true
 		}
 	}
+}
+
+// staleTransferMarker says that the marker file is the "transferring to X" of a Transfer that did not reach this server's
+// own grantor: the grantor does not name X as the holder of the group.
+func (m *Manager) staleTransferMarker(file string, group int32) bool {
+	b, err := os.ReadFile(file)
+	if err != nil || m.c.Grantor == nil {
+		return false
+	}
+	to, ok := strings.CutPrefix(strings.TrimSpace(string(b)), "transferring to ")
+	if !ok || to == "" {
+		return false
+	}
+	for _, e := range m.c.Grantor.Snapshot() {
+		if e.Group == group && e.Holder == to {
+			return false
+		}
+	}
+	return true
 }
 
 // TransferResult is what a hand-over found.
@@ -241,6 +268,13 @@ func (m *Manager) Transfer(ctx context.Context, group int32, to string) (Transfe
 	}
 	members := t.Members
 	need := majority(members)
+	// The marker is on disk before the first request, as ReleaseGroup does (F2-03, phase 5 review L6): a restart of kingresd between the answer
+	// of a majority and the end of this call must not renew, or start a primary, for a group that was handed over. A transfer that fails puts
+	// the state back.
+	markerBefore := markerExists(m.c.Dir, RelinquishedMarker, group)
+	if err := pki.WriteFile(MarkerPath(m.c.Dir, RelinquishedMarker, group), []byte("transferring to "+to+"\n"), 0o600); err != nil {
+		return TransferResult{}, fmt.Errorf("lease: writing the relinquished marker: %w", err)
+	}
 	req := Request{Group: group, DurationMs: m.c.Duration.Milliseconds(), TransferTo: to}
 	rctx, cancel := context.WithTimeout(ctx, m.c.Duration-m.c.Margin)
 	defer cancel()
@@ -269,12 +303,15 @@ func (m *Manager) Transfer(ctx context.Context, group int32, to string) (Transfe
 	}
 	res := TransferResult{Granted: granted, Need: need}
 	if granted < need {
+		if !markerBefore {
+			_ = os.Remove(MarkerPath(m.c.Dir, RelinquishedMarker, group))
+		}
 		return res, fmt.Errorf("lease: only %d of the %d grantors needed moved the lease of shard group %d to %s (a grantor of an older version does not know the call)", granted, need, group, to)
 	}
-	// The lease is `to`'s. This server does not hold it and does not renew it any more. The
-	// marker makes that survive a restart of kingresd.
+	// The lease is `to`'s. This server does not hold it and does not renew it any more. The marker, written before the
+	// requests, makes that survive a restart of kingresd; it now says where the lease went.
 	if err := pki.WriteFile(MarkerPath(m.c.Dir, RelinquishedMarker, group), []byte("transferred to "+to+"\n"), 0o600); err != nil {
-		m.c.Log.Warn("writing the relinquished marker after a transfer", "group", group, "error", err)
+		m.c.Log.Warn("rewriting the relinquished marker after a transfer", "group", group, "error", err)
 	}
 	m.mu.Lock()
 	m.relinq[group] = true
@@ -304,8 +341,9 @@ func (m *Manager) ReleaseGroup(ctx context.Context, group int32) (TransferResult
 	was := m.relinq[group]
 	m.relinq[group] = true
 	m.mu.Unlock()
-	m.rmu.Lock()
-	m.rmu.Unlock() //nolint:staticcheck // waiting for the round in flight is the point
+	rl := m.rmuFor(group)
+	rl.Lock()
+	rl.Unlock() //nolint:staticcheck // waiting for the round in flight is the point
 	// A round ends when a majority answered: the request to the last grantor may still be on its way, and must not be
 	// received after the release (FO-13).
 	m.fl.wait(group)
@@ -495,8 +533,13 @@ func (m *Manager) HandOverMarked(group int32) bool {
 // stopped for the hand-over, removed when the hold ends. The old leader of the map group resumes its primary only on the word of that server.
 const CandidateMarker = "candidate"
 
-// RecordCandidate names the server that the group is being handed to.
+// RecordCandidate names the server that the group is being handed to. A record that names another server is refused (M1 of the review of the hard failover of the map
+// group): a rerun of a failover must not move the word that ends the hold to a server that did not take the group; only ForgetCandidate, Unrelinquish and
+// BecameStandby change it.
 func (m *Manager) RecordCandidate(group int32, server string) error {
+	if have := m.Candidate(group); have != "" && have != server {
+		return fmt.Errorf("lease: the group is being handed to %s already; give that hand-over up before naming %s", have, server)
+	}
 	return pki.WriteFile(MarkerPath(m.c.Dir, CandidateMarker, group), []byte(server+"\n"), 0o600)
 }
 

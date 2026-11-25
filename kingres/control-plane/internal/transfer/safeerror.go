@@ -47,6 +47,19 @@ const (
 	CodeImportEndMarker = "import_end_marker"
 	CodeRecordTooLarge  = "import_record_too_large"
 	CodeImportTooLarge  = "import_too_large"
+	// The codes of the database export (contract 0.29.0): the structure changed while the archive was written, the dump holds a construct that
+	// the archive does not carry, the schema dump could not be made, the archive that was written is not valid.
+	CodeSchemaChanged      = "schema_changed"
+	CodeSchemaUnrecognised = "schema_unrecognised"
+	CodeDumpFailed         = "schema_dump_failed"
+	CodeArchiveInvalid     = "archive_invalid"
+	// The codes of the database import (contract 0.30.0).
+	CodeArchiveIncompatible = "archive_incompatible"
+	CodeStatementRefused    = "archive_statement_refused"
+	CodeLedgerRestart       = "ledger_restart_not_acknowledged"
+	CodeForeignKey          = "foreign_key_violation"
+	CodeTableNotEligible    = "table_not_eligible"
+	CodeVerification        = "verification_failed"
 	// CodeInternal is every failure the server does not describe to the client.
 	CodeInternal = "internal_error"
 )
@@ -135,11 +148,21 @@ func (e *Error) Problem() *problem.Problem {
 	switch e.Code {
 	case CodeForbidden:
 		code = problem.Forbidden
+	case CodeArchiveInvalid:
+		code = problem.ArchiveInvalid
+	case CodeArchiveIncompatible:
+		code = problem.ArchiveIncompatible
+	case CodeStatementRefused:
+		code = problem.ArchiveStatementRefused
+	case CodeLedgerRestart:
+		code = problem.LedgerRestartNotAcknowledged
+	case CodeImportTooLarge:
+		code = problem.ImportTooLarge
 	case CodeQuotaExceeded:
 		code = problem.TransferQuotaExceeded
 	case CodeInsufficientDisk:
 		code = problem.InsufficientDisk
-	case CodeCancelled, CodeTimeout, CodeLeaderChanged, CodeSessionLost, CodeCopyInterrupted, CodeRowCountMismatch, CodeOutcomeUnknown, CodeKeyLost, CodeExportTooLarge:
+	case CodeSchemaChanged, CodeDumpFailed, CodeCancelled, CodeTimeout, CodeLeaderChanged, CodeSessionLost, CodeCopyInterrupted, CodeRowCountMismatch, CodeOutcomeUnknown, CodeKeyLost, CodeExportTooLarge:
 		code = problem.Conflict
 	}
 	return problem.New(code, e.Error())

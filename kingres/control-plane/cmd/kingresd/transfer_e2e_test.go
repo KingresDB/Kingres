@@ -237,7 +237,7 @@ func TestUploadChecksumAndLimits(t *testing.T) {
 	e.expect(t, 204, "DELETE", "/data-uploads/"+gid, nil)
 
 	for name, body := range map[string]map[string]any{
-		"unknown purpose":     {"purpose": "databaseArchive", "sizeBytes": 10},
+		"unknown purpose":     {"purpose": "somethingElse", "sizeBytes": 10},
 		"no size":             {"purpose": "tableImport"},
 		"zero size":           {"purpose": "tableImport", "sizeBytes": 0},
 		"above the file max":  {"purpose": "tableImport", "sizeBytes": (1 << 30) + 1},

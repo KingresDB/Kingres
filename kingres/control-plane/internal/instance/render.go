@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"path"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -218,8 +219,9 @@ type ManagedSettings struct {
 
 // PreloadLibraries is the value of shared_preload_libraries of every instance. kingres_columnar is preloaded because it registers a WAL
 // resource manager: without it a columnar table is refused every write and kingres_timepart cannot convert a partition. kingres_shard stays
-// first. kingres_timepart and kingres_sketch need no preload.
-const PreloadLibraries = "kingres_shard,kingres_ledger,kingres_columnar"
+// first. pg_stat_statements is preloaded because it needs shared memory that only the postmaster can set up: without it nothing is collected and its views
+// fail. kingres_timepart and kingres_sketch need no preload. The manager leaves out a library the installation lacks (see optionalLibraries).
+const PreloadLibraries = "kingres_shard,kingres_ledger,kingres_columnar,pg_stat_statements"
 
 // preloadValue is the list the settings ask for.
 func preloadValue(s ManagedSettings) string {
@@ -388,10 +390,19 @@ func validGUCName(k string) bool {
 	return true
 }
 
+// rootedPath says whether p starts at the root: "/" on every system, and, only in a binary built for Windows (the unit
+// tests of the control plane run there; the product runs on Linux), a drive letter such as "C:/".
+func rootedPath(p string) bool {
+	if strings.HasPrefix(p, "/") {
+		return true
+	}
+	return runtime.GOOS == "windows" && len(p) > 3 && p[1] == ':' && p[2] == '/' && (p[0]|0x20) >= 'a' && (p[0]|0x20) <= 'z'
+}
+
 // validateConfPath checks a path that is written into postgresql.conf: it
 // must be absolute, clean, free of control characters and of ".." elements.
 func validateConfPath(p string) error {
-	if p == "" || !strings.HasPrefix(p, "/") {
+	if !rootedPath(p) {
 		return invalid("path %q must be absolute", trunc(p))
 	}
 	if strings.ContainsAny(p, "\x00\r\n") || !utf8.ValidString(p) {

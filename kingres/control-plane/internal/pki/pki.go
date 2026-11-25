@@ -485,7 +485,9 @@ func (ca *CA) CRL(now time.Time) ([]byte, error) {
 		}
 		entries = append(entries, x509.RevocationListEntry{SerialNumber: new(big.Int).SetBytes(b), RevocationTime: t})
 	}
-	ca.crlNum++
+	// The number is at least the time in seconds, so that the lists of two holders of the key (a former leader and the new one) are in the
+	// order they were issued in, and never below the previous number of this CA.
+	ca.crlNum = max(ca.crlNum+1, now.Unix())
 	if err := ca.saveLocked(); err != nil {
 		return nil, err
 	}
@@ -520,3 +522,38 @@ const (
 	CRLValidity     = 30 * 24 * time.Hour
 	CRLRefreshAfter = CRLValidity / 3
 )
+
+// MergeRevoked revokes every serial of the list that is not revoked yet (a revocation list never shrinks: the lists
+// other servers hold, the escrow copy and the file the previous leader distributed are all merged in before this
+// server distributes anything). It returns how many were added.
+func (ca *CA) MergeRevoked(serials []string, now time.Time) (int, error) {
+	ca.mu.Lock()
+	defer ca.mu.Unlock()
+	n := 0
+	for _, s := range serials {
+		s = strings.ToLower(s)
+		if _, err := hex.DecodeString(s); err != nil || s == "" {
+			continue
+		}
+		if _, ok := ca.revoked[s]; !ok {
+			ca.revoked[s] = now.UTC()
+			n++
+		}
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	return n, ca.saveLocked()
+}
+
+// EnsureCRLNumberAbove makes the next revocation list carry a number above n (the number of a list that was already
+// published): the number of the lists a CA issues never goes back.
+func (ca *CA) EnsureCRLNumberAbove(n int64) error {
+	ca.mu.Lock()
+	defer ca.mu.Unlock()
+	if ca.crlNum >= n {
+		return nil
+	}
+	ca.crlNum = n
+	return ca.saveLocked()
+}

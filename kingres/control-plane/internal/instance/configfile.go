@@ -152,10 +152,13 @@ func (m *Manager) EnsureConfig(id int) (bool, error) {
 		return changed, nil
 	}
 	if preloadDiffers(string(cur), want) {
-		m.log.Warn("shared_preload_libraries of an instance is brought up to date; it takes effect when the instance is restarted (standbys first), and until then a columnar table cannot be written",
+		m.log.Warn("shared_preload_libraries of an instance is brought up to date; it takes effect when the instance is restarted (standbys first), "+
+			"and until then a columnar table cannot be written and pg_stat_statements collects nothing",
 			"instance", id, "now", preloadOf(string(cur)), "next", want)
-		if want != PreloadLibraries {
-			m.log.Warn("the installation has no kingres_columnar library: the instance does not preload it, and columnar storage is not available on this server", "instance", id)
+		for _, o := range optionalLibraries {
+			if !libraryIn(want, o.name) {
+				m.log.Warn("the installation has no "+o.name+" library: the instance does not preload it, and "+o.lack+" is not available on this server", "instance", id)
+			}
 		}
 	}
 	s, err := m.Settings(id)
@@ -196,21 +199,70 @@ func preloadDiffers(managed, want string) bool {
 	return have != "" && have != want
 }
 
-// columnarLibrary is the library whose absence from the installation makes the manager leave it out of the preload list.
-const columnarLibrary = "kingres_columnar"
+// columnarLibrary and statStatementsLibrary are the libraries whose absence from the installation makes the manager leave them out of the preload list.
+const (
+	columnarLibrary       = "kingres_columnar"
+	statStatementsLibrary = "pg_stat_statements"
+)
 
-// preloadList is the value of shared_preload_libraries for an instance of this installation: PreloadLibraries, without kingres_columnar when the
-// installation has no such library file in its package library directory (a package that was not upgraded with kingresd, an image that mixes versions).
-// The answer is looked up each time: the directory is read through pg_config, which is cheap, and a package that is upgraded while kingresd runs is seen.
-func (m *Manager) preloadList() string {
-	if m.libraryExists(columnarLibrary) {
-		return PreloadLibraries
+// optionalLibrary is a library of PreloadLibraries that an installation may lack (a package that was not upgraded with kingresd, an image that mixes
+// versions). sticky says that an instance that has had it in its list keeps it even when the file is missing: that is for a library whose absence
+// makes data unreadable (columnar tables need the resource manager). pg_stat_statements holds no data that matters, so it is not sticky: a missing
+// file never keeps an instance from starting, and the library comes back into the list at the next EnsureConfig after the file is back.
+type optionalLibrary struct {
+	name   string
+	marker string // file in the directory of the instance, for a sticky library
+	sticky bool
+	lack   string // what the server cannot do without it
+}
+
+var optionalLibraries = []optionalLibrary{
+	{name: columnarLibrary, marker: columnarMarker, sticky: true, lack: "columnar storage"},
+	{name: statStatementsLibrary, lack: "pg_stat_statements"},
+}
+
+func optionalOf(lib string) (optionalLibrary, bool) {
+	for _, o := range optionalLibraries {
+		if o.name == lib {
+			return o, true
+		}
 	}
-	return strings.TrimSuffix(PreloadLibraries, ","+columnarLibrary)
+	return optionalLibrary{}, false
+}
+
+// preloadList is the value of shared_preload_libraries for an instance of this installation: PreloadLibraries, without the optional libraries that the
+// installation has no library file for in its package library directory (a package that was not upgraded with kingresd, an image that mixes versions).
+// The answer is looked up each time: the directory is read through pg_config, which is cheap, and a package that is upgraded while kingresd runs is seen.
+func (m *Manager) preloadList() string { return m.preloadListWith(0, false) }
+
+// preloadListWith builds the list; with keep, a sticky library that instance id has had stays in it when its file is missing.
+func (m *Manager) preloadListWith(id int, keep bool) string {
+	var out []string
+	for _, n := range strings.Split(PreloadLibraries, ",") {
+		o, optional := optionalOf(n)
+		switch {
+		case !optional || m.libraryExists(n):
+			out = append(out, n)
+		case keep && o.sticky && m.hadLibrary(id, o):
+			m.log.Warn("the installation has no "+n+" library file, and this instance has preloaded it before and may have "+o.lack+": the library stays in its list, "+
+				"and the instance cannot start until the package that has the file is installed", "instance", id)
+			out = append(out, n)
+		}
+	}
+	return strings.Join(out, ",")
 }
 
 // columnarMarker is the file in the directory of an instance that says the instance has had kingres_columnar in its preload list.
 const columnarMarker = "columnar-preload"
+
+func (m *Manager) hadLibrary(id int, o optionalLibrary) bool {
+	dir, err := m.Dir(id)
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(filepath.Join(dir, o.marker))
+	return err == nil
+}
 
 // markColumnarPreload records that the instance preloads kingres_columnar (the managed file at hand names it), so that the library is never taken out of the
 // list of an instance that may have columnar tables because the file is missing for a moment (a package upgrade removes the old library before it installs the new).
@@ -232,22 +284,10 @@ func libraryIn(list, lib string) bool {
 	return false
 }
 
-// preloadListFor is preloadList for an instance: when the installation has no library file but the instance has had it in its list (it may have columnar
+// preloadListFor is preloadList for an instance: when the installation has no kingres_columnar file but the instance has had it in its list (it may have columnar
 // tables), the library stays in the list and a warning says that the instance will not start until the library is back. A new instance, which never had it, gets
 // the list without it.
-func (m *Manager) preloadListFor(id int) string {
-	if m.libraryExists(columnarLibrary) {
-		return PreloadLibraries
-	}
-	if dir, err := m.Dir(id); err == nil {
-		if _, err := os.Stat(filepath.Join(dir, columnarMarker)); err == nil {
-			m.log.Warn("the installation has no kingres_columnar library file, and this instance has preloaded it before and may have columnar tables: the library stays in its list, "+
-				"and the instance cannot start until the package that has the file is installed", "instance", id)
-			return PreloadLibraries
-		}
-	}
-	return m.preloadList()
-}
+func (m *Manager) preloadListFor(id int) string { return m.preloadListWith(id, true) }
 
 // libraryExists tells whether the installation has the library file lib (lib.so, or the extension of the platform), through pg_config --pkglibdir.
 // When pg_config cannot be run the library is assumed to be there, which is what the product did before.

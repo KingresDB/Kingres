@@ -28,17 +28,34 @@ func TestNotDistributableListsEveryBlocker(t *testing.T) {
 	}
 }
 
-func TestSchemaErrorMapsTheExtensionsMessages(t *testing.T) {
-	cases := map[string]problem.Code{
-		`schema_pinned: schema "a" holds the ledger table`:                      problem.SchemaPinned,
-		`CREATE MATERIALIZED VIEW is not supported in a distributed schema yet`: problem.SchemaNotDistributable,
-		`schema "a" is already distributed`:                                     problem.Conflict,
+// schemaError tells the refusals of the extension by SQLSTATE: KS020 (pinned), 0A000 (not distributable) and 42710 (already distributed).
+// The wording is not read, except for the pin of the extension 0.8, which gave 55000 with "schema_pinned" in the text.
+func TestSchemaErrorMapsTheExtensionsSQLSTATEs(t *testing.T) {
+	cases := []struct {
+		code, msg string
+		want      problem.Code
+	}{
+		{"KS020", `schema_pinned: schema "a" holds the ledger table`, problem.SchemaPinned},
+		{"KS020", `the schema cannot move any more: another wording`, problem.SchemaPinned},
+		{"55000", `schema_pinned: schema "a" holds the ledger table`, problem.SchemaPinned}, // extension 0.8
+		{"0A000", `CREATE MATERIALIZED VIEW is not supported in a distributed schema yet`, problem.SchemaNotDistributable},
+		{"0A000", `another wording`, problem.SchemaNotDistributable},
+		{"42710", `schema "a" is already distributed`, problem.Conflict},
+		{"42710", `another wording`, problem.Conflict},
 	}
-	for msg, want := range cases {
-		err := schemaError(&pgconn.PgError{Message: msg})
+	for _, c := range cases {
+		err := schemaError(&pgconn.PgError{Code: c.code, Message: c.msg})
 		var p *problem.Problem
-		if !errors.As(err, &p) || p.Code != want {
-			t.Errorf("%q: %v", msg, err)
+		if !errors.As(err, &p) || p.Code != c.want {
+			t.Errorf("%s %q: %v", c.code, c.msg, err)
+		}
+	}
+	// the wording under another SQLSTATE is nothing: the error keeps its text
+	for _, msg := range []string{`schema "a" is already distributed`, `x is not supported`, `schema "a" cannot be distributed`, `schema_pinned: x`} {
+		err := schemaError(&pgconn.PgError{Code: "XX000", Message: msg})
+		var p *problem.Problem
+		if errors.As(err, &p) || err == nil || err.Error() != msg {
+			t.Errorf("%q under XX000: %v", msg, err)
 		}
 	}
 	if schemaError(nil) != nil {
@@ -46,6 +63,15 @@ func TestSchemaErrorMapsTheExtensionsMessages(t *testing.T) {
 	}
 	if err := schemaError(&pgconn.PgError{Message: "boom"}); err == nil || err.Error() != "boom" {
 		t.Errorf("other errors keep their text: %v", err)
+	}
+}
+
+// A catalog function called on a node that is not the map group primary answers KS022 (KS010 of the extension 0.8 and 55000 stay accepted).
+func TestIsNotMapPrimary(t *testing.T) {
+	for code, want := range map[string]bool{"KS022": true, "KS010": true, "55000": true, "KS011": false, "XX000": false, "": false} {
+		if got := isNotMapPrimary(&pgconn.PgError{Code: code, Message: "this function can only run on the map group primary"}); got != want {
+			t.Errorf("%q: %v", code, got)
+		}
 	}
 }
 

@@ -9,6 +9,7 @@ package ops
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -211,6 +212,9 @@ func (o *Ops) PrepareDistribute(ctx context.Context, db, schema, table string, r
 	if err := o.rebalanceRunning(ctx); err != nil {
 		return nil, err
 	}
+	if len(req.RelatedTables) > 0 {
+		return o.prepareRelated(ctx, p, req)
+	}
 	p, err = o.resolveMode(ctx, req.Mode, p)
 	if err != nil {
 		return nil, err
@@ -408,6 +412,7 @@ func (o *Ops) PreviewTableChange(ctx context.Context, db, schema, table string, 
 	}
 	p := tableParams{V: 2, Database: db, Schema: schema, Table: table}
 	mode := ""
+	var relReq *api.DistributeTableRequest
 	switch req.Kind {
 	case "distribute":
 		d := req.Distribute
@@ -415,6 +420,9 @@ func (o *Ops) PreviewTableChange(ctx context.Context, db, schema, table string, 
 			return api.TableChangePreview{}, problem.Validation("The request is invalid.", field("/distribute", "is required for kind distribute", "required"))
 		}
 		p.Op, p.Method, p.Column, p.DependentViews, mode = "distribute", d.Method, d.DistributionColumn, d.DependentViews, d.Mode
+		if len(d.RelatedTables) > 0 {
+			relReq = d
+		}
 		if d.BucketCount != nil {
 			p.BucketCount = *d.BucketCount
 		}
@@ -468,7 +476,7 @@ func (o *Ops) PreviewTableChange(ctx context.Context, db, schema, table string, 
 	if err != nil {
 		return api.TableChangePreview{}, wrap(err)
 	}
-	onlineOK := len(onlBlockers) == 0 && p.Op != "partition"
+	onlineOK := len(onlBlockers) == 0 && p.Op != "partition" && relReq == nil
 	run := p
 	run.Online = onlineOK && (mode == "online" || (mode != "blocking" && rows > onlineRowsThreshold))
 	blockers, warnings, notes, err := b.Report(ctx, run)
@@ -491,6 +499,11 @@ func (o *Ops) PreviewTableChange(ctx context.Context, db, schema, table string, 
 	if !onlineOK && p.Op != "partition" {
 		r := describeBlockers(onlBlockers)
 		out.Estimate.OnlineUnavailableReason = &r
+	}
+	if relReq != nil {
+		if err := o.previewRelated(ctx, p, relReq, &out); err != nil {
+			return api.TableChangePreview{}, err
+		}
 	}
 	return out, nil
 }
@@ -548,6 +561,7 @@ func (o *Ops) ListTablePartitions(ctx context.Context, db, schema, table string,
 		if len(page.Items) == 0 && cursor == "" {
 			return o.nativePartitions(ctx, tx, schema, table, cursor, limit, &page) // not a user-partitioned distributed table
 		}
+		o.fillDistPartitions(ctx, tx, schema, table, page.Items)
 		return nil
 	})
 	if err != nil {
@@ -559,6 +573,69 @@ func (o *Ops) ListTablePartitions(ctx context.Context, db, schema, table string,
 		page.NextCursor = &c
 	}
 	return page, nil
+}
+
+// distBoundRE reads the bound of a range partition of a distributed table as it was given to create_partition: FROM ('2026-01-01') TO ('2026-02-01').
+var distBoundRE = regexp.MustCompile(`^(?i)\s*FROM\s*\(\s*'([^']*)'\s*\)\s*TO\s*\(\s*'([^']*)'\s*\)\s*$`)
+
+// fillDistPartitions adds to the partitions of a distributed table what the policy of phase 12 needs to show: the bounds of a range partition and how the leaves
+// are stored, with the words of kingres_timepart (timepart__dist_kinds): columnar when every leaf is, heap when every leaf is, mixed while a conversion is half done (some
+// leaves are columnar and the others are not; the next run of the policy goes on), other when a leaf is missing or has another access method. The storage is read on
+// the nodes that hold the leaves (kingres.partition_leaf_storage), so a node that does not answer, a bucket whose group has no active primary, or a sharding extension
+// that is older, leaves the member out and does not fail the list. It reads every node for each page of the list (a page is 50 partitions by default): the listing is
+// not a hot path, and a cache would show a conversion that is over as half done.
+func (o *Ops) fillDistPartitions(ctx context.Context, tx pgx.Tx, schema, table string, items []api.TablePartition) {
+	for i := range items {
+		if items[i].Method != "range" || items[i].IsDefault {
+			continue
+		}
+		if m := distBoundRE.FindStringSubmatch(items[i].Bound); m != nil {
+			from, to := m[1], m[2]
+			items[i].RangeFrom, items[i].RangeTo = &from, &to
+		}
+	}
+	// kingres_shard is verified before anything is looked up or called in the schema kingres (extguard): a schema that cannot be trusted is not read, and the list
+	// goes on without the access methods, as it does for a node that does not answer.
+	if ok, err := extUsable(ctx, tx, extguard.Shard); err != nil || !ok {
+		return
+	}
+	var have bool
+	if err := tx.QueryRow(ctx, `SELECT to_regprocedure('kingres.partition_leaf_storage(regclass)') IS NOT NULL`).Scan(&have); err != nil || !have {
+		return
+	}
+	sp, err := tx.Begin(ctx) // a savepoint: a node that fails must not end the transaction of the list
+	if err != nil {
+		return
+	}
+	defer func() { _ = sp.Rollback(context.WithoutCancel(ctx)) }()
+	rows, err := sp.Query(ctx, `SELECT partition_name, CASE WHEN count(*) = count(*) FILTER (WHERE access_method = 'columnar') THEN 'columnar'
+		WHEN count(*) = count(*) FILTER (WHERE access_method = 'heap') THEN 'heap'
+		WHEN count(*) FILTER (WHERE access_method = 'columnar') > 0 THEN 'mixed' ELSE 'other' END
+		FROM kingres.partition_leaf_storage($1::regclass) GROUP BY partition_name`, qualified(schema, table))
+	if err != nil {
+		if o.Log != nil {
+			o.Log.Warn("reading the storage of the leaves of a distributed table failed", "table", qualified(schema, table), "error", err)
+		}
+		return
+	}
+	defer rows.Close()
+	am := map[string]string{}
+	for rows.Next() {
+		var name, kind string
+		if err := rows.Scan(&name, &kind); err != nil {
+			return
+		}
+		am[name] = kind
+	}
+	if rows.Err() != nil {
+		return
+	}
+	for i := range items {
+		if k, ok := am[items[i].Name]; ok {
+			k := k
+			items[i].AccessMethod = &k
+		}
+	}
 }
 
 var _ = task.CodeStepFailed

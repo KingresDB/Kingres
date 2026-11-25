@@ -11,7 +11,7 @@
 #   "could not connect to node", the shared_preload_libraries error;
 #   "cannot commit" (KS009) for every call that commits on every primary: add_node, remove_node,
 #   rotate_secret, sync_catalog, within the bound, changing nothing;
-#   promote_node: the wrong node (KS010), a node still in recovery (KS011), the id of a node that
+#   promote_node: not the map group primary (KS022), the wrong node (KS010), a node still in recovery (KS011), the id of a node that
 #   is not a standby of anything in the group, the WARNING for an old primary that cannot be reached
 #   and the NOTICE for "already";
 #   the "registered on port P" refusal, which is also the answer of a call sent to the wrong node.
@@ -107,7 +107,7 @@ my ($map, $g1, $g2) = @n;
 	my $mid = register_standby($map, $msb, 0);
 	wait_catchup($g1, $sb);
 	wait_catchup($map, $msb);
-	refused('promote_node on a node that is not the map group primary', $g2, "SELECT kingres.promote_node($id)", 'KS010',
+	refused('promote_node on a node that is not the map group primary', $g2, "SELECT kingres.promote_node($id)", 'KS022',
 		qr/this function can only run on the map group primary/);
 	refused('promote_node of a standby that is still in recovery', $map, "SELECT kingres.promote_node($id)", 'KS011',
 		qr/node $id \(.*\) is still in recovery/);

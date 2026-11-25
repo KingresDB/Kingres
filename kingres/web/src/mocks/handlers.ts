@@ -10,6 +10,8 @@ import { ledgerHandlers } from './ledger'
 import { decorateStatus, distributedSchemaCount, elasticityHandlers } from './elasticity'
 import { analyticsHandlers, describePartitions, describeTable, explainPlan } from './analytics'
 import { transferHandlers } from './transfer'
+import { archiveHandlers } from './transfer-archive'
+import { importHandlers } from './transfer-import'
 import { AGGREGATE_SIZE, anchoringOf, digestAnchorsOf, l7, publicationOf } from './ledger-view'
 import type { HttpHandler } from 'msw'
 import type { components } from '@/api/schema'
@@ -70,13 +72,58 @@ import {
 import {
   columnDefsOf,
   previewChange,
+  relatedPlan,
   startAlter,
   startDistribute,
   startPartition,
   startUndistribute,
+  withOperation,
 } from './tables'
 
 type S = components['schemas']
+
+// The escrow of the CA key in the mock: one recipient, the standby of the map group; `?escrow=` shows the other states.
+function caEscrowStatus(): S['CaEscrowStatus'] {
+  const e = mockConfig.caEscrow
+  const on = e.enabled
+  const now = new Date().toISOString()
+  const copy = (
+    serverId: string,
+    state: S['CaEscrowRecipient']['state'],
+    error: string | null = null,
+  ): S['CaEscrowRecipient'] => ({
+    serverId,
+    state,
+    keyId: state === 'current' || state === 'dropPending' ? 'a1b2c3d4e5f60718' : null,
+    generation: state === 'current' || state === 'dropPending' ? e.generation : null,
+    sealedAt: state === 'current' || state === 'dropPending' ? now : null,
+    error,
+  })
+  const recipients: S['CaEscrowRecipient'][] = !on
+    ? e.scenario === 'dropping'
+      ? [copy('10.0.0.12', 'dropPending')]
+      : []
+    : e.scenario === 'refused'
+      ? [copy('10.0.0.12', 'refused', 'the internal API of the server answered 403')]
+      : e.scenario === 'pending'
+        ? [copy('10.0.0.12', 'pending')]
+        : e.scenario === 'standbys'
+          ? [copy('10.0.0.12', 'current'), copy('10.0.0.13', 'pending')]
+          : [copy('10.0.0.12', 'current')]
+  const complete = on && recipients.length > 0 && recipients.every((r) => r.state === 'current')
+  return {
+    enabled: on,
+    holdsKey: true,
+    generation: e.generation,
+    recipients,
+    complete,
+    message: !on
+      ? 'Escrow is off: a new manager leader has no CA key until an operator restores it by hand.'
+      : complete
+        ? 'Every server that can become leader holds a sealed copy of the CA key.'
+        : 'Not every server that can become leader holds the newest copy yet; the leader sends again.',
+  }
+}
 
 /**
  * A digest document as the extension prints it: its own key order and spacing, and an integer a
@@ -1358,6 +1405,8 @@ export function createHandlers(): HttpHandler[] {
     ...ledgerHandlers(),
     ...elasticityHandlers(),
     ...analyticsHandlers(),
+    ...archiveHandlers(),
+    ...importHandlers(),
     ...transferHandlers((rec, t) =>
       (rec.extraColumns?.[t.name] ?? columnsFor(rec, t)).map((col) => col.name),
     ),
@@ -2060,7 +2109,7 @@ export function createHandlers(): HttpHandler[] {
                 (!schema || t.schema === schema) &&
                 (!cls || t.classes.includes(cls as Table['classes'][number])),
             )
-            .map((t) => describeTable(c.s, rec, t))
+            .map((t) => withOperation(c.s, rec, describeTable(c.s, rec, t)))
             // A partitioned table matches columnar when any of its partitions is columnar (contract 0.18.0).
             .filter((t) => {
               if (storage === null) return true
@@ -2073,6 +2122,12 @@ export function createHandlers(): HttpHandler[] {
       )
     },
     // The table lifecycle of contract 0.14.0 (increment 9.7): src/mocks/tables.ts.
+    listRelatedTables: (c) => {
+      const { rec, t } = tableOf(c)
+      if (!t.classes.includes('plain'))
+        throw problem('unprocessable', 'The table is already distributed or a reference table.')
+      return ok(relatedPlan(rec, t, c.url.searchParams.get('distributionColumn')))
+    },
     previewTableChange: (c) => {
       const { s, rec, t } = tableOf(c)
       const b = body<S['TableChangeRequest']>(c)
@@ -2158,7 +2213,7 @@ export function createHandlers(): HttpHandler[] {
       )
       if (!t) throw problem('not_found', 'Table does not exist.')
       return ok({
-        ...describeTable(c.s, rec, t),
+        ...withOperation(c.s, rec, describeTable(c.s, rec, t)),
         columns: rec.extraColumns?.[t.name] ?? columnsFor(rec, t),
       } satisfies S['TableDetail'])
     },
@@ -2472,12 +2527,45 @@ export function createHandlers(): HttpHandler[] {
       const b = body<S['AbandonMapGroupBootstrapRequest']>(c)
       if (typeof b.reason !== 'string' || b.reason.length === 0)
         throw problem('unprocessable', 'A reason is needed.')
-      if (failoverStatusView(c.s).phase === 'bootstrap')
+      const view = failoverStatusView(c.s)
+      // 0.28.0: a server declared lost must be the one the map group was handed to, and the cluster must not hear it (409 otherwise).
+      if (b.lostServerId !== undefined) {
+        const candidate = view.groups.find((g) => g.toServerId)?.toServerId ?? null
+        if (view.phase !== 'bootstrap' || b.lostServerId !== candidate)
+          throw problem(
+            'conflict',
+            `Server ${b.lostServerId} is not the server that the map group was handed to.`,
+          )
+        const rec = c.s.servers.find((x) => x.id === b.lostServerId)
+        if (!rec || effectiveStatus(rec) !== 'dead')
+          throw problem(
+            'conflict',
+            `Server ${b.lostServerId} is still heard by the cluster; it cannot be declared lost.`,
+          )
+        return ok({ abandoned: true } satisfies S['AbandonMapGroupBootstrapResult'])
+      }
+      if (view.phase === 'bootstrap')
         throw problem(
           'conflict',
           'The standby of the map group was promoted already; the bootstrap goes on to its end.',
         )
       return ok({ abandoned: false } satisfies S['AbandonMapGroupBootstrapResult'])
+    },
+    // --- escrow of the key of the certificate authority (0.26.0): the standby of the map group is the one recipient
+    getCaEscrow: () => ok(caEscrowStatus()),
+    setCaEscrow: (c) => {
+      const req = body<S['CaEscrowUpdate']>(c)
+      if (mockConfig.caUnavailable) throw problem('certificate_authority_unavailable')
+      if (req.enabled && !mockConfig.caEscrow.enabled) mockConfig.caEscrow.generation += 1
+      mockConfig.caEscrow.enabled = req.enabled
+      return ok(caEscrowStatus())
+    },
+    rotateCaEscrow: () => {
+      if (mockConfig.caUnavailable) throw problem('certificate_authority_unavailable')
+      if (!mockConfig.caEscrow.enabled)
+        throw problem('conflict', 'The escrow of the CA key is off; there is nothing to rotate.')
+      mockConfig.caEscrow.generation += 1
+      return ok(caEscrowStatus())
     },
 
     // --- tasks

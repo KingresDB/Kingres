@@ -132,8 +132,13 @@ func (s *Service) Resolve(ctx context.Context, actor, server string, req Request
 			return Input{}, problem.New(problem.Unprocessable, fmt.Sprintf("A target names shard group %d, which the request does not fail over.", g))
 		}
 	}
+	if req.Mode == ModeHard && in[0] && req.AllowDataLoss && !req.ActorIsAdmin {
+		return Input{}, problem.New(problem.Forbidden, "A hard failover of the map group that accepts a loss of data needs the role kingres_admin.")
+	}
+	// A hard failover that includes the map group is, for this task, the failover of a live leader's server: it runs here, on the server of the map
+	// group's primary, because a server whose primary of the map group is not heard is taken by the bootstrap and never gets here.
 	return Input{Mode: req.Mode, ServerID: server, Groups: groups, Targets: targets, AllowDataLoss: req.AllowDataLoss,
-		Comment: req.Comment, Trigger: "manual", RequestedBy: actor}, nil
+		Comment: req.Comment, Trigger: "manual", RequestedBy: actor, MapLive: req.Mode == ModeHard && in[0]}, nil
 }
 
 // Plan reads the state and answers what the request would do. The positions are read

@@ -318,6 +318,55 @@ kl_has_armed_capture_trigger(Oid relid, Oid extoid)
 }
 
 /*
+ * kl_refuse_untrusted_write
+ *		While the registry cannot be read (kl_registry_untrusted: the schema of the extension is not a
+ *		superuser's, or lets another role create objects in it) nothing can be said of which tables
+ *		are ledger tables, and the protection that depends on the registry (the history tables, the
+ *		tables whose triggers were switched off) is off.  An UPDATE, DELETE or TRUNCATE of a table
+ *		that carries a capture trigger of the extension, in any state, or that has a history table
+ *		next to it, is refused with an error that says so, whoever asks, a superuser too (who can
+ *		repair the schema first).  Never silently allowed.
+ */
+void
+kl_refuse_untrusted_write(Oid relid, Oid extoid, const char *what)
+{
+	Relation	tgrel;
+	SysScanDesc scan;
+	ScanKeyData key;
+	HeapTuple	tup;
+	bool		found = false;
+	char	   *relname;
+
+	if (!OidIsValid(relid) || !OidIsValid(extoid) || !kl_registry_untrusted())
+		return;
+	relname = get_rel_name(relid);
+	if (relname == NULL || get_rel_relkind(relid) != RELKIND_RELATION)
+		return;
+	tgrel = table_open(TriggerRelationId, AccessShareLock);
+	ScanKeyInit(&key, Anum_pg_trigger_tgrelid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relid));
+	scan = systable_beginscan(tgrel, TriggerRelidNameIndexId, true, NULL, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		if (kl_is_ledger_function(((Form_pg_trigger) GETSTRUCT(tup))->tgfoid, extoid, KL_SYM_CAPTURE))
+		{
+			found = true;
+			break;
+		}
+	}
+	systable_endscan(scan);
+	table_close(tgrel, AccessShareLock);
+	if (!found)
+		found = OidIsValid(get_relname_relid(psprintf("%s_ledger_history", relname), get_rel_namespace(relid)));
+	if (found)
+		ereport(ERROR,
+				(errcode(ERRCODE_KL_PROTECTED),
+				 errmsg("cannot %s table \"%s\": it is, or looks like, a ledger table, and the registry of the ledger cannot be trusted", what, relname),
+				 errdetail("The schema \"%s\" is not owned by a superuser, or lets a role that is not a superuser create objects in it, so the ledger cannot tell which tables it protects.", KL_SCHEMA_NAME),
+				 errhint("A superuser must make the schema its own and close it (ALTER SCHEMA ... OWNER TO, REVOKE CREATE ON SCHEMA ...) after looking at what is in it.")));
+}
+
+/*
  * kl_is_registered
  *		Whether the table is registered in kingres.ledger_table.  Uses the
  *		latest snapshot so that a table registered by the current transaction
@@ -1622,6 +1671,10 @@ static void
 kl_check_truncate(TruncateStmt *stmt, Oid extoid)
 {
 	ListCell   *lc;
+
+	/* while the registry cannot be trusted, every role is refused (a superuser too) a table that looks like a ledger table */
+	foreach(lc, stmt->relations)
+		kl_refuse_untrusted_write(RangeVarGetRelid(lfirst_node(RangeVar, lc), NoLock, true), extoid, "truncate");
 
 	/* A superuser is stopped by the trigger, as it always was. */
 	if (superuser())

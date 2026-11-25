@@ -41,6 +41,9 @@ const (
 // leader does not hold the CA key.
 const codeCAUnavailable = "ca_unavailable"
 
+// codeStaleRevocations is the answer of a server that refuses a revocation list that takes a revocation back.
+const codeStaleRevocations = "stale_revocations"
+
 type certInput struct {
 	ServerID string `json:"serverId"`
 }
@@ -219,7 +222,7 @@ func (m *Manager) RenewFromPeer(ctx context.Context, peer string, req wire.Renew
 	if err != nil {
 		return wire.RenewResponse{}, err
 	}
-	res, err := m.renewalAnswer(is)
+	res, err := m.renewalAnswer(ctx, is)
 	if err != nil {
 		return wire.RenewResponse{}, err
 	}
@@ -229,11 +232,13 @@ func (m *Manager) RenewFromPeer(ctx context.Context, peer string, req wire.Renew
 
 // renewalAnswer builds the answer of a renewal: the certificate with the CA
 // certificate and the current revocation list.
-func (m *Manager) renewalAnswer(is issued) (wire.RenewResponse, error) {
+func (m *Manager) renewalAnswer(ctx context.Context, is issued) (wire.RenewResponse, error) {
 	ca, err := m.ca()
 	if err != nil {
 		return wire.RenewResponse{}, err
 	}
+	// The list that goes out with a certificate is at least what the servers hold.
+	m.reconcileRevocations(ctx, ca)
 	crl, err := m.Svc.CRLPEM()
 	if err != nil {
 		return wire.RenewResponse{}, err
@@ -253,7 +258,7 @@ func (m *Manager) RenewSelf(ctx context.Context) (notAfter time.Time, err error)
 	if err != nil {
 		return time.Time{}, err
 	}
-	res, err := m.renewalAnswer(is)
+	res, err := m.renewalAnswer(ctx, is)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -408,7 +413,7 @@ func (m *Manager) stepCertRenewIssue(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
-	res, err := m.renewalAnswer(is)
+	res, err := m.renewalAnswer(ctx, is)
 	if err != nil {
 		return err
 	}
@@ -445,33 +450,35 @@ func (m *Manager) stepCertRevoke(ctx context.Context, env *task.Env) error {
 // to the local instance. A server that cannot be reached makes the task wait,
 // as in every other cluster-wide task: the list reaches it when it is back.
 func (m *Manager) stepCertRevokeDistribute(ctx context.Context, env *task.Env) error {
-	if err := m.Svc.PublishLocalCRL(ctx); err != nil {
-		return err
-	}
 	ca, err := m.ca()
 	if err != nil {
+		return err
+	}
+	m.reconcileRevocations(ctx, ca)
+	if err := m.Svc.PublishLocalCRL(ctx); err != nil {
 		return err
 	}
 	crl, err := m.Svc.CRLPEM()
 	if err != nil {
 		return err
 	}
-	infos, err := m.peerInfos(ctx, "", "")
+	// The servers are the active members of the table: the address of a server is the peer directory's business (the row of the server that
+	// created the cluster has none, and after a failover of the map group that server is one of the others).
+	ids, revoked, err := m.revocationTargets(ctx)
 	if err != nil {
 		return err
 	}
 	req := wire.PKIRequest{CACert: string(ca.CertPEM()), Revoked: ca.Revoked(), CRL: string(crl)}
-	for _, p := range infos {
-		if p.ServerID == m.Self {
-			continue
+	// A server that refuses does not stop the others (the revoked ones are last and have no say); a server that cannot be reached is waited for, as
+	// in every cluster-wide task, but a revoked one is not waited for.
+	err = m.distributeAll(ids, revoked, func(id string) error {
+		if revoked[id] {
+			return m.installRevocations(ctx, id, ca, req)
 		}
-		if err := m.waitUnreachable(ctx, env, p.ServerID, "sending the revocation list", func() error {
-			return m.doUnchecked(ctx, p.ServerID, "POST", "/pki/install", req, nil)
-		}); err != nil {
-			return fmt.Errorf("sending the revocation list to %s: %w", p.ServerID, err)
-		}
-	}
-	return nil
+		return m.waitUnreachable(ctx, env, id, "sending the revocation list", func() error { return m.installRevocations(ctx, id, ca, req) })
+	})
+	m.escrowAfterRevocation(ctx)
+	return err
 }
 
 func (m *Manager) stepCertRevokeClose(ctx context.Context, env *task.Env) error {

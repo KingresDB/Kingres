@@ -45,8 +45,9 @@ $n1->safe_psql('postgres', "UPDATE pg_trigger SET tgenabled = 'D' WHERE tgname =
 $n1->safe_psql('postgres', "INSERT INTO public.va VALUES (1, 5000, 'behind'); UPDATE public.va SET v = 'changed' WHERE id = 7;");
 is(q1($n1, "SELECT count(*) FROM kingres.tlog_${op}_1"), '0', 'A: nothing was captured');
 is(q1($n1, "SELECT kingres.table_operation_advance($op, 'switching')"), 'cleaning', 'A: the switch goes through (the proof does not cover this)');
-my ($rc, $out, $err) = run_sql($n1, "SELECT kingres.table_operation_advance($op, 'cleaning')");
+my ($rc, $out, $err) = run_sql($n1, "\\set VERBOSITY verbose\n" . "SELECT kingres.table_operation_advance($op, 'cleaning')");
 isnt($rc, 0, 'A: the verification fails');
+like($err, qr/\bKS021\b/, 'A: with its own SQLSTATE KS021, which the control plane matches instead of the text');
 like($err, qr/verification of table operation $op failed: the new table holds 300 rows \(the old copy has 301\) or a different content/, 'A: and says what differs');
 is(q1($n1, "SELECT verified FROM kingres.table_operation WHERE op_id = $op"), 'failed', 'A: the operation records it');
 is(q1($n1, "SELECT phase FROM kingres.table_operation WHERE op_id = $op"), 'cleaning', 'A: the operation does not end');

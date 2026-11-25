@@ -264,6 +264,9 @@ func (o *Ops) StartImport(ctx context.Context, actor, db, schema, table string, 
 	if err != nil {
 		return task.Task{}, err
 	}
+	if up.Purpose == "databaseArchive" {
+		return task.Task{}, problem.Validation("The upload is a database archive, not a CSV file.", field("/uploadId", "the purpose of the upload is databaseArchive", "conflict"))
+	}
 	switch up.State {
 	case transfer.StateReceiving:
 		return task.Task{}, problem.New(problem.UploadIncomplete, "The upload has not received all its bytes.")

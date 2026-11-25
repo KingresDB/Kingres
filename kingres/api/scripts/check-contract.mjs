@@ -386,14 +386,23 @@ const MUST_MENTION = {
   '0.15.0': ['byDiskSize', 'RebalanceOptions', 'weight', 'RebalanceSettingsUpdate', 'excludeServerIds', 'drainServer', 'previewServerDrain', 'replicas_cannot_be_kept', 'RebalanceAutomaticSettings', 'rebalanceFailed', 'previewBucketSplit', 'splitBucket', 'bucket.split', 'splitting', 'listSchemas', 'distributeSchema', 'moveSchema', 'schema_pinned', 'ShardingMode', 'additive'],
   '0.17.0': ['getApproximateAggregates', 'configureApproximateAggregates', 'setTableStorage', 'setPartitionStorage', 'putPartitionPolicy', 'runPartitionPolicy', 'planPartitionPolicy', 'database.approximateAggregates', 'table.setStorage', 'partition.maintain', 'extension_missing', 'conversion_refused', 'partition_policy_conflict', 'partitionsAheadLow', 'additive'],
   '0.18.0': ['abandonMapGroupBootstrap', 'skipped', 'mapGroup', 'additive'],
+  '0.26.0': ['getCaEscrow', 'setCaEscrow', 'rotateCaEscrow', 'additive'],
   '0.14.0': ['previewTableChange', 'undistributeTable', 'alterTableDistribution', 'createTablePartition', 'table_not_eligible', 'dependentViews', 'additive'],
   '0.16.0': ['previewConfigChange', 'warnings', 'config_value_unusual', 'config_reserved_connections', 'additive'],
+  '0.27.0': ['drainServer', 'server_hosts_map_group', 'Hand over the map group', 'maxStandbyLagBytes', 'groupDegraded', 'RebalanceOptions.force', 'additive'],
+  '0.28.0': ['failoverServer', 'unsupported_operation', 'lostServerId', 'additive'],
+  '0.29.0': ['exportDatabase', 'validateDatabaseArchive', 'database.export', 'archive.validate', 'ArchiveReport', 'export_not_readable', 'archive_invalid', 'databaseArchive', 'additive'],
+  '0.31.0': ['schemaName', 'kind', 'schema_pinned', 'drainServer', 'previewServerDrain', 'additive'],
+  '0.33.0': ['failoverServer', 'kingres_admin', 'allowDataLoss', 'forbidden'],
+  '0.32.0': ['listRelatedTables', 'RelatedTablesPlan', 'relatedTables', 'TableOperation', 'Table.operation', 'related_table_missing', 'additive'],
+  '0.30.0': ['importDatabase', 'database.import', 'ImportDatabaseRequest', 'archive_statement_refused', 'ledger_restart_not_acknowledged', 'acknowledgeLedgerRestart', 'private', 'extensionSkipped', 'additive'],
+  '0.25.0': ['TablePartition.accessMethod', 'mixed', 'other', 'kingres_timepart', 'additive'],
   '0.19.0': ['exportTable', 'importTable', 'createDataUpload', 'uploadDataChunk', 'downloadDataExport', 'x-streams', 'dataTransfer', 'data_transfer_disabled', 'import_outcome_unknown', 'Upload-Offset', 'additive'],
   '0.12.0': ['completedWithWarnings', 'failover_needs_decision', 'plan', 'notScheduled', 'additive'],
   '0.9.0': ['startRebalance', 'previewRebalancePlan', 'nothing_to_rebalance', 'cluster_inconsistent', 'skipped', 'ledgerSummary', 'Prefer', 'additive'],
   '0.5.0': ['renewServerCertificates', 'revokeServerCertificates', 'certificate_authority_unavailable', 'certificate_revoked', 'certificateRenewalFailed', 'partial', 'additive'],
 };
-for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.10.0', '0.11.0', '0.12.0', '0.13.0', '0.14.0', '0.15.0', '0.16.0', '0.17.0', '0.18.0', '0.19.0']) {
+for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.10.0', '0.11.0', '0.12.0', '0.13.0', '0.14.0', '0.15.0', '0.16.0', '0.17.0', '0.18.0', '0.19.0', '0.25.0', '0.26.0', '0.27.0', '0.28.0', '0.29.0', '0.30.0', '0.31.0', '0.32.0', '0.33.0']) {
   const changelog = changelogOf(version);
   if (!changelog) { fail('README.md', `changelog heading for ${version} is missing`); continue; }
   for (const h of ['#### Breaking', '#### Additive', '#### Documentation']) if (!changelog.includes(h)) fail('README.md', `changelog of ${version} lacks "${h}"`);
@@ -405,7 +414,7 @@ for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.
   if (!m) fail('README.md', `the changelog summary of ${version} must state "N operations added (M operations, P paths)"`);
   else if (version === doc.info?.version && (Number(m[2]) !== operations.length || Number(m[3]) !== Object.keys(doc.paths ?? {}).length)) fail('README.md', `changelog says ${m[2]} operations and ${m[3]} paths, the contract has ${operations.length} and ${Object.keys(doc.paths ?? {}).length}`);
 }
-if (doc.info?.version !== '0.19.0') fail('info.version', 'the contract is revision 0.19.0');
+if (doc.info?.version !== '0.33.0') fail('info.version', 'the contract is revision 0.33.0');
 
 
 // 0.5.0 rules: certificate operations, partial answers, additive changes only.
@@ -641,6 +650,81 @@ for (const [n, prop] of [['SetupTaskSummary', 'detail'], ['NodeStateInfo', 'inte
   // The text says what a reader must not assume.
   for (const needle of ['global snapshot', 'not a security feature']) if (!opDesc('exportTable').includes(needle)) fail('exportTable', 'description must mention ' + needle);
   for (const needle of ['All or nothing', 'import_outcome_unknown']) if (!opDesc('importTable').includes(needle)) fail('importTable', 'description must mention ' + needle);
+}
+// 0.29.0 rules, database export and archive validation (additive only): the two operations, the
+// kinds, the codes, the report, and the sentences a reader must not miss. Every request and response has an example.
+{
+  const need = { exportDatabase: ['post', 202], validateDatabaseArchive: ['post', 202] };
+  for (const [id, [method, ok]] of Object.entries(need)) {
+    const o = opById.get(id);
+    if (!o) { fail(id, 'operation of 0.29.0 does not exist'); continue; }
+    if (o.method !== method) fail(id, 'must be a ' + method.toUpperCase());
+    if (o.op['x-required-role'] !== 'kingres_admin') fail(id, 'x-required-role must be kingres_admin');
+    if (!(o.op.tags ?? []).includes('Data transfer')) fail(id, 'must have the tag Data transfer');
+    if (o.op['x-streams'] !== undefined) fail(id, 'must not stream (only uploadDataChunk and downloadDataExport do)');
+    for (const c of [String(ok), '403', '404', '409', '422']) if (!respCodes(id).includes(c)) fail(id, 'must list ' + c);
+    const body = deref(o.op.requestBody);
+    for (const [mt, media] of Object.entries(body?.content ?? {})) if (!media.examples && media.example === undefined) fail(id, 'request ' + mt + ' has no example');
+    for (const [code, r] of Object.entries(o.op.responses ?? {})) {
+      const resp = deref(r);
+      for (const [mt, media] of Object.entries(resp?.content ?? {})) if (!media.examples && media.example === undefined) fail(id + ' ' + code, mt + ' has no example');
+    }
+  }
+  if (schemas.ExportDatabaseRequest?.additionalProperties !== false) fail('ExportDatabaseRequest', 'must be closed (additionalProperties: false)');
+  if ((schemas.ExportDatabaseRequest?.required ?? []).length) fail('ExportDatabaseRequest', 'every member is optional');
+  for (const n of ['sql', 'where', 'pgDumpArguments', 'options']) if (schemas.ExportDatabaseRequest?.properties?.[n]) fail('ExportDatabaseRequest', n + ' would let a client send SQL or a command line');
+  for (const v of ['databaseArchive']) if (!(schemas.CreateDataUploadRequest?.properties?.purpose?.enum ?? []).includes(v)) fail('CreateDataUploadRequest.purpose', 'missing ' + v);
+  for (const v of ['validating', 'valid', 'invalid']) if (!(schemas.DataUpload?.properties?.state?.enum ?? []).includes(v)) fail('DataUpload.state', 'missing ' + v);
+  if (!schemas.DataUpload?.properties?.report || (schemas.DataUpload?.required ?? []).includes('report')) fail('DataUpload', 'report must exist and stay optional');
+  if (!(schemas.DataExport?.properties?.kind?.enum ?? []).includes('databaseExport')) fail('DataExport.kind', 'missing databaseExport');
+  if (!(schemas.DataExport?.properties?.format?.enum ?? []).includes('archive/1')) fail('DataExport.format', 'missing archive/1');
+  if (!(schemas.TableConsistency?.properties?.level?.enum ?? []).includes('archive-single-snapshot')) fail('TableConsistency.level', 'missing archive-single-snapshot');
+  for (const r of ['valid', 'format', 'versions', 'tables', 'reasons']) if (!(schemas.ArchiveReport?.required ?? []).includes(r)) fail('ArchiveReport', 'must require ' + r);
+  for (const c of ['export_not_readable', 'large_objects_present', 'schema_unrecognised', 'archive_invalid', 'archive_incompatible']) if (!problemCodes.has(c)) fail('ProblemCode', 'missing ' + c);
+  for (const k of ['database.export', 'archive.validate']) if (!(schemas.TaskKind?.enum ?? []).includes(k)) fail('TaskKind', 'missing ' + k);
+  for (const a of ['exportDatabase', 'validateDatabaseArchive']) if (!(schemas.AuditAction?.enum ?? []).includes(a)) fail('AuditAction', 'missing ' + a);
+  for (const needle of ['global snapshot', 'export_not_readable', 'large_objects_present', 'schema_changed']) if (!opDesc('exportDatabase').includes(needle)) fail('exportDatabase', 'description must mention ' + needle);
+  for (const needle of ['touches no database', 'never shown']) if (!opDesc('validateDatabaseArchive').includes(needle)) fail('validateDatabaseArchive', 'description must mention ' + needle);
+}
+// 0.30.0 rules, database import (additive only): the operation, the closed request, the kind, the codes and the sentences a reader must not miss.
+{
+  const o = opById.get('importDatabase');
+  if (!o) fail('importDatabase', 'operation of 0.30.0 does not exist');
+  else {
+    if (o.method !== 'post') fail('importDatabase', 'must be a POST');
+    if (o.op['x-required-role'] !== 'kingres_admin') fail('importDatabase', 'x-required-role must be kingres_admin');
+    if (!(o.op.tags ?? []).includes('Data transfer')) fail('importDatabase', 'must have the tag Data transfer');
+    if (o.op['x-streams'] !== undefined) fail('importDatabase', 'must not stream');
+    for (const c of ['202', '403', '404', '409', '422']) if (!respCodes('importDatabase').includes(c)) fail('importDatabase', 'must list ' + c);
+    const body = deref(o.op.requestBody);
+    for (const [mt, media] of Object.entries(body?.content ?? {})) if (!media.examples && media.example === undefined) fail('importDatabase', 'request ' + mt + ' has no example');
+    for (const [code, r] of Object.entries(o.op.responses ?? {})) {
+      const resp = deref(r);
+      for (const [mt, media] of Object.entries(resp?.content ?? {})) if (!media.examples && media.example === undefined) fail('importDatabase ' + code, mt + ' has no example');
+    }
+  }
+  const req = schemas.ImportDatabaseRequest;
+  if (req?.additionalProperties !== false) fail('ImportDatabaseRequest', 'must be closed (additionalProperties: false)');
+  if (JSON.stringify(req?.required ?? []) !== JSON.stringify(['uploadId'])) fail('ImportDatabaseRequest', 'uploadId is the only required member');
+  for (const n of ['privileges', 'allowCode', 'bucketCount', 'sql', 'owner', 'path']) if (req?.properties?.[n]) fail('ImportDatabaseRequest', n + ' is not part of the request (owners and grants are not restored, code is refused, the archive keeps its bucket counts)');
+  for (const n of ['uploadId', 'database', 'expectedSha256', 'acknowledgeLedgerRestart', 'onForeignKeyViolation', 'keepOnFailure']) if (!req?.properties?.[n]) fail('ImportDatabaseRequest', 'missing ' + n);
+  for (const c of ['archive_statement_refused', 'ledger_restart_not_acknowledged']) if (!problemCodes.has(c)) fail('ProblemCode', 'missing ' + c);
+  if (!(schemas.TaskKind?.enum ?? []).includes('database.import')) fail('TaskKind', 'missing database.import');
+  if (!(schemas.AuditAction?.enum ?? []).includes('importDatabase')) fail('AuditAction', 'missing importDatabase');
+  for (const needle of ['hostile', 'as the signed-in role', 'private name', 'new chain', 'disabled', 'never the text']) if (!opDesc('importDatabase').includes(needle)) fail('importDatabase', 'description must mention ' + needle);
+}
+// 0.30.0: the alert extensionSkipped (an extension left out of a database on a server because a tenant made its schema its own).
+if (!(schemas.AlertKind?.enum ?? []).includes('extensionSkipped')) fail('AlertKind', 'missing extensionSkipped');
+if (!String(schemas.AlertKind?.description ?? '').includes('extensionSkipped')) fail('AlertKind', 'the description does not explain extensionSkipped');
+// 0.31.0: the schema items of the rebalance (additive only): the report move names the schema like the plan and the in-flight move do.
+for (const [name, props] of [['PlannedMove', schemas.PlannedMove?.properties], ['BucketMove', schemas.BucketMove?.properties]]) {
+  for (const n of ['kind', 'schemaName']) if (!props?.[n]) fail(name, 'missing ' + n);
+}
+{
+  const reportMove = schemas.RebalanceReport?.allOf?.flatMap((s) => (s.properties?.moves?.items?.properties ? [s.properties.moves.items.properties] : []))[0];
+  for (const n of ['kind', 'schemaName']) if (!reportMove?.[n]) fail('getRebalanceReport', 'the result of a move lacks ' + n + ' (0.31.0)');
+  if (!problemCodes.has('schema_pinned')) fail('ProblemCode', 'missing schema_pinned');
+  for (const id of ['drainServer', 'previewServerDrain']) if (!opDesc(id).includes('schema')) fail(id, 'the description does not say that distributed schemas move with the drain (0.31.0)');
 }
 // ------------------------------------------------------------------ report
 const pathCount = Object.keys(doc.paths ?? {}).length;

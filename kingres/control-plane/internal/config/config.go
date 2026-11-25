@@ -132,6 +132,8 @@ type Config struct {
 	TransferKeyFile     string
 	TransferMaxDuration time.Duration
 	MaxAtomicBytes      int64
+	// MaxImportBytes is the largest sum of the sizes of the entries of a database archive that an import accepts (design "Limits and timeouts", maxImportBytes).
+	MaxImportBytes int64
 	// HA are the settings of high availability (see ha.go).
 	HA HAConfig
 }
@@ -256,6 +258,8 @@ var settings = []setting{
 		apply: dur(func(c *Config) *time.Duration { return &c.TransferMaxDuration })},
 	{key: "max-atomic-bytes", env: "KINGRES_MAX_ATOMIC_BYTES", usage: "largest decompressed CSV file that a table import accepts, in bytes (default 2 GiB); the import is one transaction, a larger file is split by the user",
 		apply: integer(func(c *Config) *int64 { return &c.MaxAtomicBytes }, 1)},
+	{key: "max-import-bytes", env: "KINGRES_MAX_IMPORT_BYTES", usage: "largest sum of the sizes of the entries of a database archive that an import accepts, in bytes (default 100 GiB)",
+		apply: integer(func(c *Config) *int64 { return &c.MaxImportBytes }, 1)},
 	{key: "pg-port", env: "KINGRES_PG_PORT", usage: "TCP port of the managed instance",
 		apply: func(c *Config, v string) error {
 			n := int64(0)
@@ -348,7 +352,7 @@ func Defaults() Config {
 		CertificateLifetime: 365 * 24 * time.Hour, CertificateRenewFraction: 1.0 / 3.0,
 		CertificateCheckInterval: time.Hour, CertificateRetryInterval: time.Minute,
 		MonitorInterval: 10 * time.Second, LedgerPendingMaxAge: 5 * time.Minute, VersionCheckInterval: time.Minute, RebalanceRetryBackoff: 30 * time.Second, GatherTimeout: 3 * time.Second, PartitionSchedulerInterval: time.Minute,
-		TransferMaxDuration: 24 * time.Hour, MaxAtomicBytes: 2 << 30,
+		TransferMaxDuration: 24 * time.Hour, MaxAtomicBytes: 2 << 30, MaxImportBytes: 100 << 30,
 		HA: DefaultHA(),
 	}
 }
@@ -492,6 +496,10 @@ func (c *Config) Validate() error {
 	}
 	if err := c.HA.validate(); err != nil {
 		errs = append(errs, err)
+	}
+	// The first port tried for a standby is standby-port-base, or pg-port plus 1000 when it is not set: the end must not lie below it.
+	if base := c.HA.EffectiveStandbyPortBase(c.PGPort); c.HA.StandbyPortEnd != 0 && c.HA.StandbyPortEnd < base {
+		errs = append(errs, fmt.Errorf("standby-port-end %d is below the first standby port %d (standby-port-base, or pg-port plus 1000)", c.HA.StandbyPortEnd, base))
 	}
 	return errors.Join(errs...)
 }

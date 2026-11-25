@@ -77,6 +77,8 @@ export const DELIMITER_LABEL: Record<string, string> = {
 /** What a consistency level means for a person who reads the file, in one sentence. */
 export function consistencySentence(c: TableConsistency): string {
   if (c.level === 'single-snapshot') return 'The file is one snapshot of the table.'
+  if (c.level === 'archive-single-snapshot')
+    return 'This table was read in the one transaction that read every table of the archive.'
   if (c.level === 'per-group')
     return `The table is spread over ${c.groups} groups. Each group was read at its own moment, so a transaction that touched two groups can appear in one and not in the other.`
   return `The table is spread over ${c.groups} groups. Each group was read at its own moment, and the partitions of one group may be different snapshots.`
@@ -95,6 +97,7 @@ export function consistencyBefore(
 
 /** The label of the file format of an export. */
 export function formatLabel(format: DataExport['format']): string {
+  if (format === 'archive/1') return 'Database archive (zip)'
   return format === 'csv.gz' ? 'CSV, compressed (gzip)' : 'CSV'
 }
 
@@ -102,6 +105,10 @@ export function formatLabel(format: DataExport['format']): string {
 export function exportFileName(
   e: Pick<DataExport, 'database' | 'table' | 'format' | 'exportId'>,
 ): string {
+  if (e.format === 'archive/1') {
+    const db = (e.database ?? '').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 40)
+    return `${db || `export-${e.exportId}`}.kdx.zip`
+  }
   const safe = (v: string | null | undefined): string =>
     (v ?? '').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 40)
   const base = [safe(e.database), safe(e.table)].filter(Boolean).join('-') || `export-${e.exportId}`

@@ -174,6 +174,8 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	if err != nil {
 		return fmt.Errorf("preparing instance management: %w", err)
 	}
+	svc.SetExtensionSkippedHandler(raiseExtensionSkipped(serviceAlertSys(svc), serverHost, log))
+	svc.SetExtensionAppliedHandler(clearExtensionSkipped(serviceAlertSys(svc), serverHost, log))
 	if svc.Enabled() {
 		// An instance that fenced itself (its group lease was lost) is not started as a
 		// primary again until the lease manager holds a lease (package lease).
@@ -373,6 +375,9 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		if foDeps.mf != nil {
 			deps.MapFailover = foDeps.mf
 		}
+		if rbs != nil {
+			wireMapGroupHandOver(rbs, fos, faultHook)
+		}
 	}
 	// The signing keys of the ledger and the scheduler that runs their jobs on the manager leader.
 	var lgs *ledgerParts
@@ -482,6 +487,8 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 				rbs.IsLeader = func(ctx context.Context) bool { id, err := leaders.Get(ctx); return err == nil && id == serverHost }
 				wg.Add(1)
 				go func() { defer wg.Done(); rbs.RunAuto(bgCtx) }()
+				wg.Add(1)
+				go func() { defer wg.Done(); rbs.RunDrainWatch(bgCtx) }()
 			}
 			if fos != nil && foDeps.mf != nil {
 				auto := newAutoFailover(foDeps.mf, fos, rbs, leaders, serverHost, cfg.HA.FailureTimeout, log)
@@ -552,6 +559,9 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	foDeps.d = hd
 	hd.MapFailover = foDeps.mf
 	hd.IdentityCheck = newIdentityChecker(authn, serverHost)
+	if members != nil && foDeps.mf != nil {
+		wireEscrow(members, foDeps.mf)
+	}
 	if cfgp != nil {
 		cfgp.start(hd, haCalls)
 	}
@@ -604,6 +614,9 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		job := members.NewRenewalJob(cfg.CertificateRenewFraction, cfg.CertificateCheckInterval, cfg.CertificateRetryInterval)
 		wg.Add(1)
 		go func() { defer wg.Done(); job.Run(bgCtx) }()
+		// The leader keeps the sealed copies of the CA key on the servers that can become leader (when the operator switched the escrow on).
+		wg.Add(1)
+		go func() { defer wg.Done(); members.RunEscrow(bgCtx, time.Minute) }()
 	}
 
 	serveErr := make(chan error, 1)
