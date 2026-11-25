@@ -130,7 +130,10 @@ func TestImportRollForwardAfterALeaderChangeFinishesTheOldLeader(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if ran, err := e2.RunOnce(context.Background()); !ran || err != nil {
+			// a roll forward that cannot reach a server waits for it for ever: the run is bounded, so that the test fails and does not hang
+			bound, stop := context.WithTimeout(context.Background(), 90*time.Second)
+			defer stop()
+			if ran, err := e2.RunOnce(bound); !ran || err != nil {
 				t.Fatalf("the takeover: %v %v", ran, err)
 			}
 			done := r.get(e2, tk.ID)
