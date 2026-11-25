@@ -21,6 +21,11 @@ type SweepReport struct {
 	Restored bool
 }
 
+// uploadInUseSQL is true for a transfer row that an unfinished task uses: the task named by the row, or a database.import whose input names the upload (a start whose link
+// to its upload could not be written is still protected, so its archive is not expired under the running import).
+const uploadInUseSQL = `EXISTS (SELECT 1 FROM kingres_cp.task t WHERE t.state IN ('pending', 'running', 'paused')
+	AND (t.id = d.task_id OR (t.kind = 'database.import' AND d.kind = 'upload' AND t.input->>'uploadId' = d.transfer_id::text)))`
+
 // TransferSweep is the janitor of the staged files (design "Where files live", limit 4). It runs on the manager leader every 5 minutes and once
 // before the first transfer. It expires files whose time has passed, uploads that received nothing for 48 hours and files of roles that were dropped,
 // deletes the files of rows that are done with, sets rows whose file is gone to lost, and hands the rest to the rules of the staging store (a name that
@@ -36,7 +41,7 @@ func (o *Ops) TransferSweep(ctx context.Context) (SweepReport, error) {
 	var highest int64
 	err = wrap(o.asService(ctx, sysdb.Database, func(tx pgx.Tx) error {
 		tag, e := tx.Exec(ctx, `UPDATE kingres_cp.data_transfer d SET state = 'expired'
-			WHERE d.server_id = $1 AND d.state IN ('ready', 'receiving')
+			WHERE d.server_id = $1 AND d.state IN ('ready', 'receiving') AND NOT `+uploadInUseSQL+`
 			  AND (d.expires_at < now() OR (d.kind = 'upload' AND d.state = 'receiving' AND d.updated_at < now() - interval '48 hours'))`, o.ServerHost)
 		if e != nil {
 			return e
@@ -44,7 +49,7 @@ func (o *Ops) TransferSweep(ctx context.Context) (SweepReport, error) {
 		rep.Expired = int(tag.RowsAffected())
 		// A role that was dropped or renamed does not keep its files: its OID no longer belongs to that name.
 		tag, e = tx.Exec(ctx, `UPDATE kingres_cp.data_transfer d SET state = 'deleted'
-			WHERE d.server_id = $1 AND d.state IN ('ready', 'receiving', 'building')
+			WHERE d.server_id = $1 AND d.state IN ('ready', 'receiving', 'building') AND NOT `+uploadInUseSQL+`
 			  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r WHERE r.oid::bigint = d.created_by_oid AND r.rolname = d.created_by)`, o.ServerHost)
 		if e != nil {
 			return e
@@ -118,7 +123,8 @@ func (o *Ops) TransferSweep(ctx context.Context) (SweepReport, error) {
 	rep.Deleted += len(sr.Deleted)
 	// Old rows of finished transfers are not kept for ever.
 	if perr := wrap(o.asService(ctx, sysdb.Database, func(tx pgx.Tx) error {
-		tag, e := tx.Exec(ctx, `DELETE FROM kingres_cp.data_transfer WHERE server_id = $1 AND state IN ('deleted', 'failed', 'expired', 'lost') AND updated_at < now() - interval '7 days'
+		tag, e := tx.Exec(ctx, `DELETE FROM kingres_cp.data_transfer d WHERE d.server_id = $1 AND d.state IN ('deleted', 'failed', 'expired', 'lost') AND d.updated_at < now() - interval '7 days'
+			AND NOT `+uploadInUseSQL+`
 			AND transfer_id <> (SELECT max(transfer_id) FROM kingres_cp.data_transfer)`, o.ServerHost)
 		rep.Pruned = int(tag.RowsAffected())
 		return e

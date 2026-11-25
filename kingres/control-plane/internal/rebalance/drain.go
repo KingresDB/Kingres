@@ -290,17 +290,18 @@ func (s *Service) stepDrainEmpty(ctx context.Context, env *task.Env, _ *PGRows, 
 	}
 	deadline := time.Now().Add(s.drainWait())
 	for {
-		left, err := s.bucketsOn(ctx, o.DrainServer)
+		left, private, err := s.bucketsOnWithPrivate(ctx, o.DrainServer)
 		if err != nil {
 			return err
 		}
 		if left == 0 {
 			return nil
 		}
+		note := privateNote(private)
 		if time.Now().After(deadline) {
-			return problem.New(problem.ServerOwnsBuckets, "Server "+o.DrainServer+" still owns "+strconv.Itoa(left)+" buckets"+s.schemaNote(ctx, o.DrainServer)+" (or a move away from it has not been cleaned up) after the drain; start it again.")
+			return problem.New(problem.ServerOwnsBuckets, "Server "+o.DrainServer+" still owns "+strconv.Itoa(left)+" buckets"+s.schemaNote(ctx, o.DrainServer)+note+" (or a move away from it has not been cleaned up) after the drain; start it again.")
 		}
-		_ = env.SetDetail(ctx, fmt.Sprintf("%d buckets%s are still on %s", left, s.schemaNote(ctx, o.DrainServer), o.DrainServer))
+		_ = env.SetDetail(ctx, fmt.Sprintf("%d buckets%s%s are still on %s", left, s.schemaNote(ctx, o.DrainServer), note, o.DrainServer))
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -326,12 +327,25 @@ func (s *Service) drainWait() time.Duration {
 // bucketsOn counts, over the databases with distributed tables, the buckets that groups with a primary on the
 // server own (the one bucket of a distributed schema is one of them: a server that still hosts a schema is not drained) plus the moves that are not finished with them (a bucket in cleaning still has its old copy).
 func (s *Service) bucketsOn(ctx context.Context, server string) (int, error) {
+	n, _, err := s.bucketsOnWithPrivate(ctx, server)
+	return n, err
+}
+
+// bucketsOnWithPrivate is bucketsOn, and names the databases of imports (running, or kept after a failure) that hold some of the buckets: while an import runs a drain is refused
+// (task exclusion), so such a database is one that an import left (keepOnFailure), and its buckets on the server keep it from being empty. Its catalog is read, never changed.
+func (s *Service) bucketsOnWithPrivate(ctx context.Context, server string) (int, []string, error) {
 	// Strict: a database that cannot be verified is an error here, never a database with no buckets (the drain would report done with buckets still on the server).
-	dbs, err := s.Backend.Databases(ctx, Options{Strict: true})
+	// WithPrivate: the private database of an import is counted too, so that it is reported and not hidden.
+	dbs, err := s.Backend.Databases(ctx, Options{Strict: true, WithPrivate: true})
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	total := 0
+	privateSet, err := s.Backend.privateDatabases(ctx)
+	if err != nil {
+		return 0, nil, err
+	}
+	var private []string
 	for _, db := range dbs {
 		var n int
 		err := s.Backend.withShard(ctx, db, func(c *pgx.Conn) error {
@@ -341,11 +355,14 @@ func (s *Service) bucketsOn(ctx context.Context, server string) (int, error) {
 					WHERE mv.phase IN ('preparing', 'copying', 'catching_up', 'switching', 'cleaning')), 0)`, server).Scan(&n)
 		})
 		if err != nil {
-			return 0, err
+			return 0, nil, err
+		}
+		if n > 0 && privateSet[db] {
+			private = append(private, db)
 		}
 		total += n
 	}
-	return total, nil
+	return total, private, nil
 }
 
 // stepDrainStandbys takes the server out of the ring of the standbys and waits until it hosts none (design 11.3 step 5): the
@@ -530,4 +547,13 @@ func (s *Service) schemaNote(ctx context.Context, server string) string {
 		return ""
 	}
 	return fmt.Sprintf(", %d of them distributed schemas", n)
+}
+
+// privateNote words the buckets that the private database of an import holds ("" when none): such a database is kept after a failed import (keepOnFailure) and its
+// catalog is not followed, so a rebalance does not move its buckets; the operator drops it (DELETE of the database) when the import is not wanted any more.
+func privateNote(private []string) string {
+	if len(private) == 0 {
+		return ""
+	}
+	return ", some of them in the kept private database of a failed import (" + strings.Join(private, ", ") + "; drop it)"
 }

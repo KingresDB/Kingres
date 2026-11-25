@@ -908,6 +908,9 @@ paths:
         and that named the server's certificate (see `AddServerRequest.expectedFingerprint` and
         `allowUnpinned`); a server that holds a certificate but has not finished joining (`status` still
         pending) may make no other call to the cluster.
+
+        Refused with 409 `operation_in_progress` while a database import (`importDatabase`) is pending, running or paused, and an import is refused while a server is being added: the
+        private database of an import is made on the servers that the import started with, so a server that joined meanwhile would be in its catalog without the database.
       tags: [Servers]
       x-required-role: kingres_admin
       requestBody:
@@ -951,8 +954,8 @@ paths:
       operationId: updateServer
       summary: Update a server
       description: |
-        Changes the server group or whether the server should hold shards (partial update, answered
-        synchronously with the whole `Server`). **Only `serverGroup` and `shouldHaveShards` can be
+        Changes the server group, whether the server should hold shards or its weight (partial update, answered
+        synchronously with the whole `Server`). **Only `serverGroup`, `shouldHaveShards` and `weight` can be
         changed**; every other property of `Server` is read-only and a request that contains any other
         member is refused with 400 `validation_failed` (`errors[].field` names it, for example `/status`).
         An empty body is refused with 400. A value equal to the current one changes nothing and still
@@ -970,6 +973,9 @@ paths:
         (`POST /rebalance`); `true` makes a server that owns no bucket `pendingRebalance`. Nothing moves by itself.
         The change is made in the sharding catalog of every database through `kingres.set_node_property`; 409
         `no_receiving_server` when it would leave no server that should hold shards.
+
+        While a database import (`importDatabase`) is pending, running or paused, a request that changes `shouldHaveShards` or `weight` is refused with 409 `operation_in_progress` (the private
+        database of the import has a catalog that no change of the flag or the weight follows); a request that only changes `serverGroup`, or that sets a value equal to the current one, is not refused.
       tags: [Servers]
       x-required-role: kingres_ops
       requestBody:
@@ -1015,6 +1021,10 @@ paths:
         the standbys it hosts for other groups are not counted); 409 `rebalance_in_progress` while a rebalance runs and `operation_in_progress` while
         another task of this server runs. A `dead` server is refused with 422 `node_state_invalid`: fail
         it over first.
+
+        A database import (`importDatabase`) that is pending, running or paused refuses the removal with 409 `operation_in_progress`, and an import is refused while a removal is
+        unfinished. The buckets that the private database of a failed import that was kept (`keepOnFailure`) holds on the server keep it from being removed too: the `detail` of
+        `server_owns_buckets` names that database, which an operator drops with `dropDatabase`.
       tags: [Servers]
       x-required-role: kingres_ops
       responses:
@@ -1159,6 +1169,10 @@ paths:
         new manager leader when the switchover has ended. The task is paused meanwhile (`getRebalanceStatus` shows `stopped`, `stoppedBy` `safetyRule`) and keeps its id. A switchover
         that is refused or rolled back fails the task with the code of the refusal, or `server_hosts_map_group` when the server still runs the map group; the server stays `draining`
         and the drain can be started again. Needs `kingres_ops`.
+
+        A drain is refused with 409 `operation_in_progress` while a database import (`importDatabase`) is pending, running or paused, and an import is refused while a drain is pending or
+        running; a drain that is paused does not refuse an import, but it cannot be resumed until the import has ended. The buckets that the private database of a failed import that was kept
+        (`keepOnFailure`) holds on the server keep the drain from ending: the task fails with `server_owns_buckets` and its detail names that database, which an operator drops with `dropDatabase`.
       tags: [Servers]
       x-required-role: kingres_ops
       requestBody:
@@ -3204,7 +3218,7 @@ paths:
 
         **A start is refused, before any task exists, with the reason in the problem code (0.9.0):** 409
         `rebalance_in_progress` (a run is unfinished and not stopped); `operation_in_progress` (another task adds,
-        removes or detaches a server); `failover_in_progress` (these two also when the other task is created at the same moment: the check and the creation are one step in the system database, so a rebalance and a server operation are never both created); `version_mismatch` (the servers do not run the same
+        removes or detaches a server, or a database import (`importDatabase`) is pending, running or paused); `failover_in_progress` (these two also when the other task is created at the same moment: the check and the creation are one step in the system database, so a rebalance and a server operation are never both created); `version_mismatch` (the servers do not run the same
         version of the sharding extension and the same PostgreSQL major); `cluster_inconsistent` (`kingres.check_cluster()`
         reports something that makes moving unsafe; the detail names it); `no_receiving_server` (no server should hold
         shards); `nothing_to_rebalance` (the plan is empty); `group_degraded` (0.27.0: a group has a standby that is behind its primary by more than `maxStandbyLagBytes`, or whose lag cannot be read; `force: true` overrides this and only this). The same conditions are checked again before every move; one
@@ -3403,7 +3417,7 @@ paths:
       description: |
         Requests cancellation of a `pending`, `running` or `paused` task. Steps already completed are not
         undone unless the task kind defines compensation (create database cleans up). The task ends as
-        `failed` with error code `cancelled`. A running task stops at its next step boundary (a rebalance stops like a stop, between moves, and its run is recorded with outcome `cancelled`, not `failed`); a paused task (a stopped rebalance) ends at once. A cancel is a person's decision: it raises no `taskFailed` alert. Returns 409 for a task that is already `done` or `failed`.
+        `failed` with error code `cancelled`. A running task stops at its next step boundary (a rebalance stops like a stop, between moves, and its run is recorded with outcome `cancelled`, not `failed`); a paused task (a stopped rebalance) ends at once. A cancel is a person's decision: it raises no `taskFailed` alert. A `database.import` is cancellable in every step until its commit point (also in its last step and while it waits for a server that does not answer): it is undone as after a failure and ends as `failed` with code `cancelled`; a cancel that is recorded before its commit mark is written wins over the commit. A `database.import` that passed its commit point is never undone by a cancel: a running one is paused (its `detail` says it is committed and not finished), and a paused or pending one (committed or not) is ended as `failed` with code `cancelled` and, when committed, a message that names the database and the servers where it is open and where it is not, nothing being undone (the way out of an import that cannot be resumed). Returns 409 `task_not_cancellable` for a task that is already `done` or `failed` or that is past the point after which its kind accepts no cancel, and 409 `operation_in_progress` when the task changed state at each of five tries to record the cancel (read the task and try again).
       tags: [Tasks]
       x-required-role: kingres_ops
       responses:
@@ -5928,17 +5942,22 @@ paths:
         The statements run **as the signed-in role**, one per round trip, never as the service role, so PostgreSQL's privileges are the guarantee; a role with `SUPERUSER`, `REPLICATION` or `BYPASSRLS`, or with access to
         server files, programs or logs, is refused with 403 `forbidden` and must sign in as another role. The extensions of the archive are installed from a closed list.
 
-        The import works in a database with a **private name** (`kingres_import_<task id>`) that only the task uses, and renames it to its final name as its last step; a failed or cancelled import drops the private database
-        (unless `keepOnFailure`), and nothing of the final name exists. Order: the extensions, the tables, the distribution of the tables **while they are empty**, the views, the data (one transaction per table, the rows
+        The import works in a database with a **private name** (`kingres_import_<task id>`) that only the task uses, and renames it to its final name as its last step; the last step has one commit point (a mark of the task, written
+        before the first server opens the database to its owner). Before it a failed or cancelled import drops the private database (unless `keepOnFailure`)
+        and nothing of the final name exists; after it the import only goes forward, possibly after retries while a server does not answer, goes on from the mark after a restart or a change of leader (on every server, the starting server included), and the system never removes it. It does not always end `done`: when the task engine itself gives a committed task up (a server that refuses the calls of the task again and again, a task store that cannot be read, a commit whose outcome is not known) or when a cancel is accepted for it while it runs, the task is **`paused`**, not `failed`, with a `detail` that starts with what to do, says that the import is committed and not finished and names the servers (a long list is shortened with "and N more"); the database is left as it is (possibly closed or marked on some servers) and nothing is undone.
+
+        **Repeating this request** with the same `uploadId`, by the role that owns the upload, resumes any paused import of that upload, committed or not: a committed one goes on from its mark; one that was paused only because its mark could not be read, and whose mark is empty now, goes on as an import that is not committed (it can still be undone). If `database` is given it must be the database of the task (another name is a new request, and it is refused with 409 `operation_in_progress` while the paused task holds the upload). **Every other field of the repeat is ignored** (`expectedSha256`, `onForeignKeyViolation`, `acknowledgeLedgerRestart`, `keepOnFailure`): the task goes on with what it was started with. The answer is 202 with the task, as for a new import; while the task runs a repeat is 409 `operation_in_progress`.
+
+        **A paused import is always cancellable**, and that is the exit of an import that cannot be resumed (a server that is gone for good, a role that was dropped, a database that was dropped by hand): `POST /tasks/{taskId}/cancel` ends a paused committed import as `failed` with error code `cancelled` and a message that starts with what to do and names the database, the servers where it is open and those where it is not (and those that could not be asked), and the manual steps are in the operator guide. Nothing is undone and no database is touched, and the end of the task releases the exclusion of the addition, the removal and the leaving of a server and of a rebalance. A cancel of a running committed import pauses it. The janitor of the staged files never expires, deletes or prunes an upload whose import task is pending, running or paused. A server that is no longer a member of the cluster (removed, or it left) is skipped by the roll forward and named in the final `detail`; a member that cannot be reached keeps the import waiting, and the exit is the cancel of the paused task, then the removal of the server. Order: the extensions, the tables, the distribution of the tables **while they are empty**, the views, the data (one transaction per table, the rows
         counted against the manifest), the indexes and constraints, the sequences, then the ledger and the time-partition policies. **Ledger tables are carried as data and start a new chain** (ADR 0028): the import
         enters their rows as the first entries of a new chain, `ledger_verify` must find nothing, and then the signature policy of the source is set again; it needs `acknowledgeLedgerRestart: true` (422
         `ledger_restart_not_acknowledged` otherwise). **Time-partition policies come back disabled**; the task's last detail lists them with the call that enables each.
 
         Needs `kingres_admin`, `dataTransfer.enabled` (403 `data_transfer_disabled`) and a request over TLS (403 `insecure_transport`). 404: the upload does not exist or is another role's. 409 `upload_incomplete`;
-        409 `already_exists`: the database exists; 409 `operation_in_progress`: a task uses the upload or the transfer limit is reached. 422 `archive_invalid`, `archive_incompatible` (the PostgreSQL major of the
+        409 `already_exists`: the database exists; 409 `operation_in_progress`: a task uses the upload, the transfer limit is reached, a rebalance (a drain is one) is pending or running, or the addition, the removal or the leaving of a server is unfinished (an import that is pending, running or paused refuses those in turn, and the change of `shouldHaveShards`; a rebalance that is paused does not refuse an import, but cannot be resumed until it has ended). 422 `archive_invalid`, `archive_incompatible` (the PostgreSQL major of the
         target must be at least the source's), `archive_statement_refused`, `import_too_large` (more than `maxImportBytes`, a statement or a count above its limit) and `ledger_restart_not_acknowledged`.
         Steps: *Check the archive*, *Create the private database* (and one step for each other server), *Install the extensions*, *Check the functions*, *Create the tables*, *Distribute the tables*, *Create the views*,
-        *Load the data*, *Create the indexes and constraints*, *Set the sequences*, *Enable the ledger and the policies*, *Verify*, *Take the final name*. A task is cancellable until *Set the sequences* starts.
+        *Load the data*, *Create the indexes and constraints*, *Set the sequences*, *Enable the ledger and the policies*, *Verify*, *Take the final name*. A task is cancellable in every step until its commit point (the mark that the last step writes); see `POST /tasks/{taskId}/cancel`.
         Task codes: `archive_invalid`, `archive_incompatible`, `archive_statement_refused`, `foreign_key_violation` (the constraint's name and the count), `table_not_eligible`, `row_count_mismatch`, `verification_failed`,
         `transfer_leader_changed` (retryable), `transfer_session_lost` (retryable), `forbidden`, `cancelled`. The error of a task never carries a value, a row, the text of a statement or text of the server.
       tags: [Data transfer]
@@ -6599,7 +6618,7 @@ components:
       description: |
         The import was accepted and runs as the task `database.import` (added in 0.30.0). Poll `GET /tasks/{taskId}` (the `Location` header) until `state` is `done` or `failed`. When it is `done` the database
         exists under its final name and `detail` lists what needs a decision (the disabled time-partition policies, the ledger chains that started again); when it failed the private database was removed (or kept, with
-        `keepOnFailure`) and the final name was never taken.
+        `keepOnFailure`) and the final name was never taken (a task that passed its commit point is not failed or undone by the system: it keeps going until the database is open on every server, and when it is stopped or given up it is `paused` with a `detail` that says what to do and that it is committed and not finished; repeat the request to resume it, or cancel the paused task to give it up).
       headers:
         Location:
           description: URL of the task, `/api/v1/tasks/{taskId}`.

@@ -15,6 +15,7 @@ import (
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/archive"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/importdb"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlx"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/transfer"
@@ -316,7 +317,7 @@ func hasInstalled(l []importExtSpec, prefix string) bool {
 
 // importMarker is the comment that marks a private database as the one that a task made: its name already says which task it is.
 func importMarker(priv string) string {
-	return "kingres-import:" + strings.TrimPrefix(priv, privatePrefix)
+	return importdb.Marker(priv)
 }
 
 // createOp builds the parameters of the creation from the manifest: the locale of the source, the schemas and the extensions other than the sharding one.
@@ -404,16 +405,30 @@ func (o *Ops) stepIMInstall(ctx context.Context, env *task.Env) error {
 		return transfer.SafeError(err)
 	}
 	if sharded {
-		for _, s := range p.Servers {
-			s := s
-			if err := o.onServer(ctx, env, s, "register the server", func() error {
+		// The primaries as the system catalog names them now (host and port), not the home port of each server: after a switchover a primary runs on another
+		// instance of its server, and the catalog of every other database names that one.
+		sysNodes, err := o.readSystemNodes(ctx)
+		if err != nil {
+			return err
+		}
+		for _, n := range primariesToRegister(sysNodes, p.Servers, o.ServerHost) {
+			n := n
+			if err := o.importOnServer(ctx, env, n.Host, "register the server", func() error {
 				if o.Fanout == nil {
 					return nil
 				}
-				return o.Fanout.Register(ctx, priv, OtherServer{ID: s, PGPort: o.pgPortOf(ctx, s)})
+				return o.Fanout.Register(ctx, priv, OtherServer{ID: n.Host, PGPort: int(n.Port)})
 			}); err != nil {
 				return err
 			}
+		}
+		// the placement flags and the weights of the cluster, as the drain and the weight of a server set them in every other database
+		if err := o.seedImportCatalog(ctx, priv); err != nil {
+			return err
+		}
+		// a mismatch now is a cluster whose primaries are not on their preferred servers (or a failover under way): it fails here, with that message, not after the load
+		if err := o.checkImportCatalogEarly(ctx, priv, p.Servers); err != nil {
+			return err
 		}
 		if len(m.Extensions) > 0 && len(a.st.res.Catalog.DistributedSchemas) > 0 {
 			if err := o.setShardingMode(ctx, priv, "both", nil); err != nil {

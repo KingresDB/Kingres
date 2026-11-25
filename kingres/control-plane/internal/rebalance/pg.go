@@ -19,6 +19,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extgate"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fence"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/importdb"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
@@ -82,11 +83,14 @@ func (b *PG) with(ctx context.Context, db string, f func(c *pgx.Conn) error) err
 func (b *PG) Databases(ctx context.Context, o Options) ([]string, error) {
 	var names []string
 	err := b.with(ctx, "postgres", func(c *pgx.Conn) error {
-		rows, err := c.Query(ctx, `SELECT datname FROM pg_catalog.pg_database WHERE NOT datistemplate AND datallowconn ORDER BY datname`)
-		if err != nil {
-			return err
+		// The private database of an import is left out: its tables are loaded, not rebalanced, and its catalog is not followed (and stays stale for ever when the import failed
+		// and the database was kept). WithPrivate puts it back for the read-only count of the buckets of a drained server.
+		public, private, err := importdb.ListAll(ctx, c)
+		names = public
+		if o.WithPrivate {
+			names = append(names, private...)
+			sort.Strings(names)
 		}
-		names, err = pgx.CollectRows(rows, pgx.RowTo[string])
 		return err
 	})
 	if err != nil {
@@ -140,7 +144,7 @@ func (b *PG) Check(ctx context.Context, dbs []string) error {
 	var tasks []string
 	err := b.with(ctx, sysdb.Database, func(c *pgx.Conn) error {
 		rows, err := c.Query(ctx, `SELECT kind || ' ' || subject_id FROM kingres_cp.task
-			WHERE state IN ('pending', 'running', 'paused') AND kind IN ('server.failover', 'replication.restorePreferredPrimaries', 'server.add', 'server.remove', 'server.leave')`)
+			WHERE state IN ('pending', 'running', 'paused') AND kind IN ('server.failover', 'replication.restorePreferredPrimaries', 'server.add', 'server.remove', 'server.leave', 'database.import')`)
 		if err != nil {
 			return err
 		}
@@ -1152,4 +1156,18 @@ func (b *PG) standbyLagOf(ctx context.Context, group int32, stat, slots string) 
 		return 0, fmt.Errorf("the lag of shard group %d is not a number: %w", group, err)
 	}
 	return n, nil
+}
+
+// privateDatabases are the private databases of imports (the name, the marker and the owner all match, importdb.IsPrivate): a database that a client made under the prefix
+// is not one of them.
+func (b *PG) privateDatabases(ctx context.Context) (map[string]bool, error) {
+	out := map[string]bool{}
+	err := b.with(ctx, "postgres", func(c *pgx.Conn) error {
+		_, private, err := importdb.ListAll(ctx, c)
+		for _, n := range private {
+			out[n] = true
+		}
+		return err
+	})
+	return out, err
 }

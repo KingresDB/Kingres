@@ -330,7 +330,7 @@ func TestDefinitionStepsAndTheCancelGuard(t *testing.T) {
 	if s, _ := def.Dynamic(one); len(s) != 13 {
 		t.Errorf("%d steps for a cluster of one server", len(s))
 	}
-	// A cancel is accepted until the sequences are set.
+	// A cancel is accepted in every step before the commit point (the running step sees it and the import is undone), also in the last four steps.
 	mk := func(state string, step string) task.Task {
 		var ts []task.StepState
 		for _, n := range names {
@@ -345,9 +345,20 @@ func TestDefinitionStepsAndTheCancelGuard(t *testing.T) {
 	for _, tc := range []struct {
 		step, state string
 		ok          bool
-	}{{stepMData, task.StepRunning, true}, {stepMPost, task.StepDone, true}, {stepMSeq, task.StepRunning, false}, {stepMSeq, task.StepDone, false}, {stepMLedger, task.StepRunning, false}, {stepMRename, task.StepRunning, false}} {
+	}{{stepMData, task.StepRunning, true}, {stepMPost, task.StepDone, true}, {stepMSeq, task.StepRunning, true}, {stepMSeq, task.StepDone, true}, {stepMLedger, task.StepRunning, true}, {stepMVerify, task.StepDone, true}, {stepMRename, task.StepRunning, true}} {
 		if got := def.Cancellable(mk(tc.state, tc.step)); got != tc.ok {
 			t.Errorf("cancel while %s is %s: %v", tc.step, tc.state, got)
+		}
+	}
+	// every step can be interrupted by a cancel, the steps that run on one server included; a finished import is not cancellable
+	for _, st := range steps {
+		if !st.Interruptible {
+			t.Errorf("the step %q cannot be interrupted by a cancel", st.Name)
+		}
+	}
+	for _, state := range []task.State{task.Done, task.Failed} {
+		if def.Cancellable(task.Task{State: state}) {
+			t.Errorf("a %s import is cancellable", state)
 		}
 	}
 }

@@ -5,12 +5,14 @@ package membership
 import (
 	"context"
 	"errors"
+	"slices"
 	"strconv"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extgate"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/importdb"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
 )
 
@@ -85,6 +87,10 @@ func (m *Manager) catalogFacts(ctx context.Context, id string) (removalFacts, er
 		return f, err
 	}
 	f.Holds, err = m.holds(ctx, id)
+	if err != nil {
+		return f, err
+	}
+	f.Private, err = m.privateHolds(ctx, f.Holds)
 	return f, err
 }
 
@@ -143,4 +149,28 @@ func bucketsOwned(ctx context.Context, c *pgx.Conn, db, server string) (int, err
 	err := c.QueryRow(ctx, `SELECT count(*) FROM kingres.bucket_map b
 		WHERE b.group_id IN (SELECT n.group_id FROM kingres.node n WHERE n.host = $1 AND n.role = 'primary')`, server).Scan(&n)
 	return n, err
+}
+
+// privateHolds names, among the databases that hold buckets of the server, the private databases of imports (importdb.IsPrivate: name, marker and owner): such a database
+// is kept after a failed import (keepOnFailure), no walk follows its catalog, and the operator drops it. A database that a client made under the prefix is not one of them.
+func (m *Manager) privateHolds(ctx context.Context, holds []bucketHold) ([]string, error) {
+	if len(holds) == 0 {
+		return nil, nil
+	}
+	c, err := m.Svc.ServiceConn(ctx, "postgres")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	_, private, err := importdb.ListAll(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, h := range holds {
+		if slices.Contains(private, h.DB) {
+			out = append(out, h.DB)
+		}
+	}
+	return out, nil
 }
