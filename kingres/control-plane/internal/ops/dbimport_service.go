@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -20,6 +21,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/archive"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fence"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlx"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
@@ -950,7 +952,10 @@ func (o *Ops) openRenamed(ctx context.Context, name, owner, marker string) error
 
 // importCommitMark is the value that the rename step writes to the mark of its task (Task.Mark) at the commit point: the task has decided that the database at the
 // final name is the result of the import. It is written, and read back, before the first server opens the database.
-func importCommitMark(priv string) string { return "import-committed:" + priv }
+// importCommitPrefix starts every commit mark.
+const importCommitPrefix = "import-committed:"
+
+func importCommitMark(priv string) string { return importCommitPrefix + priv }
 
 // importCommitted tells whether the task state says that the commit point was passed (or cannot be told: the hook could not read the mark).
 func importCommitted(t task.Task, priv string) bool {
@@ -994,9 +999,6 @@ func (o *Ops) stepIMRename(ctx context.Context, env *task.Env) error {
 	_, rec, x, lerr := o.loadImport(ctx, env)
 	if lerr == nil {
 		a, lerr = o.openImport(ctx, x, rec, p, env.Task.ID)
-		if lerr == nil {
-			defer a.close()
-		}
 	}
 	if lerr != nil && !committed {
 		return lerr
@@ -1026,12 +1028,15 @@ func (o *Ops) stepIMRename(ctx context.Context, env *task.Env) error {
 				break
 			}
 		}
+		tables, rows := len(a.st.res.Catalog.Tables), a.st.res.Manifest.Totals.Rows
 		w.done = func(ctx context.Context) {
 			if o.Transfer != nil && o.Transfer.Audit != nil {
 				o.Transfer.Audit(ctx, "dataTransfer.completed", map[string]any{"kind": "databaseImport", "database": p.Database, "uploadId": idText(p.UploadID), "sha256": rec.SHA256,
-					"tables": len(a.st.res.Catalog.Tables), "rows": a.st.res.Manifest.Totals.Rows, "outcome": "success"})
+					"tables": tables, "rows": rows, "outcome": "success"})
 			}
 		}
+		// The archive was read for what the step needs; it is not held open through the roll forward, which may take long.
+		a.close()
 	}
 	return o.importRenameFinal(ctx, env, w)
 }
@@ -1093,6 +1098,14 @@ func (o *Ops) importRenameFinal(ctx context.Context, env *task.Env, w renameFina
 	// name of the work in progress and the hook of the task finds all of it.
 	revert := func() string {
 		bg := context.WithoutCancel(ctx)
+		// A committed import is never undone: a run that lost its lease and reaches this point reads the mark first (the run that holds the task may have
+		// written it meanwhile). A mark that cannot be read counts as committed; the hook of the task decides later, when it can read.
+		if got, rerr := env.ReadMark(bg); rerr != nil || got == importCommitMark(priv) {
+			if o.Log != nil {
+				o.Log.Warn("an import that may be committed was not put back", "database", p.Database, "private", priv, "error", rerr)
+			}
+			return "; the import may be committed, so nothing was put back"
+		}
 		var failed []string
 		for _, s := range done {
 			if _, err := o.putBackOn(bg, s, p.Database, priv); err != nil {
@@ -1104,7 +1117,7 @@ func (o *Ops) importRenameFinal(ctx context.Context, env *task.Env, w renameFina
 		}
 		// A settings row of the final name is this import's: no database was there when the names were taken. When a put back failed the hook does it, after its own.
 		if len(done) > 0 && len(failed) == 0 {
-			if uerr := o.unrecordImportedSettings(bg, p.Database); uerr != nil && o.Log != nil {
+			if uerr := o.unrecordImportedSettings(bg, p.Database, p.Owner.Name); uerr != nil && o.Log != nil {
 				o.Log.Error("the settings of an import that was undone could not be removed", "database", p.Database, "error", uerr)
 			}
 		}
@@ -1206,16 +1219,50 @@ func (o *Ops) commitImport(ctx context.Context, env *task.Env, mark string) (com
 // importCommitPause is the pause between two tries to write the commit mark.
 var importCommitPause = time.Second
 
-// importRollForward is the part of the step after the commit point: open on every server, then remove the marker on every server. It does not give up: an error is
-// logged and shown, and the work is tried again after a pause, until it is done or this run is stopped (shutdown, lost lease; the next run goes on from the mark).
+// importCancelPoll is how often the roll forward asks the store whether a cancel was requested.
+var importCancelPoll = time.Second
+
+// importRollForward is the part of the step after the commit point: open on every server, then remove the marker on every server. It does not give up on an
+// error: it is logged and shown, and the work is tried again after a pause that grows to fifteen times importForwardPause, until it is done or this run is stopped
+// (shutdown, lost lease; the next run goes on from the mark). A cancel request stops the run too, without undoing anything: the task is paused (committed, not
+// finished) and goes on from the mark when it is resumed.
 func (o *Ops) importRollForward(ctx context.Context, env *task.Env, w renameFinal) error {
 	p := w.p
+	fctx, stop := context.WithCancel(ctx)
+	defer stop()
+	var cancelled atomic.Bool
+	go func() {
+		t := time.NewTicker(importCancelPoll)
+		defer t.Stop()
+		for {
+			select {
+			case <-fctx.Done():
+				return
+			case <-t.C:
+				if env.CancelRequested(fctx) {
+					cancelled.Store(true)
+					stop()
+					return
+				}
+			}
+		}
+	}()
+	paused := func() error {
+		return task.Pause("A cancel was requested; the import is committed and was not undone. Repeat the import request to finish it.")
+	}
+	pause := importForwardPause
 	for {
-		err := o.importForwardOnce(ctx, env, w)
+		if cancelled.Load() {
+			return paused()
+		}
+		err := o.importForwardOnce(fctx, env, w)
 		if err == nil {
 			break
 		}
-		if leaseOrStop(ctx, err) {
+		if cancelled.Load() {
+			return paused()
+		}
+		if leaseOrStop(fctx, err) {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -1226,11 +1273,18 @@ func (o *Ops) importRollForward(ctx context.Context, env *task.Env, w renameFina
 		}
 		_ = env.SetDetail(ctx, "The import is committed and finishes again after an error: "+safeSentence(err.Error()))
 		select {
-		case <-ctx.Done():
+		case <-fctx.Done():
+			if cancelled.Load() {
+				return paused()
+			}
 			return ctx.Err()
-		case <-time.After(importForwardPause):
+		case <-time.After(pause):
+		}
+		if pause *= 2; pause > 15*importForwardPause {
+			pause = 15 * importForwardPause
 		}
 	}
+	stop()
 	detail := "imported " + p.Database
 	if st := o.importState(env.Task.ID); st != nil && len(st.notes) > 0 {
 		detail += "\n" + strings.Join(st.notes, "\n")
@@ -1255,13 +1309,16 @@ func (o *Ops) importRollForward(ctx context.Context, env *task.Env, w renameFina
 // finished, counts as done), so it can run again after any error, after a restart or on another leader.
 func (o *Ops) importForwardOnce(ctx context.Context, env *task.Env, w renameFinal) error {
 	p, priv := w.p, w.priv
+	// Every server that may hold the database: the others of the request, the starting server and the servers of the cluster now (the leader that runs this may
+	// not be the one that renamed, and it is not in the list of the request).
+	servers := o.importServers(ctx, p)
 	marker := importMarker(priv)
 	if err := o.openRenamed(ctx, p.Database, p.Owner.Name, marker); err != nil {
 		return err
 	}
 	open := importRenameOp{From: p.Database, To: priv, Owner: p.Owner.Name, Open: true}
 	if o.Fanout != nil {
-		for _, s := range p.Servers {
+		for _, s := range servers {
 			s := s
 			if err := o.onServer(ctx, env, s, "open the database", func() error { return o.Fanout.Apply(ctx, s, ApplyImportRename, open) }); err != nil {
 				return err
@@ -1283,7 +1340,7 @@ func (o *Ops) importForwardOnce(ctx context.Context, env *task.Env, w renameFina
 		return err
 	}
 	if o.Fanout != nil {
-		for _, s := range p.Servers {
+		for _, s := range servers {
 			s := s
 			if err := o.onServer(ctx, env, s, "finish the import", func() error { return o.Fanout.Apply(ctx, s, ApplyImportRename, fin) }); err != nil {
 				return err
@@ -1305,10 +1362,11 @@ func (o *Ops) putBackOn(ctx context.Context, server, final, priv string) (bool, 
 	return false, o.Fanout.Apply(ctx, server, ApplyImportRename, importRenameOp{From: final, To: priv, Back: true, Marker: importMarker(priv)})
 }
 
-// unrecordImportedSettings removes the registry row that recordImportedSettings wrote, for an import that was undone after it.
-func (o *Ops) unrecordImportedSettings(ctx context.Context, database string) error {
+// unrecordImportedSettings removes the registry row that recordImportedSettings wrote, for an import that was undone after it. Only a row that the importing role
+// created is removed (recordImportedSettings takes the row over), so that the row of a database that somebody else made under that name is never deleted.
+func (o *Ops) unrecordImportedSettings(ctx context.Context, database, owner string) error {
 	return o.asService(ctx, sysdb.Database, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `DELETE FROM kingres_cp.database_setting WHERE database_name = $1`, database)
+		_, err := tx.Exec(ctx, `DELETE FROM kingres_cp.database_setting WHERE database_name = $1 AND created_by = $2`, database, owner)
 		return err
 	})
 }
@@ -1397,7 +1455,8 @@ func (o *Ops) recordImportedSettings(ctx context.Context, p dbImportParams, shar
 			(database_name, sharding_enabled, bucket_count, durability, ledger_mode, ledger_digest_interval, created_by)
 			VALUES ($1, $2, $3, 'sync', $4, 3600, $5)
 			ON CONFLICT (database_name) DO UPDATE SET sharding_enabled = EXCLUDED.sharding_enabled, bucket_count = EXCLUDED.bucket_count,
-			  durability = EXCLUDED.durability, ledger_mode = EXCLUDED.ledger_mode, ledger_digest_interval = EXCLUDED.ledger_digest_interval`,
+			  durability = EXCLUDED.durability, ledger_mode = EXCLUDED.ledger_mode, ledger_digest_interval = EXCLUDED.ledger_digest_interval,
+			  created_by = EXCLUDED.created_by`,
 			p.Database, sharded, bc, ledgerMode, p.Owner.Name); err != nil {
 			return err
 		}
@@ -1457,7 +1516,7 @@ func (o *Ops) importOnFailHook(ctx context.Context, t task.Task) {
 		// Every server that the task made the database on, and every server that is there now: the leader that runs this hook may not be the one that started the task.
 		seen := map[string]bool{o.ServerHost: true}
 		var servers []string
-		for _, s := range append(append([]string(nil), p.Servers...), ids(o.others(bg))...) {
+		for _, s := range o.importServers(bg, p) {
 			if !seen[s] {
 				seen[s] = true
 				servers = append(servers, s)
@@ -1485,7 +1544,7 @@ func (o *Ops) withdrawEverywhere(ctx context.Context, p dbImportParams, priv str
 	}
 	op.Full = false
 	seen := map[string]bool{o.ServerHost: true}
-	for _, s := range append(append([]string(nil), p.Servers...), ids(o.others(ctx))...) {
+	for _, s := range o.importServers(ctx, p) {
 		if seen[s] {
 			continue
 		}
@@ -1584,7 +1643,7 @@ func (o *Ops) putBackEverywhere(ctx context.Context, p dbImportParams, id int64)
 			}
 		}
 		if stale {
-			if uerr := o.unrecordImportedSettings(ctx, p.Database); uerr != nil && o.Log != nil {
+			if uerr := o.unrecordImportedSettings(ctx, p.Database, p.Owner.Name); uerr != nil && o.Log != nil {
 				o.Log.Error("the settings of a failed import could not be removed", "database", p.Database, "error", uerr)
 			}
 		}
@@ -1593,7 +1652,7 @@ func (o *Ops) putBackEverywhere(ctx context.Context, p dbImportParams, id int64)
 		return
 	}
 	seen := map[string]bool{o.ServerHost: true}
-	for _, s := range append(append([]string(nil), p.Servers...), ids(o.others(ctx))...) {
+	for _, s := range o.importServers(ctx, p) {
 		if seen[s] {
 			continue
 		}
@@ -1612,4 +1671,85 @@ func putBackNote(failed []string, final string) string {
 	}
 	return fmt.Sprintf("; the database could not be put back to its private name on %s: it is still there under the final name %s, with the marker of this import, and the removal of the failed import tries again; if %s is still there after it, drop it with DROP DATABASE on that server",
 		strings.Join(failed, ", "), final, final)
+}
+
+// importServers are the other servers that an import may have touched: the servers that the request named, the server that accepted it and every other server of
+// the cluster now, without this server and without repeats. The leader that runs a step after a change of leader is not the one that started the task, and the one
+// that started it is not among the "others" of the request, so the list of the request alone is not enough.
+func (o *Ops) importServers(ctx context.Context, p dbImportParams) []string {
+	seen := map[string]bool{o.ServerHost: true, "": true}
+	var out []string
+	add := func(s string) {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	for _, s := range p.Servers {
+		add(s)
+	}
+	add(p.Origin)
+	if o.Fanout != nil {
+		for _, s := range ids(o.others(ctx)) {
+			add(s)
+		}
+	}
+	return out
+}
+
+// importCommittedNote is Definition.Committed of the import: whether the task passed the commit point of its last step (or may have: the mark could not be read),
+// and the sentence that the paused task carries then. The database is at the final name and is never undone from there.
+func importCommittedNote(t task.Task) (string, bool) {
+	p, err := inputOf[dbImportParams](t)
+	if err != nil || !importCommitted(t, p.private(t.ID)) {
+		return "", false
+	}
+	servers := append([]string(nil), p.Servers...)
+	if p.Origin != "" {
+		servers = append(servers, p.Origin)
+	}
+	where := strings.Join(servers, ", ")
+	state := "The import of " + p.Database + " is committed but not finished"
+	if t.Mark == task.MarkUnreadable {
+		state = "The import of " + p.Database + " may be committed (the task store could not be read) and is not finished"
+	}
+	return state + ": the database was left as it is and nothing is undone; it may still be closed on some of the servers (" + where + "). Repeat the same import request to finish it.", true
+}
+
+// resumeCommittedImport goes on with a paused import of this upload that passed its commit point: a repeat of the import request is the way to resume it (the
+// archive is not read again, the mark decides). It reports whether there was such a task.
+func (o *Ops) resumeCommittedImport(ctx context.Context, up transfer.Record, database string) (task.Task, bool, error) {
+	eng := o.Engine()
+	if eng == nil || up.TaskID == nil {
+		return task.Task{}, false, nil
+	}
+	t, err := eng.Get(ctx, *up.TaskID)
+	if err != nil || t.Kind != KindDatabaseImport || t.State != task.Paused {
+		return task.Task{}, false, nil
+	}
+	if _, ok := importCommittedNote(t); !ok {
+		return task.Task{}, false, nil
+	}
+	if p, perr := inputOf[dbImportParams](t); perr != nil || (database != "" && database != p.Database) {
+		return task.Task{}, false, nil
+	}
+	if err := eng.Resume(ctx, t.ID); err != nil {
+		var x *task.ExcludedError
+		if errors.As(err, &x) {
+			return task.Task{}, true, x.Problem()
+		}
+		if errors.Is(err, task.ErrNotPaused) {
+			return task.Task{}, true, problem.New(problem.OperationInProgress, "The import is already running.")
+		}
+		return task.Task{}, true, err
+	}
+	o.wg.Add(1)
+	go func() { //nolint:contextcheck // the run outlives the request
+		defer o.wg.Done()
+		if err := eng.RunNow(o.bg(), t.ID, nil); err != nil && o.bg().Err() == nil { //nolint:contextcheck // the background run outlives the request
+			o.Log.Error("task ended with an error", "task", t.ID, "kind", KindDatabaseImport, "error", err)
+		}
+	}()
+	t, err = eng.Get(ctx, t.ID)
+	return t, true, err
 }

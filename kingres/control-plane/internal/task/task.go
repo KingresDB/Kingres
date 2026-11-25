@@ -367,6 +367,54 @@ type Definition struct {
 	// cancellable once its irreversible step is done: it rolls forward only. Nil: every
 	// unfinished task is cancellable.
 	Cancellable func(t Task) bool
+	// Committed, when set, says whether a task has passed a point of no return that its steps recorded in its Mark (the task is read as the store has it now;
+	// its Mark is MarkUnreadable when the store could not be asked, which counts as passed). The engine never fails or cancels such a task: where it would
+	// (a step that returns an error, the give-up after repeated fence refusals, a cancel request), the task is paused instead, with note and the reason as its
+	// detail, so that the operator can see that it is committed and not finished and can resume it (Engine.Resume). The OnFail hook does not run for it.
+	Committed func(t Task) (note string, ok bool)
+}
+
+// holdCommitted pauses a task of a kind with a Committed guard instead of ending it. It reports whether the task was paused (or the run lost its lease: the
+// error says so); false means the task is not committed and the caller ends it as before.
+func (e *Engine) holdCommitted(ctx context.Context, t Task, i int, why string) (bool, error) {
+	d, ok := e.def(t.Kind)
+	if !ok || d.Committed == nil {
+		return false, nil
+	}
+	c := context.WithoutCancel(ctx)
+	var fresh Task
+	if err := e.retry(c, func() (gerr error) { fresh, gerr = e.store.Get(c, t.ID); return gerr }); err != nil {
+		fresh = t
+		fresh.Mark = MarkUnreadable
+	}
+	note, committed := d.Committed(fresh)
+	if !committed {
+		return false, nil
+	}
+	ps, ok := e.store.(PauseStore)
+	if !ok {
+		return false, nil
+	}
+	if i < len(t.Steps) {
+		if _, err := e.setStep(ctx, t, i, StepPending, percent(i, len(t.Steps))); err != nil && leaseLost(err) {
+			return true, ErrLeaseLost
+		}
+	}
+	e.log.Error("a committed task is paused, not ended", "task", t.ID, "kind", t.Kind, "why", why)
+	if len(note) > 330 {
+		note = note[:330] + "..."
+	}
+	reason := note
+	if why != "" {
+		reason += " Reason: " + why
+	}
+	if err := e.retry(c, func() error { return ps.Pause(c, t.ID, e.leaseOf(t), clip(reason)) }); err != nil {
+		if leaseLost(err) {
+			return true, ErrLeaseLost
+		}
+		return true, err
+	}
+	return true, nil
 }
 
 func (d Definition) steps(input json.RawMessage) ([]Step, error) {
@@ -904,6 +952,9 @@ func (e *Engine) renewLoop(ctx context.Context, g *leaseGuard, l Lease, id int64
 }
 
 func (e *Engine) cancelTask(ctx context.Context, t Task, def Definition, next int) error {
+	if held, err := e.holdCommitted(ctx, t, len(t.Steps), "A cancel was requested; it does not undo a committed task."); held {
+		return err
+	}
 	var irrev []string
 	for _, s := range def.Steps[:next] {
 		if s.Irreversible {
@@ -942,6 +993,9 @@ func (e *Engine) pause(ctx context.Context, t Task, i int, reason string) (bool,
 }
 
 func (e *Engine) fail(ctx context.Context, t Task, i int, st Step, te *Error) error {
+	if held, err := e.holdCommitted(ctx, t, i, te.Message); held {
+		return err
+	}
 	if i < len(t.Steps) {
 		if _, err := e.setStep(ctx, t, i, StepFailed, percent(i, len(t.Steps))); err != nil {
 			if leaseLost(err) {

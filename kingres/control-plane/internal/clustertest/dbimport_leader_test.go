@@ -289,6 +289,9 @@ func TestDatabaseImportWithALeaderChangeAtEveryStep(t *testing.T) {
 				})
 			}
 			if res["state"] == "done" {
+				for _, n := range c.Nodes {
+					assertImportOpen(t, n, target)
+				}
 				for _, tb := range dimTables {
 					if got := dimDigest(t, leader, target, tb); got != want[tb] {
 						t.Errorf("table %s of the finished import: %s, want %s", tb, got, want[tb])
@@ -583,6 +586,9 @@ func TestDatabaseImportAfterTheFailoverOfTheLeader(t *testing.T) {
 				})
 			}
 			if res["state"] == "done" {
+				for _, n := range []*clustertest.Node{cand, other} {
+					assertImportOpen(t, n, "dif_x")
+				}
 				for _, tb := range dimTables {
 					if a, b := dimDigest(t, cand, "src", tb), dimDigest(t, cand, "dif_x", tb); a != b {
 						t.Errorf("table %s of the finished import: source %s, imported %s", tb, a, b)
@@ -591,4 +597,20 @@ func TestDatabaseImportAfterTheFailoverOfTheLeader(t *testing.T) {
 			}
 		})
 	}
+}
+
+// assertImportOpen checks that a finished import left the database open on the server: CONNECT for PUBLIC is not revoked, the importing role owns it and no marker
+// of the import is on it (an import that ended done on a server that stayed closed or marked is the defect that this guards against).
+func assertImportOpen(t *testing.T, n *clustertest.Node, name string) {
+	t.Helper()
+	until(t, 2*time.Minute, fmt.Sprintf("the database %s to be open on node %d", name, n.Index), func() bool {
+		c := n.ServicePG("postgres")
+		defer func() { _ = c.Close(context.Background()) }()
+		var owner, comment string
+		var public int
+		err := c.QueryRow(context.Background(), `SELECT pg_catalog.pg_get_userbyid(d.datdba), coalesce(pg_catalog.shobj_description(d.oid, 'pg_database'), ''),
+			(SELECT count(*)::int FROM pg_catalog.aclexplode(coalesce(d.datacl, pg_catalog.acldefault('d', d.datdba))) a WHERE a.grantee = 0 AND a.privilege_type = 'CONNECT')
+			FROM pg_catalog.pg_database d WHERE d.datname = $1`, name).Scan(&owner, &comment, &public)
+		return err == nil && owner == dimImporter && comment == "" && public == 1
+	})
 }

@@ -91,6 +91,9 @@ type dbImportParams struct {
 	KeepOnFailure  bool              `json:"keepOnFailure"`
 	// Servers are the other servers of the cluster at the time of the request: the private database is made on each of them.
 	Servers []string `json:"servers,omitempty"`
+	// Origin is the server that accepted the request (the leader then). After a change of leader it is not among Servers; it is named so that the steps after the
+	// commit point finish the database there too.
+	Origin string `json:"origin,omitempty"`
 	// Nonce is the random part of the private name and of its marker.
 	Nonce string `json:"nonce"`
 }
@@ -245,6 +248,10 @@ func (o *Ops) StartDatabaseImport(ctx context.Context, actor string, req api.Imp
 	if up.Purpose != "databaseArchive" {
 		return task.Task{}, problem.Validation("The upload is not a database archive.", field("/uploadId", "the purpose of the upload is not databaseArchive", "conflict"))
 	}
+	// A repeat of the request of an import that is committed and paused goes on with it.
+	if t, ok, err := o.resumeCommittedImport(ctx, up, req.Database); ok || err != nil {
+		return t, err
+	}
 	switch up.State {
 	case transfer.StateReceiving:
 		return task.Task{}, problem.New(problem.UploadIncomplete, "The upload has not received all its bytes.")
@@ -322,7 +329,7 @@ func (o *Ops) StartDatabaseImport(ctx context.Context, actor string, req api.Imp
 		return task.Task{}, err
 	}
 	p := dbImportParams{UploadID: up.ID, Owner: who, Database: name, ExpectedSHA256: req.ExpectedSHA256, AckLedger: req.AcknowledgeLedgerRestart, ForeignKeys: fk,
-		KeepOnFailure: req.KeepOnFailure, Servers: ids(o.others(ctx)), Nonce: nonce}
+		KeepOnFailure: req.KeepOnFailure, Servers: ids(o.others(ctx)), Origin: o.ServerHost, Nonce: nonce}
 	t, err := o.StartTask(ctx, KindDatabaseImport, "database", name, p, actor)
 	if err != nil {
 		return task.Task{}, err
@@ -388,9 +395,14 @@ func (o *Ops) dbImportDefinition() task.Definition {
 				task.Step{Name: stepMRename, Run: importStep(stepMRename, o.stepIMRename)},
 			), nil
 		},
-		OnFail: o.importOnFailHook,
-		// A cancel is accepted until the sequences are set (design: until step 11 starts); after it the task rolls forward only.
+		OnFail:    o.importOnFailHook,
+		Committed: importCommittedNote,
+		// A cancel is accepted until the sequences are set (design: until step 11 starts); after it the task rolls forward only. A task that passed the commit point
+		// of the last step accepts a cancel only while it runs, and the cancel then pauses it (nothing is undone, see Committed); a paused one is resumed, not cancelled.
 		Cancellable: func(t task.Task) bool {
+			if strings.HasPrefix(t.Mark, importCommitPrefix) {
+				return t.State == task.Running
+			}
 			for _, n := range []string{stepMSeq, stepMLedger, stepMVerify, stepMRename} {
 				switch stepState(t, n) {
 				case task.StepRunning, task.StepDone, task.StepSkipped:

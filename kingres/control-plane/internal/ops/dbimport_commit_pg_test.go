@@ -167,7 +167,7 @@ func (r *importRig) engine(holder string, store task.Store, wrap func(task.Step)
 	if wrap != nil {
 		step = wrap(step)
 	}
-	def := task.Definition{Kind: "test.import.final", Steps: []task.Step{step}, OnFail: r.o[0].importOnFailHook}
+	def := task.Definition{Kind: "test.import.final", Steps: []task.Step{step}, OnFail: r.o[0].importOnFailHook, Committed: importCommittedNote}
 	e, err := task.NewEngine(store, []task.Definition{def}, task.Options{Holder: holder, Lease: time.Minute, StoreTries: 1, Now: r.clk.Now})
 	if err != nil {
 		r.t.Fatal(err)
