@@ -19,6 +19,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extgate"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fence"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/importdb"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
@@ -82,11 +83,9 @@ func (b *PG) with(ctx context.Context, db string, f func(c *pgx.Conn) error) err
 func (b *PG) Databases(ctx context.Context, o Options) ([]string, error) {
 	var names []string
 	err := b.with(ctx, "postgres", func(c *pgx.Conn) error {
-		rows, err := c.Query(ctx, `SELECT datname FROM pg_catalog.pg_database WHERE NOT datistemplate AND datallowconn ORDER BY datname`)
-		if err != nil {
-			return err
-		}
-		names, err = pgx.CollectRows(rows, pgx.RowTo[string])
+		var err error
+		// the private database of a running import is the task's own work in progress: its tables are loaded, not rebalanced, and its catalog is not followed
+		names, err = importdb.List(ctx, c)
 		return err
 	})
 	if err != nil {

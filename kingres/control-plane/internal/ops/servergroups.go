@@ -17,6 +17,7 @@ import (
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/importdb"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
 )
@@ -352,11 +353,7 @@ func (o *Ops) setShouldHaveShards(ctx context.Context, host string, want bool) e
 	if err != nil {
 		return connectProblem(err)
 	}
-	rows, err := c.Query(ctx, `SELECT datname FROM pg_catalog.pg_database WHERE NOT datistemplate AND datallowconn ORDER BY datname`)
-	var dbs []string
-	if err == nil {
-		dbs, err = pgx.CollectRows(rows, pgx.RowTo[string])
-	}
+	dbs, err := importdb.List(ctx, c) // without the private database of a running import: its catalog is the task's own
 	_ = c.Close(context.WithoutCancel(ctx))
 	if err != nil {
 		return connectProblem(err)
@@ -455,11 +452,7 @@ func (o *Ops) setWeight(ctx context.Context, host string, w float64) error {
 	if err != nil {
 		return connectProblem(err)
 	}
-	rows, err := c.Query(ctx, `SELECT datname FROM pg_catalog.pg_database WHERE NOT datistemplate AND datallowconn ORDER BY datname`)
-	var dbs []string
-	if err == nil {
-		dbs, err = pgx.CollectRows(rows, pgx.RowTo[string])
-	}
+	dbs, err := importdb.List(ctx, c) // without the private database of a running import: its catalog is the task's own
 	_ = c.Close(context.WithoutCancel(ctx))
 	if err != nil {
 		return connectProblem(err)

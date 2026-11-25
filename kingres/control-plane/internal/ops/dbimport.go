@@ -36,6 +36,7 @@ import (
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/archive"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/importdb"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlshape"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
@@ -63,7 +64,7 @@ const (
 )
 
 // privatePrefix is the start of the name of the database that a task works in; the rest is the id of the task.
-const privatePrefix = "kingres_import_"
+const privatePrefix = importdb.Prefix
 
 // privateName is the name of the database that task id works in, and the only database that its failure hook may drop. The nonce is random and made at the request:
 // a role with CREATEDB cannot make a database under the name of a task that has not started.

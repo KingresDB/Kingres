@@ -15,6 +15,7 @@ import (
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/archive"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/importdb"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlx"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/transfer"
@@ -316,13 +317,7 @@ func hasInstalled(l []importExtSpec, prefix string) bool {
 
 // importMarker is the comment that marks a private database as the one that a task made: its name already says which task it is.
 func importMarker(priv string) string {
-	return "kingres-import:" + strings.TrimPrefix(priv, privatePrefix)
-}
-
-// IsPrivateImportDatabase says whether a database is the private database of an import: the private name of a task and the comment that the task put on it (the
-// name alone is not enough, a client may make a database under that prefix). The failover and the registration of the standbys in the catalogs leave it out.
-func IsPrivateImportDatabase(name, comment string) bool {
-	return strings.HasPrefix(name, privatePrefix) && comment == importMarker(name)
+	return importdb.Marker(priv)
 }
 
 // createOp builds the parameters of the creation from the manifest: the locale of the source, the schemas and the extensions other than the sharding one.

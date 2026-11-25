@@ -27,6 +27,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fence"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ha"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/importdb"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/instance"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/lease"
@@ -1242,7 +1243,7 @@ var _ = url.Values{}
 // catalogDatabases lists the databases that have a sharding catalog (kingres.node): every sharded database has one of
 // its own, with its own node ids, besides the system database. withSystem puts the system database first.
 //
-// The private database of a running import (kingres_import_<task id>_<nonce>, marked with the comment of its task) is not listed: it is
+// The private database of a running import (importdb.IsPrivate: the prefix, the marker of its task as comment, and the service role as owner) is not listed: it is
 // the task's own work in progress, its catalog knows the primaries of the servers that the task registered and no standby, and the
 // task makes it again or drops it. Listed, it stops every catalog follow-up: the promotion of the map group needs the standby in the
 // catalog of each database, and the registration of a standby there needs the promotion to be recognised first, so the two wait for
@@ -1252,26 +1253,11 @@ func catalogDatabases(ctx context.Context, svc *cluster.Service, withSystem bool
 	if err != nil {
 		return nil, err
 	}
-	rows, err := pc.Query(ctx, `SELECT datname, coalesce(pg_catalog.shobj_description(oid, 'pg_database'), '') FROM pg_catalog.pg_database WHERE NOT datistemplate AND datallowconn ORDER BY datname`)
+	names, err := importdb.List(ctx, pc)
+	_ = pc.Close(context.WithoutCancel(ctx))
 	if err != nil {
-		_ = pc.Close(context.WithoutCancel(ctx))
 		return nil, err
 	}
-	var names []string
-	for rows.Next() {
-		var n, comment string
-		if err := rows.Scan(&n, &comment); err != nil {
-			rows.Close()
-			_ = pc.Close(context.WithoutCancel(ctx))
-			return nil, err
-		}
-		if ops.IsPrivateImportDatabase(n, comment) {
-			continue
-		}
-		names = append(names, n)
-	}
-	rows.Close()
-	_ = pc.Close(context.WithoutCancel(ctx))
 	var out []string
 	if withSystem {
 		out = append(out, sysdb.Database)
