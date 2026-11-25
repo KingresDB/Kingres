@@ -416,6 +416,10 @@ func (o *Ops) stepIMInstall(ctx context.Context, env *task.Env) error {
 				return err
 			}
 		}
+		// the placement flags and the weights of the cluster, as the drain and the weight of a server set them in every other database
+		if err := o.seedImportCatalog(ctx, priv); err != nil {
+			return err
+		}
 		if len(m.Extensions) > 0 && len(a.st.res.Catalog.DistributedSchemas) > 0 {
 			if err := o.setShardingMode(ctx, priv, "both", nil); err != nil {
 				return transfer.Errorf(transfer.CodeTableNotEligible, false, "the sharding mode of the private database could not be set for distributed schemas")
