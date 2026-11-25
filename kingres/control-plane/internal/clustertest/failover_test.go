@@ -368,15 +368,16 @@ func TestFailoverRefusals(t *testing.T) {
 	leader := c.Leader()
 	_, old, _ := foVictim(t, c)
 
-	// The planned switchover of the map group is built (TestSwitchoverOfTheMapGroup): its plan names the map group, which moves the manager. A hard failover of a
-	// server whose map group primary answers is not, and is refused.
+	// The planned switchover of the map group is built (TestSwitchoverOfTheMapGroup): its plan names the map group, which moves the manager. So is the hard failover of a
+	// server whose map group primary still answers (TestHardFailoverOfTheMapGroupWhileItsServerIsAlive): it is not refused, and its dry run is a plan that names the
+	// map group and changes nothing (a request that is not a dry run starts the failover, and every later request of this test is then a 409).
 	st, p := leader.Do("POST", "/servers/"+leader.Host+"/failover", map[string]any{"mode": "graceful", "dryRun": true}, nil)
 	if gs, _ := p["groups"].([]any); st != 200 || len(gs) != 1 || gs[0].(map[string]any)["isMapGroup"] != true || gs[0].(map[string]any)["movesTheManager"] != true {
 		t.Errorf("the plan of a planned switchover of the map group: %d %v", st, p)
 	}
-	st, p = leader.Do("POST", "/servers/"+leader.Host+"/failover", map[string]any{"mode": "hard"}, nil)
-	if st != 422 {
-		t.Errorf("a server that runs the map group primary: %d %v", st, p)
+	st, p = leader.Do("POST", "/servers/"+leader.Host+"/failover", map[string]any{"mode": "hard", "dryRun": true}, nil)
+	if gs, _ := p["groups"].([]any); st != 200 || p["kind"] != "failover" || len(gs) != 1 || gs[0].(map[string]any)["isMapGroup"] != true || gs[0].(map[string]any)["movesTheManager"] != true {
+		t.Errorf("the plan of a hard failover of a server that runs the map group primary: %d %v", st, p)
 	}
 	st, p = leader.Do("POST", "/servers/nosuchserver/failover", map[string]any{"mode": "hard"}, nil)
 	if st != 404 {
