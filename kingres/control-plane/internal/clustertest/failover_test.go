@@ -143,9 +143,15 @@ func foCluster(t *testing.T) (*clustertest.Cluster, int, *x509.CertPool) {
 // foClusterWith is foCluster with the lease settings of the caller.
 func foClusterWith(t *testing.T, lease ...string) (*clustertest.Cluster, int, *x509.CertPool) {
 	t.Helper()
+	return foClusterOf(t, 3, lease...)
+}
+
+// foClusterOf is foClusterWith for n servers.
+func foClusterOf(t *testing.T, n int, lease ...string) (*clustertest.Cluster, int, *x509.CertPool) {
+	t.Helper()
 	port := pgtest.FreePort(t)
 	t.Cleanup(func() { pgtest.ReleasePorts(port) })
-	c := clustertest.FormEach(t, 3, func(n *clustertest.Node) []string {
+	c := clustertest.FormEach(t, n, func(n *clustertest.Node) []string {
 		return append(append([]string{"-client-listen", fmt.Sprintf("%s:%d", n.Host, port)}, lease...), standbyArgs...)
 	}, nil)
 	waitStandbys(t, c, 1)
