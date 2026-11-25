@@ -326,15 +326,9 @@ func (o *Ops) StartDatabaseImport(ctx context.Context, actor string, req api.Imp
 		return task.Task{}, problem.New(problem.Forbidden, importDangerousText)
 	}
 	// The lock covers the check of the limits and the start of the task, not the link of the upload that follows (a store that is failing makes that wait long).
-	o.startMu.Lock()
-	if err := o.concurrency(ctx, st, actor); err != nil {
-		o.startMu.Unlock()
-		return task.Task{}, err
-	}
 	p := dbImportParams{UploadID: up.ID, Owner: who, Database: name, ExpectedSHA256: req.ExpectedSHA256, AckLedger: req.AcknowledgeLedgerRestart, ForeignKeys: fk,
 		KeepOnFailure: req.KeepOnFailure, Servers: ids(o.others(ctx)), Origin: o.ServerHost, Nonce: nonce}
-	t, err := o.StartTask(ctx, KindDatabaseImport, "database", name, p, actor)
-	o.startMu.Unlock()
+	t, err := o.startImportTask(ctx, st, actor, name, p)
 	if err != nil {
 		return task.Task{}, err
 	}
@@ -355,6 +349,16 @@ var (
 	importLinkTries = 3
 	importLinkPause = 300 * time.Millisecond
 )
+
+// startImportTask checks the limits and starts the task under startMu. The unlock is deferred, so a panic in either call does not leave the lock held.
+func (o *Ops) startImportTask(ctx context.Context, st transfer.Settings, actor, name string, p dbImportParams) (task.Task, error) {
+	o.startMu.Lock()
+	defer o.startMu.Unlock()
+	if err := o.concurrency(ctx, st, actor); err != nil {
+		return task.Task{}, err
+	}
+	return o.StartTask(ctx, KindDatabaseImport, "database", name, p, actor)
+}
 
 // linkImportHook is called by a test before each write of the link; an error is the error of the write.
 var linkImportHook func() error
@@ -403,6 +407,7 @@ func (o *Ops) cancelUnlinkedImport(id int64) error {
 				continue
 			}
 		}
+		// ErrNotCancellable counts as success only because the cancel guard of an import depends on the state alone: the task has ended, so there is nothing left to cancel.
 		if err = eng.Cancel(context.WithoutCancel(o.bg()), id); err == nil || errors.Is(err, task.ErrNotCancellable) {
 			return nil
 		}
