@@ -215,7 +215,7 @@ func TestRecheckImportCatalogAfterTheRename(t *testing.T) {
 	// the failover promoted h1 after the first check: the system catalog says so, the database at the final name does not
 	pgExecAll(t, sys, "update kingres.node set role = case host when 'h1' then 'primary' else 'standby' end")
 	err := o.recheckImportCatalog(ctx, final, nil, revert)
-	if !errors.As(err, &te) || te.Code != transfer.CodeLeaderChanged || !te.Retryable || !strings.Contains(te.Error(), "h2:5432") || !strings.HasSuffix(te.Error(), "; the names were put back") || reverted != 1 {
+	if !errors.As(err, &te) || te.Code != transfer.CodeLeaderChanged || !te.Retryable || !strings.Contains(te.Error(), "h2:5432") || !strings.HasSuffix(te.Error(), "; the names were put back.") || reverted != 1 {
 		t.Fatalf("a failover between the check and the last rename: %v (reverted %d)", err, reverted)
 	}
 	// the failover is not over

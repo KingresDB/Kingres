@@ -208,8 +208,12 @@ func TestTheResumeOfAPausedImportIsRefusedInItsOwnWords(t *testing.T) {
 	e := newEnvNoTask(t)
 	ctx := context.Background()
 	e.clear(t)
-	e.other(t, importKind, "paused")
+	// the import is paused while a rebalance runs (a paused import is made by the engine from a running one, so it is set up through done)
 	e.other(t, Kind, "running")
+	e.other(t, importKind, "done")
+	if _, err := e.sys.Exec(ctx, `UPDATE kingres_cp.task SET state = 'paused' WHERE kind = 'database.import'`); err != nil {
+		t.Fatal(err)
+	}
 	var id int64
 	if err := e.sys.QueryRow(ctx, `SELECT id FROM kingres_cp.task WHERE kind = 'database.import'`).Scan(&id); err != nil {
 		t.Fatal(err)

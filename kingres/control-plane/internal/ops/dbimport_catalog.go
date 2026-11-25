@@ -297,7 +297,7 @@ func (o *Ops) recheckImportCatalog(ctx context.Context, db string, servers []str
 	note := revert()
 	var te *transfer.Error
 	if errors.As(err, &te) {
-		return transfer.Errorf(te.Code, te.Retryable, "%s%s", te.Error(), note)
+		return transfer.Errorf(te.Code, te.Retryable, "%s%s", te.Sentence, note)
 	}
 	return fmt.Errorf("%w%s", err, note)
 }
