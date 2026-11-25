@@ -83,9 +83,14 @@ func (b *PG) with(ctx context.Context, db string, f func(c *pgx.Conn) error) err
 func (b *PG) Databases(ctx context.Context, o Options) ([]string, error) {
 	var names []string
 	err := b.with(ctx, "postgres", func(c *pgx.Conn) error {
-		var err error
-		// the private database of a running import is the task's own work in progress: its tables are loaded, not rebalanced, and its catalog is not followed
-		names, err = importdb.List(ctx, c)
+		// The private database of an import is left out: its tables are loaded, not rebalanced, and its catalog is not followed (and stays stale for ever when the import failed
+		// and the database was kept). WithPrivate puts it back for the read-only count of the buckets of a drained server.
+		public, private, err := importdb.ListAll(ctx, c)
+		names = public
+		if o.WithPrivate {
+			names = append(names, private...)
+			sort.Strings(names)
+		}
 		return err
 	})
 	if err != nil {
@@ -139,7 +144,7 @@ func (b *PG) Check(ctx context.Context, dbs []string) error {
 	var tasks []string
 	err := b.with(ctx, sysdb.Database, func(c *pgx.Conn) error {
 		rows, err := c.Query(ctx, `SELECT kind || ' ' || subject_id FROM kingres_cp.task
-			WHERE state IN ('pending', 'running', 'paused') AND kind IN ('server.failover', 'replication.restorePreferredPrimaries', 'server.add', 'server.remove', 'server.leave')`)
+			WHERE state IN ('pending', 'running', 'paused') AND kind IN ('server.failover', 'replication.restorePreferredPrimaries', 'server.add', 'server.remove', 'server.leave', 'database.import')`)
 		if err != nil {
 			return err
 		}

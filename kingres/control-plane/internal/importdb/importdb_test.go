@@ -81,3 +81,42 @@ func TestListOnARealInstance(t *testing.T) {
 		t.Fatalf("List = %v, want %v", got, want)
 	}
 }
+
+// ListAll puts the private database apart, and List is ListAll without it: the read-only check of a drain counts the private databases, the walks that change
+// something do not visit them.
+func TestListAllNamesThePrivateDatabases(t *testing.T) {
+	if !pgtest.Available() {
+		t.Skip("KINGRES_PG_BIN is not set; skipping the PostgreSQL integration test")
+	}
+	in := pgtest.Start(t, nil)
+	c := in.Connect(t, "postgres")
+	ctx := context.Background()
+	other := Prefix + "22_0123456789ab"
+	for _, q := range []string{
+		"create database " + priv, "comment on database " + priv + " is '" + Marker(priv) + "'",
+		"create database " + other, "comment on database " + other + " is '" + Marker(other) + "'",
+		"create database shop",
+	} {
+		if _, err := c.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	names, private, err := ListAll(ctx, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(private)
+	want := []string{priv, other}
+	sort.Strings(want)
+	if !reflect.DeepEqual(private, want) {
+		t.Fatalf("private = %v, want %v", private, want)
+	}
+	for _, n := range names {
+		if n == priv || n == other {
+			t.Fatalf("the public list has a private database: %v", names)
+		}
+	}
+	if len(names) != 2 { // postgres and shop
+		t.Fatalf("names = %v", names)
+	}
+}

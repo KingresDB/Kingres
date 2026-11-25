@@ -345,6 +345,13 @@ func (m *MemStore) excludedLocked(kind string) error {
 			return &ExcludedError{Kind: kind, Other: o.Kind}
 		case membershipOps[kind] && schemaMoves[o.Kind] && o.State.Active():
 			return &ExcludedError{Kind: kind, Other: o.Kind}
+		// Migration 0045: a database import and a rebalance (a drain is one), or the removal of a server, exclude each other.
+		case kind == "database.import" && o.Kind == "rebalance" && (o.State == Pending || o.State == Running):
+			return &ExcludedError{Kind: kind, Other: o.Kind}
+		case kind == "database.import" && (o.Kind == "server.remove" || o.Kind == "server.leave") && o.State.Active():
+			return &ExcludedError{Kind: kind, Other: o.Kind}
+		case (kind == "rebalance" || kind == "server.remove" || kind == "server.leave") && o.Kind == "database.import" && o.State.Active():
+			return &ExcludedError{Kind: kind, Other: o.Kind}
 		}
 	}
 	return nil

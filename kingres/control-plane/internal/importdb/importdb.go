@@ -35,24 +35,34 @@ const ListSQL = `SELECT d.datname::pg_catalog.text, coalesce(pg_catalog.shobj_de
 	FROM pg_catalog.pg_database d WHERE NOT d.datistemplate AND d.datallowconn ORDER BY d.datname`
 
 // List returns the databases that a walk visits, in the order of their names: every database that is not a template and accepts connections, except the private
-// databases of running imports. c must be the connection of the service role.
+// databases of imports (one that runs, and one that failed and was kept). c must be the connection of the service role.
+//
+// A walk that changes something (the flag or the weight of a server, the follow-up of a failover, a rebalance) uses List: the catalog of a private database is the
+// task's own, and it is stale for ever once the task has failed and the database is kept. A walk that only reads and must not miss anything (the check that a drained
+// server owns no bucket) uses ListAll.
 func List(ctx context.Context, c *pgx.Conn) ([]string, error) {
+	names, _, err := ListAll(ctx, c)
+	return names, err
+}
+
+// ListAll returns the databases of List, and the private databases of imports apart, both in the order of their names.
+func ListAll(ctx context.Context, c *pgx.Conn) (names, private []string, err error) {
 	rows, err := c.Query(ctx, ListSQL)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
-	var names []string
 	for rows.Next() {
 		var n, comment string
 		var mine bool
 		if err := rows.Scan(&n, &comment, &mine); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if IsPrivate(n, comment, mine) {
+			private = append(private, n)
 			continue
 		}
 		names = append(names, n)
 	}
-	return names, rows.Err()
+	return names, private, rows.Err()
 }

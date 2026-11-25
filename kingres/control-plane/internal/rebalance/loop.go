@@ -52,6 +52,9 @@ type Options struct {
 	// Strict makes a database that cannot be verified (its schema kingres cannot be trusted) an error of Databases instead of a database that is left out. A
 	// drain counts the buckets of a server with it: a database that was not counted must not make the drain report done. Not part of a request.
 	Strict bool `json:"-"`
+	// WithPrivate adds the private databases of imports (running, or kept after a failure) to the list that Databases returns. Only the read-only check of a drain uses it: a
+	// bucket that such a database holds on the drained server must keep the server from being reported empty. Not part of a request.
+	WithPrivate bool `json:"-"`
 	// CleanupDelaySeconds overrides the delay before the source orphan is dropped, for this run.
 	CleanupDelaySeconds int `json:"cleanupDelaySeconds,omitempty"`
 	// Force lets a manual start go on although a standby lags by more than maxStandbyLagBytes; never stored (a resumed run asks again).

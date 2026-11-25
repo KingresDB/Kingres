@@ -244,7 +244,8 @@ type ServerPlacement struct {
 // UpdateServer applies a validated update to a server that exists in the shard
 // catalog. Order of the checks: group exists (422), then, only when something
 // would change, an unfinished add/remove/leave of the server (409
-// operation_in_progress) and a running rebalance (409 rebalance_in_progress).
+// operation_in_progress), a running rebalance (409 rebalance_in_progress) and, for a change of the flag or the weight, an unfinished database import (409
+// operation_in_progress).
 // A value equal to the current one changes nothing. The group assignment and
 // the catalog change are made under one transaction of the system database:
 // when the catalog refuses, the assignment is rolled back.
@@ -305,6 +306,17 @@ func (o *Ops) UpdateServer(ctx context.Context, serverID string, cur ServerPlace
 		if rebalancing {
 			return problem.New(problem.RebalanceInProgress, "A rebalance is running; it would change the placement under it.")
 		}
+		// The private database of an import is left out of the change of the flag and the weight, so it would keep the old value and receive buckets that the cluster means
+		// to keep away; a change of the group alone is not affected (the same lock as the creation of the import: migration 0045).
+		if changeShards || changeWeight {
+			var importing bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM kingres_cp.task WHERE kind = 'database.import' AND state IN ('pending', 'running', 'paused'))`).Scan(&importing); err != nil {
+				return err
+			}
+			if importing {
+				return problem.New(problem.OperationInProgress, "A database import is running; the weight and the shouldHaveShards flag of a server cannot change until it has ended.")
+			}
+		}
 		if changeGroup {
 			if _, err := tx.Exec(ctx, `UPDATE kingres_cp.server SET server_group = $2 WHERE server_id = $1`, serverID, req.ServerGroup); err != nil {
 				return err
@@ -349,14 +361,9 @@ func (o *Ops) SetShouldHaveShards(ctx context.Context, server string, want bool)
 // extension's function, which runs on the map group's primary, that is, on the
 // leader, and publishes the catalog). Rebalance moves nothing until it runs.
 func (o *Ops) setShouldHaveShards(ctx context.Context, host string, want bool) error {
-	c, err := o.Service.ServiceConn(ctx, "postgres")
+	dbs, err := o.walkDatabases(ctx)
 	if err != nil {
-		return connectProblem(err)
-	}
-	dbs, err := importdb.List(ctx, c) // without the private database of a running import: its catalog is the task's own
-	_ = c.Close(context.WithoutCancel(ctx))
-	if err != nil {
-		return connectProblem(err)
+		return err
 	}
 	for _, db := range dbs {
 		if err := o.setShouldHaveShardsIn(ctx, db, host, want); err != nil {
@@ -448,14 +455,9 @@ func setNodeProperty(ctx context.Context, c *pgx.Conn, db string, ids []int32, w
 // shard catalog (design 4.3: so that a failover to a standby on another server brings that server's weight).
 // It needs the extension of version 0.8 (set_node_property with three arguments).
 func (o *Ops) setWeight(ctx context.Context, host string, w float64) error {
-	c, err := o.Service.ServiceConn(ctx, "postgres")
+	dbs, err := o.walkDatabases(ctx)
 	if err != nil {
-		return connectProblem(err)
-	}
-	dbs, err := importdb.List(ctx, c) // without the private database of a running import: its catalog is the task's own
-	_ = c.Close(context.WithoutCancel(ctx))
-	if err != nil {
-		return connectProblem(err)
+		return err
 	}
 	for _, db := range dbs {
 		if err := o.setWeightIn(ctx, db, host, w); err != nil {
@@ -526,3 +528,20 @@ func isNotMapPrimary(pe *pgconn.PgError) bool {
 
 // ValidGroupName reports whether name can be the name of a group.
 func ValidGroupName(name string) bool { return groupNameRE.MatchString(name) }
+
+// walkDatabases lists the databases whose shard catalog the flag and the weight of a server are written to: every database but the private database of an import
+// (importdb.List). Its catalog is the task's own, and stale for ever when the import failed and the database was kept, so a write there could fail with "not the
+// primary of the map group" and stop the drain; an import that runs is not a reason to skip it, because the change is refused while one runs (UpdateServer), and the
+// import gives its catalog the flags of the cluster when it registers the servers (seedImportCatalog).
+func (o *Ops) walkDatabases(ctx context.Context) ([]string, error) {
+	c, err := o.Service.ServiceConn(ctx, "postgres")
+	if err != nil {
+		return nil, connectProblem(err)
+	}
+	dbs, err := importdb.List(ctx, c)
+	_ = c.Close(context.WithoutCancel(ctx))
+	if err != nil {
+		return nil, connectProblem(err)
+	}
+	return dbs, nil
+}
