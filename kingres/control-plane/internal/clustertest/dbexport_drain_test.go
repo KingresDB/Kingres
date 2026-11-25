@@ -67,11 +67,16 @@ func TestDatabaseExportAndDrainAtTheSameTime(t *testing.T) {
 	p10Cleanup(t, c, "3s")
 	victim := c.Nodes[2]
 
-	rep := waitReport(t, l, clustertest.TaskID(l.Expect(202, "POST", "/rebalance", nil)), 10*time.Minute)
-	if rep["outcome"] != "completed" {
-		t.Fatalf("the first rebalance: %v", rep)
+	// The tables are made after the formation, so the buckets may already be placed as the plan would place them: that answer is not a failure here.
+	if st, out := l.Do("POST", "/rebalance", nil, nil); st == 202 {
+		rep := waitReport(t, l, clustertest.TaskID(out), 10*time.Minute)
+		if rep["outcome"] != "completed" {
+			t.Fatalf("the first rebalance: %v", rep)
+		}
+		until(t, 2*time.Minute, "the first rebalance to have ended", func() bool { return rbStatus(l)["state"] == "idle" })
+	} else if !(st == 409 && out["code"] == "nothing_to_rebalance") {
+		t.Fatalf("the first rebalance: %d %v", st, out)
 	}
-	until(t, 2*time.Minute, "the first rebalance to have ended", func() bool { return rbStatus(l)["state"] == "idle" })
 	if primaryBuckets(t, l)[victim.Host] == 0 {
 		t.Fatalf("the victim owns no bucket: %v", primaryBuckets(t, l))
 	}
