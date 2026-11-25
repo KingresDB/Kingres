@@ -15,7 +15,6 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
-	"github.com/KingresDB/Kingres/kingres/control-plane/internal/importdb"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
@@ -342,6 +341,10 @@ func (s *Service) bucketsOnWithPrivate(ctx context.Context, server string) (int,
 		return 0, nil, err
 	}
 	total := 0
+	privateSet, err := s.Backend.privateDatabases(ctx)
+	if err != nil {
+		return 0, nil, err
+	}
 	var private []string
 	for _, db := range dbs {
 		var n int
@@ -354,7 +357,7 @@ func (s *Service) bucketsOnWithPrivate(ctx context.Context, server string) (int,
 		if err != nil {
 			return 0, nil, err
 		}
-		if n > 0 && strings.HasPrefix(db, importdb.Prefix) {
+		if n > 0 && privateSet[db] {
 			private = append(private, db)
 		}
 		total += n

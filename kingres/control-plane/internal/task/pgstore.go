@@ -254,10 +254,15 @@ func (s *PGStore) Pause(ctx context.Context, id int64, l Lease, reason string) e
 func (s *PGStore) Resume(ctx context.Context, id int64) error {
 	tag, err := s.db.Exec(ctx, `UPDATE kingres_cp.task SET state = 'pending', cancel_requested = false, updated_at = clock_timestamp()
 		WHERE id = $1 AND state = 'paused'`, id)
-	if x := excluded("rebalance", err); x != nil {
-		return x
-	}
 	if err != nil {
+		// the task that is resumed is named by its own kind, so that a refusal (the exclusion of migration 0045 for an import, 0009 and 0041 for the others) says what is refused
+		kind := "rebalance"
+		if t, gerr := s.Get(ctx, id); gerr == nil {
+			kind = t.Kind
+		}
+		if x := excluded(kind, err); x != nil {
+			return x
+		}
 		return err
 	}
 	if tag.RowsAffected() == 1 {

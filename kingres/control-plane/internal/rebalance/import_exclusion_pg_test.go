@@ -137,7 +137,9 @@ func TestTheDrainCountsTheBucketsOfAKeptPrivateDatabase(t *testing.T) {
 	ctx := context.Background()
 	priv := importdb.Prefix + "21_0123456789ab"
 	c := e.in.Connect(t, "postgres")
-	for _, q := range []string{"create database " + priv, "comment on database " + priv + " is '" + importdb.Marker(priv) + "'"} {
+	// a database that a client made under the prefix (no marker) is a database like any other: the note about a kept private database does not name it
+	clientDB := importdb.Prefix + "22_client"
+	for _, q := range []string{"create database " + priv, "comment on database " + priv + " is '" + importdb.Marker(priv) + "'", "create database " + clientDB} {
 		if _, err := c.Exec(ctx, q); err != nil {
 			t.Fatal(err)
 		}
@@ -172,7 +174,7 @@ func TestTheDrainCountsTheBucketsOfAKeptPrivateDatabase(t *testing.T) {
 		t.Fatalf("the count %d does not include the private database (others: %d)", n, withoutPrivate)
 	}
 	err = s.stepDrainEmpty(ctx, nil, nil, Options{DrainServer: "10.0.0.1"})
-	if err == nil || codeOf(t, err) != problem.ServerOwnsBuckets || !strings.Contains(err.Error(), priv) {
+	if err == nil || codeOf(t, err) != problem.ServerOwnsBuckets || !strings.Contains(err.Error(), priv) || strings.Contains(err.Error(), clientDB) {
 		t.Fatalf("the drain ended, or does not name the private database: %v", err)
 	}
 	// the databases of the clients hold no bucket of the server any more: the private one alone keeps the drain from ending
@@ -198,5 +200,26 @@ func TestTheCheckBeforeARebalanceRefusesWhileAnImportRuns(t *testing.T) {
 	err := b.Check(context.Background(), nil)
 	if err == nil || codeOf(t, err) != problem.OperationInProgress || !strings.Contains(err.Error(), importKind) {
 		t.Fatalf("with an import: %v", err)
+	}
+}
+
+// The resume of a paused task that the exclusion refuses is worded for the task that is resumed: a paused import is not "a rebalance is running".
+func TestTheResumeOfAPausedImportIsRefusedInItsOwnWords(t *testing.T) {
+	e := newEnvNoTask(t)
+	ctx := context.Background()
+	e.clear(t)
+	e.other(t, importKind, "paused")
+	e.other(t, Kind, "running")
+	var id int64
+	if err := e.sys.QueryRow(ctx, `SELECT id FROM kingres_cp.task WHERE kind = 'database.import'`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	err := task.NewPGStore(e.sys).Resume(ctx, id)
+	var x *task.ExcludedError
+	if !errors.As(err, &x) || x.Kind != importKind || x.Other != Kind {
+		t.Fatalf("the resume of a paused import while a rebalance runs: %v, want an ExcludedError of %s caused by %s", err, importKind, Kind)
+	}
+	if p := x.Problem(); p.Code != problem.OperationInProgress || strings.Contains(p.Detail, "A rebalance is running") || !strings.Contains(p.Detail, "import") {
+		t.Errorf("the wording: %q", p.Detail)
 	}
 }

@@ -1157,3 +1157,17 @@ func (b *PG) standbyLagOf(ctx context.Context, group int32, stat, slots string) 
 	}
 	return n, nil
 }
+
+// privateDatabases are the private databases of imports (the name, the marker and the owner all match, importdb.IsPrivate): a database that a client made under the prefix
+// is not one of them.
+func (b *PG) privateDatabases(ctx context.Context) (map[string]bool, error) {
+	out := map[string]bool{}
+	err := b.with(ctx, "postgres", func(c *pgx.Conn) error {
+		_, private, err := importdb.ListAll(ctx, c)
+		for _, n := range private {
+			out[n] = true
+		}
+		return err
+	})
+	return out, err
+}
