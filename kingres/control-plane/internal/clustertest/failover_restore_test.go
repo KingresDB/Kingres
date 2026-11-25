@@ -117,6 +117,9 @@ func TestSwitchoverAndBack(t *testing.T) {
 			_, body := leader.Do("GET", fmt.Sprintf("/tasks/%v", rid), nil, nil)
 			t.Logf("the restore task %v: %v", rid, body)
 			t.Logf("the failover status after the restore: %v", leader.Expect(200, "GET", "/failover", nil))
+			_, rep := leader.Do("GET", fmt.Sprintf("/failover/reports/%v", rid), nil, nil)
+			t.Logf("the report of the restore (the code of each group that failed): %v", rep)
+			t.Logf("the lease and stop lines of the servers: %s", leaseLines(leader.LogTail(8000000)))
 		}
 	}()
 	swWait(t, e, rid, 8*time.Minute)
