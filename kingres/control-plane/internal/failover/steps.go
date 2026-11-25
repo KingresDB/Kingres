@@ -89,6 +89,7 @@ type Runner struct {
 	DrainWait          time.Duration // the wait for prepared transactions of a switchover (default 1 min)
 	DrainEvery         time.Duration // (default 10 s)
 	MarkWait           time.Duration // the wait for the standby to replay the mark (default 10 s)
+	MapStopLease       time.Duration // the length the lease of the task is given before the clean stop of the map group (default MapStopLeaseDefault)
 	VerifyWait         time.Duration // the proof is repeated this long (default 30 s)
 	OldServerWait      time.Duration // the calls to the old primary's server after the promotion wait this long (default 15 s)
 	MapVerdictWait     time.Duration // the old leader of a planned switchover of the map group waits this long for the candidate to promote or to refuse (default 6 min)

@@ -89,6 +89,7 @@ type world struct {
 	undoTerms          []int64 // the terms of the quiesce, unquiesce and resume calls
 	stopErr            error   // the answer of the clean stop call
 	dbDownAfterStop    bool    // the rows cannot be read after the clean stop (the map group: its system database is the stopped instance)
+	beforeStop         func()  // called when the clean stop is asked for, before it is done (a test reads what the task lease is at that moment)
 	afterStop          func()  // called when the clean stop is done (a test cancels the context of the step, as the engine does when the task lease cannot be renewed)
 	notReleased        bool    // the clean stop does not release the lease
 	markTerms          []int64
@@ -293,6 +294,9 @@ func (p fpeers) Demote(_ context.Context, server string, r DemoteRequest) (Demot
 		p.w.mu.Unlock()
 		if p.w.stopErr != nil {
 			return DemoteAnswer{}, p.w.stopErr
+		}
+		if p.w.beforeStop != nil {
+			p.w.beforeStop()
 		}
 		p.w.rec("demote-fast %s", server)
 		p.w.oldWritable = false

@@ -1056,3 +1056,50 @@ func TestTheCleanStopOfTheMapGroupNamesTheCandidate(t *testing.T) {
 		}
 	}
 }
+
+// The lease of the task of the map group is a row of the system database that the clean stop shuts down, so the step lengthens it before the stop: at the
+// moment of the stop the run holds the task for much longer than the lease of the engine (here 30 s), and for an ordinary group it does not.
+func TestTheStopOfTheMapGroupIsAskedForOnALeaseThatOutlastsTheStop(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		world func() *world
+		in    func() Input
+		long  bool
+	}{
+		{"map group", mapWorld, mapGracefulInput, true},
+		{"ordinary group", gracefulWorld, gracefulInput, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := tc.world()
+			r := w.runner()
+			w.fakeClock(r)
+			st := task.NewMemStore()
+			eng, err := task.NewEngine(st, []task.Definition{r.Definition(nil)}, task.Options{Holder: "A", Lease: 30 * time.Second, StoreTries: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			tk, err := eng.Submit(ctx, KindFailover, task.Subject{Type: "server", ID: "s1"}, tc.in(), "tester")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var left time.Duration
+			w.beforeStop = func() {
+				got, _ := st.Get(ctx, tk.ID)
+				left = time.Until(got.LeaseExpires)
+			}
+			if _, err := eng.RunOnce(ctx); err != nil {
+				t.Fatalf("run: %v\n%s", err, strings.Join(w.log, "\n"))
+			}
+			if left == 0 {
+				t.Fatalf("the stop was not asked for:\n%s", strings.Join(w.log, "\n"))
+			}
+			if tc.long && left < 100*time.Second {
+				t.Errorf("the task lease has %v left at the stop of the map group, want it lengthened to cover the stop", left)
+			}
+			if !tc.long && left > 31*time.Second {
+				t.Errorf("the task lease has %v left at the stop of an ordinary group, want the lease of the engine", left)
+			}
+		})
+	}
+}

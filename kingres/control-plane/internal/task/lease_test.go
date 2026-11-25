@@ -182,3 +182,99 @@ func TestNoStepStartsOnAnExpiredLease(t *testing.T) {
 		t.Errorf("running mark on an expired lease: %v", err)
 	}
 }
+
+// extendFixture is the renew fixture with a step that lengthens its lease to two minutes and then waits, as the stop of the map group does; the store
+// becomes unreachable right after (it is the instance that is stopped).
+func newExtendFixture(t *testing.T, d time.Duration) *renewFixture {
+	t.Helper()
+	f := &renewFixture{clk: newClock(), counter: &counter{n: map[string]int{}}, tick: make(chan time.Time),
+		started: make(chan struct{}), release: make(chan struct{}), sawCancel: make(chan struct{}, 1), done: make(chan error, 1)}
+	f.st = task.NewMemStoreClock(f.clk.Now)
+	def := task.Definition{Kind: "test.kind", Steps: []task.Step{{Name: "work", Run: func(ctx context.Context, env *task.Env) error {
+		restore, err := env.ExtendLease(ctx, d)
+		if err != nil {
+			return err
+		}
+		defer restore()
+		f.st.FailOn(func(op string) error {
+			if op == "renew" {
+				return errors.New("the store is stopped")
+			}
+			return nil
+		})
+		f.started <- struct{}{}
+		select {
+		case <-f.release:
+			return nil
+		case <-ctx.Done():
+			f.sawCancel <- struct{}{}
+			return ctx.Err()
+		}
+	}}}}
+	a, err := task.NewEngine(f.st, []task.Definition{def}, task.Options{Holder: "A", Lease: 30 * time.Second, Now: f.clk.Now, StoreTries: 1, RenewEvery: f.tick})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	tk, _ := a.Submit(ctx, "test.kind", task.Subject{Type: "x", ID: "1"}, nil, "u")
+	f.id = tk.ID
+	go func() { _, err := a.RunOnce(ctx); f.done <- err }()
+	<-f.started
+	return f
+}
+
+// A step that lengthened its lease is not stopped when the store cannot be reached for longer than the lease of the engine (the clean stop of the map group
+// outlasts it), and the store holds the task for that long, so no other server can take it over meanwhile.
+func TestAStepWithALengthenedLeaseSurvivesAStoreThatCannotBeReached(t *testing.T) {
+	f := newExtendFixture(t, 2*time.Minute)
+	f.clk.Add(40 * time.Second) // beyond lease 30 s: it would have been stopped at 20 s
+	f.tick <- f.clk.Now()
+	f.tick <- f.clk.Now()
+	b := engine(t, f.st, "B", f.clk, task.Definition{Kind: "test.kind", Steps: []task.Step{{Name: "work", Run: func(context.Context, *task.Env) error { f.counter.inc("work"); return nil }}}})
+	if ran, err := b.RunOnce(context.Background()); ran || err != nil {
+		t.Fatalf("B took over a task whose lease was lengthened: %v %v", ran, err)
+	}
+	select {
+	case <-f.sawCancel:
+		t.Fatal("the step was stopped inside its lengthened lease")
+	default:
+	}
+	close(f.release)
+	if err := <-f.done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+}
+
+// The step is stopped once the lengthened lease, less its margin, has passed without a renewal: the extension moves the end of the trust, it does not remove it.
+func TestAStepWithALengthenedLeaseStopsWhenTheLengthenedLeaseRunsOut(t *testing.T) {
+	f := newExtendFixture(t, 2*time.Minute)
+	f.clk.Add(111 * time.Second) // 120 s minus a margin of 10 s has passed
+	f.tick <- f.clk.Now()
+	<-f.sawCancel
+	if err := <-f.done; !errors.Is(err, task.ErrLeaseLost) {
+		t.Fatalf("ended with %v, want ErrLeaseLost", err)
+	}
+}
+
+// A lease that cannot be lengthened is an error of the step (the store did not take it), and a length that is not longer than the engine's changes nothing.
+func TestAStepThatCannotLengthenItsLeaseIsToldSo(t *testing.T) {
+	clk := newClock()
+	st := task.NewMemStoreClock(clk.Now)
+	var got error
+	var short error
+	def := task.Definition{Kind: "test.kind", Steps: []task.Step{{Name: "work", Run: func(ctx context.Context, env *task.Env) error {
+		_, short = env.ExtendLease(ctx, 10*time.Second)
+		st.FailOn(func(op string) error { return errors.New("the store is stopped") })
+		_, got = env.ExtendLease(ctx, time.Minute)
+		return nil
+	}}}}
+	e := engine(t, st, "A", clk, def)
+	e.Submit(context.Background(), "test.kind", task.Subject{Type: "x", ID: "1"}, nil, "u")
+	_, _ = e.RunOnce(context.Background())
+	if short != nil {
+		t.Errorf("a shorter length: %v", short)
+	}
+	if got == nil {
+		t.Error("a lengthening that the store refused was reported as done")
+	}
+}

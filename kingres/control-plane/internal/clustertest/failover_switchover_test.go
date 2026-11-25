@@ -405,6 +405,46 @@ func TestSwitchoverOfTheMapGroup(t *testing.T) {
 	}
 }
 
+// The clean stop of the map group's primary outlasts the lease of the task (the fault keeps the call open for 25 s after the instance is down; the task lease
+// is 30 s with a margin of 10 s, and the lease is a row of the very system database that is stopped, so no renewal can reach it): a shutdown checkpoint of
+// a large instance does this. The task lease is lengthened before the stop, so the stop is not cut short by the guard of the engine and the switchover ends
+// done on the new leader, with the new leader as the primary of the map group and nothing acknowledged lost.
+func TestSwitchoverOfTheMapGroupSurvivesACleanStopThatOutlastsTheTaskLease(t *testing.T) {
+	c, port, pool, leader, nw, w := mapSwitchoverEnv(t)
+	leader.SetFaults(fault.Spec{FailoverPoint: "demote:longstop", FailoverMode: "slow"})
+	id := mapSwitchoverRequest(t, leader, nw)
+	var task map[string]any
+	defer func() {
+		if t.Failed() {
+			t.Logf("task %v: %v", id, task)
+			t.Logf("new leader log: %s", quietLog(nw.LogTail(60000)))
+			t.Logf("old leader log: %s", quietLog(leader.LogTail(60000)))
+		}
+	}()
+	until(t, 10*time.Minute, "the task to end on the new leader", func() bool {
+		st, body := nw.Do("GET", fmt.Sprintf("/tasks/%v", id), nil, nil)
+		if st != 200 {
+			return false
+		}
+		if s, _ := body["state"].(string); s == "failed" || s == "done" {
+			task = body
+			return true
+		}
+		return false
+	})
+	if task["state"] != "done" {
+		t.Fatalf("the task ended %v: %v", task["state"], task["error"])
+	}
+	if strings.Contains(leader.LogTail(200000), "task lease not confirmed in time") {
+		t.Errorf("the lease guard of the old leader cancelled the stop")
+	}
+	hosts, _ := primaryOf(t, nw)
+	if hosts[0] != nw.Host {
+		t.Fatalf("the primary of the map group is on %s, want %s", hosts[0], nw.Host)
+	}
+	mapAcked(t, c, port, pool, w)
+}
+
 // mapSwitchoverEnv forms the cluster of the map group tests and starts the writers.
 func mapSwitchoverEnv(t *testing.T) (c *clustertest.Cluster, port int, pool *x509.CertPool, leader, nw *clustertest.Node, w *foWriters) {
 	t.Helper()
