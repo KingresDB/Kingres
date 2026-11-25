@@ -356,13 +356,23 @@ func (m *Manager) start(ctx context.Context, id int) error {
 	if _, err := m.Managed(id); err != nil {
 		return err
 	}
-	if up, err := m.Running(ctx, id); err != nil || up {
-		if err == nil {
+	up, err := m.Running(ctx, id)
+	if err != nil {
+		return err
+	}
+	if up {
+		// A postmaster that is shutting down is not a running instance: pg_ctl status still says so until the pid file is gone, and a start
+		// that took it for running would report success while the instance goes down (a rollback after a stop that outlasted its call).
+		// The shutdown is waited for, bounded, and the instance is started after it; a shutdown that does not end is an error.
+		if !postmasterStopping(m.dataDirOf(id)) {
 			// Found running (a start whose pg_ctl -w ran out of time, but whose postmaster went on): it bound its port, so the
 			// port is not provisional any more.
 			m.clearNeverStarted(id)
+			return nil
 		}
-		return err
+		if err := m.waitShutdown(ctx, id); err != nil {
+			return err
+		}
 	}
 	if m.gate != nil {
 		if err := m.gate(id); err != nil {
@@ -784,4 +794,43 @@ func postmasterIdentity(data string) string {
 		return ""
 	}
 	return strings.TrimSpace(lines[0]) + " " + strings.TrimSpace(lines[2])
+}
+
+func (m *Manager) dataDirOf(id int) string {
+	d, _ := m.DataDir(id)
+	return d
+}
+
+// postmasterStopping reports that postmaster.pid says the postmaster is shutting down. The last line of the file is the status of the postmaster
+// ("starting", "ready", "standby", "stopping"); it is written by both majors and changes to "stopping" when the shutdown begins, before the
+// shutdown checkpoint, while pg_controldata only says "shutting down" once the checkpoint runs.
+func postmasterStopping(data string) bool {
+	b, err := os.ReadFile(filepath.Join(data, "postmaster.pid")) //nolint:gosec // path below the manager root
+	if err != nil {
+		return false
+	}
+	lines := strings.Split(strings.TrimRight(string(b), "\r\n"), "\n")
+	return len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "stopping"
+}
+
+// waitShutdown waits until the instance that is shutting down is gone (the pid file removed), for as long as a stop is allowed to take.
+func (m *Manager) waitShutdown(ctx context.Context, id int) error {
+	deadline := time.Now().Add(m.stopTO)
+	for {
+		up, err := m.Running(ctx, id)
+		if err != nil {
+			return err
+		}
+		if !up {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("instance: the postmaster of instance %d is still shutting down after %s; it was not started", id, m.stopTO)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
 }
