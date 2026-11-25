@@ -263,6 +263,18 @@ func (m *MemStore) Import(ts []Task) {
 	}
 }
 
+// SetMark implements MarkStore.
+func (m *MemStore) SetMark(_ context.Context, id int64, l Lease, mark string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, err := m.held(id, l)
+	if err != nil {
+		return err
+	}
+	t.Mark = mark
+	return nil
+}
+
 // SetDetail implements DetailStore.
 func (m *MemStore) SetDetail(_ context.Context, id int64, l Lease, detail string) error {
 	m.mu.Lock()

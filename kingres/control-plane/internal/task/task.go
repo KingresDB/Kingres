@@ -104,7 +104,10 @@ type Task struct {
 	Percent float64
 	// Detail is free text a step records for the operator (for example the
 	// certificate fingerprint it saw); never a secret. Not part of the contract.
-	Detail          string
+	Detail string
+	// Mark is a decision that a step wrote with Env.SetMark and that later runs of the step, and the OnFail hook, must find (a point of no return). Internal:
+	// not shown to users, not part of the contract. The hook sees the value as the store has it when the task failed (MarkUnreadable when it could not be read).
+	Mark            string
 	Error           *Error
 	CancelRequested bool
 	CreatedAt       time.Time
@@ -234,6 +237,54 @@ func (e *Env) SetDetail(ctx context.Context, detail string) error {
 	}
 	e.Task.Detail = detail
 	return ds.SetDetail(ctx, e.Task.ID, e.lease, detail)
+}
+
+// MarkStore is implemented by stores that can keep a task's Mark.
+type MarkStore interface {
+	SetMark(ctx context.Context, id int64, l Lease, mark string) error
+}
+
+// ErrNoMarks means the store of the engine cannot keep a Mark.
+var ErrNoMarks = errors.New("the task store cannot keep a mark")
+
+// MarkUnreadable is the Mark that the OnFail hook gets when the store could not be asked: a hook must read it as "possibly decided".
+const MarkUnreadable = "\x00unreadable"
+
+// SetMark records the mark of the task (see Task.Mark). It returns only when the store has written it under this run's lease; a store that cannot keep it is an
+// error, never ignored, because the caller relies on the mark for a decision that must survive a restart.
+func (e *Env) SetMark(ctx context.Context, mark string) error {
+	if e.eng == nil {
+		return ErrNoMarks
+	}
+	ms, ok := e.eng.store.(MarkStore)
+	if !ok {
+		return ErrNoMarks
+	}
+	if err := ms.SetMark(ctx, e.Task.ID, e.lease, mark); err != nil {
+		return err
+	}
+	// Confirmed: the store is asked for the mark it holds now.
+	got, err := e.ReadMark(ctx)
+	if err != nil {
+		return err
+	}
+	if got != mark {
+		return fmt.Errorf("the task store does not hold the mark that was written")
+	}
+	e.Task.Mark = mark
+	return nil
+}
+
+// ReadMark reads the mark of the task as the store holds it now.
+func (e *Env) ReadMark(ctx context.Context) (string, error) {
+	if e.eng == nil {
+		return "", ErrNoMarks
+	}
+	t, err := e.eng.store.Get(ctx, e.Task.ID)
+	if err != nil {
+		return "", err
+	}
+	return t.Mark, nil
 }
 
 // CancelRequested reports whether a cancel request is recorded for the task now: a step that runs for long asks it between its
@@ -914,6 +965,14 @@ func (e *Engine) fail(ctx context.Context, t Task, i int, st Step, te *Error) er
 func (e *Engine) onFail(ctx context.Context, t Task, te *Error) {
 	if d, ok := e.def(t.Kind); ok && d.OnFail != nil {
 		t.State, t.Error = Failed, te
+		// The task in hand is the copy of the claim; the mark is what a step wrote during the run, so it is read as the store has it.
+		var fresh Task
+		if err := e.retry(context.WithoutCancel(ctx), func() (gerr error) { fresh, gerr = e.store.Get(context.WithoutCancel(ctx), t.ID); return gerr }); err == nil {
+			t.Mark = fresh.Mark
+		} else {
+			e.log.Error("reading the mark of a failed task", "task", t.ID, "error", err)
+			t.Mark = MarkUnreadable
+		}
 		d.OnFail(context.WithoutCancel(ctx), t)
 	}
 }

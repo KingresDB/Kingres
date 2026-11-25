@@ -33,6 +33,7 @@ const cols = `id, kind, state, subject_type, subject_id, input, progress, error,
 
 type progressJSON struct {
 	Detail  string      `json:"detail,omitempty"`
+	Mark    string      `json:"mark,omitempty"`
 	Percent float64     `json:"percent"`
 	Steps   []StepState `json:"steps"`
 }
@@ -54,7 +55,7 @@ func scan(row pgx.Row) (Task, error) {
 	if err := json.Unmarshal(prog, &p); err != nil {
 		return Task{}, fmt.Errorf("task %d: progress: %w", t.ID, err)
 	}
-	t.Percent, t.Steps, t.Detail = p.Percent, p.Steps, p.Detail
+	t.Percent, t.Steps, t.Detail, t.Mark = p.Percent, p.Steps, p.Detail, p.Mark
 	if len(errj) > 0 {
 		var e Error
 		if err := json.Unmarshal(errj, &e); err == nil {
@@ -272,6 +273,16 @@ func (s *PGStore) Resume(ctx context.Context, id int64) error {
 		return err
 	}
 	return ErrNotPaused
+}
+
+// SetMark implements MarkStore: the update is conditional on the lease and its row count is checked, so a mark that returns without error is in the table.
+func (s *PGStore) SetMark(ctx context.Context, id int64, l Lease, mark string) error {
+	tag, err := s.db.Exec(ctx, `UPDATE kingres_cp.task SET progress = jsonb_set(progress, '{mark}', to_jsonb($4::text))
+		WHERE id = $1 AND lease_holder = $2 AND lease_epoch = $3 AND state = 'running'`, id, l.Holder, l.Epoch, mark)
+	if err != nil {
+		return err
+	}
+	return s.heldOrErr(ctx, tag, id)
 }
 
 // SetDetail implements DetailStore.

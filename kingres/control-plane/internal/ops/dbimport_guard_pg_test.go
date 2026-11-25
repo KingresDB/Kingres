@@ -659,7 +659,8 @@ func TestTheRenameCanBeRunAgainAfterARestartAndTheHookPutsItBack(t *testing.T) {
 	if err := o.importRenameLocal(ctx, open); err != nil {
 		t.Fatal(err)
 	}
-	if err := o.importRenameLocal(ctx, rename); err != nil || finalState(c, "shop_final") != "imp/"+importMarker(privDB) {
+	// an opened database is not "ours to rename" any more: the importing role owns it, so the rename answers "exists" and changes nothing
+	if err := o.importRenameLocal(ctx, rename); !errors.Is(err, errDatabaseExists) || finalState(c, "shop_final") != "imp/"+importMarker(privDB) {
 		t.Errorf("the rename after the opening: %v %q", err, finalState(c, "shop_final"))
 	}
 	if err := o.importRenameLocal(ctx, open); err != nil {
@@ -672,7 +673,12 @@ func TestTheRenameCanBeRunAgainAfterARestartAndTheHookPutsItBack(t *testing.T) {
 			t.Errorf("%s: %v, want the database exists", name, err)
 		}
 	}
-	// the hook: the task failed after the rename; the database is at the final name with the marker (service ownership: the opening is undone first)
+	// an opened database is never put back, whatever its marker says (the service role does not own it)
+	if err := o.importRenameLocal(ctx, importRenameOp{From: "shop_final", To: privDB, Back: true, Marker: importMarker(privDB)}); err != nil || finalState(c, "shop_final") != "imp/"+importMarker(privDB) || finalState(c, privDB) != "missing" {
+		t.Errorf("the put back of an opened database: %v %q %q", err, finalState(c, "shop_final"), finalState(c, privDB))
+	}
+	// the hook: the task failed after the rename; the database is at the final name with the marker and the service role owns it (the state before the opening)
+	pgExecAll(t, c, "alter database shop_final owner to kingresd")
 	if err := o.importRenameLocal(ctx, importRenameOp{From: "shop_final", To: privDB, Back: true, Marker: importMarker(privDB)}); err != nil {
 		t.Fatal(err)
 	}

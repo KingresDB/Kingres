@@ -166,6 +166,14 @@ func (f *FileStore) Resume(ctx context.Context, id int64) error {
 	return f.save(id) //nolint:contextcheck // saving does not depend on a request
 }
 
+// SetMark implements MarkStore.
+func (f *FileStore) SetMark(ctx context.Context, id int64, l Lease, mark string) error {
+	if err := f.inner.SetMark(ctx, id, l, mark); err != nil {
+		return err
+	}
+	return f.save(id) //nolint:contextcheck // saving does not depend on a request
+}
+
 // SetDetail implements DetailStore.
 func (f *FileStore) SetDetail(ctx context.Context, id int64, l Lease, detail string) error {
 	if err := f.inner.SetDetail(ctx, id, l, detail); err != nil {

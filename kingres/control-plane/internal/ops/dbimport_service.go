@@ -19,6 +19,7 @@ import (
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/archive"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/extguard"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fence"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlx"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
@@ -826,7 +827,8 @@ func (o *Ops) importRenameLocal(ctx context.Context, op importRenameOp) error {
 			op.Marker == "" || op.Marker != importMarker(op.To) {
 			return errors.New("this rename is not allowed")
 		}
-		return o.renameBack(ctx, op.From, op.To, op.Marker)
+		_, err := o.renameBack(ctx, op.From, op.To, op.Marker)
+		return err
 	}
 	if !strings.HasPrefix(op.From, privatePrefix) || !dbNameRE.MatchString(op.From) || !dbNameRE.MatchString(op.To) || protectedDB[op.To] || strings.HasPrefix(op.To, privatePrefix) {
 		return errors.New("this rename is not allowed")
@@ -846,10 +848,12 @@ func (o *Ops) importRenameLocal(ctx context.Context, op importRenameOp) error {
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
 	// A database at the final name that carries the marker of this task is this task's own rename, made by an earlier run of the step that did not end (kingresd was
 	// restarted): the rename is done. Any other database at that name is not ours.
-	if ok, comment, err := databaseComment(ctx, c, op.To); err != nil {
+	// The marker is readable by everybody, so it is not proof by itself: the database must also be owned by the service role (until the opening it is, and no role
+	// that may create a database can give a database of its own to the service role).
+	if st, err := databaseStateOf(ctx, c, op.To); err != nil {
 		return err
-	} else if ok {
-		if comment == importMarker(op.From) {
+	} else if st.Exists {
+		if st.Comment == importMarker(op.From) && st.ServiceOwned {
 			return nil
 		}
 		return errDatabaseExists
@@ -882,24 +886,38 @@ func (o *Ops) importRenameLocal(ctx context.Context, op importRenameOp) error {
 	return last
 }
 
-// databaseComment tells whether a database of this name exists and what its comment is ("" without one).
-func databaseComment(ctx context.Context, x execer, name string) (bool, string, error) {
+// dbState is what the catalog says about a database name on one server.
+type dbState struct {
+	Exists       bool
+	Comment      string // "" without one
+	Owner        string
+	ServiceOwned bool // the owner is the role of the connection (the service role)
+}
+
+// databaseStateOf reads the existence, the comment (the marker of an import), the owner and whether the service role owns the database of this name.
+func databaseStateOf(ctx context.Context, x execer, name string) (dbState, error) {
 	var comment *string
-	err := x.QueryRow(ctx, `SELECT pg_catalog.shobj_description(d.oid, 'pg_database') FROM pg_catalog.pg_database d WHERE d.datname = $1::pg_catalog.text::pg_catalog.name`, name).Scan(&comment)
+	var owner string
+	var svc bool
+	err := x.QueryRow(ctx, `SELECT pg_catalog.shobj_description(d.oid, 'pg_database'), pg_catalog.pg_get_userbyid(d.datdba)::pg_catalog.text, pg_catalog.pg_get_userbyid(d.datdba) = current_user
+		FROM pg_catalog.pg_database d WHERE d.datname = $1::pg_catalog.text::pg_catalog.name`, name).Scan(&comment, &owner, &svc)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, "", nil
+		return dbState{}, nil
 	}
 	if err != nil {
-		return false, "", err
+		return dbState{}, err
 	}
-	if comment == nil {
-		return true, "", nil
+	st := dbState{Exists: true, Owner: owner, ServiceOwned: svc}
+	if comment != nil {
+		st.Comment = *comment
 	}
-	return true, *comment, nil
+	return st, nil
 }
 
 // openRenamed opens the database at the final name to its clients on this server: the importing role owns it and PUBLIC may connect (the default of a database that
-// database.create makes). Only the database that carries the marker of the task is touched; doing it twice is harmless.
+// database.create makes). It is called only after the commit point of the import. The database that carries the marker of the task (owned by the service role, or
+// by the importing role when the opening ran before) is opened, doing it twice is harmless; a database without the marker that the importing role owns and that has
+// no comment is a database whose import is finished here (the marker is removed last): nothing is left to do. Any other database is not touched.
 func (o *Ops) openRenamed(ctx context.Context, name, owner, marker string) error {
 	db, err := sqlx.NewIdent(name)
 	if err != nil {
@@ -914,9 +932,14 @@ func (o *Ops) openRenamed(ctx context.Context, name, owner, marker string) error
 		return err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-	if ok, comment, err := databaseComment(ctx, c, name); err != nil {
+	st, err := databaseStateOf(ctx, c, name)
+	if err != nil {
 		return err
-	} else if !ok || comment != marker {
+	}
+	switch {
+	case st.Exists && st.Comment == "" && st.Owner == owner:
+		return nil
+	case !st.Exists || st.Comment != marker || !(st.ServiceOwned || st.Owner == owner):
 		return errors.New("the database at the final name does not carry the marker of this import")
 	}
 	if err := run(ctx, c, stmt().Text("ALTER DATABASE").ID(db).Text("OWNER TO").ID(role)); err != nil {
@@ -925,45 +948,135 @@ func (o *Ops) openRenamed(ctx context.Context, name, owner, marker string) error
 	return run(ctx, c, stmt().Text("GRANT CONNECT ON DATABASE").ID(db).Text("TO PUBLIC"))
 }
 
+// importCommitMark is the value that the rename step writes to the mark of its task (Task.Mark) at the commit point: the task has decided that the database at the
+// final name is the result of the import. It is written, and read back, before the first server opens the database.
+func importCommitMark(priv string) string { return "import-committed:" + priv }
+
+// importCommitted tells whether the task state says that the commit point was passed (or cannot be told: the hook could not read the mark).
+func importCommitted(t task.Task, priv string) bool {
+	return t.Mark == importCommitMark(priv) || t.Mark == task.MarkUnreadable
+}
+
+// renameChecks are the checks around the rename: the withdrawal of the access of the role, the comparison of the servers and of the catalog before the rename, and
+// the comparison after it (a test replaces them).
+type renameChecks struct {
+	access  func(ctx context.Context) error
+	servers func(ctx context.Context) error
+	catalog func(ctx context.Context) error
+	recheck func(ctx context.Context, revert func() string) error
+}
+
+// renameFinal is what the last step of an import works with.
+type renameFinal struct {
+	p          dbImportParams
+	priv       string
+	sharded    bool
+	buckets    int
+	ledgerMode string
+	checks     renameChecks
+	// done is called once, after the import is finished (the audit record and the like); nil in a test.
+	done func(ctx context.Context)
+}
+
+// importForwardPause is the pause between two tries of the part of the rename step that only goes forward.
+var importForwardPause = 2 * time.Second
+
 func (o *Ops) stepIMRename(ctx context.Context, env *task.Env) error {
-	p, rec, x, err := o.loadImport(ctx, env)
+	p, err := inputOf[dbImportParams](env.Task)
 	if err != nil {
-		return err
-	}
-	a, err := o.openImport(ctx, x, rec, p, env.Task.ID)
-	if err != nil {
-		return err
-	}
-	defer a.close()
-	if err := o.refuseDangerousImporter(ctx, p.Owner.Name); err != nil {
 		return err
 	}
 	priv := p.private(env.Task.ID)
-	// The name is looked at once more at the moment it is taken. A database at the final name that carries the marker of this task is the work of an earlier run of
-	// this step (kingresd was restarted after the first rename and before the end): the step goes on from there. Any other database at that name is not ours.
-	var exists, resumed bool
+	committed := env.Task.Mark == importCommitMark(priv)
+	// After the commit point the step needs neither the upload nor the archive (they are for the audit record only): a staging store that is gone does not stop it.
+	var rec transfer.Record
+	var a *archiveFile
+	_, rec, x, lerr := o.loadImport(ctx, env)
+	if lerr == nil {
+		a, lerr = o.openImport(ctx, x, rec, p, env.Task.ID)
+		if lerr == nil {
+			defer a.close()
+		}
+	}
+	if lerr != nil && !committed {
+		return lerr
+	}
+	if !committed {
+		if err := o.refuseDangerousImporter(ctx, p.Owner.Name); err != nil {
+			return err
+		}
+	}
+	w := renameFinal{p: p, priv: priv, ledgerMode: "off", buckets: 128}
+	w.checks = renameChecks{
+		access:  func(ctx context.Context) error { return o.importAccess(ctx, env, p, priv, false) },
+		servers: func(ctx context.Context) error { return o.checkImportServers(ctx, p.Servers) },
+		catalog: func(ctx context.Context) error { return o.checkImportCatalog(ctx, priv) },
+		recheck: func(ctx context.Context, revert func() string) error {
+			return o.recheckImportCatalog(ctx, p.Database, p.Servers, revert)
+		},
+	}
+	if a != nil {
+		w.sharded = hasExt(a.st.res.Manifest, extguard.Shard)
+		if hasExt(a.st.res.Manifest, extguard.Ledger) {
+			w.ledgerMode = "optIn"
+		}
+		for _, g := range a.st.res.Catalog.ColocationGroups {
+			if g.BucketCount > 0 && g.BucketCount <= archive.MaxBuckets {
+				w.buckets = g.BucketCount
+				break
+			}
+		}
+		w.done = func(ctx context.Context) {
+			if o.Transfer != nil && o.Transfer.Audit != nil {
+				o.Transfer.Audit(ctx, "dataTransfer.completed", map[string]any{"kind": "databaseImport", "database": p.Database, "uploadId": idText(p.UploadID), "sha256": rec.SHA256,
+					"tables": len(a.st.res.Catalog.Tables), "rows": a.st.res.Manifest.Totals.Rows, "outcome": "success"})
+			}
+		}
+	}
+	return o.importRenameFinal(ctx, env, w)
+}
+
+// importRenameFinal is the last step of an import, built around ONE COMMIT POINT.
+//
+// Before it: the private database takes the final name on every server (closed: owned by the service role, PUBLIC may not connect, the marker of the task on it),
+// the catalogs are compared again and the settings are recorded. Any failure puts the names back on the servers that were renamed, removes the settings and fails the
+// import; the hook of the task may put back and drop only a database that the service role owns, and only when the task is not committed.
+//
+// The commit point is the mark of the task (Task.Mark), written to the system store and read back BEFORE the first server opens the database. From then on the step
+// only goes forward: open on every server, then remove the marker on every server (the last act), every error is tried again and nothing is put back or dropped, by
+// the step or by the hook. After a restart or a change of leader the mark decides, not the state of the databases.
+func (o *Ops) importRenameFinal(ctx context.Context, env *task.Env, w renameFinal) error {
+	p, priv := w.p, w.priv
+	if env.Task.Mark == importCommitMark(priv) {
+		return o.importRollForward(ctx, env, w)
+	}
+	// The name is looked at once more at the moment it is taken. A database at the final name that carries the marker of this task and that the service role still
+	// owns is the work of an earlier run of this step (kingresd was restarted after the first rename and before the commit point): the step goes on from there. Any
+	// other database at that name is not ours.
+	var st dbState
 	if err := o.asService(ctx, "postgres", func(tx pgx.Tx) error {
-		ok, comment, e := databaseComment(ctx, tx, p.Database)
-		exists, resumed = ok, ok && comment == importMarker(priv)
+		var e error
+		st, e = databaseStateOf(ctx, tx, p.Database)
 		return e
 	}); err != nil {
 		return transfer.Errorf(transfer.CodeSessionLost, true, "the service role cannot connect to this cluster now; repeat the operation")
 	}
+	resumed := st.Exists && st.Comment == importMarker(priv) && st.ServiceOwned
 	if !resumed {
-		if err := o.importAccess(ctx, env, p, priv, false); err != nil {
+		if err := w.checks.access(ctx); err != nil {
 			return err
 		}
 	}
-	if exists && !resumed {
+	if st.Exists && !resumed {
 		return transfer.Errorf(transfer.CodeForbidden, false, "the database %s exists; the import is not finished and the private database is removed", p.Database)
 	}
 	// A server that joined during the import does not have the private database, and a failover that ran during it leaves the catalog of the private database with the
 	// old primary of a group: the database is not renamed. (After a restart the private name is gone: the recheck below, on the final name, is the check.)
-	if err := o.checkImportServers(ctx, p.Servers); err != nil {
+	if err := w.checks.servers(ctx); err != nil {
 		return err
 	}
 	if !resumed {
-		if err := o.checkImportCatalog(ctx, priv); err != nil {
+		if err := w.checks.catalog(ctx); err != nil {
 			return err
 		}
 	}
@@ -976,17 +1089,23 @@ func (o *Ops) stepIMRename(ctx context.Context, env *task.Env) error {
 			done = append(done, p.Servers...)
 		}
 	}
-	// A server that fails after another one was renamed puts the others back, so that the private name is the only name of the work in progress and the hook of
-	// the task finds all of it.
+	// A failure before the commit point puts the names back on the servers that took the final name (and removes the settings), so that the private name is the only
+	// name of the work in progress and the hook of the task finds all of it.
 	revert := func() string {
 		bg := context.WithoutCancel(ctx)
 		var failed []string
 		for _, s := range done {
-			if err := o.putBackOn(bg, s, p.Database, priv); err != nil {
+			if _, err := o.putBackOn(bg, s, p.Database, priv); err != nil {
 				if o.Log != nil {
 					o.Log.Error("the private name of an import could not be put back", "server", s, "database", p.Database, "private", priv, "error", err)
 				}
 				failed = append(failed, safeName(s))
+			}
+		}
+		// A settings row of the final name is this import's: no database was there when the names were taken. When a put back failed the hook does it, after its own.
+		if len(done) > 0 && len(failed) == 0 {
+			if uerr := o.unrecordImportedSettings(bg, p.Database); uerr != nil && o.Log != nil {
+				o.Log.Error("the settings of an import that was undone could not be removed", "database", p.Database, "error", uerr)
 			}
 		}
 		return putBackNote(failed, p.Database)
@@ -1006,8 +1125,11 @@ func (o *Ops) stepIMRename(ctx context.Context, env *task.Env) error {
 			break
 		}
 		if err := o.onServer(ctx, env, s, "take the final name", func() error { return o.Fanout.Apply(ctx, s, ApplyImportRename, op) }); err != nil {
+			if leaseOrStop(ctx, err) {
+				return err
+			}
 			// The server may have renamed before it failed to answer: it is put back too, but only if the database at the final name carries the marker of this task
-			// (renameBack leaves any other database alone).
+			// and the service role owns it (renameBack leaves any other database alone).
 			if !resumed {
 				done = append(done, s)
 			}
@@ -1020,46 +1142,93 @@ func (o *Ops) stepIMRename(ctx context.Context, env *task.Env) error {
 	}
 	// A failover that started after the check above and before the last server took the final name: the catalog is checked again, and the names are put back on a
 	// difference (a failover that starts from now on follows the catalog of the database like that of any other).
-	if err := o.recheckImportCatalog(ctx, p.Database, p.Servers, revert); err != nil {
+	if err := w.checks.recheck(ctx, revert); err != nil {
 		return err
 	}
 	// The registry: the settings of the database, as database.create writes them.
-	sharded := hasExt(a.st.res.Manifest, extguard.Shard)
-	ledgerMode := "off"
-	if hasExt(a.st.res.Manifest, extguard.Ledger) {
-		ledgerMode = "optIn"
-	}
-	buckets := 128
-	for _, g := range a.st.res.Catalog.ColocationGroups {
-		if g.BucketCount > 0 && g.BucketCount <= archive.MaxBuckets {
-			buckets = g.BucketCount
-			break
-		}
-	}
-	if err := o.recordImportedSettings(ctx, p, sharded, buckets, ledgerMode); err != nil {
+	if err := o.recordImportedSettings(ctx, p, w.sharded, w.buckets, w.ledgerMode); err != nil {
 		note := revert()
 		return transfer.Errorf(transfer.CodeSQLError, false, "the settings of the database could not be recorded, so the import was undone%s", note)
 	}
-	// Every server has the final name and the catalogs agree: only now the importing role becomes the owner and PUBLIC may connect, so that no client has been in the
-	// database that a failure above puts back.
-	if err := o.openEverywhere(ctx, env, p, priv); err != nil {
+	// The commit point.
+	switch res, cerr := o.commitImport(ctx, env, importCommitMark(priv)); res {
+	case commitNot:
 		note := revert()
-		if uerr := o.unrecordImportedSettings(context.WithoutCancel(ctx), p.Database); uerr != nil && o.Log != nil {
-			o.Log.Error("the settings of an import that was undone could not be removed", "database", p.Database, "error", uerr)
-		}
-		return transfer.Errorf(transfer.CodeSQLError, false, "the database could not be opened to its owner, so the import was undone%s", note)
+		return transfer.Errorf(transfer.CodeSQLError, false, "the import could not be committed, so it was undone%s", note)
+	case commitUnknown:
+		// Whether the mark is written is not known (the store did not answer, the lease is gone): nothing is put back by the step. The hook of the task reads the mark
+		// itself and puts the names back only when the task is not committed.
+		return cerr
 	}
-	// Every server has the final name and the registry has the settings: the marker of the task goes. An error here leaves a comment on a finished database.
-	fin := importRenameOp{From: p.Database, To: priv, Finish: true, Marker: importMarker(priv)}
-	for _, s := range append([]string{""}, p.Servers...) {
-		var ferr error
-		if s == "" {
-			ferr = o.finishRename(ctx, p.Database, fin.Marker)
-		} else if o.Fanout != nil {
-			ferr = o.Fanout.Apply(ctx, s, ApplyImportRename, fin)
+	return o.importRollForward(ctx, env, w)
+}
+
+// leaseOrStop tells whether an error means that this run must not do anything more in the name of the task: it was cancelled, lost its lease or was fenced.
+func leaseOrStop(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, task.ErrLeaseLost) || errors.Is(err, fence.ErrFenced)
+}
+
+type commitResult int
+
+const (
+	commitDone    commitResult = iota // the mark is written and was read back
+	commitNot                         // the mark is not written (the store said so and the store shows it)
+	commitUnknown                     // it is not known
+)
+
+// commitImport writes the commit mark of the task and reads it back. A write that failed is looked at again in the store: only when the store shows that the mark
+// is not there is the commit "not done" (and the step may undo its work); when the store cannot be asked, or this run lost its lease, nothing is known.
+func (o *Ops) commitImport(ctx context.Context, env *task.Env, mark string) (commitResult, error) {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err = env.SetMark(ctx, mark); err == nil {
+			return commitDone, nil
 		}
-		if ferr != nil && o.Log != nil {
-			o.Log.Error("the marker of an import could not be removed", "server", s, "database", p.Database, "error", ferr)
+		if leaseOrStop(ctx, err) {
+			return commitUnknown, err
+		}
+		select {
+		case <-ctx.Done():
+			return commitUnknown, ctx.Err()
+		case <-time.After(importCommitPause):
+		}
+	}
+	got, rerr := env.ReadMark(ctx)
+	switch {
+	case rerr != nil:
+		return commitUnknown, fmt.Errorf("the commit of the import is not known: %w", err)
+	case got == mark:
+		return commitDone, nil
+	}
+	return commitNot, err
+}
+
+// importCommitPause is the pause between two tries to write the commit mark.
+var importCommitPause = time.Second
+
+// importRollForward is the part of the step after the commit point: open on every server, then remove the marker on every server. It does not give up: an error is
+// logged and shown, and the work is tried again after a pause, until it is done or this run is stopped (shutdown, lost lease; the next run goes on from the mark).
+func (o *Ops) importRollForward(ctx context.Context, env *task.Env, w renameFinal) error {
+	p := w.p
+	for {
+		err := o.importForwardOnce(ctx, env, w)
+		if err == nil {
+			break
+		}
+		if leaseOrStop(ctx, err) {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return err
+		}
+		if o.Log != nil {
+			o.Log.Error("the import is committed and goes on after an error", "database", p.Database, "error", err)
+		}
+		_ = env.SetDetail(ctx, "The import is committed and finishes again after an error: "+safeSentence(err.Error()))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(importForwardPause):
 		}
 	}
 	detail := "imported " + p.Database
@@ -1067,40 +1236,73 @@ func (o *Ops) stepIMRename(ctx context.Context, env *task.Env) error {
 		detail += "\n" + strings.Join(st.notes, "\n")
 	}
 	o.setImportState(env.Task.ID, nil)
-	if o.Transfer != nil && o.Transfer.Audit != nil {
-		o.Transfer.Audit(ctx, "dataTransfer.completed", map[string]any{"kind": "databaseImport", "database": p.Database, "uploadId": idText(p.UploadID), "sha256": rec.SHA256,
-			"tables": len(a.st.res.Catalog.Tables), "rows": a.st.res.Manifest.Totals.Rows, "outcome": "success"})
+	if w.done != nil {
+		w.done(ctx)
 	}
-	return env.SetDetail(ctx, detail)
-}
-
-// openEverywhere opens the database at the final name to its owner and to PUBLIC on this server and on every other.
-func (o *Ops) openEverywhere(ctx context.Context, env *task.Env, p dbImportParams, priv string) error {
-	if err := o.openRenamed(ctx, p.Database, p.Owner.Name, importMarker(priv)); err != nil {
-		return err
-	}
-	if o.Fanout == nil {
-		return nil
-	}
-	op := importRenameOp{From: p.Database, To: priv, Owner: p.Owner.Name, Open: true}
-	for _, s := range p.Servers {
-		s := s
-		if err := o.onServer(ctx, env, s, "open the database", func() error { return o.Fanout.Apply(ctx, s, ApplyImportRename, op) }); err != nil {
+	// The import is over: a record of it that cannot be written does not undo it.
+	if err := env.SetDetail(ctx, detail); err != nil {
+		if leaseOrStop(ctx, err) {
 			return err
+		}
+		if o.Log != nil {
+			o.Log.Warn("the detail of a finished import could not be recorded", "database", p.Database, "error", err)
 		}
 	}
 	return nil
 }
 
-// putBackOn puts the database at the final name back to its private name on one server ("" is this one); a database without the marker of the task is left alone.
-func (o *Ops) putBackOn(ctx context.Context, server, final, priv string) error {
+// importForwardOnce opens the database on every server and then removes the marker on every server. Every part is idempotent (a database that is opened, or
+// finished, counts as done), so it can run again after any error, after a restart or on another leader.
+func (o *Ops) importForwardOnce(ctx context.Context, env *task.Env, w renameFinal) error {
+	p, priv := w.p, w.priv
+	marker := importMarker(priv)
+	if err := o.openRenamed(ctx, p.Database, p.Owner.Name, marker); err != nil {
+		return err
+	}
+	open := importRenameOp{From: p.Database, To: priv, Owner: p.Owner.Name, Open: true}
+	if o.Fanout != nil {
+		for _, s := range p.Servers {
+			s := s
+			if err := o.onServer(ctx, env, s, "open the database", func() error { return o.Fanout.Apply(ctx, s, ApplyImportRename, open) }); err != nil {
+				return err
+			}
+		}
+	}
+	// The registry row is written before the commit point; a row that is gone (an operator removed it) is reported, not made again.
+	if o.Service != nil {
+		var n int
+		if err := o.asService(ctx, sysdb.Database, func(tx pgx.Tx) error {
+			return tx.QueryRow(ctx, `SELECT pg_catalog.count(*)::pg_catalog.int4 FROM kingres_cp.database_setting WHERE database_name = $1`, p.Database).Scan(&n)
+		}); err == nil && n == 0 && o.Log != nil {
+			o.Log.Warn("the settings row of an imported database is not there", "database", p.Database)
+		}
+	}
+	// The marker goes last, on every server. Until it is gone from all of them an error here is tried again.
+	fin := importRenameOp{From: p.Database, To: priv, Finish: true, Marker: marker}
+	if err := o.finishRename(ctx, p.Database, marker); err != nil {
+		return err
+	}
+	if o.Fanout != nil {
+		for _, s := range p.Servers {
+			s := s
+			if err := o.onServer(ctx, env, s, "finish the import", func() error { return o.Fanout.Apply(ctx, s, ApplyImportRename, fin) }); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// putBackOn puts the database at the final name back to its private name on one server ("" is this one); a database without the marker of the task, or that the
+// service role does not own, is left alone. It reports whether this server's database was renamed (always false for another server, which does not answer).
+func (o *Ops) putBackOn(ctx context.Context, server, final, priv string) (bool, error) {
 	if server == "" {
 		return o.renameBack(ctx, final, priv, importMarker(priv))
 	}
 	if o.Fanout == nil {
-		return nil
+		return false, nil
 	}
-	return o.Fanout.Apply(ctx, server, ApplyImportRename, importRenameOp{From: final, To: priv, Back: true, Marker: importMarker(priv)})
+	return false, o.Fanout.Apply(ctx, server, ApplyImportRename, importRenameOp{From: final, To: priv, Back: true, Marker: importMarker(priv)})
 }
 
 // unrecordImportedSettings removes the registry row that recordImportedSettings wrote, for an import that was undone after it.
@@ -1111,31 +1313,32 @@ func (o *Ops) unrecordImportedSettings(ctx context.Context, database string) err
 	})
 }
 
-// renameBack undoes the rename of this server (a failure after this one was renamed): the final name goes back to the private one, the service role owns the
-// database again, the marker is written again and PUBLIC may not connect. Every part is tried and the errors are joined.
-func (o *Ops) renameBack(ctx context.Context, from, to, marker string) error {
+// renameBack undoes the rename of this server (a failure before the commit point): the final name goes back to the private one, the marker is written again and
+// PUBLIC may not connect. It acts only on a database that carries the marker of the task AND that the service role owns: an opened database (the importing role owns
+// it) is never put back, whatever its marker says. It reports whether the database was renamed. Every part is tried and the errors are joined.
+func (o *Ops) renameBack(ctx context.Context, from, to, marker string) (bool, error) {
 	if marker == "" {
-		return errors.New("the marker of the task is needed to put a name back")
+		return false, errors.New("the marker of the task is needed to put a name back")
 	}
 	c, err := o.Service.ServiceConn(ctx, "postgres")
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-	// Only the database that this task renamed is put back: it carries the marker. Another database at that name (a peer that did not rename because the name was
-	// taken, a database that a role made in the meantime) is left as it is.
-	var comment *string
-	if err := c.QueryRow(ctx, `SELECT pg_catalog.shobj_description(d.oid, 'pg_database') FROM pg_catalog.pg_database d WHERE d.datname = $1::pg_catalog.text::pg_catalog.name`, from).Scan(&comment); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil
-		}
-		return err
+	// Only the database that this task renamed is put back: it carries the marker and the service role owns it. Another database at that name (a peer that did not
+	// rename because the name was taken, a database that a role made in the meantime, a database that was opened to its owner) is left as it is.
+	st, err := databaseStateOf(ctx, c, from)
+	if err != nil {
+		return false, err
 	}
-	if comment == nil || *comment != marker {
+	if !st.Exists {
+		return false, nil
+	}
+	if st.Comment != marker || !st.ServiceOwned {
 		if o.Log != nil {
-			o.Log.Warn("a database at the final name of an import was left alone: it does not carry the marker of the task", "database", from)
+			o.Log.Warn("a database at the final name of an import was left alone: it does not carry the marker of the task or is not owned by the service role", "database", from)
 		}
-		return nil
+		return false, nil
 	}
 	var errs []error
 	if err := o.rollbackPreparedLocal(ctx, c, from); err != nil {
@@ -1152,21 +1355,16 @@ func (o *Ops) renameBack(ctx context.Context, from, to, marker string) error {
 		time.Sleep(250 * time.Millisecond)
 	}
 	if rerr != nil {
-		return rerr
+		return false, rerr
 	}
 	t := sqlx.MustIdent(to)
-	if err := run(ctx, c, stmt().Text("ALTER DATABASE").ID(t).Text("OWNER TO CURRENT_USER")); err != nil {
+	if err := run(ctx, c, stmt().Text("COMMENT ON DATABASE").ID(t).Text("IS").Lit(marker)); err != nil {
 		errs = append(errs, err)
-	}
-	if marker != "" {
-		if err := run(ctx, c, stmt().Text("COMMENT ON DATABASE").ID(t).Text("IS").Lit(marker)); err != nil {
-			errs = append(errs, err)
-		}
 	}
 	if err := run(ctx, c, stmt().Text("REVOKE CONNECT ON DATABASE").ID(t).Text("FROM PUBLIC")); err != nil {
 		errs = append(errs, err)
 	}
-	return errors.Join(errs...)
+	return true, errors.Join(errs...)
 }
 
 // finishRename removes the marker of the task from the database at the final name, if it still carries it.
@@ -1218,6 +1416,14 @@ func (o *Ops) importOnFailHook(ctx context.Context, t task.Task) {
 		return
 	}
 	o.setImportState(t.ID, nil)
+	// A task that passed the commit point (or whose mark cannot be read) is not undone: the database at the final name is the result of the import, it may be open
+	// and written to by its owner. Nothing is put back, dropped or withdrawn, and no failure is audited for it.
+	if importCommitted(t, p.private(t.ID)) {
+		if o.Log != nil {
+			o.Log.Error("a database import failed after its commit point; the database is left as it is", "task", t.ID, "database", p.Database)
+		}
+		return
+	}
 	code := ""
 	if t.Error != nil {
 		code = t.Error.Code
@@ -1355,15 +1561,33 @@ func safeSentence(s string) string {
 	return b.String()
 }
 
-// putBackEverywhere puts the database at the final name of a failed import back to its private name on this server and on every other one that the task used or that
-// is in the cluster now (the leader that runs the hook may not be the one that started the task). It touches a database only when it carries the marker of this task.
+// putBackEverywhere puts the database at the final name of a failed import (a task that is not committed) back to its private name on this server and on every other
+// one that the task used or that is in the cluster now (the leader that runs the hook may not be the one that started the task). It touches a database only when it
+// carries the marker of this task and the service role owns it. The settings row of the final name is removed when a database was put back here, or when no database
+// is at the final name on this server (a row without a database is stale); a database of somebody else at the final name keeps its row.
 func (o *Ops) putBackEverywhere(ctx context.Context, p dbImportParams, id int64) {
 	if o.Service == nil {
 		return
 	}
 	priv := p.private(id)
-	if err := o.putBackOn(ctx, "", p.Database, priv); err != nil && o.Log != nil {
+	changed, err := o.putBackOn(ctx, "", p.Database, priv)
+	if err != nil && o.Log != nil {
 		o.Log.Warn("the final name of a failed import could not be put back", "database", p.Database, "error", err)
+	}
+	if err == nil {
+		stale := changed
+		if !stale {
+			if c, cerr := o.Service.ServiceConn(ctx, "postgres"); cerr == nil {
+				st, serr := databaseStateOf(ctx, c, p.Database)
+				_ = c.Close(context.WithoutCancel(ctx))
+				stale = serr == nil && !st.Exists
+			}
+		}
+		if stale {
+			if uerr := o.unrecordImportedSettings(ctx, p.Database); uerr != nil && o.Log != nil {
+				o.Log.Error("the settings of a failed import could not be removed", "database", p.Database, "error", uerr)
+			}
+		}
 	}
 	if o.Fanout == nil {
 		return
@@ -1374,7 +1598,7 @@ func (o *Ops) putBackEverywhere(ctx context.Context, p dbImportParams, id int64)
 			continue
 		}
 		seen[s] = true
-		if err := o.putBackOn(ctx, s, p.Database, priv); err != nil && o.Log != nil {
+		if _, err := o.putBackOn(ctx, s, p.Database, priv); err != nil && o.Log != nil {
 			o.Log.Warn("the final name of a failed import could not be put back on a server", "database", p.Database, "server", s, "error", err)
 		}
 	}
