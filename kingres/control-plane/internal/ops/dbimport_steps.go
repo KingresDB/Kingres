@@ -427,7 +427,7 @@ func (o *Ops) stepIMInstall(ctx context.Context, env *task.Env) error {
 			return err
 		}
 		// a mismatch now is a cluster whose primaries are not on their preferred servers (or a failover under way): it fails here, with that message, not after the load
-		if err := o.checkImportCatalogEarly(ctx, priv); err != nil {
+		if err := o.checkImportCatalogEarly(ctx, priv, p.Servers); err != nil {
 			return err
 		}
 		if len(m.Extensions) > 0 && len(a.st.res.Catalog.DistributedSchemas) > 0 {

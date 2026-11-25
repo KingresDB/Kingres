@@ -5,6 +5,7 @@ package ops
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -167,8 +168,14 @@ func TestPreparedTransactionsAreRolledBack(t *testing.T) {
 		t.Error("a prepared transaction of the renamed database")
 	}
 	var owner string
+	if err := c.QueryRow(ctx, `select pg_get_userbyid(datdba) from pg_database where datname = 'shop_final'`).Scan(&owner); err != nil || owner != "kingresd" {
+		t.Errorf("owner after the rename: %q (%v), the service role keeps the database until it is opened", owner, err)
+	}
+	if err := o.importRenameLocal(ctx, importRenameOp{From: "shop_final", To: privDB, Owner: "imp", Open: true}); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.QueryRow(ctx, `select pg_get_userbyid(datdba) from pg_database where datname = 'shop_final'`).Scan(&owner); err != nil || owner != "imp" {
-		t.Errorf("owner after the rename: %q (%v)", owner, err)
+		t.Errorf("owner after the opening: %q (%v)", owner, err)
 	}
 }
 
@@ -198,14 +205,19 @@ func TestDropRollsBackPreparedTransactions(t *testing.T) {
 	}
 }
 
-// L1: a failure after the rename puts the private name, the owner, the marker and the closed door back.
+// L1: a failure after the rename (the opening of the database) is undone: the private name, the owner, the marker and the closed door are back.
 func TestRenameUndoesItselfOnAFailure(t *testing.T) {
 	in, c, o := newGuardInstance(t)
 	makePrivate(t, o, c)
 	ctx := context.Background()
-	err := o.importRenameLocal(ctx, importRenameOp{From: privDB, To: "shop_final", Owner: "no_such_role"})
-	if err == nil {
-		t.Fatal("the rename succeeded for a role that does not exist")
+	if err := o.importRenameLocal(ctx, importRenameOp{From: privDB, To: "shop_final", Owner: "no_such_role"}); err != nil {
+		t.Fatalf("the rename itself does not need the role: %v", err)
+	}
+	if err := o.importRenameLocal(ctx, importRenameOp{From: "shop_final", To: privDB, Owner: "no_such_role", Open: true}); err == nil {
+		t.Fatal("the opening succeeded for a role that does not exist")
+	}
+	if err := o.importRenameLocal(ctx, importRenameOp{From: "shop_final", To: privDB, Back: true, Marker: importMarker(privDB)}); err != nil {
+		t.Fatal(err)
 	}
 	var names string
 	if e := c.QueryRow(ctx, `select string_agg(datname, ',' order by datname) from pg_database where datname like 'kingres_import_%' or datname = 'shop_final'`).Scan(&names); e != nil || names != privDB {
@@ -493,7 +505,7 @@ func TestRenameBackLeavesAForeignDatabaseAlone(t *testing.T) {
 	if err := o.importRenameLocal(ctx, importRenameOp{From: privDB, To: "shop_final", Owner: "imp"}); err != nil {
 		t.Fatal(err)
 	}
-	if got := state("shop_final"); got != "imp/"+importMarker(privDB) {
+	if got := state("shop_final"); got != "kingresd/"+importMarker(privDB) {
 		t.Errorf("the final name after the rename: %q", got)
 	}
 	if err := o.importRenameLocal(ctx, importRenameOp{From: "shop_final", To: privDB, Back: true, Marker: importMarker(privDB)}); err != nil {
@@ -503,6 +515,9 @@ func TestRenameBackLeavesAForeignDatabaseAlone(t *testing.T) {
 		t.Errorf("after the undoing: final %q, private %q", state("shop_final"), state(privDB))
 	}
 	if err := o.importRenameLocal(ctx, importRenameOp{From: privDB, To: "shop_final", Owner: "imp"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.importRenameLocal(ctx, importRenameOp{From: "shop_final", To: privDB, Owner: "imp", Open: true}); err != nil {
 		t.Fatal(err)
 	}
 	if err := o.importRenameLocal(ctx, importRenameOp{From: "shop_final", To: privDB, Finish: true, Marker: importMarker(privDB)}); err != nil {
@@ -548,5 +563,160 @@ func TestLockSchemaTablesRefusesWhatTheCatalogDoesNotName(t *testing.T) {
 		if (err == nil) != tc.ok {
 			t.Errorf("%s: %v, want ok=%v", tc.name, err, tc.ok)
 		}
+	}
+}
+
+// finalState is owner/marker of a database ("missing" when it is not there).
+func finalState(c *pgx.Conn, name string) string {
+	var s string
+	if err := c.QueryRow(context.Background(), `select pg_get_userbyid(datdba) || '/' || coalesce(shobj_description(oid, 'pg_database'), '') from pg_database where datname = $1`, name).Scan(&s); err != nil {
+		return "missing"
+	}
+	return s
+}
+
+// M1 (the fourth review of the import): the final name is open to nobody between the rename and the opening, which happens after the catalogs were compared again.
+// No role can connect to it and the importing role does not own it until the opening.
+func TestNoClientConnectsBetweenTheRenameAndTheOpening(t *testing.T) {
+	in, c, o := newGuardInstance(t)
+	makePrivate(t, o, c)
+	ctx := context.Background()
+	// the access of the role is withdrawn before the rename, as the step does
+	if err := o.importAccessLocal(ctx, importAccessOp{Name: privDB, Role: "imp", Allow: false, Full: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.importRenameLocal(ctx, importRenameOp{From: privDB, To: "shop_final", Owner: "imp"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, role := range []string{"outsider", "imp", "bystander"} {
+		if s, err := asRole(in, "shop_final", role); err == nil {
+			_ = s.Close(ctx)
+			t.Errorf("%s connected to the final name before the recheck passed", role)
+		}
+	}
+	if got := finalState(c, "shop_final"); got != "kingresd/"+importMarker(privDB) {
+		t.Errorf("between the rename and the opening: %q", got)
+	}
+	if err := o.importRenameLocal(ctx, importRenameOp{From: "shop_final", To: privDB, Owner: "imp", Open: true}); err != nil {
+		t.Fatal(err)
+	}
+	s, err := asRole(in, "shop_final", "outsider")
+	if err != nil {
+		t.Fatalf("PUBLIC cannot connect after the opening: %v", err)
+	}
+	_ = s.Close(ctx)
+	if got := finalState(c, "shop_final"); got != "imp/"+importMarker(privDB) {
+		t.Errorf("after the opening: %q", got)
+	}
+	// a database without the marker of the task is never opened
+	pgExecAll(t, c, "create database shop_other")
+	if err := o.importRenameLocal(ctx, importRenameOp{From: "shop_other", To: privDB, Owner: "imp", Open: true}); err == nil {
+		t.Error("a database without the marker was opened")
+	}
+}
+
+// recFanout records what the failure hook sends to the other servers.
+type recFanout struct {
+	mu   sync.Mutex
+	sent []string
+}
+
+func (f *recFanout) Others(context.Context) ([]OtherServer, error) {
+	return []OtherServer{{ID: "s2"}}, nil
+}
+func (f *recFanout) Apply(_ context.Context, server, kind string, params any) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if op, ok := params.(importRenameOp); ok {
+		f.sent = append(f.sent, fmt.Sprintf("%s %s back=%t from=%s to=%s", server, kind, op.Back, op.From, op.To))
+	}
+	return nil
+}
+func (f *recFanout) Register(context.Context, string, OtherServer) error { return nil }
+
+// M2 and M3 (the fourth review of the import): the rename step can be run again after a restart. A database at the final name that carries the marker of this task is
+// its own earlier rename (the rename answers nothing to do, and the opening can be repeated); any other database at that name is "exists". When the task fails after
+// that, the failure hook puts the database back by the marker, on this server and on the others, and then drops it as the private database; a database without the
+// marker is never touched.
+func TestTheRenameCanBeRunAgainAfterARestartAndTheHookPutsItBack(t *testing.T) {
+	_, c, o := newGuardInstance(t)
+	makePrivate(t, o, c)
+	ctx := context.Background()
+	rename := importRenameOp{From: privDB, To: "shop_final", Owner: "imp"}
+	if err := o.importRenameLocal(ctx, rename); err != nil {
+		t.Fatal(err)
+	}
+	want := "kingresd/" + importMarker(privDB)
+	// the restart: the step runs again
+	if err := o.importRenameLocal(ctx, rename); err != nil {
+		t.Fatalf("the rename after a restart: %v", err)
+	}
+	if got := finalState(c, "shop_final"); got != want {
+		t.Errorf("after the second run: %q", got)
+	}
+	// ... and again after the opening
+	open := importRenameOp{From: "shop_final", To: privDB, Owner: "imp", Open: true}
+	if err := o.importRenameLocal(ctx, open); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.importRenameLocal(ctx, rename); err != nil || finalState(c, "shop_final") != "imp/"+importMarker(privDB) {
+		t.Errorf("the rename after the opening: %v %q", err, finalState(c, "shop_final"))
+	}
+	if err := o.importRenameLocal(ctx, open); err != nil {
+		t.Errorf("the opening twice: %v", err)
+	}
+	// a database of somebody else at the final name, or one with the marker of another task, is "exists"
+	pgExecAll(t, c, "create database shop_x", "create database shop_y", "comment on database shop_y is '"+importMarker("kingres_import_8_001122334455")+"'")
+	for _, name := range []string{"shop_x", "shop_y"} {
+		if err := o.importRenameLocal(ctx, importRenameOp{From: privDB, To: name, Owner: "imp"}); !errors.Is(err, errDatabaseExists) {
+			t.Errorf("%s: %v, want the database exists", name, err)
+		}
+	}
+	// the hook: the task failed after the rename; the database is at the final name with the marker (service ownership: the opening is undone first)
+	if err := o.importRenameLocal(ctx, importRenameOp{From: "shop_final", To: privDB, Back: true, Marker: importMarker(privDB)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.importRenameLocal(ctx, rename); err != nil {
+		t.Fatal(err)
+	}
+	fan := &recFanout{}
+	o.Fanout = fan
+	o.ServerHost = "s1"
+	p := dbImportParams{Database: "shop_final", Nonce: "aabbccddeeff", Servers: []string{"s2"}}
+	o.putBackEverywhere(ctx, p, 7)
+	if got := finalState(c, "shop_final"); got != "missing" {
+		t.Errorf("the final name after the hook: %q", got)
+	}
+	if got := finalState(c, privDB); got != want {
+		t.Errorf("the private name after the hook: %q", got)
+	}
+	if len(fan.sent) != 1 || !strings.Contains(fan.sent[0], "s2 import.rename back=true from=shop_final to="+privDB) {
+		t.Errorf("sent to the other servers: %v", fan.sent)
+	}
+	if err := o.importDropLocal(ctx, privDB); err != nil || finalState(c, privDB) != "missing" {
+		t.Errorf("the drop of the put-back database: %v %q", err, finalState(c, privDB))
+	}
+	// a database at the final name without the marker of the task is left alone by the hook
+	pgExecAll(t, c, "create database shop_final")
+	before := finalState(c, "shop_final")
+	o.putBackEverywhere(ctx, p, 7)
+	if got := finalState(c, "shop_final"); got != before || finalState(c, privDB) != "missing" {
+		t.Errorf("the hook touched a database that is not the task's: %q, private %q", got, finalState(c, privDB))
+	}
+}
+
+// M3: the note of a failed putting back names the database as it is on that server (the final name) and says what happens and what the operator does.
+func TestThePutBackNoteNamesTheFinalName(t *testing.T) {
+	n := putBackNote([]string{"s2", "s3"}, "shop")
+	for _, w := range []string{"s2, s3", "under the final name shop", "tries again", "DROP DATABASE"} {
+		if !strings.Contains(n, w) {
+			t.Errorf("the note lacks %q: %s", w, n)
+		}
+	}
+	if strings.Contains(n, privatePrefix) {
+		t.Errorf("the note names the private database, which is not there: %s", n)
+	}
+	if putBackNote(nil, "shop") != "" {
+		t.Error("a note without a failure")
 	}
 }

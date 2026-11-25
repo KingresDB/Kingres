@@ -245,13 +245,13 @@ func TestPrimariesToRegister(t *testing.T) {
 		n("c", 5432, "primary"), n("c", 5434, "standby"),
 		n("d", 5432, "primary"), // not a server of the import
 	}
-	got := primariesToRegister(sys, []string{"b", "c"}, "a")
+	got := primariesToRegister(sys, []string{"c", "b"}, "a")
 	var addrs []string
 	for _, x := range got {
 		addrs = append(addrs, x.addr())
 	}
-	if strings.Join(addrs, ",") != "b:5433,c:5432" {
-		t.Fatalf("registered %v, want b:5433,c:5432 (the primaries of the system catalog on the servers of the import, never this server or another one)", addrs)
+	if strings.Join(addrs, ",") != "c:5432,b:5433" {
+		t.Fatalf("registered %v, want c:5432,b:5433 (in the order of the servers of the request; the primaries of the system catalog on the servers of the import, never this server or another one)", addrs)
 	}
 	if got := primariesToRegister(sys, nil, "a"); len(got) != 0 {
 		t.Fatalf("a single server: %v", got)
@@ -278,7 +278,7 @@ func TestCheckImportCatalogEarlyOnASwitchedOverCluster(t *testing.T) {
 	// the private catalog as the import made it by the home ports (the old way)
 	mk(privDB, "(1, 0, 'h1', 5432, 'primary')", "(2, 1, 'h2', 5432, 'primary')")
 	ctx := context.Background()
-	err := o.checkImportCatalogEarly(ctx, privDB)
+	err := o.checkImportCatalogEarly(ctx, privDB, []string{"h1", "h2"})
 	var te *transfer.Error
 	if !errors.As(err, &te) || te.Code != transfer.CodeLeaderChanged || !te.Retryable || !strings.Contains(te.Error(), "restore the preferred primaries") ||
 		!strings.Contains(te.Error(), "h2:5432") || !strings.Contains(te.Error(), "h2:5433") || strings.Contains(te.Error(), "changed during the import") {
@@ -287,12 +287,37 @@ func TestCheckImportCatalogEarlyOnASwitchedOverCluster(t *testing.T) {
 	// registered as the system catalog names the primaries
 	d := pgConnect(t, o, privDB)
 	pgExecAll(t, d, "update kingres.node set port = 5433 where host = 'h2'")
-	if err := o.checkImportCatalogEarly(ctx, privDB); err != nil {
+	if err := o.checkImportCatalogEarly(ctx, privDB, []string{"h1", "h2"}); err != nil {
 		t.Fatalf("the primaries of the system catalog: %v", err)
 	}
 	// readSystemNodes reads the same catalog that the registration is made from
 	nodes, err := o.readSystemNodes(ctx)
 	if err != nil || len(nodes) != 3 {
 		t.Fatalf("readSystemNodes: %v %v", nodes, err)
+	}
+}
+
+// L1 (the fourth review): a primary of the system catalog on a server that the import was not made for (a server that is being added or removed) is not registered; the
+// early check says that, not "restore the preferred primaries".
+func TestCheckImportCatalogEarlyOnAPrimaryOutsideTheRequest(t *testing.T) {
+	_, c, o := newGuardInstance(t)
+	pgExecAll(t, c, "create database "+sysdb.Database, "create database "+privDB)
+	node := "create table kingres.node (node_id int, group_id int, host text, port int, role text, is_active bool default true, should_have_shards bool default true, weight float8)"
+	for db, rows := range map[string][]string{
+		sysdb.Database: {"(1, 0, 'h1', 5432, 'primary')", "(2, 1, 'h2', 5432, 'primary')", "(3, 2, 'h3', 5432, 'primary')"},
+		privDB:         {"(1, 0, 'h1', 5432, 'primary')", "(2, 1, 'h2', 5432, 'primary')"},
+	} {
+		d := pgConnect(t, o, db)
+		pgExecAll(t, d, "create schema kingres", node)
+		for _, r := range rows {
+			pgExecAll(t, d, "insert into kingres.node (node_id, group_id, host, port, role) values "+r)
+		}
+	}
+	sys := pgConnect(t, o, sysdb.Database)
+	pgExecAll(t, sys, "create schema kingres_cp", "create table kingres_cp.task (kind text, state text)")
+	err := o.checkImportCatalogEarly(context.Background(), privDB, []string{"h1", "h2"})
+	var te *transfer.Error
+	if !errors.As(err, &te) || !te.Retryable || !strings.Contains(te.Error(), "h3:5432") || !strings.Contains(te.Error(), "not made for") || strings.Contains(te.Error(), "restore the preferred primaries") {
+		t.Fatalf("a primary on a server outside the request: %v", err)
 	}
 }
