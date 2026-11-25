@@ -41,21 +41,21 @@ func TestDatabaseExportAndDrainAtTheSameTime(t *testing.T) {
 	c := clustertest.FormTLS(t, 3, []string{"-rebalance-retry-backoff", "1s"}, func(leader *clustertest.Node) {
 		body := leader.Expect(202, "POST", "/databases", map[string]any{"name": "sk", "sharding": map[string]any{"enabled": true, "mode": "both", "bucketCount": 8}})
 		leader.WaitTaskDone(clustertest.TaskID(body), 4*time.Minute)
-		sc := leader.ServicePG("sk")
-		if _, err := sc.Exec(context.Background(), `CREATE TABLE items (id bigint PRIMARY KEY, val text)`); err != nil {
-			t.Fatal(err)
-		}
-		body = leader.Expect(202, "PUT", "/databases/sk/schemas/public/tables/items/distribution", map[string]any{"method": "hash", "distributionColumn": "id"})
-		leader.WaitTaskDone(clustertest.TaskID(body), 2*time.Minute)
-		if _, err := sc.Exec(context.Background(), `INSERT INTO items SELECT g, repeat('x', 150) FROM generate_series(1, $1::int) g`, itemRows); err != nil {
-			t.Fatal(err)
-		}
 	})
 	l := c.Leader()
 	for _, n := range c.Nodes {
 		n.Login(clustertest.AdminUser, clustertest.AdminPass)
 	}
 	l.Expect(200, "PATCH", "/settings/cluster", map[string]any{"defaultReplicaCount": 0, "dataTransfer": map[string]any{"enabled": true, "maxConcurrent": 4}, "analytics": map[string]any{"allowNonSuperuserOwners": true}})
+	// The objects are made and filled through POST /query as the logged-in admin, as in the export test: the export runs as the admin's role, which cannot read
+	// objects of the service role (the export refuses them with export_not_readable).
+	q := func(sql string) {
+		t.Helper()
+		l.Expect(200, "POST", "/query", map[string]any{"database": "sk", "sql": sql, "timeoutMs": 300000})
+	}
+	q(`CREATE TABLE public.items (id bigint PRIMARY KEY, val text)`)
+	l.WaitTaskDone(clustertest.TaskID(l.Expect(202, "PUT", "/databases/sk/schemas/public/tables/items/distribution", map[string]any{"method": "hash", "distributionColumn": "id"})), 2*time.Minute)
+	q(fmt.Sprintf(`INSERT INTO public.items SELECT g, repeat('x', 150) FROM generate_series(1, %d) g`, itemRows))
 	until(t, 3*time.Minute, "no standby task to run", func() bool {
 		for _, st := range []string{"pending", "running"} {
 			if len(anyList(l.Expect(200, "GET", "/tasks?kind=standby.reconcile&state="+st, nil)["items"])) > 0 {
@@ -83,13 +83,13 @@ func TestDatabaseExportAndDrainAtTheSameTime(t *testing.T) {
 	// A schema is made empty and distributed first: the rows of a schema decide the shard group it is distributed to (a schema that holds rows on the leader
 	// goes to the group of the leader, and asking for another group is refused), so the rows are written after, through the leader, to the owner.
 	for _, s := range schemas {
-		skExec(t, c, "sk", `CREATE SCHEMA `+s)
-		skExec(t, c, "sk", `CREATE TABLE `+s+`.t (id bigint PRIMARY KEY, v text)`)
+		q(`CREATE SCHEMA ` + s)
+		q(`CREATE TABLE ` + s + `.t (id bigint PRIMARY KEY, v text)`)
 		l.WaitTaskDone(clustertest.TaskID(l.Expect(202, "PUT", "/databases/sk/schemas/"+s+"/distribution", map[string]any{"shardGroupId": victimGroup})), 3*time.Minute)
 		if host, _ := sdOwner(t, l, s); host != victim.Host {
 			t.Fatalf("schema %s is on %s, want %s", s, host, victim.Host)
 		}
-		skExec(t, c, "sk", `INSERT INTO `+s+`.t SELECT g, repeat('r', 100) FROM generate_series(1, $1) g`, schemaRows)
+		q(fmt.Sprintf(`INSERT INTO %s.t SELECT g, repeat('r', 100) FROM generate_series(1, %d) g`, s, schemaRows))
 	}
 	tables := []string{"public.items", "dr_a.t", "dr_b.t"}
 	want := map[string]int64{"public.items": itemRows, "dr_a.t": schemaRows, "dr_b.t": schemaRows}
