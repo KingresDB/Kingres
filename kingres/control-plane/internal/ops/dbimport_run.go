@@ -229,7 +229,7 @@ func (o *Ops) importAccess(ctx context.Context, env *task.Env, p dbImportParams,
 		if o.Fanout == nil {
 			break
 		}
-		if err := o.onServer(ctx, env, s, "change the access of the role", func() error { return o.Fanout.Apply(ctx, s, ApplyImportAccess, op) }); err != nil {
+		if err := o.importOnServer(ctx, env, s, "change the access of the role", func() error { return o.Fanout.Apply(ctx, s, ApplyImportAccess, op) }); err != nil {
 			return err
 		}
 	}

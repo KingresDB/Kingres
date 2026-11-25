@@ -145,6 +145,14 @@ func (f *FileStore) RequestCancel(ctx context.Context, id int64, now time.Time) 
 	return f.save(id) //nolint:contextcheck // saving does not depend on a request
 }
 
+// RequestCancelIf implements CondCancelStore.
+func (f *FileStore) RequestCancelIf(ctx context.Context, id int64, now time.Time, seen State, fail *Error) error {
+	if err := f.inner.RequestCancelIf(ctx, id, now, seen, fail); err != nil {
+		return err
+	}
+	return f.save(id) //nolint:contextcheck // saving does not depend on a request
+}
+
 // List implements Store.
 func (f *FileStore) List(ctx context.Context, limit int) ([]Task, error) {
 	return f.inner.List(ctx, limit)
@@ -161,6 +169,14 @@ func (f *FileStore) Pause(ctx context.Context, id int64, l Lease, reason string)
 // Resume implements PauseStore.
 func (f *FileStore) Resume(ctx context.Context, id int64) error {
 	if err := f.inner.Resume(ctx, id); err != nil {
+		return err
+	}
+	return f.save(id) //nolint:contextcheck // saving does not depend on a request
+}
+
+// SetMark implements MarkStore.
+func (f *FileStore) SetMark(ctx context.Context, id int64, l Lease, mark string) error {
+	if err := f.inner.SetMark(ctx, id, l, mark); err != nil {
 		return err
 	}
 	return f.save(id) //nolint:contextcheck // saving does not depend on a request

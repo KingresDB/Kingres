@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -104,7 +105,10 @@ type Task struct {
 	Percent float64
 	// Detail is free text a step records for the operator (for example the
 	// certificate fingerprint it saw); never a secret. Not part of the contract.
-	Detail          string
+	Detail string
+	// Mark is a decision that a step wrote with Env.SetMark and that later runs of the step, and the OnFail hook, must find (a point of no return). Internal:
+	// not shown to users, not part of the contract. The hook sees the value as the store has it when the task failed (MarkUnreadable when it could not be read).
+	Mark            string
 	Error           *Error
 	CancelRequested bool
 	CreatedAt       time.Time
@@ -236,6 +240,60 @@ func (e *Env) SetDetail(ctx context.Context, detail string) error {
 	return ds.SetDetail(ctx, e.Task.ID, e.lease, detail)
 }
 
+// MarkStore is implemented by stores that can keep a task's Mark.
+type MarkStore interface {
+	SetMark(ctx context.Context, id int64, l Lease, mark string) error
+}
+
+// ErrNoMarks means the store of the engine cannot keep a Mark.
+var ErrNoMarks = errors.New("the task store cannot keep a mark")
+
+// MarkUnreadable is the Mark that the OnFail hook gets when the store could not be asked: a hook must read it as "possibly decided".
+const MarkUnreadable = "\x00unreadable"
+
+// ErrCancelRequested is the answer of SetMark when a cancel request is recorded for the task: a mark is a point of no return, and it is never written over a
+// request to cancel (the check and the write are one statement of the store). The caller undoes its work, as for any failure before the point.
+var ErrCancelRequested = errors.New("task: a cancel was requested")
+
+// SetMark records the mark of the task (see Task.Mark). It returns only when the store has written it under this run's lease; a store that cannot keep it is an
+// error, never ignored, because the caller relies on the mark for a decision that must survive a restart. The write is conditional on no cancel request being
+// recorded (ErrCancelRequested otherwise, nothing written), in the same statement as the lease and the epoch: a cancel that was accepted before the mark is
+// written wins, and a cancel that arrives after it is a cancel of a committed task (see Definition.Committed).
+func (e *Env) SetMark(ctx context.Context, mark string) error {
+	if e.eng == nil {
+		return ErrNoMarks
+	}
+	ms, ok := e.eng.store.(MarkStore)
+	if !ok {
+		return ErrNoMarks
+	}
+	if err := ms.SetMark(ctx, e.Task.ID, e.lease, mark); err != nil {
+		return err
+	}
+	// Confirmed: the store is asked for the mark it holds now.
+	got, err := e.ReadMark(ctx)
+	if err != nil {
+		return err
+	}
+	if got != mark {
+		return fmt.Errorf("the task store does not hold the mark that was written")
+	}
+	e.Task.Mark = mark
+	return nil
+}
+
+// ReadMark reads the mark of the task as the store holds it now.
+func (e *Env) ReadMark(ctx context.Context) (string, error) {
+	if e.eng == nil {
+		return "", ErrNoMarks
+	}
+	t, err := e.eng.store.Get(ctx, e.Task.ID)
+	if err != nil {
+		return "", err
+	}
+	return t.Mark, nil
+}
+
 // CancelRequested reports whether a cancel request is recorded for the task now: a step that runs for long asks it between its
 // own waits, because the engine looks at the mark only between steps (a step that is not Interruptible). A task that cannot be
 // read is not cancelled.
@@ -316,6 +374,56 @@ type Definition struct {
 	// cancellable once its irreversible step is done: it rolls forward only. Nil: every
 	// unfinished task is cancellable.
 	Cancellable func(t Task) bool
+	// Committed, when set, says whether a task has passed a point of no return that its steps recorded in its Mark (the task is read as the store has it now;
+	// its Mark is MarkUnreadable when the store could not be asked, which counts as passed). The engine never fails or cancels such a task: where it would
+	// (a step that returns an error, the give-up after repeated fence refusals, a cancel request), the task is paused instead, with note and the reason as its
+	// detail, so that the operator can see that it is committed and not finished and can resume it (Engine.Resume). The OnFail hook does not run for it.
+	Committed func(t Task) (note string, ok bool)
+	// CanceledNote, set together with Committed, is the message of the error of a paused task that has passed its point of no return and that an operator
+	// cancels (the exit of a committed task that cannot be resumed): the cancel ends the task as failed with code canceled and this message, and nothing is
+	// undone (the OnFail hook runs, finds the mark and touches nothing). It runs before the task is ended and may ask the servers; it must bound its own time.
+	CanceledNote func(ctx context.Context, t Task) string
+}
+
+// holdCommitted pauses a task of a kind with a Committed guard instead of ending it. It reports whether the task was paused (or the run lost its lease: the
+// error says so); false means the task is not committed and the caller ends it as before.
+func (e *Engine) holdCommitted(ctx context.Context, t Task, i int, why string) (bool, error) {
+	d, ok := e.def(t.Kind)
+	if !ok || d.Committed == nil {
+		return false, nil
+	}
+	c := context.WithoutCancel(ctx)
+	var fresh Task
+	if err := e.retry(c, func() (gerr error) { fresh, gerr = e.store.Get(c, t.ID); return gerr }); err != nil {
+		fresh = t
+		fresh.Mark = MarkUnreadable
+	}
+	note, committed := d.Committed(fresh)
+	if !committed {
+		return false, nil
+	}
+	ps, ok := e.store.(PauseStore)
+	if !ok {
+		return false, nil
+	}
+	if i < len(t.Steps) {
+		if _, err := e.setStep(ctx, t, i, StepPending, percent(i, len(t.Steps))); err != nil && leaseLost(err) {
+			return true, ErrLeaseLost
+		}
+	}
+	e.log.Error("a committed task is paused, not ended", "task", t.ID, "kind", t.Kind, "why", why)
+	note = cutUTF8(note, 330)
+	reason := note
+	if why != "" {
+		reason += " Reason: " + why
+	}
+	if err := e.retry(c, func() error { return ps.Pause(c, t.ID, e.leaseOf(t), clip(reason)) }); err != nil {
+		if leaseLost(err) {
+			return true, ErrLeaseLost
+		}
+		return true, err
+	}
+	return true, nil
 }
 
 func (d Definition) steps(input json.RawMessage) ([]Step, error) {
@@ -359,6 +467,17 @@ type Store interface {
 	RequestCancel(ctx context.Context, id int64, now time.Time) error
 	// List returns tasks, newest first.
 	List(ctx context.Context, limit int) ([]Task, error)
+}
+
+// ErrStateChanged is the answer of a conditional cancel when the task is no longer in the state that the caller decided on.
+var ErrStateChanged = errors.New("task: the state of the task changed")
+
+// CondCancelStore is implemented by stores that can end or mark a task for cancellation only when it is in the state that the caller looked at.
+type CondCancelStore interface {
+	// RequestCancelIf does what RequestCancel does for the state seen, and only when the task is still in it, in one atomic write: a task that was seen pending
+	// or paused is ended as failed with fail (code canceled) when it is still in that state; a task that was seen running only gets its cancel request, and
+	// only while it still runs. Any other state is ErrStateChanged; a finished task is ErrNotCancellable.
+	RequestCancelIf(ctx context.Context, id int64, now time.Time, seen State, fail *Error) error
 }
 
 // Engine runs tasks.
@@ -533,31 +652,91 @@ func (e *Engine) Run(ctx context.Context) {
 // step boundary, or at the next pause point of a step that can pause. A paused task
 // is not run by anybody, so it is failed at once (the store's condition is "still
 // paused") and its cleanup hook runs here, with the task as recorded.
+//
+// The request is conditional on the state that the guard was asked about (CondCancelStore): a task that was read as running only gets the request while it
+// runs, and a task that was read as paused is ended only while it is paused. A cancel that was meant as a pause of a committed task never ends it, when the
+// task paused between the read and the write.
 func (e *Engine) Cancel(ctx context.Context, id int64) error {
-	t, gerr := e.store.Get(ctx, id)
-	if gerr != nil {
-		// Without the task its guard cannot be asked: a cancel is never recorded blind (FO-11).
-		return gerr
-	}
-	if recordedKinds[t.Kind] {
-		return ErrNotCancellable // written by its owner, not run by the engine
-	}
-	if gerr == nil {
-		if def, ok := e.def(t.Kind); ok && def.Cancellable != nil && !def.Cancellable(t) {
+	cs, cond := e.store.(CondCancelStore)
+	var first State
+	// The message of a committed task that is ended by a cancel asks the servers: it is built once per request, not on every pass of the loop.
+	var note string
+	haveNote := false
+	for attempt := 0; attempt < 5; attempt++ {
+		t, gerr := e.store.Get(ctx, id)
+		if gerr != nil {
+			// Without the task its guard cannot be asked: a cancel is never recorded blind (FO-11).
+			return gerr
+		}
+		if attempt == 0 {
+			first = t.State
+		}
+		if recordedKinds[t.Kind] {
+			return ErrNotCancellable // written by its owner, not run by the engine
+		}
+		def, haveDef := e.def(t.Kind)
+		if haveDef && def.Cancellable != nil && !def.Cancellable(t) {
 			return ErrNotCancellable // the guard of the kind: past the point of no return
 		}
+		committed := haveDef && heldCommitted(def, t)
+		if attempt > 0 && first == Running && t.State == Paused && committed {
+			// The cancel of a running committed task is a pause, and the task paused meanwhile: the request is met, and the same click does not also end it.
+			return nil
+		}
+		if !cond {
+			if err := e.store.RequestCancel(ctx, id, e.now()); err != nil {
+				return err
+			}
+			e.afterCancel(ctx, t)
+			return nil
+		}
+		fail := &Error{Code: CodeCanceled, Message: "The task was canceled before it started."}
+		if t.State == Paused {
+			fail.Message = "The task was canceled while it was paused."
+		}
+		if committed && (t.State == Paused || t.State == Pending) && def.CanceledNote != nil {
+			// A committed task that no run holds is not undone: it ends with the note of its kind (a pending one is a resumed one that no run has claimed yet).
+			if !haveNote {
+				note, haveNote = clip(def.CanceledNote(ctx, t)), true
+			}
+			fail.Message = note
+		}
+		err := cs.RequestCancelIf(ctx, id, e.now(), t.State, fail)
+		if errors.Is(err, ErrStateChanged) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		e.afterCancel(ctx, t)
+		return nil
 	}
-	if err := e.store.RequestCancel(ctx, id, e.now()); err != nil {
-		return err
-	}
-	if gerr == nil && t.State == Paused {
-		// Read again: the hook runs only when this request ended the task (it may have
-		// been resumed meanwhile, and then a run owns it).
-		if now, err := e.store.Get(ctx, id); err == nil && now.State == Failed && now.Error != nil && now.Error.Code == CodeCanceled {
-			e.onFail(ctx, now, now.Error)
+	return ErrStateChanged
+}
+
+// afterCancelTimeout bounds the hook that runs after the cancel of a task that no run holds.
+const afterCancelTimeout = 10 * time.Minute
+
+// afterCancel runs the hook of a task that the cancel ended without a run: a paused task, or a pending one that ran before (a resumed one), is not run by
+// anybody, so its cleanup hook runs here, with the task as recorded. It does not depend on the request that asked: it runs under its own context (as the hook of a
+// failed run does) with its own time limit, so a client that went away does not leave the work of the task behind.
+func (e *Engine) afterCancel(ctx context.Context, was Task) {
+	// A pending task that was claimed before (the epoch of its lease grows with each claim) is a resumed one: it ran, so it has work to undo.
+	started := was.Epoch > 0
+	for _, s := range was.Steps {
+		if s.State != StepPending {
+			started = true
 		}
 	}
-	return nil
+	if was.State != Paused && !(was.State == Pending && started) {
+		return
+	}
+	c, stop := context.WithTimeout(context.WithoutCancel(ctx), afterCancelTimeout)
+	defer stop()
+	// Read again: the hook runs only when this request ended the task (it may have been resumed meanwhile, and then a run owns it).
+	if now, err := e.store.Get(c, was.ID); err == nil && now.State == Failed && now.Error != nil && now.Error.Code == CodeCanceled {
+		e.onFail(c, now, now.Error)
+	}
 }
 
 // Resume makes a paused task pending; the next claim (or RunNow) runs it.
@@ -769,7 +948,7 @@ func (e *Engine) watchCancel(runCtx context.Context, id int64, def Definition, s
 				return
 			case <-tick.C:
 				now, err := e.store.Get(context.WithoutCancel(runCtx), id)
-				if err == nil && now.CancelRequested && def.Cancellable(now) {
+				if err == nil && now.CancelRequested && def.Cancellable(now) && !heldCommitted(def, now) {
 					interrupted.Store(true)
 					cancel()
 					return
@@ -778,6 +957,16 @@ func (e *Engine) watchCancel(runCtx context.Context, id int64, def Definition, s
 		}
 	}()
 	return stepCtx, interrupted, func() { close(done); cancel() }
+}
+
+// heldCommitted tells whether a task has passed its point of no return (Definition.Committed). A step of such a task is not interrupted by a cancel: it goes
+// forward and pauses itself.
+func heldCommitted(def Definition, t Task) bool {
+	if def.Committed == nil {
+		return false
+	}
+	_, ok := def.Committed(t)
+	return ok
 }
 
 // leaseGuard cancels a run whose lease may have expired. validUntil is the
@@ -853,6 +1042,9 @@ func (e *Engine) renewLoop(ctx context.Context, g *leaseGuard, l Lease, id int64
 }
 
 func (e *Engine) cancelTask(ctx context.Context, t Task, def Definition, next int) error {
+	if held, err := e.holdCommitted(ctx, t, len(t.Steps), "A cancel was requested; it does not undo a committed task."); held {
+		return err
+	}
 	var irrev []string
 	for _, s := range def.Steps[:next] {
 		if s.Irreversible {
@@ -891,6 +1083,9 @@ func (e *Engine) pause(ctx context.Context, t Task, i int, reason string) (bool,
 }
 
 func (e *Engine) fail(ctx context.Context, t Task, i int, st Step, te *Error) error {
+	if held, err := e.holdCommitted(ctx, t, i, te.Message); held {
+		return err
+	}
 	if i < len(t.Steps) {
 		if _, err := e.setStep(ctx, t, i, StepFailed, percent(i, len(t.Steps))); err != nil {
 			if leaseLost(err) {
@@ -914,6 +1109,14 @@ func (e *Engine) fail(ctx context.Context, t Task, i int, st Step, te *Error) er
 func (e *Engine) onFail(ctx context.Context, t Task, te *Error) {
 	if d, ok := e.def(t.Kind); ok && d.OnFail != nil {
 		t.State, t.Error = Failed, te
+		// The task in hand is the copy of the claim; the mark is what a step wrote during the run, so it is read as the store has it.
+		var fresh Task
+		if err := e.retry(context.WithoutCancel(ctx), func() (gerr error) { fresh, gerr = e.store.Get(context.WithoutCancel(ctx), t.ID); return gerr }); err == nil {
+			t.Mark = fresh.Mark
+		} else {
+			e.log.Error("reading the mark of a failed task", "task", t.ID, "error", err)
+			t.Mark = MarkUnreadable
+		}
 		d.OnFail(context.WithoutCancel(ctx), t)
 	}
 }
@@ -1000,11 +1203,17 @@ func (e *Engine) retry(ctx context.Context, f func() error) error {
 func percent(done, total int) float64 { return float64(done) * 100 / float64(total) }
 
 // clip bounds a message stored in a task row.
-func clip(s string) string {
-	if len(s) > 500 {
-		return s[:500] + "..."
+func clip(s string) string { return cutUTF8(s, 500) }
+
+// cutUTF8 shortens s to at most n bytes of text and a trailing "..." when it was cut; the cut never splits a UTF-8 sequence.
+func cutUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
 	}
-	return s
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + "..."
 }
 
 // Register adds a definition after the engine was built (a definition that
@@ -1087,6 +1296,10 @@ func (e *Engine) SubmitHeld(ctx context.Context, kind string, subj Subject, inpu
 // operation_in_progress (a rebalance refused by a change of the servers).
 func (e *ExcludedError) Problem() *problem.Problem {
 	switch {
+	case e.Kind == "database.import":
+		return problem.New(problem.OperationInProgress, "A rebalance, a drain or the addition or removal of a server ("+e.Other+") is unfinished; the import starts when it has ended.")
+	case e.Other == "database.import":
+		return problem.New(problem.OperationInProgress, "A database import is running; a rebalance, a drain and the addition or removal of a server wait until it has ended.")
 	case e.Other == "rebalance":
 		return problem.New(problem.RebalanceInProgress, "A rebalance is running; wait until it has finished.")
 	case e.Other == "server.failover" || e.Other == "replication.restorePreferredPrimaries":

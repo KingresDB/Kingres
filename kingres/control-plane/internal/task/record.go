@@ -77,7 +77,7 @@ func (e *Engine) ReserveID(ctx context.Context) int64 {
 }
 
 func progressOf(t Task) ([]byte, error) {
-	return json.Marshal(progressJSON{Detail: t.Detail, Percent: t.Percent, Steps: t.Steps})
+	return json.Marshal(progressJSON{Detail: t.Detail, Mark: t.Mark, Percent: t.Percent, Steps: t.Steps})
 }
 
 func (t Task) active() bool { return t.State.Active() }

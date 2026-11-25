@@ -222,6 +222,30 @@ func (m *MemStore) RequestCancel(_ context.Context, id int64, now time.Time) err
 	return nil
 }
 
+// RequestCancelIf implements CondCancelStore.
+func (m *MemStore) RequestCancelIf(_ context.Context, id int64, now time.Time, seen State, fail *Error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.tasks[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if t.State == Done || t.State == Failed || seen == Done || seen == Failed {
+		return ErrNotCancellable
+	}
+	if t.State != seen {
+		return ErrStateChanged
+	}
+	switch seen {
+	case Pending, Paused:
+		e := *fail
+		t.State, t.UpdatedAt, t.Error = Failed, now, &e
+	default:
+		t.CancelRequested = true
+	}
+	return nil
+}
+
 // List implements Store.
 func (m *MemStore) List(_ context.Context, limit int) ([]Task, error) {
 	m.mu.Lock()
@@ -261,6 +285,21 @@ func (m *MemStore) Import(ts []Task) {
 			m.next = t.ID
 		}
 	}
+}
+
+// SetMark implements MarkStore.
+func (m *MemStore) SetMark(_ context.Context, id int64, l Lease, mark string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, err := m.held(id, l)
+	if err != nil {
+		return err
+	}
+	if t.CancelRequested {
+		return ErrCancelRequested
+	}
+	t.Mark = mark
+	return nil
 }
 
 // SetDetail implements DetailStore.
@@ -344,6 +383,13 @@ func (m *MemStore) excludedLocked(kind string) error {
 		case schemaMoves[kind] && membershipOps[o.Kind] && o.State.Active():
 			return &ExcludedError{Kind: kind, Other: o.Kind}
 		case membershipOps[kind] && schemaMoves[o.Kind] && o.State.Active():
+			return &ExcludedError{Kind: kind, Other: o.Kind}
+		// Migration 0045: a database import and a rebalance (a drain is one), or the addition or the removal of a server, exclude each other.
+		case kind == "database.import" && o.Kind == "rebalance" && (o.State == Pending || o.State == Running):
+			return &ExcludedError{Kind: kind, Other: o.Kind}
+		case kind == "database.import" && (o.Kind == "server.add" || o.Kind == "server.remove" || o.Kind == "server.leave") && o.State.Active():
+			return &ExcludedError{Kind: kind, Other: o.Kind}
+		case (kind == "rebalance" || kind == "server.add" || kind == "server.remove" || kind == "server.leave") && o.Kind == "database.import" && o.State.Active():
 			return &ExcludedError{Kind: kind, Other: o.Kind}
 		}
 	}

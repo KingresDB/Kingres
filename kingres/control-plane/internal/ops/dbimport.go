@@ -31,11 +31,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/archive"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/importdb"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlshape"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
@@ -63,7 +65,7 @@ const (
 )
 
 // privatePrefix is the start of the name of the database that a task works in; the rest is the id of the task.
-const privatePrefix = "kingres_import_"
+const privatePrefix = importdb.Prefix
 
 // privateName is the name of the database that task id works in, and the only database that its failure hook may drop. The nonce is random and made at the request:
 // a role with CREATEDB cannot make a database under the name of a task that has not started.
@@ -90,6 +92,9 @@ type dbImportParams struct {
 	KeepOnFailure  bool              `json:"keepOnFailure"`
 	// Servers are the other servers of the cluster at the time of the request: the private database is made on each of them.
 	Servers []string `json:"servers,omitempty"`
+	// Origin is the server that accepted the request (the leader then). After a change of leader it is not among Servers; it is named so that the steps after the
+	// commit point finish the database there too.
+	Origin string `json:"origin,omitempty"`
 	// Nonce is the random part of the private name and of its marker.
 	Nonce string `json:"nonce"`
 }
@@ -244,6 +249,11 @@ func (o *Ops) StartDatabaseImport(ctx context.Context, actor string, req api.Imp
 	if up.Purpose != "databaseArchive" {
 		return task.Task{}, problem.Validation("The upload is not a database archive.", field("/uploadId", "the purpose of the upload is not databaseArchive", "conflict"))
 	}
+	// A repeat of the request of an import of this upload that is paused (committed or not) goes on with it, as it was started: the other fields of the repeat
+	// (expectedSha256, keepOnFailure, the acknowledgements) are not read.
+	if t, ok, err := o.resumeCommittedImport(ctx, up, req.Database); ok || err != nil {
+		return t, err
+	}
 	switch up.State {
 	case transfer.StateReceiving:
 		return task.Task{}, problem.New(problem.UploadIncomplete, "The upload has not received all its bytes.")
@@ -315,20 +325,97 @@ func (o *Ops) StartDatabaseImport(ctx context.Context, actor string, req api.Imp
 	if bad {
 		return task.Task{}, problem.New(problem.Forbidden, importDangerousText)
 	}
+	// The lock covers the check of the limits and the start of the task, not the link of the upload that follows (a store that is failing makes that wait long).
+	p := dbImportParams{UploadID: up.ID, Owner: who, Database: name, ExpectedSHA256: req.ExpectedSHA256, AckLedger: req.AcknowledgeLedgerRestart, ForeignKeys: fk,
+		KeepOnFailure: req.KeepOnFailure, Servers: ids(o.others(ctx)), Origin: o.ServerHost, Nonce: nonce}
+	t, err := o.startImportTask(ctx, st, actor, name, p)
+	if err != nil {
+		return task.Task{}, err
+	}
+	if err := o.linkImportTask(ctx, up.ID, t.ID); err != nil {
+		// Without the link a paused import cannot be resumed by a repeat of the request: the import does not go on. The task that was started is canceled (it has
+		// just begun, so it is undone as any import that is canceled) and the request fails. The janitor does not depend on the link (it also looks at the input of
+		// the unfinished import tasks), so even a task that could not be canceled keeps its archive.
+		if cerr := o.cancelUnlinkedImport(t.ID); cerr != nil {
+			return task.Task{}, problem.New(problem.ServiceUnavailable, fmt.Sprintf("The import could not be recorded for its upload and could not be canceled either: task %d may still be running. Find it among the tasks of kind database.import, cancel it, then repeat the request.", t.ID))
+		}
+		return task.Task{}, problem.New(problem.ServiceUnavailable, "The import could not be recorded for its upload, so it was canceled before it did any work that is kept. Repeat the request.").WithRetryAfter(5)
+	}
+	return t, nil
+}
+
+// importLinkTries and importLinkPause are how often, and how long apart, the id of the task is written into the upload row before the start is given up.
+var (
+	importLinkTries = 3
+	importLinkPause = 300 * time.Millisecond
+)
+
+// startImportTask checks the limits and starts the task under startMu. The unlock is deferred, so a panic in either call does not leave the lock held.
+func (o *Ops) startImportTask(ctx context.Context, st transfer.Settings, actor, name string, p dbImportParams) (task.Task, error) {
 	o.startMu.Lock()
 	defer o.startMu.Unlock()
 	if err := o.concurrency(ctx, st, actor); err != nil {
 		return task.Task{}, err
 	}
-	p := dbImportParams{UploadID: up.ID, Owner: who, Database: name, ExpectedSHA256: req.ExpectedSHA256, AckLedger: req.AcknowledgeLedgerRestart, ForeignKeys: fk,
-		KeepOnFailure: req.KeepOnFailure, Servers: ids(o.others(ctx)), Nonce: nonce}
-	t, err := o.StartTask(ctx, KindDatabaseImport, "database", name, p, actor)
-	if err != nil {
-		return task.Task{}, err
+	return o.StartTask(ctx, KindDatabaseImport, "database", name, p, actor)
+}
+
+// linkImportHook is called by a test before each write of the link; an error is the error of the write.
+var linkImportHook func() error
+
+// linkImportTask writes the id of the task into the record of its upload (the repeat of the request and the janitor find the task through it). The write is
+// tried again a few times and its error is returned when none works.
+func (o *Ops) linkImportTask(ctx context.Context, upload, id int64) error {
+	c := context.WithoutCancel(ctx)
+	var err error
+	for i := 0; i < importLinkTries; i++ {
+		if i > 0 {
+			time.Sleep(importLinkPause)
+		}
+		if h := linkImportHook; h != nil {
+			if err = h(); err != nil {
+				continue
+			}
+		}
+		if err = o.records().Apply(c, upload, transfer.Update{TaskID: &id}); err == nil {
+			return nil
+		}
+		if o.Log != nil {
+			o.Log.Warn("the id of an import task could not be written into its upload", "upload", upload, "task", id, "error", err)
+		}
 	}
-	tid := t.ID
-	_ = o.records().Apply(ctx, up.ID, transfer.Update{TaskID: &tid})
-	return t, nil
+	return err
+}
+
+// cancelImportHook is called by a test before each try to cancel a task that could not be linked; an error is the error of the try.
+var cancelImportHook func() error
+
+// cancelUnlinkedImport cancels a task that was started and could not be linked to its upload. The cancel is tried as often as the link; a task that has already
+// ended is as good as canceled. It returns the last error when none of the tries worked.
+func (o *Ops) cancelUnlinkedImport(id int64) error {
+	eng := o.Engine()
+	if eng == nil {
+		return errors.New("the task engine is not running")
+	}
+	var err error
+	for i := 0; i < importLinkTries; i++ {
+		if i > 0 {
+			time.Sleep(importLinkPause)
+		}
+		if h := cancelImportHook; h != nil {
+			if err = h(); err != nil {
+				continue
+			}
+		}
+		// ErrNotCancellable counts as success only because the cancel guard of an import depends on the state alone: the task has ended, so there is nothing left to cancel.
+		if err = eng.Cancel(context.WithoutCancel(o.bg()), id); err == nil || errors.Is(err, task.ErrNotCancellable) {
+			return nil
+		}
+	}
+	if o.Log != nil {
+		o.Log.Error("an import that could not be linked to its upload could not be canceled", "task", id, "error", err)
+	}
+	return err
 }
 
 const importDangerousText = "An import runs the statements of the archive as the signed-in role, so it is refused for a role with the SUPERUSER, REPLICATION or BYPASSRLS attribute or with access to server files, programs or logs; sign in as another role."
@@ -365,38 +452,49 @@ func (o *Ops) dbImportDefinition() task.Definition {
 				{Name: stepMCheck, Run: importStep(stepMCheck, o.stepIMCheck)},
 				{Name: stepMCreate, Run: importStep(stepMCreate, o.stepIMCreate)},
 			}
-			steps = append(steps, o.perServer(p.Servers, "Create the private database on server %s", func(ctx context.Context, env *task.Env, s string) error {
-				if h := ImportHook; h != nil {
-					if err := h(ctx, "Create the private database on server "+s, ""); err != nil {
-						return err
-					}
-				}
-				return o.stepIMCreateOn(ctx, env, s)
-			})...)
-			return append(steps,
+			for _, s := range p.Servers {
+				s := s
+				name := "Create the private database on server " + s
+				steps = append(steps, task.Step{Name: name, Run: func(ctx context.Context, env *task.Env) error {
+					return o.importOnServer(ctx, env, s, strings.ToLower(name), func() error {
+						if h := ImportHook; h != nil {
+							if err := h(ctx, name, ""); err != nil {
+								return err
+							}
+						}
+						return o.stepIMCreateOn(ctx, env, s)
+					})
+				}})
+			}
+			steps = append(steps,
 				task.Step{Name: stepMInstall, Run: importStep(stepMInstall, o.stepIMInstall)},
 				task.Step{Name: stepMFunctions, Run: importStep(stepMFunctions, o.stepIMFunctions)},
-				task.Step{Name: stepMTables, Interruptible: true, Run: importStep(stepMTables, o.stepIMTables)},
+				task.Step{Name: stepMTables, Run: importStep(stepMTables, o.stepIMTables)},
 				task.Step{Name: stepMDistribute, Run: importStep(stepMDistribute, o.stepIMDistribute)},
-				task.Step{Name: stepMViews, Interruptible: true, Run: importStep(stepMViews, o.stepIMViews)},
-				task.Step{Name: stepMData, Interruptible: true, Run: importStep(stepMData, o.stepIMData)},
-				task.Step{Name: stepMPost, Interruptible: true, Run: importStep(stepMPost, o.stepIMPost)},
+				task.Step{Name: stepMViews, Run: importStep(stepMViews, o.stepIMViews)},
+				task.Step{Name: stepMData, Run: importStep(stepMData, o.stepIMData)},
+				task.Step{Name: stepMPost, Run: importStep(stepMPost, o.stepIMPost)},
 				task.Step{Name: stepMSeq, Run: importStep(stepMSeq, o.stepIMSequences)},
 				task.Step{Name: stepMLedger, Run: importStep(stepMLedger, o.stepIMLedger)},
 				task.Step{Name: stepMVerify, Run: importStep(stepMVerify, o.stepIMVerify)},
 				task.Step{Name: stepMRename, Run: importStep(stepMRename, o.stepIMRename)},
-			), nil
-		},
-		OnFail: o.importOnFailHook,
-		// A cancel is accepted until the sequences are set (design: until step 11 starts); after it the task rolls forward only.
-		Cancellable: func(t task.Task) bool {
-			for _, n := range []string{stepMSeq, stepMLedger, stepMVerify, stepMRename} {
-				switch stepState(t, n) {
-				case task.StepRunning, task.StepDone, task.StepSkipped:
-					return false
-				}
+			)
+			// A cancel is accepted in every step before the commit point of the last one, and it reaches a step that waits (for a server that is gone, for a long
+			// statement): every step is interruptible. A step of a committed task is not interrupted (the engine leaves it to the step, which pauses).
+			for i := range steps {
+				steps[i].Interruptible = true
 			}
-			return true
+			return steps, nil
+		},
+		OnFail:       o.importOnFailHook,
+		Committed:    importCommittedNote,
+		CanceledNote: o.importCancelNote,
+		// A cancel of an import is accepted until its commit point (the mark of the last step), in every step: the running step sees it and the import is undone as
+		// after any failure before that point. A task that passed the commit point is cancellable while it runs or waits to run, and the cancel then pauses it or ends
+		// it without undoing anything (see Committed). A PAUSED import is always cancellable, committed or not: it is the exit of an import that cannot be resumed
+		// (a server that is gone, a role that was dropped). A finished import is not.
+		Cancellable: func(t task.Task) bool {
+			return t.State != task.Done && t.State != task.Failed
 		},
 	}
 }

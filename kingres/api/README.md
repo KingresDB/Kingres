@@ -412,6 +412,7 @@ This revision is additive:
 
 - `AuditAction` describes the event. The command is not a REST operation.
 - `abandonMapGroupBootstrap`: the text of `lostServerId` now says "seen dead", who receives the proof, and the errors (409 or 503) of a declaration that releases nothing.
+- `importDatabase`, `addServer`, `updateServer`, `removeServer`, `drainServer` and `startRebalance` say that a database import that is pending, running or paused and a rebalance (a drain is one), the addition or the removal of a server, and a change of `shouldHaveShards` refuse each other with 409 `operation_in_progress`, and that the buckets of a kept private database of a failed import keep a server from being drained or removed (`server_owns_buckets` names the database). Descriptions only: no member, code or role changes, the contract stays 0.34.0.
 
 ### 0.33.0
 

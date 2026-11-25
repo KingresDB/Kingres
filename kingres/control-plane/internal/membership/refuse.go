@@ -31,6 +31,8 @@ type removalFacts struct {
 	HostsMapGroup bool
 	// Holds lists the databases in which the server holds buckets.
 	Holds []bucketHold
+	// Private names, among Holds, the databases that are the kept private database of a failed import.
+	Private []string
 	// RebalanceRunning: a rebalance task is unfinished.
 	RebalanceRunning bool
 	// OperationRunning: another task of this server (add, remove, leave) is
@@ -60,13 +62,17 @@ func decideRemoval(id string, self bool, f removalFacts) *problem.Problem {
 	case len(f.Holds) > 0:
 		parts := make([]string, len(f.Holds))
 		total := 0
+		note := ""
+		if len(f.Private) > 0 {
+			note = fmt.Sprintf(" %s the kept private database of a failed import (keepOnFailure): drop it (DELETE /databases/{name}) if the import is not wanted any more.", strings.Join(f.Private, ", "))
+		}
 		for i, h := range f.Holds {
 			parts[i] = fmt.Sprintf("%q (%d)", h.DB, h.Buckets)
 			total += h.Buckets
 		}
 		return problem.New(problem.ServerOwnsBuckets, fmt.Sprintf(
-			"%s still holds %d bucket copies in the databases %s. Rebalance them away from it first: PATCH /servers/{serverId} with shouldHaveShards false, then POST /rebalance.",
-			who, total, strings.Join(parts, ", ")))
+			"%s still holds %d bucket copies in the databases %s. Rebalance them away from it first: PATCH /servers/{serverId} with shouldHaveShards false, then POST /rebalance.%s",
+			who, total, strings.Join(parts, ", "), note))
 	case f.RebalanceRunning:
 		return problem.New(problem.RebalanceInProgress, "A rebalance is running; wait until it has finished.")
 	case f.OperationRunning:

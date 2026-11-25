@@ -141,3 +141,43 @@ func TestMemStoreExcludesASecondFailoverClassTask(t *testing.T) {
 		t.Fatalf("a rebalance during a failover: %v", err)
 	}
 }
+
+// A database import and a rebalance (a drain), or the removal of a server, exclude each other in the memory store as in the database (migration 0045).
+func TestMemStoreExcludesAnImportAndARebalanceOrARemoval(t *testing.T) {
+	create := func(st *task.MemStore, kind, typ, subject string, state task.State) error {
+		_, err := st.Create(context.Background(), task.Task{Kind: kind, SubjectType: typ, SubjectID: subject, State: state})
+		return err
+	}
+	var x *task.ExcludedError
+	for _, state := range []task.State{task.Pending, task.Running, task.Paused} {
+		st := task.NewMemStore()
+		if err := create(st, "database.import", "database", "shop", state); err != nil {
+			t.Fatal(err)
+		}
+		for _, k := range []string{"rebalance", "server.add", "server.remove", "server.leave"} {
+			err := create(st, k, "server", "s1-"+k, task.Pending)
+			if !errors.As(err, &x) || x.Other != "database.import" || x.Problem().Code != "operation_in_progress" {
+				t.Errorf("%s while an import is %s: %v", k, state, err)
+			}
+		}
+		if err := create(st, "server.failover", "server", "s2", task.Pending); err != nil {
+			t.Errorf("server.failover while an import is %s: %v", state, err)
+		}
+	}
+	for _, k := range []string{"rebalance", "server.add", "server.remove", "server.leave"} {
+		st := task.NewMemStore()
+		if err := create(st, k, "server", "s1", task.Running); err != nil {
+			t.Fatal(err)
+		}
+		if err := create(st, "database.import", "database", "shop", task.Pending); !errors.As(err, &x) || x.Other != k || x.Problem().Code != "operation_in_progress" {
+			t.Errorf("an import while %s runs: %v", k, err)
+		}
+	}
+	st := task.NewMemStore()
+	if err := create(st, "rebalance", "server", "s1", task.Paused); err != nil {
+		t.Fatal(err)
+	}
+	if err := create(st, "database.import", "database", "shop", task.Pending); err != nil {
+		t.Errorf("an import while a rebalance is paused: %v", err)
+	}
+}

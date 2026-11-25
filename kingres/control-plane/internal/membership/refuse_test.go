@@ -83,3 +83,22 @@ func TestBucketRefusalNamesDatabasesAndCounts(t *testing.T) {
 		}
 	}
 }
+
+// The buckets that a kept private database of a failed import holds keep a server from being removed: the refusal names that database and says to drop it (a rebalance
+// does not move its buckets), and a database that only has a name under the prefix gets no such hint.
+func TestBucketRefusalNamesAKeptPrivateDatabase(t *testing.T) {
+	f := ok()
+	f.Holds = []bucketHold{{"orders", 12}, {"kingres_import_15_a8ad1b646370", 3}}
+	f.Private = []string{"kingres_import_15_a8ad1b646370"}
+	p := decideRemoval("db2", false, f)
+	if p == nil || p.Code != problem.ServerOwnsBuckets {
+		t.Fatalf("not refused: %v", p)
+	}
+	if !strings.Contains(p.Detail, "kingres_import_15_a8ad1b646370 the kept private database of a failed import") || !strings.Contains(p.Detail, "drop it") {
+		t.Errorf("detail %q does not name the kept private database", p.Detail)
+	}
+	f.Private = nil
+	if p := decideRemoval("db2", false, f); p == nil || strings.Contains(p.Detail, "private database") {
+		t.Errorf("a database of a client under the prefix gets the hint: %v", p)
+	}
+}
