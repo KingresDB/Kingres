@@ -80,12 +80,16 @@ func TestDatabaseExportAndDrainAtTheSameTime(t *testing.T) {
 		t.Fatal(err)
 	}
 	schemas := []string{"dr_a", "dr_b"}
+	// A schema is made empty and distributed first: the rows of a schema decide the shard group it is distributed to (a schema that holds rows on the leader
+	// goes to the group of the leader, and asking for another group is refused), so the rows are written after, through the leader, to the owner.
 	for _, s := range schemas {
-		skMake(t, c, s, schemaRows)
+		skExec(t, c, "sk", `CREATE SCHEMA `+s)
+		skExec(t, c, "sk", `CREATE TABLE `+s+`.t (id bigint PRIMARY KEY, v text)`)
 		l.WaitTaskDone(clustertest.TaskID(l.Expect(202, "PUT", "/databases/sk/schemas/"+s+"/distribution", map[string]any{"shardGroupId": victimGroup})), 3*time.Minute)
 		if host, _ := sdOwner(t, l, s); host != victim.Host {
 			t.Fatalf("schema %s is on %s, want %s", s, host, victim.Host)
 		}
+		skExec(t, c, "sk", `INSERT INTO `+s+`.t SELECT g, repeat('r', 100) FROM generate_series(1, $1) g`, schemaRows)
 	}
 	tables := []string{"public.items", "dr_a.t", "dr_b.t"}
 	want := map[string]int64{"public.items": itemRows, "dr_a.t": schemaRows, "dr_b.t": schemaRows}
