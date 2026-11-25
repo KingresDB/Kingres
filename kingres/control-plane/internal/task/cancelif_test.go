@@ -187,13 +187,16 @@ func TestAClearedCancelRequestDoesNotStay(t *testing.T) {
 		t.Run(m.name, func(t *testing.T) {
 			clk := newClock()
 			st := m.make(t, clk)
-			var before, after bool
+			var before, after, intruderCleared, stillSet bool
 			var e *task.Engine
 			d := task.Definition{Kind: "test.clear", Steps: []task.Step{{Name: "s", Run: func(ctx context.Context, env *task.Env) error {
 				if err := e.Cancel(ctx, env.Task.ID); err != nil {
 					return err
 				}
 				before = env.CancelRequested(ctx)
+				// a run that does not hold the lease cannot clear the request, and it stays
+				intruderCleared = st.(task.CancelClearStore).ClearCancel(ctx, env.Task.ID, task.Lease{Holder: "intruder", Epoch: 99}) == nil
+				stillSet = env.CancelRequested(ctx)
 				if err := env.ClearCancel(ctx); err != nil {
 					return err
 				}
@@ -202,19 +205,15 @@ func TestAClearedCancelRequestDoesNotStay(t *testing.T) {
 			}}}}
 			e = engine(t, st, "A", clk, d)
 			ctx := context.Background()
-			tk, _ := e.Submit(ctx, "test.clear", task.Subject{Type: "x", ID: "1"}, nil, "u")
+			_, _ = e.Submit(ctx, "test.clear", task.Subject{Type: "x", ID: "1"}, nil, "u")
 			if ran, err := e.RunOnce(ctx); !ran || err != nil {
 				t.Fatalf("the run: %v %v", ran, err)
 			}
-			if !before || after {
-				t.Fatalf("the request before the clear: %v, after: %v", before, after)
+			if !before || after || intruderCleared || !stillSet {
+				t.Fatalf("the request before the clear: %v, after the clear of an intruder: cleared %v and still set %v, after the clear of the run: %v", before, intruderCleared, stillSet, after)
 			}
-			cc, ok := st.(task.CancelClearStore)
-			if !ok {
+			if _, ok := st.(task.CancelClearStore); !ok {
 				t.Fatal("the store cannot clear a request")
-			}
-			if err := cc.ClearCancel(ctx, tk.ID, task.Lease{Holder: "intruder", Epoch: 99}); err == nil {
-				t.Error("a request was cleared without the lease")
 			}
 		})
 	}
