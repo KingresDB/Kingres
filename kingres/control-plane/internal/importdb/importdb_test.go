@@ -6,6 +6,7 @@ package importdb
 import (
 	"context"
 	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pgtest"
@@ -73,7 +74,9 @@ func TestListOnARealInstance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{forged, unmarked, "postgres", "shop", wrongMarker}
+	// the order is the collation of the instance, so the names are compared as a set
+	want := []string{forged, unmarked, wrongMarker, "postgres", "shop"}
+	sort.Strings(got)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("List = %v, want %v", got, want)
 	}
