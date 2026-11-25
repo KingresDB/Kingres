@@ -135,7 +135,14 @@ const failoverUnfinishedSQL = `SELECT count(*) FROM kingres_cp.task WHERE kind I
 // not over: a standby that is promoted before the system catalog says so would pass the comparison. The failure goes the way of every failure of the task: the
 // private database is removed and the operation is repeated. db is the private database, or the database at its final name when the check is made after the rename.
 func (o *Ops) checkImportCatalog(ctx context.Context, db string) error {
-	return o.compareImportCatalog(ctx, db)
+	return o.compareImportCatalog(ctx, db, false)
+}
+
+// checkImportCatalogEarly is the check right after the private catalog was made (the registration of the servers and the seed): a mismatch then is a cluster whose
+// primaries are not where the import registered them (a switchover or a failover left a primary away from its preferred server), and the import fails at once instead
+// of after the load.
+func (o *Ops) checkImportCatalogEarly(ctx context.Context, priv string) error {
+	return o.compareImportCatalog(ctx, priv, true)
 }
 
 // serverSetDifference lists, in words, the servers that joined or left the cluster since the import started (started is the list that the import was made for, now the
@@ -179,7 +186,7 @@ func (o *Ops) checkImportServers(ctx context.Context, started []string) error {
 	return nil
 }
 
-func (o *Ops) compareImportCatalog(ctx context.Context, priv string) error {
+func (o *Ops) compareImportCatalog(ctx context.Context, priv string, early bool) error {
 	pc, err := o.Service.ServiceConn(ctx, priv)
 	if err != nil {
 		return transfer.Errorf(transfer.CodeSessionLost, true, "the service role cannot connect to the private database now; repeat the operation")
@@ -212,6 +219,10 @@ func (o *Ops) compareImportCatalog(ctx context.Context, priv string) error {
 		return transfer.Errorf(transfer.CodeLeaderChanged, true, "a failover or a planned switchover is not over, so the primaries of the cluster are not settled; the private database is removed, repeat the operation when it has ended")
 	}
 	if d := catalogDifferences(pn, sn); len(d) > 0 {
+		if early {
+			return transfer.Errorf(transfer.CodeLeaderChanged, true, "the primaries of the cluster are not the ones that the import registered (%s); if a failover or a switchover moved a primary away from its preferred server, restore the preferred primaries first; the private database is removed, repeat the operation",
+				safeSentence(strings.Join(d, "; ")))
+		}
 		return transfer.Errorf(transfer.CodeLeaderChanged, true, "a primary of the cluster changed during the import (%s); the private database is removed, repeat the operation",
 			safeSentence(strings.Join(d, "; ")))
 	}
@@ -289,4 +300,39 @@ func (o *Ops) recheckImportCatalog(ctx context.Context, db string, servers []str
 		return transfer.Errorf(te.Code, te.Retryable, "%s%s", te.Error(), note)
 	}
 	return fmt.Errorf("%w%s", err, note)
+}
+
+// readSystemNodes reads kingres.node of the system database (the primary of the map group is the source of truth for every database).
+func (o *Ops) readSystemNodes(ctx context.Context) ([]catalogNode, error) {
+	sc, err := o.Service.ServiceConn(ctx, sysdb.Database)
+	if err != nil {
+		return nil, transfer.Errorf(transfer.CodeSessionLost, true, "the service role cannot connect to the system database now; repeat the operation")
+	}
+	sn, hasSys, err := readCatalogNodes(ctx, sc)
+	_ = sc.Close(context.WithoutCancel(ctx))
+	if err != nil {
+		return nil, transfer.SafeError(err)
+	}
+	if !hasSys {
+		return nil, transfer.Errorf(transfer.CodeVerification, false, "the system database has no shard catalog, so the servers cannot be registered in the private database")
+	}
+	return sn, nil
+}
+
+// primariesToRegister are the nodes that the import registers in its private catalog besides this server (init_cluster registers it): the primaries that the system
+// catalog names now, on the servers that the import was made for. A cluster that was switched over has a primary on another instance of a server than its home
+// instance, and that instance (host and port) is the one that every database of the cluster names, so it is the one that the private catalog must name as well.
+func primariesToRegister(system []catalogNode, servers []string, self string) []catalogNode {
+	want := map[string]bool{}
+	for _, s := range servers {
+		want[s] = true
+	}
+	var out []catalogNode
+	for _, n := range system {
+		if n.Role == "primary" && n.Host != self && want[n.Host] {
+			out = append(out, n)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].addr() < out[j].addr() })
+	return out
 }

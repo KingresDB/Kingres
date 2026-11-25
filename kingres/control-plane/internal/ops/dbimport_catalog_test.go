@@ -232,3 +232,67 @@ func TestRecheckImportCatalogAfterTheRename(t *testing.T) {
 		t.Fatalf("a server that joined: %v (reverted %d)", err, reverted)
 	}
 }
+
+// The import registers the primaries as the system catalog names them (host and port), not the home port of each server: on a cluster that was switched over a primary
+// runs on another instance of its server.
+func TestPrimariesToRegister(t *testing.T) {
+	n := func(h string, p int32, r string) catalogNode {
+		return catalogNode{Host: h, Port: p, Role: r, Active: true, Should: true}
+	}
+	sys := []catalogNode{
+		n("a", 5432, "primary"), n("a", 5433, "standby"), // this server
+		n("b", 5432, "standby"), n("b", 5433, "primary"), // switched over: the primary of the group of b is the second instance
+		n("c", 5432, "primary"), n("c", 5434, "standby"),
+		n("d", 5432, "primary"), // not a server of the import
+	}
+	got := primariesToRegister(sys, []string{"b", "c"}, "a")
+	var addrs []string
+	for _, x := range got {
+		addrs = append(addrs, x.addr())
+	}
+	if strings.Join(addrs, ",") != "b:5433,c:5432" {
+		t.Fatalf("registered %v, want b:5433,c:5432 (the primaries of the system catalog on the servers of the import, never this server or another one)", addrs)
+	}
+	if got := primariesToRegister(sys, nil, "a"); len(got) != 0 {
+		t.Fatalf("a single server: %v", got)
+	}
+}
+
+// Right after the registration the private catalog is compared with the system catalog: a cluster whose primary is not on the home instance of a server fails the import
+// at once, with a message that names the restore of the preferred primaries, and a catalog that was registered as the system catalog names the primaries passes.
+func TestCheckImportCatalogEarlyOnASwitchedOverCluster(t *testing.T) {
+	_, c, o := newGuardInstance(t)
+	pgExecAll(t, c, "create database "+sysdb.Database, "create database "+privDB)
+	node := "create table kingres.node (node_id int, group_id int, host text, port int, role text, is_active bool default true, should_have_shards bool default true, weight float8)"
+	mk := func(db string, rows ...string) {
+		d := pgConnect(t, o, db)
+		pgExecAll(t, d, "create schema kingres", node)
+		for _, r := range rows {
+			pgExecAll(t, d, "insert into kingres.node (node_id, group_id, host, port, role) values "+r)
+		}
+	}
+	sys := pgConnect(t, o, sysdb.Database)
+	pgExecAll(t, sys, "create schema kingres_cp", "create table kingres_cp.task (kind text, state text)")
+	// the system catalog after a switchover: the primary of the group of h2 is its second instance
+	mk(sysdb.Database, "(1, 0, 'h1', 5432, 'primary')", "(2, 1, 'h2', 5432, 'standby')", "(3, 1, 'h2', 5433, 'primary')")
+	// the private catalog as the import made it by the home ports (the old way)
+	mk(privDB, "(1, 0, 'h1', 5432, 'primary')", "(2, 1, 'h2', 5432, 'primary')")
+	ctx := context.Background()
+	err := o.checkImportCatalogEarly(ctx, privDB)
+	var te *transfer.Error
+	if !errors.As(err, &te) || te.Code != transfer.CodeLeaderChanged || !te.Retryable || !strings.Contains(te.Error(), "restore the preferred primaries") ||
+		!strings.Contains(te.Error(), "h2:5432") || !strings.Contains(te.Error(), "h2:5433") || strings.Contains(te.Error(), "changed during the import") {
+		t.Fatalf("home ports on a switched-over cluster: %v", err)
+	}
+	// registered as the system catalog names the primaries
+	d := pgConnect(t, o, privDB)
+	pgExecAll(t, d, "update kingres.node set port = 5433 where host = 'h2'")
+	if err := o.checkImportCatalogEarly(ctx, privDB); err != nil {
+		t.Fatalf("the primaries of the system catalog: %v", err)
+	}
+	// readSystemNodes reads the same catalog that the registration is made from
+	nodes, err := o.readSystemNodes(ctx)
+	if err != nil || len(nodes) != 3 {
+		t.Fatalf("readSystemNodes: %v %v", nodes, err)
+	}
+}
