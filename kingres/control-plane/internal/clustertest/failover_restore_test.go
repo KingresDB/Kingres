@@ -72,10 +72,24 @@ func TestSwitchoverAndBack(t *testing.T) {
 	})
 	// The plan of the restore. The old primary is a ready standby that is registered in the catalog only after its rebuild has been
 	// noticed: until then the group is skipped (preferredNotReady), so the plan is asked until it lists the group.
-	until(t, 5*time.Minute, "the plan of the restore to list the group and to be possible", func() bool {
+	until(t, 5*time.Minute, "the plan of the restore to list the group, to be possible and to show the standby caught up", func() bool {
 		st, plan = leader.Do("POST", "/replication/restore-preferred-primaries", map[string]any{"dryRun": true}, nil)
 		gs, _ := plan["groups"].([]any)
-		return st == 200 && len(gs) == 1 && plan["canProceed"] == true
+		if st != 200 || len(gs) != 1 || plan["canProceed"] != true {
+			return false
+		}
+		// The old primary has only just become a standby: the restore stops the new primary and waits for the standby to replay its position (a few
+		// seconds); a standby that is still behind makes the switchover of the group refuse (standby_behind), the task ends done with the outcome partial and
+		// the primary stays where it is. So the restore is requested only when the plan shows no lag.
+		cands, _ := gs[0].(map[string]any)["candidates"].([]any)
+		for _, c := range cands {
+			cm, _ := c.(map[string]any)
+			if cm["chosen"] == true {
+				lag, _ := cm["lagBytes"].(float64)
+				return cm["readable"] == true && lag == 0
+			}
+		}
+		return false
 	})
 	if plan["kind"] != "restorePreferredPrimaries" || plan["mode"] != "restore" || plan["serverId"] != nil || plan["canProceed"] != true {
 		t.Fatalf("the plan of the restore: %v", plan)
@@ -97,6 +111,14 @@ func TestSwitchoverAndBack(t *testing.T) {
 		}
 		return false
 	})
+	defer func() {
+		if t.Failed() {
+			// A restore whose group switchover was refused or rolled back ends done with the outcome partial: the task and the status say which code.
+			_, body := leader.Do("GET", fmt.Sprintf("/tasks/%v", rid), nil, nil)
+			t.Logf("the restore task %v: %v", rid, body)
+			t.Logf("the failover status after the restore: %v", leader.Expect(200, "GET", "/failover", nil))
+		}
+	}()
 	swWait(t, e, rid, 8*time.Minute)
 	if host := swPrimaryHost(t, leader, g); host != old.Host {
 		t.Fatalf("after the restore the primary of group %d is on %s, want %s", g, host, old.Host)

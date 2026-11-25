@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -86,6 +87,7 @@ type Manager struct {
 	log                 *slog.Logger
 	startTO             time.Duration
 	stopTO              time.Duration
+	serviceStopping     atomic.Bool // StopForShutdown was called: no start follows a wait for a shutdown
 	gate                func(id int) error
 	// runner replaces the execution of the PostgreSQL programs in a test (nil: run them).
 	runner func(ctx context.Context, prog string, args ...string) (string, error)
@@ -372,6 +374,9 @@ func (m *Manager) start(ctx context.Context, id int) error {
 		}
 		if err := m.waitShutdown(ctx, id); err != nil {
 			return err
+		}
+		if m.serviceStopping.Load() {
+			return errors.New("instance: the service is stopping; the instance was not started")
 		}
 	}
 	if m.gate != nil {
@@ -746,6 +751,7 @@ func (m *Manager) StopImmediate(ctx context.Context, id int) error {
 // that moment can no longer cost a write that was acknowledged. Stopping a
 // stopped instance is not an error and calls nothing.
 func (m *Manager) StopForShutdown(ctx context.Context, id int, requested func(postmaster string)) error {
+	m.serviceStopping.Store(true) // a start that is waiting for a shutdown must not bring an instance back during the stop of the service
 	if up, err := m.Running(ctx, id); err != nil || !up {
 		return err
 	}
@@ -801,16 +807,40 @@ func (m *Manager) dataDirOf(id int) string {
 	return d
 }
 
-// postmasterStopping reports that postmaster.pid says the postmaster is shutting down. The last line of the file is the status of the postmaster
-// ("starting", "ready", "standby", "stopping"); it is written by both majors and changes to "stopping" when the shutdown begins, before the
-// shutdown checkpoint, while pg_controldata only says "shutting down" once the checkpoint runs.
+// postmasterStopping reports that postmaster.pid says the postmaster is shutting down. The file has the pid, the data directory, the start time, the
+// port, the socket directory, the listen addresses, the shared memory key and, as line 8, the status ("starting", "ready", "standby", "stopping", padded
+// to 8 characters). Both majors write it; the status changes to "stopping" when the shutdown begins, before the shutdown checkpoint, while
+// pg_controldata only says "shutting down" once the checkpoint runs. A file with fewer than 8 lines (a postmaster that is still starting) is not
+// stopping, and neither is a file whose pid is a zombie or another program (pg_ctl status counts those as running, and a wait for them never ends).
 func postmasterStopping(data string) bool {
 	b, err := os.ReadFile(filepath.Join(data, "postmaster.pid")) //nolint:gosec // path below the manager root
 	if err != nil {
 		return false
 	}
-	lines := strings.Split(strings.TrimRight(string(b), "\r\n"), "\n")
-	return len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "stopping"
+	lines := strings.Split(strings.ReplaceAll(string(b), string(rune(13)), ""), string(rune(10)))
+	if len(lines) < 8 || strings.TrimSpace(lines[7]) != "stopping" {
+		return false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(lines[0]))
+	return err == nil && pid > 0 && !notAPostmaster(pid)
+}
+
+// notAPostmaster reports, from /proc where there is one, that the process pid is a zombie or runs another program than PostgreSQL. Where /proc cannot be
+// read nothing is known and the answer is no.
+func notAPostmaster(pid int) bool {
+	stat, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat") //nolint:gosec // a fixed prefix and a number
+	if err != nil {
+		return false
+	}
+	s := string(stat)
+	if i := strings.LastIndex(s, ")"); i >= 0 && i+2 < len(s) && s[i+2] == 'Z' {
+		return true
+	}
+	cmd, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cmdline") //nolint:gosec // a fixed prefix and a number
+	if err != nil {
+		return false
+	}
+	return !strings.Contains(string(cmd), "postgres") && !strings.Contains(string(cmd), "postmaster")
 }
 
 // waitShutdown waits until the instance that is shutting down is gone (the pid file removed), for as long as a stop is allowed to take.

@@ -279,6 +279,9 @@ func (r *Runner) drain(ctx context.Context, env *task.Env, sc *stepCtx) error {
 // of the map group is made to cover it before the stop, because the store of that task is the instance that is being stopped.
 const DemoteCallBound = 90 * time.Second
 
+// MapRollbackBound bounds the rollback of the map group after a stop that failed or was not clean.
+const MapRollbackBound = 4 * time.Minute
+
 // stopClean marks the position, waits until the new primary has replayed the mark, and stops the old primary with a fast shutdown (design
 // S4 and S5). The call that stops it releases the lease and answers the position of the shutdown checkpoint.
 func (r *Runner) stopClean(ctx context.Context, env *task.Env, sc *stepCtx) error {
@@ -348,16 +351,25 @@ func (r *Runner) stopClean(ctx context.Context, env *task.Env, sc *stepCtx) erro
 		defer restore() // a safety net: the call below is the normal place, and the restore runs once
 	}
 	ans, err := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "fast", ExpectedTerm: run.ExpectedTerm, Candidate: sc.candidateOf(nw)})
-	restoreLease() // the stop is over, however it ended: the lease is brought back to its normal length at once, not after the verdict wait or the rollback
+	// The rollback of the map group runs on a context that the lease guard cannot cancel (its store is the instance that was stopped, so the guard is not
+	// raised again), with a bound of its own: starting the old primary again may wait for a postmaster that is still shutting down. The lease stays extended
+	// until the rollback has returned (the deferred restore); on the clean path it is restored at once, below.
+	rbctx := ctx
+	if sc.group == 0 {
+		var cancelRB context.CancelFunc
+		rbctx, cancelRB = context.WithTimeout(context.WithoutCancel(ctx), MapRollbackBound)
+		defer cancelRB()
+	}
 	if err != nil {
 		if IsCode(err, "stale_term") {
-			return sc.rollbackFailed(ctx, CodeSuperseded, false, "another failover changed the catalog term of the cluster")
+			return sc.rollbackFailed(rbctx, CodeSuperseded, false, "another failover changed the catalog term of the cluster")
 		}
-		return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the old primary of shard group %d could not be stopped cleanly: %v", sc.group, err)
+		return sc.rollbackFailed(rbctx, CodeSwitchoverUnproven, true, "the old primary of shard group %d could not be stopped cleanly: %v", sc.group, err)
 	}
 	if !ans.Stopped || ans.ClusterState != "shut down" || ans.Checkpoint == "" || !ans.Released {
-		return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the stop of the old primary of shard group %d was not clean (state %q, released %v)", sc.group, ans.ClusterState, ans.Released)
+		return sc.rollbackFailed(rbctx, CodeSwitchoverUnproven, true, "the stop of the old primary of shard group %d was not clean (state %q, released %v)", sc.group, ans.ClusterState, ans.Released)
 	}
+	restoreLease() // the clean stop is over: the lease is brought back to its normal length at once, not after the verdict wait
 	sc.event(ctx, "stoppedClean", map[string]any{"checkpoint": ans.Checkpoint, "clusterState": ans.ClusterState})
 	if sc.group == 0 {
 		// The old leader is stopped: nothing can be recorded by this task until the new leader's engine claims it. The proof goes to the candidate, which

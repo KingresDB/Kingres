@@ -1167,3 +1167,41 @@ func TestTheRollbackOfALeaseThatCannotBeLengthenedGivesTheBootstrapUpAndResumesT
 		t.Errorf("the old leader was not resumed:\n%s", log)
 	}
 }
+
+// The step context of the map group is cancelled by the lease guard once the stop has failed (its store is the instance that was stopped). The rollback
+// of a stop that failed or was not clean must still give the bootstrap up and resume the old leader: it runs on a context of its own.
+func TestTheRollbackOfAFailedStopOfTheMapGroupOutlivesTheContextOfTheStep(t *testing.T) {
+	for name, set := range map[string]func(w *world){
+		"the stop fails":      func(w *world) { w.stopErr = errors.New("the stop failed") },
+		"the stop is unclean": func(w *world) { w.stopState = "in production" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := mapWorld()
+			set(w)
+			r := w.runner()
+			w.fakeClock(r)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			w.onDemote = cancel // the guard cancels the step as the stop is asked for
+			raw, _ := json.Marshal(mapGracefulInput())
+			steps, err := r.steps(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, s := range steps {
+				err := s.Run(ctx, &task.Env{Task: task.Task{ID: 1, Input: raw}})
+				var sk *task.SkipError
+				if errors.As(err, &sk) {
+					continue
+				}
+				if err != nil {
+					break
+				}
+			}
+			log := strings.Join(w.log, "\n")
+			if w.count("map-abandon s2") != 1 || w.count("resume s1") < 1 {
+				t.Errorf("the rollback did not run on a context of its own:\n%s", log)
+			}
+		})
+	}
+}
