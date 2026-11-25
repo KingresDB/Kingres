@@ -5,6 +5,7 @@ package ops
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -21,8 +22,8 @@ import (
 // follows its catalog afterwards but the next failover, which then expects the old primary.
 //
 // A drain, a change of the flag or the weight of a server, the addition or the removal of a server and a rebalance are refused while an import runs (the exclusion of the tasks,
-// migration 0045, and UpdateServer), so the check is the second line: it finds the changes that those do not see (a failover, a planned switchover, a server that
-// joined).
+// migration 0045, and UpdateServer), so the check is the second line: it finds the changes that those do not see (a failover, a planned switchover). It is made twice:
+// before the first server takes the final name, and again when every server has it (recheckImportCatalog).
 
 // catalogNode is the part of a row of kingres.node that the check compares. The node ids and the group ids of the private database are its own, so a node is
 // known by its host and port.
@@ -268,4 +269,24 @@ func (o *Ops) seedImportCatalog(ctx context.Context, priv string) error {
 		}
 	}
 	return nil
+}
+
+// recheckImportCatalog is the check after every server has taken the final name: a failover that started after the first check and before the last rename promoted a
+// standby while the catalog follow-up skipped the private database (or has not visited the database yet), so the catalog that is now the client's names the old primary. A
+// failover that starts after this check finds the database under its final name and follows its catalog like that of any other database. On a difference (or a failover
+// that is not over) revert puts the private name back everywhere and its note is added to the error, and the import fails, retryable, as at the first check.
+func (o *Ops) recheckImportCatalog(ctx context.Context, db string, servers []string, revert func() string) error {
+	err := o.checkImportServers(ctx, servers)
+	if err == nil {
+		err = o.checkImportCatalog(ctx, db)
+	}
+	if err == nil {
+		return nil
+	}
+	note := revert()
+	var te *transfer.Error
+	if errors.As(err, &te) {
+		return transfer.Errorf(te.Code, te.Retryable, "%s%s", te.Error(), note)
+	}
+	return fmt.Errorf("%w%s", err, note)
 }

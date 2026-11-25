@@ -973,6 +973,11 @@ func (o *Ops) stepIMRename(ctx context.Context, env *task.Env) error {
 		}
 		done = append(done, s)
 	}
+	// A failover that started after the check above and before the last server took the final name: the catalog is checked again, and the names are put back on a
+	// difference (a failover that starts from now on follows the catalog of the database like that of any other).
+	if err := o.recheckImportCatalog(ctx, p.Database, p.Servers, revert); err != nil {
+		return err
+	}
 	// The registry: the settings of the database, as database.create writes them.
 	sharded := hasExt(a.st.res.Manifest, extguard.Shard)
 	ledgerMode := "off"

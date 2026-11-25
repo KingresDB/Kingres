@@ -188,3 +188,47 @@ func TestCheckImportServers(t *testing.T) {
 		t.Fatalf("a single server: %v", err)
 	}
 }
+
+// A failover that started after the first check and before the last server took the final name leaves the database at its final name with a catalog that names the old
+// primary: the check after the renames fails the import and puts the names back (revert), and nothing is undone when the catalog agrees.
+func TestRecheckImportCatalogAfterTheRename(t *testing.T) {
+	_, c, o := newGuardInstance(t)
+	const final = "shop"
+	pgExecAll(t, c, "create database "+sysdb.Database, "create database "+final)
+	node := "create table kingres.node (node_id int, group_id int, host text, port int, role text, is_active bool default true, should_have_shards bool default true, weight float8)"
+	for db, rows := range map[string][]string{sysdb.Database: {"(1, 0, 'h1', 5432, 'standby')", "(2, 0, 'h2', 5432, 'primary')"}, final: {"(1, 0, 'h2', 5432, 'primary')"}} {
+		d := pgConnect(t, o, db)
+		pgExecAll(t, d, "create schema kingres", node)
+		for _, r := range rows {
+			pgExecAll(t, d, "insert into kingres.node (node_id, group_id, host, port, role) values "+r)
+		}
+	}
+	sys := pgConnect(t, o, sysdb.Database)
+	pgExecAll(t, sys, "create schema kingres_cp", "create table kingres_cp.task (kind text, state text)")
+	ctx := context.Background()
+	reverted := 0
+	revert := func() string { reverted++; return "; the names were put back" }
+	if err := o.recheckImportCatalog(ctx, final, nil, revert); err != nil || reverted != 0 {
+		t.Fatalf("a catalog that agrees: %v (reverted %d)", err, reverted)
+	}
+	var te *transfer.Error
+	// the failover promoted h1 after the first check: the system catalog says so, the database at the final name does not
+	pgExecAll(t, sys, "update kingres.node set role = case host when 'h1' then 'primary' else 'standby' end")
+	err := o.recheckImportCatalog(ctx, final, nil, revert)
+	if !errors.As(err, &te) || te.Code != transfer.CodeLeaderChanged || !te.Retryable || !strings.Contains(te.Error(), "h2:5432") || !strings.HasSuffix(te.Error(), "; the names were put back") || reverted != 1 {
+		t.Fatalf("a failover between the check and the last rename: %v (reverted %d)", err, reverted)
+	}
+	// the failover is not over
+	pgExecAll(t, sys, "update kingres.node set role = case host when 'h1' then 'standby' else 'primary' end", "insert into kingres_cp.task values ('server.failover', 'running')")
+	err = o.recheckImportCatalog(ctx, final, nil, revert)
+	if !errors.As(err, &te) || !strings.Contains(te.Error(), "not over") || reverted != 2 {
+		t.Fatalf("a failover that is not over: %v (reverted %d)", err, reverted)
+	}
+	// a server that joined
+	pgExecAll(t, sys, "delete from kingres_cp.task")
+	o.Fanout = listFanout{servers: []OtherServer{{ID: "z"}}}
+	err = o.recheckImportCatalog(ctx, final, nil, revert)
+	if !errors.As(err, &te) || !strings.Contains(te.Error(), "server z joined") || reverted != 3 {
+		t.Fatalf("a server that joined: %v (reverted %d)", err, reverted)
+	}
+}
