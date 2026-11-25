@@ -372,7 +372,14 @@ func TestDrainOnACluster(t *testing.T) {
 	}
 
 	t.Run("the preview lists the moves, the standbys and no blocker; the map group server can be drained now (it is handed over)", func(t *testing.T) {
-		pv := l.Expect(200, "GET", "/servers/"+victim.Host+"/drain-preview", nil)
+		// The preview reads the standbys from the sharding catalog of the map group, which learns of a standby a little after
+		// the topology shows it streaming (waitStandbys and the rb catalog above do not cover that copy), so the victim can
+		// still host no standby here.  The test assumes it hosts one: wait, bounded, until the preview shows it.
+		var pv map[string]any
+		until(t, 2*time.Minute, "the preview to list a standby on the victim", func() bool {
+			pv = l.Expect(200, "GET", "/servers/"+victim.Host+"/drain-preview", nil)
+			return len(anyList(pv["standbyShardGroupIds"])) > 0
+		})
 		if pv["canDrain"] != true || pv["moveCount"].(float64) == 0 || len(anyList(pv["standbyShardGroupIds"])) == 0 || pv["canKeepReplicas"] != true {
 			t.Fatalf("preview: %v", pv)
 		}
