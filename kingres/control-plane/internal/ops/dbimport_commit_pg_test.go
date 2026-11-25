@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peerclient"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pgtest"
@@ -98,6 +99,10 @@ type importRig struct {
 	clk      *testClock
 	recheck  func(ctx context.Context, revert func() string) error
 	stepDone chan struct{}
+	// kind is the kind of the test task (the kind of the import for a test that goes through the request); sys is a pool on the system database and pg a store on it.
+	kind string
+	sys  *pgxpool.Pool
+	pg   *task.PGStore
 }
 
 func newImportRig(t *testing.T) *importRig {
@@ -105,7 +110,7 @@ func newImportRig(t *testing.T) *importRig {
 	if !pgtest.Available() {
 		t.Skip("KINGRES_PG_BIN is not set; skipping the PostgreSQL integration test")
 	}
-	r := &importRig{t: t, clk: &testClock{t: time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)}}
+	r := &importRig{t: t, clk: &testClock{t: time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)}, kind: "test.import.final"}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	for i := range r.in {
 		r.in[i] = pgtest.Start(t, nil)
@@ -167,7 +172,8 @@ func (r *importRig) engine(holder string, store task.Store, wrap func(task.Step)
 	if wrap != nil {
 		step = wrap(step)
 	}
-	def := task.Definition{Kind: "test.import.final", Steps: []task.Step{step}, OnFail: r.o[0].importOnFailHook, Committed: importCommittedNote}
+	real := r.o[0].dbImportDefinition()
+	def := task.Definition{Kind: r.kind, Steps: []task.Step{step}, OnFail: r.o[0].importOnFailHook, Committed: importCommittedNote, CanceledNote: real.CanceledNote, Cancellable: real.Cancellable}
 	e, err := task.NewEngine(store, []task.Definition{def}, task.Options{Holder: holder, Lease: time.Minute, StoreTries: 1, Now: r.clk.Now})
 	if err != nil {
 		r.t.Fatal(err)
@@ -178,7 +184,7 @@ func (r *importRig) engine(holder string, store task.Store, wrap func(task.Step)
 // submit makes the task and the private databases of it.
 func (r *importRig) submit(e *task.Engine, p dbImportParams) (task.Task, string) {
 	r.t.Helper()
-	tk, err := e.Submit(context.Background(), "test.import.final", task.Subject{Type: "database", ID: "shop"}, p, "admin")
+	tk, err := e.Submit(context.Background(), r.kind, task.Subject{Type: "database", ID: "shop"}, p, "admin")
 	if err != nil {
 		r.t.Fatal(err)
 	}

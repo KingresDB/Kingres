@@ -36,12 +36,12 @@ func TestImportCommittedNoteSaysWhatHappened(t *testing.T) {
 	if !ok {
 		t.Fatal("a task with the commit mark is committed")
 	}
-	for _, want := range []string{"shop", "committed but not finished", "s1", "s2", "s3", "Repeat the same import request"} {
+	for _, want := range []string{"shop", "is committed and not finished", "s1", "s2", "s3", "Repeat the same import request"} {
 		if !strings.Contains(note, want) {
 			t.Errorf("the note %q lacks %q", note, want)
 		}
 	}
-	if len(note) > 330 {
+	if len(note) > importNoteBudget {
 		t.Errorf("the note is %d bytes and would be cut", len(note))
 	}
 	if _, ok := importCommittedNote(committedTask(t, "", task.Running)); ok {
@@ -53,15 +53,15 @@ func TestImportCommittedNoteSaysWhatHappened(t *testing.T) {
 	}
 }
 
-// A committed import is cancelled by nobody while it is paused (it is resumed), and a cancel of a running one is accepted (it pauses the task).
+// A cancel of a running committed import pauses it, and a cancel of a paused one is accepted (it ends the task without undoing anything).
 func TestImportCancelGuardOfACommittedImport(t *testing.T) {
 	o := &Ops{Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	def := o.dbImportDefinition()
 	if !def.Cancellable(committedTask(t, "commit", task.Running)) {
 		t.Error("a cancel of a running committed import is accepted")
 	}
-	if def.Cancellable(committedTask(t, "commit", task.Paused)) {
-		t.Error("a cancel of a paused committed import is refused: it is resumed, not cancelled")
+	if !def.Cancellable(committedTask(t, "commit", task.Paused)) {
+		t.Error("a cancel of a paused committed import is accepted: it is the exit of an import that cannot be resumed")
 	}
 	if !def.Cancellable(committedTask(t, "", task.Running)) {
 		t.Error("a task before its steps is cancellable as before")

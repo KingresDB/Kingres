@@ -248,7 +248,8 @@ func (o *Ops) StartDatabaseImport(ctx context.Context, actor string, req api.Imp
 	if up.Purpose != "databaseArchive" {
 		return task.Task{}, problem.Validation("The upload is not a database archive.", field("/uploadId", "the purpose of the upload is not databaseArchive", "conflict"))
 	}
-	// A repeat of the request of an import that is committed and paused goes on with it.
+	// A repeat of the request of an import of this upload that is paused (committed or not) goes on with it, as it was started: the other fields of the repeat
+	// (expectedSha256, keepOnFailure, the acknowledgements) are not read.
 	if t, ok, err := o.resumeCommittedImport(ctx, up, req.Database); ok || err != nil {
 		return t, err
 	}
@@ -395,11 +396,17 @@ func (o *Ops) dbImportDefinition() task.Definition {
 				task.Step{Name: stepMRename, Run: importStep(stepMRename, o.stepIMRename)},
 			), nil
 		},
-		OnFail:    o.importOnFailHook,
-		Committed: importCommittedNote,
+		OnFail:       o.importOnFailHook,
+		Committed:    importCommittedNote,
+		CanceledNote: o.importCancelNote,
 		// A cancel is accepted until the sequences are set (design: until step 11 starts); after it the task rolls forward only. A task that passed the commit point
-		// of the last step accepts a cancel only while it runs, and the cancel then pauses it (nothing is undone, see Committed); a paused one is resumed, not cancelled.
+		// of the last step accepts a cancel while it runs, and the cancel then pauses it (nothing is undone, see Committed). A PAUSED import is always cancellable,
+		// committed or not: it is the exit of an import that cannot be resumed (a server that is gone, a role that was dropped). The cancel ends it as failed; for a
+		// committed one (or one that may be) nothing is undone and the hook touches no database.
 		Cancellable: func(t task.Task) bool {
+			if t.State == task.Paused {
+				return true
+			}
 			if strings.HasPrefix(t.Mark, importCommitPrefix) {
 				return t.State == task.Running
 			}

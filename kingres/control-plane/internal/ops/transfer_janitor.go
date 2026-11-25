@@ -36,7 +36,7 @@ func (o *Ops) TransferSweep(ctx context.Context) (SweepReport, error) {
 	var highest int64
 	err = wrap(o.asService(ctx, sysdb.Database, func(tx pgx.Tx) error {
 		tag, e := tx.Exec(ctx, `UPDATE kingres_cp.data_transfer d SET state = 'expired'
-			WHERE d.server_id = $1 AND d.state IN ('ready', 'receiving')
+			WHERE d.server_id = $1 AND d.state IN ('ready', 'receiving') AND NOT EXISTS (SELECT 1 FROM kingres_cp.task t WHERE t.id = d.task_id AND t.state IN ('pending', 'running', 'paused'))
 			  AND (d.expires_at < now() OR (d.kind = 'upload' AND d.state = 'receiving' AND d.updated_at < now() - interval '48 hours'))`, o.ServerHost)
 		if e != nil {
 			return e
@@ -44,7 +44,7 @@ func (o *Ops) TransferSweep(ctx context.Context) (SweepReport, error) {
 		rep.Expired = int(tag.RowsAffected())
 		// A role that was dropped or renamed does not keep its files: its OID no longer belongs to that name.
 		tag, e = tx.Exec(ctx, `UPDATE kingres_cp.data_transfer d SET state = 'deleted'
-			WHERE d.server_id = $1 AND d.state IN ('ready', 'receiving', 'building')
+			WHERE d.server_id = $1 AND d.state IN ('ready', 'receiving', 'building') AND NOT EXISTS (SELECT 1 FROM kingres_cp.task t WHERE t.id = d.task_id AND t.state IN ('pending', 'running', 'paused'))
 			  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r WHERE r.oid::bigint = d.created_by_oid AND r.rolname = d.created_by)`, o.ServerHost)
 		if e != nil {
 			return e
@@ -118,7 +118,8 @@ func (o *Ops) TransferSweep(ctx context.Context) (SweepReport, error) {
 	rep.Deleted += len(sr.Deleted)
 	// Old rows of finished transfers are not kept for ever.
 	if perr := wrap(o.asService(ctx, sysdb.Database, func(tx pgx.Tx) error {
-		tag, e := tx.Exec(ctx, `DELETE FROM kingres_cp.data_transfer WHERE server_id = $1 AND state IN ('deleted', 'failed', 'expired', 'lost') AND updated_at < now() - interval '7 days'
+		tag, e := tx.Exec(ctx, `DELETE FROM kingres_cp.data_transfer d WHERE d.server_id = $1 AND d.state IN ('deleted', 'failed', 'expired', 'lost') AND d.updated_at < now() - interval '7 days'
+			AND NOT EXISTS (SELECT 1 FROM kingres_cp.task t WHERE t.id = d.task_id AND t.state IN ('pending', 'running', 'paused'))
 			AND transfer_id <> (SELECT max(transfer_id) FROM kingres_cp.data_transfer)`, o.ServerHost)
 		rep.Pruned = int(tag.RowsAffected())
 		return e

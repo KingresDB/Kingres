@@ -91,11 +91,13 @@ func (s *killAfterMark) SetMark(ctx context.Context, id int64, l task.Lease, mar
 func TestImportRollForwardAfterALeaderChangeFinishesTheOldLeader(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
+		left   bool
 		origin string
 		others []OtherServer
 	}{
-		{"the server that is in the cluster now", "", []OtherServer{{ID: "s1"}}},
-		{"the starting server named by the request", "s1", nil},
+		{"the server that is in the cluster now", false, "", []OtherServer{{ID: "s1"}}},
+		{"the starting server named by the request and still a member", false, "s1", []OtherServer{{ID: "s1"}}},
+		{"the starting server named by the request that left the cluster is skipped", true, "s1", nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newImportRig(t)
@@ -139,6 +141,22 @@ func TestImportRollForwardAfterALeaderChangeFinishesTheOldLeader(t *testing.T) {
 			done := r.get(e2, tk.ID)
 			if done.State != task.Done {
 				t.Fatalf("after the change of leader: %s %+v %s", done.State, done.Error, done.Detail)
+			}
+			if tc.left {
+				// H1d: a server that is no longer a member is skipped: the task ends, nothing is called on it, and the detail says so
+				if got := r.state(1, "shop"); got != "imp/" {
+					t.Errorf("the new leader after the roll forward: %q", got)
+				}
+				if got := r.state(0, "shop"); got != closed {
+					t.Errorf("the server that left was touched: %q", got)
+				}
+				if c := fan2.calls(); strings.Contains(c, "s1 ") {
+					t.Errorf("a call was made to a server that is not a member: %s", c)
+				}
+				if !strings.Contains(done.Detail, "no longer members") || !strings.Contains(done.Detail, "s1") {
+					t.Errorf("the detail does not name the skipped server: %q", done.Detail)
+				}
+				return
 			}
 			for i := 0; i < 2; i++ {
 				if got := r.state(i, "shop"); got != "imp/" {
@@ -198,7 +216,7 @@ func TestImportCancelInsideTheRollForwardPausesAndResumes(t *testing.T) {
 	if got.State != task.Paused || got.Mark != importCommitMark(priv) {
 		t.Fatalf("after the cancel: %s mark %q %+v", got.State, got.Mark, got.Error)
 	}
-	if !strings.Contains(got.Detail, "committed but not finished") || !strings.Contains(got.Detail, "s2") {
+	if !strings.Contains(got.Detail, "is committed and not finished") || !strings.Contains(got.Detail, "s2") {
 		t.Errorf("the task does not say that it is committed and not finished: %q", got.Detail)
 	}
 	if c := r.fan.calls(); strings.Contains(c, "back") || strings.Contains(c, "drop") {

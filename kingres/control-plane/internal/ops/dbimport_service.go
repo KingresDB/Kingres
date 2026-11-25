@@ -1000,6 +1000,21 @@ func (o *Ops) stepIMRename(ctx context.Context, env *task.Env) error {
 	if lerr == nil {
 		a, lerr = o.openImport(ctx, x, rec, p, env.Task.ID)
 	}
+	return o.renameWithArchive(ctx, env, p, committed, rec, a, lerr)
+}
+
+// renameWithArchive is stepIMRename after the archive was opened (a nil when it could not be, with lerr). The archive is closed on every path (a refusal, an
+// error, a panic) and, as soon as the step has read what it needs, before the roll forward.
+func (o *Ops) renameWithArchive(ctx context.Context, env *task.Env, p dbImportParams, committed bool, rec transfer.Record, a *archiveFile, lerr error) error {
+	priv := p.private(env.Task.ID)
+	closed := false
+	closeArchive := func() {
+		if a != nil && !closed {
+			closed = true
+			a.close()
+		}
+	}
+	defer closeArchive()
 	if lerr != nil && !committed {
 		return lerr
 	}
@@ -1036,7 +1051,7 @@ func (o *Ops) stepIMRename(ctx context.Context, env *task.Env) error {
 			}
 		}
 		// The archive was read for what the step needs; it is not held open through the roll forward, which may take long.
-		a.close()
+		closeArchive()
 	}
 	return o.importRenameFinal(ctx, env, w)
 }
@@ -1163,6 +1178,17 @@ func (o *Ops) importRenameFinal(ctx context.Context, env *task.Env, w renameFina
 		note := revert()
 		return transfer.Errorf(transfer.CodeSQLError, false, "the settings of the database could not be recorded, so the import was undone%s", note)
 	}
+	// A cancel request that is recorded now was refused by the guard of the kind (it accepts none from the sequences on) or arrived after it was read: it must not
+	// pause the import after the commit point, where a cancel is a real request. It is dropped here, before the mark is written, so that nothing that arrives
+	// later is lost (the guard of a task that is not committed refuses a cancel, so no real request can arrive in between).
+	if err := env.ClearCancel(ctx); err != nil {
+		if leaseOrStop(ctx, err) {
+			return err
+		}
+		if o.Log != nil {
+			o.Log.Warn("a cancel request that was refused could not be cleared before the commit point of an import", "database", p.Database, "error", err)
+		}
+	}
 	// The commit point.
 	switch res, cerr := o.commitImport(ctx, env, importCommitMark(priv)); res {
 	case commitNot:
@@ -1248,14 +1274,16 @@ func (o *Ops) importRollForward(ctx context.Context, env *task.Env, w renameFina
 		}
 	}()
 	paused := func() error {
-		return task.Pause("A cancel was requested; the import is committed and was not undone. Repeat the import request to finish it.")
+		return task.Pause("A cancel was requested; the import is committed and was not undone. Repeat the import request to finish it, or cancel the task to give it up without undoing anything.")
 	}
 	pause := importForwardPause
+	var left []string
 	for {
 		if cancelled.Load() {
 			return paused()
 		}
-		err := o.importForwardOnce(fctx, env, w)
+		l, err := o.importForwardOnce(fctx, env, w)
+		left = l
 		if err == nil {
 			break
 		}
@@ -1289,6 +1317,9 @@ func (o *Ops) importRollForward(ctx context.Context, env *task.Env, w renameFina
 	if st := o.importState(env.Task.ID); st != nil && len(st.notes) > 0 {
 		detail += "\n" + strings.Join(st.notes, "\n")
 	}
+	if len(left) > 0 {
+		detail += "\n" + shortList("Servers that are no longer members of the cluster were skipped, the database was not opened on them: ", left, 330)
+	}
 	o.setImportState(env.Task.ID, nil)
 	if w.done != nil {
 		w.done(ctx)
@@ -1307,21 +1338,22 @@ func (o *Ops) importRollForward(ctx context.Context, env *task.Env, w renameFina
 
 // importForwardOnce opens the database on every server and then removes the marker on every server. Every part is idempotent (a database that is opened, or
 // finished, counts as done), so it can run again after any error, after a restart or on another leader.
-func (o *Ops) importForwardOnce(ctx context.Context, env *task.Env, w renameFinal) error {
+// It returns the servers of the request that left the cluster and were skipped.
+func (o *Ops) importForwardOnce(ctx context.Context, env *task.Env, w renameFinal) (left []string, err error) {
 	p, priv := w.p, w.priv
 	// Every server that may hold the database: the others of the request, the starting server and the servers of the cluster now (the leader that runs this may
 	// not be the one that renamed, and it is not in the list of the request).
-	servers := o.importServers(ctx, p)
+	servers, left := o.importServersLeft(ctx, p)
 	marker := importMarker(priv)
 	if err := o.openRenamed(ctx, p.Database, p.Owner.Name, marker); err != nil {
-		return err
+		return left, err
 	}
 	open := importRenameOp{From: p.Database, To: priv, Owner: p.Owner.Name, Open: true}
 	if o.Fanout != nil {
 		for _, s := range servers {
 			s := s
 			if err := o.onServer(ctx, env, s, "open the database", func() error { return o.Fanout.Apply(ctx, s, ApplyImportRename, open) }); err != nil {
-				return err
+				return left, err
 			}
 		}
 	}
@@ -1337,17 +1369,17 @@ func (o *Ops) importForwardOnce(ctx context.Context, env *task.Env, w renameFina
 	// The marker goes last, on every server. Until it is gone from all of them an error here is tried again.
 	fin := importRenameOp{From: p.Database, To: priv, Finish: true, Marker: marker}
 	if err := o.finishRename(ctx, p.Database, marker); err != nil {
-		return err
+		return left, err
 	}
 	if o.Fanout != nil {
 		for _, s := range servers {
 			s := s
 			if err := o.onServer(ctx, env, s, "finish the import", func() error { return o.Fanout.Apply(ctx, s, ApplyImportRename, fin) }); err != nil {
-				return err
+				return left, err
 			}
 		}
 	}
-	return nil
+	return left, nil
 }
 
 // putBackOn puts the database at the final name back to its private name on one server ("" is this one); a database without the marker of the task, or that the
@@ -1676,29 +1708,88 @@ func putBackNote(failed []string, final string) string {
 // importServers are the other servers that an import may have touched: the servers that the request named, the server that accepted it and every other server of
 // the cluster now, without this server and without repeats. The leader that runs a step after a change of leader is not the one that started the task, and the one
 // that started it is not among the "others" of the request, so the list of the request alone is not enough.
+//
+// A server that is no longer a member of the cluster (removed, or it left) is not in the list: nothing can be done on it and nothing waits for it. The starting
+// server is in it only while it is a member. A server that is a member and cannot be reached stays in it, and the import waits for it. When the members cannot be
+// read, no server is dropped.
 func (o *Ops) importServers(ctx context.Context, p dbImportParams) []string {
+	out, _ := o.importServersLeft(ctx, p)
+	return out
+}
+
+// importServersLeft is importServers and, besides, the servers of the request that are no longer members of the cluster (they are skipped).
+func (o *Ops) importServersLeft(ctx context.Context, p dbImportParams) (servers, left []string) {
 	seen := map[string]bool{o.ServerHost: true, "": true}
-	var out []string
-	add := func(s string) {
-		if !seen[s] {
-			seen[s] = true
-			out = append(out, s)
+	var members map[string]bool
+	var current []string
+	if o.Fanout != nil {
+		if others, err := o.Fanout.Others(ctx); err != nil {
+			if o.Log != nil {
+				o.Log.Warn("reading the other servers failed", "error", err)
+			}
+		} else {
+			members = map[string]bool{}
+			current = ids(others)
+			for _, s := range current {
+				members[s] = true
+			}
 		}
+	}
+	add := func(s string) {
+		if seen[s] {
+			return
+		}
+		seen[s] = true
+		if members != nil && !members[s] {
+			left = append(left, s)
+			return
+		}
+		servers = append(servers, s)
 	}
 	for _, s := range p.Servers {
 		add(s)
 	}
 	add(p.Origin)
-	if o.Fanout != nil {
-		for _, s := range ids(o.others(ctx)) {
-			add(s)
+	for _, s := range current {
+		add(s)
+	}
+	return servers, left
+}
+
+// importNoteBudget is the length that the note of a paused import is kept to (the task engine cuts a longer one at 330 bytes).
+const importNoteBudget = 330
+
+// shortList writes prefix and the names, separated by commas, so that the whole is at most max bytes: names that do not fit are left out and counted ("and 3
+// more"). A name is written whole or not at all, so the cut never splits a UTF-8 sequence. When not even one name fits, only their number is written.
+func shortList(prefix string, names []string, max int) string {
+	if len(names) == 0 {
+		return prefix + "none"
+	}
+	for k := len(names); k >= 0; k-- {
+		var b strings.Builder
+		b.WriteString(prefix)
+		b.WriteString(strings.Join(names[:k], ", "))
+		switch {
+		case k == len(names):
+		case k == 0:
+			if len(names) == 1 {
+				b.WriteString("1 server")
+			} else {
+				fmt.Fprintf(&b, "%d servers", len(names))
+			}
+		default:
+			fmt.Fprintf(&b, " and %d more", len(names)-k)
+		}
+		if b.Len() <= max || k == 0 {
+			return b.String()
 		}
 	}
-	return out
+	return prefix
 }
 
 // importCommittedNote is Definition.Committed of the import: whether the task passed the commit point of its last step (or may have: the mark could not be read),
-// and the sentence that the paused task carries then. The database is at the final name and is never undone from there.
+// and the sentence that the paused task carries then. The database is at the final name and is never undone from there. The instruction of the operator comes
+// first; only the list of the servers is shortened to keep the note within its length.
 func importCommittedNote(t task.Task) (string, bool) {
 	p, err := inputOf[dbImportParams](t)
 	if err != nil || !importCommitted(t, p.private(t.ID)) {
@@ -1708,16 +1799,84 @@ func importCommittedNote(t task.Task) (string, bool) {
 	if p.Origin != "" {
 		servers = append(servers, p.Origin)
 	}
-	where := strings.Join(servers, ", ")
-	state := "The import of " + p.Database + " is committed but not finished"
+	state := " is committed and not finished;"
 	if t.Mark == task.MarkUnreadable {
-		state = "The import of " + p.Database + " may be committed (the task store could not be read) and is not finished"
+		state = " may be committed (the task store could not be read) and is not finished;"
 	}
-	return state + ": the database was left as it is and nothing is undone; it may still be closed on some of the servers (" + where + "). Repeat the same import request to finish it.", true
+	head := "Repeat the same import request to finish it, or cancel the task to give it up. The import of " + p.Database + state +
+		" nothing is undone. Servers where it may still be closed: "
+	return head + shortList("", servers, importNoteBudget-len(head)-1) + ".", true
 }
 
-// resumeCommittedImport goes on with a paused import of this upload that passed its commit point: a repeat of the import request is the way to resume it (the
-// archive is not read again, the mark decides). It reports whether there was such a task.
+// importCancelNote is Definition.CanceledNote of the import: the message of the task that an operator ended while it was paused and committed. It names the
+// final database, the servers where it is open and those where it is not (asked now, with a short time for each), and the manual steps.
+func (o *Ops) importCancelNote(ctx context.Context, t task.Task) string {
+	p, err := inputOf[dbImportParams](t)
+	if err != nil {
+		return "The import was ended while it was committed; nothing was undone."
+	}
+	open, notOpen, unknown := o.importOpenness(ctx, p)
+	// The instruction comes first; the lists of servers are shortened to keep the message within the length the task row keeps.
+	b := "Ended by a cancel after the commit point; nothing was undone. Finish or drop the database " + p.Database +
+		" by hand as the operator guide says (a database import that cannot be finished)."
+	b += " " + shortList("Open on: ", open, 85) + "."
+	b += " " + shortList("Not open on: ", notOpen, 95) + "."
+	if len(unknown) > 0 {
+		b += " " + shortList("Not reached: ", unknown, 70) + "."
+	}
+	return b
+}
+
+// importOpenness asks every server that may hold the database whether it is open to its owner (the importing role owns it) or not (it is closed, or it is not
+// there). A server that cannot be asked is "unknown". The servers are those of importServers and this one; each is given a short time.
+func (o *Ops) importOpenness(ctx context.Context, p dbImportParams) (open, notOpen, unknown []string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+	defer cancel()
+	judge := func(name string, exists bool, owner string, err error) {
+		switch {
+		case err != nil:
+			unknown = append(unknown, safeName(name))
+		case exists && owner == p.Owner.Name:
+			open = append(open, safeName(name))
+		default:
+			notOpen = append(notOpen, safeName(name))
+		}
+	}
+	if o.Service != nil && o.ServerHost != "" {
+		var st dbState
+		err := o.asService(ctx, "postgres", func(tx pgx.Tx) error {
+			var e error
+			st, e = databaseStateOf(ctx, tx, p.Database)
+			return e
+		})
+		judge(o.ServerHost, st.Exists, st.Owner, err)
+	}
+	if !dbNameRE.MatchString(p.Database) {
+		return
+	}
+	q := `SELECT pg_catalog.pg_get_userbyid(datdba)::pg_catalog.text FROM pg_catalog.pg_database WHERE datname = '` + p.Database + `'`
+	for _, s := range o.importServers(ctx, p) {
+		if o.Remote == nil {
+			judge(s, false, "", errors.New("no way to ask"))
+			continue
+		}
+		sctx, c := context.WithTimeout(ctx, 5*time.Second)
+		rows, err := o.Remote.Query(sctx, s, "postgres", q)
+		c()
+		owner := ""
+		if err == nil && len(rows) > 0 && len(rows[0]) > 0 {
+			owner, _ = rows[0][0].(string)
+		}
+		judge(s, err == nil && len(rows) > 0, owner, err)
+	}
+	return
+}
+
+// resumeCommittedImport goes on with a paused import of this upload: a repeat of the import request is the way to resume it, whether the task passed its commit
+// point (the archive is not read again, the mark decides), may have (the mark could not be read when it was paused) or did not (its mark is empty now, and the step
+// runs as a step that can still be undone). The owner of the upload is checked by the caller, and a repeat for another database name is not a resume. Nothing else
+// of the repeat (expectedSha256, keepOnFailure, the flags of the request) is read: the task goes on with what it was started with. It reports whether there was
+// such a task.
 func (o *Ops) resumeCommittedImport(ctx context.Context, up transfer.Record, database string) (task.Task, bool, error) {
 	eng := o.Engine()
 	if eng == nil || up.TaskID == nil {
@@ -1725,9 +1884,6 @@ func (o *Ops) resumeCommittedImport(ctx context.Context, up transfer.Record, dat
 	}
 	t, err := eng.Get(ctx, *up.TaskID)
 	if err != nil || t.Kind != KindDatabaseImport || t.State != task.Paused {
-		return task.Task{}, false, nil
-	}
-	if _, ok := importCommittedNote(t); !ok {
 		return task.Task{}, false, nil
 	}
 	if p, perr := inputOf[dbImportParams](t); perr != nil || (database != "" && database != p.Database) {
