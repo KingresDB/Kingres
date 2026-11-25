@@ -918,6 +918,10 @@ func (o *Ops) stepIMRename(ctx context.Context, env *task.Env) error {
 	if exists {
 		return transfer.Errorf(transfer.CodeForbidden, false, "the database %s exists; the import is not finished and the private database is removed", p.Database)
 	}
+	// A failover that ran during the import leaves the catalog of the private database with the old primary of a group: it is not renamed.
+	if err := o.checkImportCatalog(ctx, priv); err != nil {
+		return err
+	}
 	op := importRenameOp{From: priv, To: p.Database, Owner: p.Owner.Name}
 	done := []string{}
 	// A server that fails after another one was renamed puts the others back, so that the private name is the only name of the work in progress and the hook of
