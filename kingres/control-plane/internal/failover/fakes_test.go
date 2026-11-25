@@ -89,6 +89,7 @@ type world struct {
 	undoTerms          []int64 // the terms of the quiesce, unquiesce and resume calls
 	stopErr            error   // the answer of the clean stop call
 	dbDownAfterStop    bool    // the rows cannot be read after the clean stop (the map group: its system database is the stopped instance)
+	onResume           func()  // called when the old primary is resumed by a rollback (a test reads the lease of the task at that moment)
 	onDemote           func()  // called when the clean stop is asked for, before anything else (a test cancels the context of the step)
 	beforeStop         func()  // called when the clean stop is asked for, before it is done (a test reads what the task lease is at that moment)
 	afterStop          func()  // called when the clean stop is done (a test cancels the context of the step, as the engine does when the task lease cannot be renewed)
@@ -866,6 +867,9 @@ func (p fpeers) Resume(ctx context.Context, server string, r ResumeRequest) erro
 	p.w.mu.Unlock()
 	if err := p.unreach(server); err != nil {
 		return err
+	}
+	if p.w.onResume != nil {
+		p.w.onResume()
 	}
 	p.w.rec("resume %s", server)
 	p.w.mu.Lock()

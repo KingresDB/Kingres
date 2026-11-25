@@ -1205,3 +1205,31 @@ func TestTheRollbackOfAFailedStopOfTheMapGroupOutlivesTheContextOfTheStep(t *tes
 		})
 	}
 }
+
+// The lease of the task stays extended while the rollback of a failed stop of the map group runs (the rollback may wait for a postmaster that is still
+// shutting down), and is brought back only when the step returns. On the clean path it is brought back at once (TestTheStopOfTheMapGroupIsAskedForOnALeaseThatOutlastsTheStop).
+func TestTheLeaseStaysExtendedWhileTheRollbackOfAFailedStopRuns(t *testing.T) {
+	w := mapWorld()
+	w.stopErr = errors.New("the stop failed")
+	r := w.runner()
+	w.fakeClock(r)
+	st := task.NewMemStore()
+	eng, err := task.NewEngine(st, []task.Definition{r.Definition(nil)}, task.Options{Holder: "A", Lease: 30 * time.Second, StoreTries: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	tk, _ := eng.Submit(ctx, KindFailover, task.Subject{Type: "server", ID: "s1"}, mapGracefulInput(), "tester")
+	var left time.Duration
+	w.onResume = func() {
+		got, _ := st.Get(ctx, tk.ID)
+		left = time.Until(got.LeaseExpires)
+	}
+	_, _ = eng.RunOnce(ctx)
+	if left == 0 {
+		t.Fatalf("the old leader was not resumed:\n%s", strings.Join(w.log, "\n"))
+	}
+	if left < 100*time.Second {
+		t.Errorf("the task lease has %v left while the rollback runs, want it still extended", left)
+	}
+}
