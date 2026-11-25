@@ -433,7 +433,7 @@ func TestJanitorLeavesTheUploadOfAnActiveTask(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := r.sys.Exec(ctx, `INSERT INTO kingres_cp.task (kind, state, subject_type, subject_id, input, created_by) VALUES ('database.import', $1, 'database', 'u' || $2::text, pg_catalog.jsonb_build_object('uploadId', $2::bigint), 'admin')`, state, id); err != nil {
+		if _, err := r.sys.Exec(ctx, `INSERT INTO kingres_cp.task (kind, state, subject_type, subject_id, input, created_by) VALUES ('database.import', $1, 'database', 'u' || ($2::bigint)::text, pg_catalog.jsonb_build_object('uploadId', $2::bigint), 'admin')`, state, id); err != nil {
 			t.Fatal(err)
 		}
 		return id
