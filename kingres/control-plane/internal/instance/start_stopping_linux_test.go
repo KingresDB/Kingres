@@ -148,11 +148,12 @@ func TestAStartThatCannotOutwaitTheShutdownIsAnError(t *testing.T) {
 // padding), one that is still starting (a file of fewer than 8 lines, or an empty one), and a "stopping" file whose pid is another program.
 func TestAStartOfAPostmasterThatIsNotShuttingDownIsANoOp(t *testing.T) {
 	for name, content := range map[string]func(pid int) string{
-		"ready":              func(pid int) string { return pidFile(pid, "ready   ", 8, "\n") },
-		"standby with pad":   func(pid int) string { return pidFile(pid, "standby ", 8, "\n") },
-		"starting":           func(pid int) string { return pidFile(pid, "starting", 8, "\n") },
-		"five lines":         func(pid int) string { return pidFile(pid, "stopping", 5, "\n") },
-		"seven lines":        func(pid int) string { return pidFile(pid, "stopping", 7, "\n") },
+		"ready":            func(pid int) string { return pidFile(pid, "ready   ", 8, "\n") },
+		"standby with pad": func(pid int) string { return pidFile(pid, "standby ", 8, "\n") },
+		"starting":         func(pid int) string { return pidFile(pid, "starting", 8, "\n") },
+		// The last line says stopping but the status line (the 8th) is not there: a postmaster that is still starting.
+		"five lines":         func(pid int) string { return fmt.Sprintf("%d\n/d\n0\n5432\nstopping\n", pid) },
+		"seven lines":        func(pid int) string { return fmt.Sprintf("%d\n/d\n0\n5432\n/s\n*\nstopping\n", pid) },
 		"empty":              func(int) string { return "" },
 		"stopping, not ours": func(int) string { return pidFile(os.Getpid(), "stopping", 8, "\n") }, // the pid of this test program, which is not a postmaster
 	} {
