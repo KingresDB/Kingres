@@ -908,6 +908,9 @@ paths:
         and that named the server's certificate (see `AddServerRequest.expectedFingerprint` and
         `allowUnpinned`); a server that holds a certificate but has not finished joining (`status` still
         pending) may make no other call to the cluster.
+
+        Refused with 409 `operation_in_progress` while a database import (`importDatabase`) is pending, running or paused, and an import is refused while a server is being added: the
+        private database of an import is made on the servers that the import started with, so a server that joined meanwhile would be in its catalog without the database.
       tags: [Servers]
       x-required-role: kingres_admin
       requestBody:
@@ -970,6 +973,9 @@ paths:
         (`POST /rebalance`); `true` makes a server that owns no bucket `pendingRebalance`. Nothing moves by itself.
         The change is made in the sharding catalog of every database through `kingres.set_node_property`; 409
         `no_receiving_server` when it would leave no server that should hold shards.
+
+        While a database import (`importDatabase`) is pending, running or paused, a request that changes `shouldHaveShards` is refused with 409 `operation_in_progress` (the private
+        database of the import has a catalog that no change of the flag follows); a request that only changes `serverGroup`, or that sets a value equal to the current one, is not refused.
       tags: [Servers]
       x-required-role: kingres_ops
       requestBody:
@@ -1015,6 +1021,10 @@ paths:
         the standbys it hosts for other groups are not counted); 409 `rebalance_in_progress` while a rebalance runs and `operation_in_progress` while
         another task of this server runs. A `dead` server is refused with 422 `node_state_invalid`: fail
         it over first.
+
+        A database import (`importDatabase`) that is pending, running or paused refuses the removal with 409 `operation_in_progress`, and an import is refused while a removal is
+        unfinished. The buckets that the private database of a failed import that was kept (`keepOnFailure`) holds on the server keep it from being removed too: the `detail` of
+        `server_owns_buckets` names that database, which an operator drops with `dropDatabase`.
       tags: [Servers]
       x-required-role: kingres_ops
       responses:
@@ -1159,6 +1169,10 @@ paths:
         new manager leader when the switchover has ended. The task is paused meanwhile (`getRebalanceStatus` shows `stopped`, `stoppedBy` `safetyRule`) and keeps its id. A switchover
         that is refused or rolled back fails the task with the code of the refusal, or `server_hosts_map_group` when the server still runs the map group; the server stays `draining`
         and the drain can be started again. Needs `kingres_ops`.
+
+        A drain is refused with 409 `operation_in_progress` while a database import (`importDatabase`) is pending, running or paused, and an import is refused while a drain is pending or
+        running; a drain that is paused does not refuse an import, but it cannot be resumed until the import has ended. The buckets that the private database of a failed import that was kept
+        (`keepOnFailure`) holds on the server keep the drain from ending: the task fails with `server_owns_buckets` and its detail names that database, which an operator drops with `dropDatabase`.
       tags: [Servers]
       x-required-role: kingres_ops
       requestBody:
@@ -3204,7 +3218,7 @@ paths:
 
         **A start is refused, before any task exists, with the reason in the problem code (0.9.0):** 409
         `rebalance_in_progress` (a run is unfinished and not stopped); `operation_in_progress` (another task adds,
-        removes or detaches a server); `failover_in_progress` (these two also when the other task is created at the same moment: the check and the creation are one step in the system database, so a rebalance and a server operation are never both created); `version_mismatch` (the servers do not run the same
+        removes or detaches a server, or a database import (`importDatabase`) is pending, running or paused); `failover_in_progress` (these two also when the other task is created at the same moment: the check and the creation are one step in the system database, so a rebalance and a server operation are never both created); `version_mismatch` (the servers do not run the same
         version of the sharding extension and the same PostgreSQL major); `cluster_inconsistent` (`kingres.check_cluster()`
         reports something that makes moving unsafe; the detail names it); `no_receiving_server` (no server should hold
         shards); `nothing_to_rebalance` (the plan is empty); `group_degraded` (0.27.0: a group has a standby that is behind its primary by more than `maxStandbyLagBytes`, or whose lag cannot be read; `force: true` overrides this and only this). The same conditions are checked again before every move; one
@@ -5935,7 +5949,7 @@ paths:
         `ledger_restart_not_acknowledged` otherwise). **Time-partition policies come back disabled**; the task's last detail lists them with the call that enables each.
 
         Needs `kingres_admin`, `dataTransfer.enabled` (403 `data_transfer_disabled`) and a request over TLS (403 `insecure_transport`). 404: the upload does not exist or is another role's. 409 `upload_incomplete`;
-        409 `already_exists`: the database exists; 409 `operation_in_progress`: a task uses the upload or the transfer limit is reached. 422 `archive_invalid`, `archive_incompatible` (the PostgreSQL major of the
+        409 `already_exists`: the database exists; 409 `operation_in_progress`: a task uses the upload, the transfer limit is reached, a rebalance (a drain is one) is pending or running, or the addition, the removal or the leaving of a server is unfinished (an import that is pending, running or paused refuses those in turn, and the change of `shouldHaveShards`; a rebalance that is paused does not refuse an import, but cannot be resumed until it has ended). 422 `archive_invalid`, `archive_incompatible` (the PostgreSQL major of the
         target must be at least the source's), `archive_statement_refused`, `import_too_large` (more than `maxImportBytes`, a statement or a count above its limit) and `ledger_restart_not_acknowledged`.
         Steps: *Check the archive*, *Create the private database* (and one step for each other server), *Install the extensions*, *Check the functions*, *Create the tables*, *Distribute the tables*, *Create the views*,
         *Load the data*, *Create the indexes and constraints*, *Set the sequences*, *Enable the ledger and the policies*, *Verify*, *Take the final name*. A task is cancellable until *Set the sequences* starts.
