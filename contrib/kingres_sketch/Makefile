@@ -1,5 +1,6 @@
 # contrib/kingres_sketch/Makefile
 #
+# SPDX-License-Identifier: AGPL-3.0-only
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 
 MODULE_big = kingres_sketch

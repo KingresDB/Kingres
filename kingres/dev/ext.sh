@@ -2,6 +2,9 @@
 #
 # kingres/dev/ext.sh
 #
+# SPDX-License-Identifier: AGPL-3.0-only
+# Portions Copyright (c) 2026, RooyeKhat Media Co
+#
 # Build and test one KingresDB extension (contrib/kingres_*) against a
 # KingresDB (or PostgreSQL) installation, without rebuilding the server.  By
 # default the installation is the one produced by kingres/dev/build.sh; the

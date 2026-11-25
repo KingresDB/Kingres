@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+// SPDX-License-Identifier: AGPL-3.0-only
+// Portions Copyright (c) 2026, RooyeKhat Media Co
+//
 // Mechanical checks of the uniform rules of kingres/api/openapi.yaml.
 //
 // Run from kingres/api (after `npm install`):  node scripts/check-contract.mjs [path/to/openapi.yaml]

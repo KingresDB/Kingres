@@ -1,3 +1,6 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+--
 -- kingres_timepart--0.2.sql
 --
 -- Install script of the kingres_timepart extension, version 0.2: time
