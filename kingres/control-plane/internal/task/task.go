@@ -215,15 +215,25 @@ type Env struct {
 	guard   *leaseGuard
 }
 
-// ExtendLease lengthens the lease of this run to d, counted from now, for a step that is about to make the store unreachable on purpose: the task
+// leaseSlack is added to the length that ExtendLease derives, so that the time the run trusts its lease covers what was asked with some room.
+const leaseSlack = 5 * time.Second
+
+// ExtendLease makes the run trust its lease for at least cover from now, for a step that is about to make the store unreachable on purpose: the task
 // of the map group lives in the system database of the very instance that its clean stop shuts down, so no renewal can reach the store for as long
-// as the stop lasts. The lease is renewed in the store first, and only a renewal that the store accepted moves the end of the time the run trusts
-// its lease, so no other server can take the task over before the run stops by itself. The returned function ends the extension (the next renewal
-// brings the lease back to its normal length); a run that does not call it keeps renewing the long lease until the step ends. A d that is not longer
-// than the lease of the engine changes nothing.
-func (e *Env) ExtendLease(ctx context.Context, d time.Duration) (func(), error) {
-	if e.eng == nil || e.guard == nil || d <= e.eng.lease {
+// as the stop lasts. The lease is renewed in the store with the length cover + the margin of the guard + a small slack (the engine's own length when
+// that is longer), so the trust window (the length less the margin) always covers cover and the lease is no longer than that needs: another server
+// can take the task over only that long after the last renewal. Only a renewal that the store accepted moves the end of the time the run trusts its
+// lease, so no other server can take the task over before the run stops by itself, and a refused renewal leaves the guard as it was. The returned
+// function ends the extension: it puts the length of the renewals back and renews once with the engine's length, for a bounded moment, to bring the
+// store and the guard back to the normal margin; when the store cannot be reached (the stop it was lengthened for is over) the lease and the guard
+// stay as they are, which is consistent and safe, and no renewal follows until the store is back.
+func (e *Env) ExtendLease(ctx context.Context, cover time.Duration) (func(), error) {
+	if e.eng == nil || e.guard == nil {
 		return func() {}, nil
+	}
+	d := cover + e.eng.leaseMargin() + leaseSlack
+	if d < e.eng.lease {
+		d = e.eng.lease
 	}
 	return e.guard.extend(ctx, e.lease, e.Task.ID, d)
 }
@@ -820,13 +830,24 @@ func (g *leaseGuard) extend(ctx context.Context, l Lease, id int64, d time.Durat
 		return nil, err
 	}
 	g.mu.Lock()
-	g.dur = d
+	if d > g.e.lease {
+		g.dur = d
+	}
 	g.mu.Unlock()
 	g.renewed(started, d)
 	return func() {
+		g.renewMu.Lock()
+		defer g.renewMu.Unlock()
 		g.mu.Lock()
 		g.dur = 0
 		g.mu.Unlock()
+		// One renewal with the normal length, bounded: it brings the store and the guard back to the normal margin when the store answers.
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		defer cancel()
+		started := g.e.now()
+		if g.e.store.Renew(rctx, id, l, g.e.lease) == nil {
+			g.renewed(started, g.e.lease)
+		}
 	}, nil
 }
 

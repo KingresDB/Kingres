@@ -1103,3 +1103,36 @@ func TestTheStopOfTheMapGroupIsAskedForOnALeaseThatOutlastsTheStop(t *testing.T)
 		})
 	}
 }
+
+// A lease that cannot be lengthened for the stop of the map group stops the switchover before anything is stopped: no clean stop is asked for, the
+// bootstrap of the candidate is given up and the task ends failed.
+func TestTheMapGroupIsNotStoppedWhenTheLeaseCannotBeLengthened(t *testing.T) {
+	w := mapWorld()
+	r := w.runner()
+	w.fakeClock(r)
+	st := task.NewMemStore()
+	eng, err := task.NewEngine(st, []task.Definition{r.Definition(nil)}, task.Options{Holder: "A", Lease: 30 * time.Second, StoreTries: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	tk, err := eng.Submit(ctx, KindFailover, task.Subject{Type: "server", ID: "s1"}, mapGracefulInput(), "tester")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.FailOn(func(op string) error {
+		if op == "renew" {
+			return errors.New("the store is unreachable")
+		}
+		return nil
+	})
+	_, _ = eng.RunOnce(ctx)
+	log := strings.Join(w.log, "\n")
+	if strings.Contains(log, "demote-fast") {
+		t.Errorf("the old primary was stopped although the lease could not be lengthened:\n%s", log)
+	}
+	got, _ := st.Get(ctx, tk.ID)
+	if got.State != task.Failed {
+		t.Errorf("the task is %s, want failed:\n%s", got.State, log)
+	}
+}

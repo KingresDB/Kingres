@@ -200,7 +200,7 @@ func (p *foPeers) StandbysGone(ctx context.Context, server, gone string, ttl tim
 
 func (p *foPeers) Demote(ctx context.Context, server string, r failover.DemoteRequest) (failover.DemoteAnswer, error) {
 	var out failover.DemoteAnswer
-	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, failover.DemoteCallBound)
 	defer cancel()
 	err := p.do(ctx, server, "POST", "/failover/demote", r, &out)
 	return out, err

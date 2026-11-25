@@ -275,10 +275,9 @@ func (r *Runner) drain(ctx context.Context, env *task.Env, sc *stepCtx) error {
 	}
 }
 
-// MapStopLeaseDefault is the length the lease of the task of a planned switchover of the map group is given before the clean stop of the old leader. It
-// is longer than the call that stops (90 s in the peer client) with the margin of the lease guard on top, so that a stop that the call allows is not cut
-// short by the lease of a task whose store is the instance that is being stopped.
-const MapStopLeaseDefault = 2 * time.Minute
+// DemoteCallBound is how long the call that stops the old primary of a switchover may take (the peer client cancels it after this). The lease of the task
+// of the map group is made to cover it before the stop, because the store of that task is the instance that is being stopped.
+const DemoteCallBound = 90 * time.Second
 
 // stopClean marks the position, waits until the new primary has replayed the mark, and stops the old primary with a fast shutdown (design
 // S4 and S5). The call that stops it releases the lease and answers the position of the shutdown checkpoint.
@@ -337,7 +336,7 @@ func (r *Runner) stopClean(ctx context.Context, env *task.Env, sc *stepCtx) erro
 		// shutdown checkpoint lasts, and the lease guard of the engine would cancel this step (and with it the stop) after a third of the lease. The lease is
 		// lengthened in the store first, while the database still answers, to cover the longest stop that the call allows; the run then trusts it exactly that
 		// long, and no other server can take the task over before it. A stop that outlasts even that is cancelled and rolled back as a stop that was not clean.
-		restore, lerr := env.ExtendLease(ctx, orDur(r.MapStopLease, MapStopLeaseDefault))
+		restore, lerr := env.ExtendLease(ctx, orDur(r.MapStopCover, DemoteCallBound))
 		if lerr != nil {
 			if errors.Is(lerr, ErrLeaseLost) {
 				return lerr
