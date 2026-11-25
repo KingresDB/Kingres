@@ -5942,8 +5942,9 @@ paths:
         The statements run **as the signed-in role**, one per round trip, never as the service role, so PostgreSQL's privileges are the guarantee; a role with `SUPERUSER`, `REPLICATION` or `BYPASSRLS`, or with access to
         server files, programs or logs, is refused with 403 `forbidden` and must sign in as another role. The extensions of the archive are installed from a closed list.
 
-        The import works in a database with a **private name** (`kingres_import_<task id>`) that only the task uses, and renames it to its final name as its last step; a failed or cancelled import drops the private database
-        (unless `keepOnFailure`), and nothing of the final name exists. Order: the extensions, the tables, the distribution of the tables **while they are empty**, the views, the data (one transaction per table, the rows
+        The import works in a database with a **private name** (`kingres_import_<task id>`) that only the task uses, and renames it to its final name as its last step; the last step has one commit point (a mark of the task, written
+        before the first server opens the database to its owner). Before it a failed or cancelled import drops the private database (unless `keepOnFailure`)
+        and nothing of the final name exists; after it the import always finishes, possibly after retries while a server does not answer, and the system never removes it. Order: the extensions, the tables, the distribution of the tables **while they are empty**, the views, the data (one transaction per table, the rows
         counted against the manifest), the indexes and constraints, the sequences, then the ledger and the time-partition policies. **Ledger tables are carried as data and start a new chain** (ADR 0028): the import
         enters their rows as the first entries of a new chain, `ledger_verify` must find nothing, and then the signature policy of the source is set again; it needs `acknowledgeLedgerRestart: true` (422
         `ledger_restart_not_acknowledged` otherwise). **Time-partition policies come back disabled**; the task's last detail lists them with the call that enables each.
@@ -6613,7 +6614,7 @@ components:
       description: |
         The import was accepted and runs as the task `database.import` (added in 0.30.0). Poll `GET /tasks/{taskId}` (the `Location` header) until `state` is `done` or `failed`. When it is `done` the database
         exists under its final name and `detail` lists what needs a decision (the disabled time-partition policies, the ledger chains that started again); when it failed the private database was removed (or kept, with
-        `keepOnFailure`) and the final name was never taken.
+        `keepOnFailure`) and the final name was never taken (a task that passed its commit point does not fail: it keeps going until the database is open on every server).
       headers:
         Location:
           description: URL of the task, `/api/v1/tasks/{taskId}`.
