@@ -954,8 +954,8 @@ paths:
       operationId: updateServer
       summary: Update a server
       description: |
-        Changes the server group or whether the server should hold shards (partial update, answered
-        synchronously with the whole `Server`). **Only `serverGroup` and `shouldHaveShards` can be
+        Changes the server group, whether the server should hold shards or its weight (partial update, answered
+        synchronously with the whole `Server`). **Only `serverGroup`, `shouldHaveShards` and `weight` can be
         changed**; every other property of `Server` is read-only and a request that contains any other
         member is refused with 400 `validation_failed` (`errors[].field` names it, for example `/status`).
         An empty body is refused with 400. A value equal to the current one changes nothing and still
@@ -974,8 +974,8 @@ paths:
         The change is made in the sharding catalog of every database through `kingres.set_node_property`; 409
         `no_receiving_server` when it would leave no server that should hold shards.
 
-        While a database import (`importDatabase`) is pending, running or paused, a request that changes `shouldHaveShards` is refused with 409 `operation_in_progress` (the private
-        database of the import has a catalog that no change of the flag follows); a request that only changes `serverGroup`, or that sets a value equal to the current one, is not refused.
+        While a database import (`importDatabase`) is pending, running or paused, a request that changes `shouldHaveShards` or `weight` is refused with 409 `operation_in_progress` (the private
+        database of the import has a catalog that no change of the flag or the weight follows); a request that only changes `serverGroup`, or that sets a value equal to the current one, is not refused.
       tags: [Servers]
       x-required-role: kingres_ops
       requestBody:
