@@ -222,6 +222,42 @@ func (m *MemStore) RequestCancel(_ context.Context, id int64, now time.Time) err
 	return nil
 }
 
+// RequestCancelIf implements CondCancelStore.
+func (m *MemStore) RequestCancelIf(_ context.Context, id int64, now time.Time, seen State, fail *Error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.tasks[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if t.State == Done || t.State == Failed || seen == Done || seen == Failed {
+		return ErrNotCancellable
+	}
+	if t.State != seen {
+		return ErrStateChanged
+	}
+	switch seen {
+	case Pending, Paused:
+		e := *fail
+		t.State, t.UpdatedAt, t.Error = Failed, now, &e
+	default:
+		t.CancelRequested = true
+	}
+	return nil
+}
+
+// ClearCancel implements CancelClearStore.
+func (m *MemStore) ClearCancel(_ context.Context, id int64, l Lease) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, err := m.held(id, l)
+	if err != nil {
+		return err
+	}
+	t.CancelRequested = false
+	return nil
+}
+
 // List implements Store.
 func (m *MemStore) List(_ context.Context, limit int) ([]Task, error) {
 	m.mu.Lock()

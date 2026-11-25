@@ -222,6 +222,49 @@ func (s *PGStore) RequestCancel(ctx context.Context, id int64, now time.Time) er
 	}
 }
 
+// RequestCancelIf implements CondCancelStore: every write names the state that the caller decided on, so a task that changed state in between is not ended or
+// marked on the strength of an old read.
+func (s *PGStore) RequestCancelIf(ctx context.Context, id int64, now time.Time, seen State, fail *Error) error {
+	var tag pgconn.CommandTag
+	var err error
+	switch seen {
+	case Done, Failed:
+		return ErrNotCancellable
+	case Pending, Paused:
+		ej, merr := json.Marshal(fail)
+		if merr != nil {
+			return merr
+		}
+		tag, err = s.db.Exec(ctx, `UPDATE kingres_cp.task SET state = 'failed', error = $2, updated_at = $3 WHERE id = $1 AND state = $4`, id, ej, now, string(seen))
+	default:
+		tag, err = s.db.Exec(ctx, `UPDATE kingres_cp.task SET cancel_requested = true WHERE id = $1 AND state = $2`, id, string(seen))
+	}
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	t, gerr := s.Get(ctx, id)
+	if gerr != nil {
+		return gerr
+	}
+	if t.State == Done || t.State == Failed {
+		return ErrNotCancellable
+	}
+	return ErrStateChanged
+}
+
+// ClearCancel implements CancelClearStore: the update is conditional on the lease and its row count is checked.
+func (s *PGStore) ClearCancel(ctx context.Context, id int64, l Lease) error {
+	tag, err := s.db.Exec(ctx, `UPDATE kingres_cp.task SET cancel_requested = false
+		WHERE id = $1 AND lease_holder = $2 AND lease_epoch = $3 AND state = 'running'`, id, l.Holder, l.Epoch)
+	if err != nil {
+		return err
+	}
+	return s.heldOrErr(ctx, tag, id)
+}
+
 // List implements Store.
 func (s *PGStore) List(ctx context.Context, limit int) ([]Task, error) {
 	rows, err := s.db.Query(ctx, `SELECT `+cols+` FROM kingres_cp.task ORDER BY id DESC LIMIT $1`, limit)

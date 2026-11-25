@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -298,6 +299,25 @@ func (e *Env) CancelRequested(ctx context.Context) bool {
 	return err == nil && t.CancelRequested
 }
 
+// CancelClearStore is implemented by stores that can drop a cancel request that the engine did not honour.
+type CancelClearStore interface {
+	// ClearCancel clears the cancel request of the task, under the lease of the run that holds it.
+	ClearCancel(ctx context.Context, id int64, l Lease) error
+}
+
+// ClearCancel drops the cancel request that is recorded for the task. A step that passes a point after which no cancel is honoured, and that has not honoured
+// the request, calls it, so that a request that the guard of the kind refused cannot act later. A store that cannot do it is an error.
+func (e *Env) ClearCancel(ctx context.Context) error {
+	if e.eng == nil {
+		return nil
+	}
+	cs, ok := e.eng.store.(CancelClearStore)
+	if !ok {
+		return errors.New("the task store cannot clear a cancel request")
+	}
+	return cs.ClearCancel(ctx, e.Task.ID, e.lease)
+}
+
 // Fence returns the fencing token of this run (the lease epoch). A step that
 // calls another server for a non-idempotent effect can send it along, so that
 // the other side refuses a call of a run that lost its lease meanwhile.
@@ -372,6 +392,10 @@ type Definition struct {
 	// (a step that returns an error, the give-up after repeated fence refusals, a cancel request), the task is paused instead, with note and the reason as its
 	// detail, so that the operator can see that it is committed and not finished and can resume it (Engine.Resume). The OnFail hook does not run for it.
 	Committed func(t Task) (note string, ok bool)
+	// CanceledNote, set together with Committed, is the message of the error of a paused task that has passed its point of no return and that an operator
+	// cancels (the exit of a committed task that cannot be resumed): the cancel ends the task as failed with code canceled and this message, and nothing is
+	// undone (the OnFail hook runs, finds the mark and touches nothing). It runs before the task is ended and may ask the servers; it must bound its own time.
+	CanceledNote func(ctx context.Context, t Task) string
 }
 
 // holdCommitted pauses a task of a kind with a Committed guard instead of ending it. It reports whether the task was paused (or the run lost its lease: the
@@ -401,9 +425,7 @@ func (e *Engine) holdCommitted(ctx context.Context, t Task, i int, why string) (
 		}
 	}
 	e.log.Error("a committed task is paused, not ended", "task", t.ID, "kind", t.Kind, "why", why)
-	if len(note) > 330 {
-		note = note[:330] + "..."
-	}
+	note = cutUTF8(note, 330)
 	reason := note
 	if why != "" {
 		reason += " Reason: " + why
@@ -458,6 +480,17 @@ type Store interface {
 	RequestCancel(ctx context.Context, id int64, now time.Time) error
 	// List returns tasks, newest first.
 	List(ctx context.Context, limit int) ([]Task, error)
+}
+
+// ErrStateChanged is the answer of a conditional cancel when the task is no longer in the state that the caller decided on.
+var ErrStateChanged = errors.New("task: the state of the task changed")
+
+// CondCancelStore is implemented by stores that can end or mark a task for cancellation only when it is in the state that the caller looked at.
+type CondCancelStore interface {
+	// RequestCancelIf does what RequestCancel does for the state seen, and only when the task is still in it, in one atomic write: a task that was seen pending
+	// or paused is ended as failed with fail (code canceled) when it is still in that state; a task that was seen running only gets its cancel request, and
+	// only while it still runs. Any other state is ErrStateChanged; a finished task is ErrNotCancellable.
+	RequestCancelIf(ctx context.Context, id int64, now time.Time, seen State, fail *Error) error
 }
 
 // Engine runs tasks.
@@ -632,31 +665,73 @@ func (e *Engine) Run(ctx context.Context) {
 // step boundary, or at the next pause point of a step that can pause. A paused task
 // is not run by anybody, so it is failed at once (the store's condition is "still
 // paused") and its cleanup hook runs here, with the task as recorded.
+//
+// The request is conditional on the state that the guard was asked about (CondCancelStore): a task that was read as running only gets the request while it
+// runs, and a task that was read as paused is ended only while it is paused. A cancel that was meant as a pause of a committed task never ends it, when the
+// task paused between the read and the write.
 func (e *Engine) Cancel(ctx context.Context, id int64) error {
-	t, gerr := e.store.Get(ctx, id)
-	if gerr != nil {
-		// Without the task its guard cannot be asked: a cancel is never recorded blind (FO-11).
-		return gerr
-	}
-	if recordedKinds[t.Kind] {
-		return ErrNotCancellable // written by its owner, not run by the engine
-	}
-	if gerr == nil {
-		if def, ok := e.def(t.Kind); ok && def.Cancellable != nil && !def.Cancellable(t) {
+	cs, cond := e.store.(CondCancelStore)
+	var first State
+	for attempt := 0; attempt < 5; attempt++ {
+		t, gerr := e.store.Get(ctx, id)
+		if gerr != nil {
+			// Without the task its guard cannot be asked: a cancel is never recorded blind (FO-11).
+			return gerr
+		}
+		if attempt == 0 {
+			first = t.State
+		}
+		if recordedKinds[t.Kind] {
+			return ErrNotCancellable // written by its owner, not run by the engine
+		}
+		def, haveDef := e.def(t.Kind)
+		if haveDef && def.Cancellable != nil && !def.Cancellable(t) {
 			return ErrNotCancellable // the guard of the kind: past the point of no return
 		}
-	}
-	if err := e.store.RequestCancel(ctx, id, e.now()); err != nil {
-		return err
-	}
-	if gerr == nil && t.State == Paused {
-		// Read again: the hook runs only when this request ended the task (it may have
-		// been resumed meanwhile, and then a run owns it).
-		if now, err := e.store.Get(ctx, id); err == nil && now.State == Failed && now.Error != nil && now.Error.Code == CodeCanceled {
-			e.onFail(ctx, now, now.Error)
+		if attempt > 0 && first == Running && t.State == Paused && haveDef && def.Committed != nil {
+			// The cancel of a running committed task is a pause, and the task paused meanwhile: the request is met, and the same click does not also end it.
+			if _, committed := def.Committed(t); committed {
+				return nil
+			}
 		}
+		if !cond {
+			if err := e.store.RequestCancel(ctx, id, e.now()); err != nil {
+				return err
+			}
+			e.afterCancel(ctx, t)
+			return nil
+		}
+		fail := &Error{Code: CodeCanceled, Message: "The task was canceled before it started."}
+		if t.State == Paused {
+			fail.Message = "The task was canceled while it was paused."
+			if haveDef && def.Committed != nil && def.CanceledNote != nil {
+				if _, committed := def.Committed(t); committed {
+					fail.Message = clip(def.CanceledNote(ctx, t))
+				}
+			}
+		}
+		err := cs.RequestCancelIf(ctx, id, e.now(), t.State, fail)
+		if errors.Is(err, ErrStateChanged) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		e.afterCancel(ctx, t)
+		return nil
 	}
-	return nil
+	return ErrStateChanged
+}
+
+// afterCancel runs the hook of a task that the cancel ended: a paused task is not run by anybody, so its cleanup hook runs here, with the task as recorded.
+func (e *Engine) afterCancel(ctx context.Context, was Task) {
+	if was.State != Paused {
+		return
+	}
+	// Read again: the hook runs only when this request ended the task (it may have been resumed meanwhile, and then a run owns it).
+	if now, err := e.store.Get(ctx, was.ID); err == nil && now.State == Failed && now.Error != nil && now.Error.Code == CodeCanceled {
+		e.onFail(ctx, now, now.Error)
+	}
 }
 
 // Resume makes a paused task pending; the next claim (or RunNow) runs it.
@@ -1113,11 +1188,17 @@ func (e *Engine) retry(ctx context.Context, f func() error) error {
 func percent(done, total int) float64 { return float64(done) * 100 / float64(total) }
 
 // clip bounds a message stored in a task row.
-func clip(s string) string {
-	if len(s) > 500 {
-		return s[:500] + "..."
+func clip(s string) string { return cutUTF8(s, 500) }
+
+// cutUTF8 shortens s to at most n bytes of text and a trailing "..." when it was cut; the cut never splits a UTF-8 sequence.
+func cutUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
 	}
-	return s
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + "..."
 }
 
 // Register adds a definition after the engine was built (a definition that
