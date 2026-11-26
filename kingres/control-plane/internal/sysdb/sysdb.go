@@ -44,7 +44,7 @@ var ErrSchemaTooNew = errors.New("the system database schema is newer than this 
 
 // Migration is one numbered schema change.
 type Migration struct {
-	// Version is the migration number, starting at 1 without gaps.
+	// Version is the migration number: unique and increasing, and it may have gaps (see the rules above).
 	Version int
 	// Name is the file name without directory.
 	Name string

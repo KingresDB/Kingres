@@ -16,8 +16,11 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/dumpnorm"
 )
 
-// ContractRevision is the revision of the contract that the archives written by this build name in their manifest.
-const ContractRevision = "0.32.0"
+// ContractRevision is the revision of the REST contract (info.version of kingres/api/openapi.yaml) that this build implements. The archives
+// written by this build name it in their manifest as the contract of the server that wrote them. It is informational: the validation of an
+// archive only demands that it is not empty and the import never compares it, so an archive written under an earlier value still imports.
+// The kingresd command prints the same constant, and a test in cmd/kingresd fails when it differs from the contract file.
+const ContractRevision = "0.34.0"
 
 // isBucket reports whether a table exists only because of the distribution (a bucket partition of a hash table or a leaf under one).
 func (f *dbFacts) isBucket(t dbTable) bool { return f.Buckets[t.OID] }
