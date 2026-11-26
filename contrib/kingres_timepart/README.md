@@ -3,31 +3,45 @@
 # kingres_timepart
 
 Time partitioning of ordinary and of distributed tables for KingresDB (a thin
-fork of PostgreSQL 18.7), version 0.3. For a table partitioned by `RANGE` on a
-time column it creates the partitions for a period ahead, converts the
-partitions that have become older than a period to columnar storage
-(`kingres_columnar`), drops or detaches the partitions that have become older
-than a retention period, and keeps a policy per table and a history of runs.
+fork of PostgreSQL; one install script serves PostgreSQL 18.7 and 19.0),
+extension version 0.3 (`default_version` in `kingres_timepart.control`). For a
+table partitioned by `RANGE` on a time column it:
+
+- creates the partitions for a period ahead (`create_ahead`);
+- converts the partitions that have become older than a period to columnar
+  storage (`kingres_columnar`), and back to heap on request;
+- drops or detaches the partitions that have become older than a retention
+  period (`retention`, `retention_action`);
+- keeps a policy per table and a history of runs, and reports problems
+  (`timepart_check`);
+- does the same for a distributed table of `kingres_shard` 0.9 (see
+  "Distributed tables").
+
 The design is section 10 of
 [`kingres/docs/design/analytics-phase12-storage.md`](../../kingres/docs/design/analytics-phase12-storage.md)
-(increments T1 and T2) and section 11 for distributed tables (increments
-St-D1a and St-D1b, version 0.3); the departures from it are listed at the end
-of this file.
+and section 11 for distributed tables; the departures from it are listed at the
+end of this file.
 
-The extension is written in SQL and PL/pgSQL. It has no C code, needs no
-`shared_preload_libraries` entry, and starts no background process: a run
-happens when something calls it (`psql`, `pg_cron`, or the scheduler of the
-KingresDB control plane). The same install script works on PostgreSQL 18 and
-19.
+**Requirements.** The extension is written in SQL and PL/pgSQL. It has no C
+code, needs no `shared_preload_libraries` entry and no setting, and starts no
+background process: a run happens when something calls it (`psql`, `pg_cron`,
+or the scheduler of the KingresDB control plane, `kingresd`, which also owns the
+REST contract and the web console for it). `CREATE EXTENSION` needs a
+superuser. Conversion needs the extension `kingres_columnar` in the same
+database (and its library in `shared_preload_libraries`, see its README);
+everything else works without it. A distributed table needs `kingres_shard` 0.9.
 
-Conversion needs the extension `kingres_columnar` in the same database (and its
-library in `shared_preload_libraries`, see its README); everything else works
-without it. The scheduler, the REST contract and the web console are the
-control plane's (`kingresd`).
+**Build and test.** See "Tests" at the end: the extension is built and tested on
+PostgreSQL 18 and 19 with `kingres/dev/ext.sh` and `kingres/dev/ext-majors.sh`.
 
-A user-partitioned distributed table (`kingres_shard` 0.9: hash on top, the
-user's range partitions below) has a policy like any other table; see
-"Distributed tables".
+**Map of this document.** "Install"; "What a table must be", "The grid of
+bounds" (what a policy accepts); "SQL interface" (tables, views, functions and
+procedures, identity and who sees the history); "What a run does, step by
+step", "Locks" (the settings), "Security", "Time limit of an action", "Default
+partition"; "Conversion"; "Dump, restore, rename, drop"; "Distributed tables";
+"Upgrade path"; "Limits"; "Departures from the design" (a record of how the
+design changed while the extension was built, in the wording of its time);
+"Tests".
 
 ## Install
 
@@ -38,6 +52,12 @@ CREATE EXTENSION kingres_timepart;
 The control file sets `schema = kingres` and `relocatable = false`. The schema
 is created if it does not exist. Every object of the extension is in it.
 `CREATE EXTENSION` needs a superuser, because it creates two event triggers.
+The schema `kingres` is shared with the other KingresDB extensions. The script
+refuses a schema that exists already when a role that is not a superuser owns
+it, or when it grants `CREATE` to such a role or to `PUBLIC`
+(`insufficient_privilege`, `42501`, with a hint): that role would own what a
+superuser runs. Every install script and every upgrade script makes this check
+(tests `t/010_schema_spoof.pl` and `t/011_old_script_schema_check.pl`).
 
 EXECUTE on every function is revoked from `PUBLIC` (the pure helpers and the
 functions that the views call excepted). An administrator grants it
@@ -308,7 +328,7 @@ Callable by the owner of the table (when EXECUTE has been granted):
 | `kingres.timepart_unset_policy(rel regclass) returns void` | Remove the policy. The history stays. |
 | `kingres.timepart_plan(rel regclass, as_of timestamptz default now()) returns table (seq integer, kind text, partition_name name, range_from timestamptz, range_to timestamptz, reason text)` | The actions a run would take at `as_of`, without taking any. A function of the catalog and `as_of`. |
 | `kingres.timepart_partitions(rel regclass) returns table (partition regclass, range_from timestamptz, range_to timestamptz, access_method name, size_bytes bigint, row_estimate bigint, compression_ratio float8, attached boolean)` | Partitions with bounds, size and format; also the partitions that a `detach` retention detached and kept, with `attached = false`. Needs ownership or `SELECT`. |
-| `kingres.timepart_check(min_ahead interval default null, as_of timestamptz default now()) returns table (schema_name name, table_name name, problem text, detail text)` | `ahead_low` (the last partition ends before `as_of + min_ahead`, default `create_ahead / 2`), `last_run_failed` (the last finished run is `failed` or `partial`), `retire_blocked` (that run could not drop or detach the partitions named, for example because a foreign key references them or a view depends on them), `convert_blocked` (that run could not convert the partitions named: refused, failed on a lock, or `kingres_columnar` is not installed; the detail is the reason), `policy_orphan` (superusers only: the table is gone or no longer suitable), `default_partition_present`, `misaligned` (partitions the policy does not recognise, which a run never retires), `lock_timeout` (the partitions could not be read within the bounded wait) and `check_failed` (any other error while checking one table). A role sees the tables it owns. |
+| `kingres.timepart_check(min_ahead interval default null, as_of timestamptz default now()) returns table (schema_name name, table_name name, problem text, detail text)` | `ahead_low` (the last partition ends before `as_of + min_ahead`, default `create_ahead / 2`), `last_run_failed` (the last finished run is `failed` or `partial`), `retire_blocked` (that run could not drop or detach the partitions named, for example because a foreign key references them or a view depends on them), `convert_blocked` (that run could not convert the partitions named: refused, failed on a lock, or `kingres_columnar` is not installed; the detail is the reason), `policy_orphan` (superusers only: the table is gone or no longer suitable), `policy_unverified` (the policy has no seal, see "Identity"), `default_partition_present`, `misaligned` (partitions the policy does not recognise, which a run never retires), `lock_timeout` (the partitions could not be read within the bounded wait) and `check_failed` (any other error while checking one table). A role sees the tables it owns. |
 
 Superuser only (the scheduler and `psql` of an administrator):
 
@@ -316,14 +336,14 @@ Superuser only (the scheduler and `psql` of an administrator):
 |---|---|
 | `CALL kingres.timepart_run(rel regclass, as_of timestamptz default now(), phases text[] default '{create,convert,retire}', INOUT run_id bigint default null)` | `timepart_begin_run`, the phases in the order create, convert, retire, and `timepart_finish_run`. The id of the run comes back in `run_id`. It commits between actions, so it cannot run inside a transaction block. |
 | `kingres.timepart_begin_run(rel regclass, as_of timestamptz default now(), trigger text default 'sql') returns bigint` | Record a run in state `running` and claim the table: a row lock (`FOR UPDATE NOWAIT`) on the table's row of `kingres.timepart_lock`, which serialises concurrent begins, and the run row, which records the backend (pid and start time). Raises `55P03` when a run of the table is `running` and its backend is alive. A `running` run whose backend is gone is marked `failed` with error `interrupted`. A run that cannot start (the owner changed, the table is no longer suitable) is recorded as `failed` at once. |
-| `kingres.timepart_run_action(run_id bigint, phase text) returns boolean` | Plan again from the catalog at the run's `as_of`, execute the next action of the phase that this run has not tried, record it, and return true; false when nothing is left. One transaction of the caller, with a `NOWAIT` row lock on the table's lock row, so two steps of a table never overlap. See "Time limit of an action". |
+| `kingres.timepart_run_action(p_run bigint, p_phase text) returns boolean` | Plan again from the catalog at the run's `as_of`, execute the next action of the phase that this run has not tried, record it, and return true; false when nothing is left. One transaction of the caller, with a `NOWAIT` row lock on the table's lock row, so two steps of a table never overlap. See "Time limit of an action". |
 | `CALL kingres.timepart_run_phase(run_id bigint, phase text)` | `timepart_run_action` in a loop with a `COMMIT` after each call. Idempotent: it re-plans from the catalog at the run's `as_of` and does what is left. |
 | `kingres.timepart_finish_run(run_id bigint) returns void` | Final state, `next_run_at`, pruning. Calling it again does nothing more. |
 | `kingres.timepart_action_timeout() returns integer` | The `statement_timeout`, in milliseconds, that a driver sets before it calls `timepart_run_action` (setting `kingres_timepart.action_timeout_ms`, default 300000). |
 | `kingres.timepart_due(as_of_time timestamptz default now()) returns table (schema_name name, table_name name, as_of timestamptz)` | Enabled, sealed policies whose `next_run_at` is at or before the time, oldest first: all of them for a superuser (after adopting the history of a restore), the caller's own tables for another role. |
-| `kingres.timepart_prune_runs(schema_name name, table_name name, as_of timestamptz default now()) returns bigint` | Delete old runs of a table; returns the number. |
-| `kingres.timepart_adopt(own_stamp boolean default false) returns bigint` | Superuser. Adopt the policies (after the checks of the catalog, see "Identity") and the history that a backup carried here. |
-| `kingres.timepart_grant_driver(role name)`, `kingres.timepart_revoke_driver(role name)` | Superuser. Give a role, or take from it, the EXECUTE to drive the maintenance of its own tables from its own session. |
+| `kingres.timepart_prune_runs(p_schema name, p_table name, p_as_of timestamptz default now()) returns bigint` | Delete old runs of a table; returns the number. |
+| `kingres.timepart_adopt(p_own_stamp boolean default false) returns bigint` | Superuser. Adopt the policies (after the checks of the catalog, see "Identity") and the history that a backup carried here. |
+| `kingres.timepart_grant_driver(p_role name)`, `kingres.timepart_revoke_driver(p_role name)` | Superuser. Give a role, or take from it, the EXECUTE to drive the maintenance of its own tables from its own session. |
 
 `timepart_set_policy`, `timepart_unset_policy`, `timepart_plan`, `timepart_partitions` and
 `timepart_check` are `SECURITY INVOKER`: they judge `current_user`. The functions that need
@@ -340,6 +360,20 @@ inside a transaction block (the error is `invalid transaction termination`):
 
 Without `kingres_columnar` both raise an error that names it (a conversion to
 heap needs it too: only a columnar partition can be converted to heap).
+
+For distributed tables (see "Distributed tables"), callable by a superuser:
+
+| Signature | Meaning |
+|---|---|
+| `kingres.timepart_dist_partitions(rel regclass) returns table (partition_name name, range_from timestamptz, range_to timestamptz, access_method text, leaves integer, columnar_leaves integer)` | The logical partitions of a distributed table with the number of leaves and of columnar leaves; `access_method` is `heap`, `columnar` or `mixed`. |
+| `kingres.convert_distributed_partition(parent regclass, partition_name name, access_method name default 'columnar', sort_by text[] default null, options jsonb default null) returns text` | Convert the leaves of one logical partition, one after the other on their nodes. |
+| `CALL kingres.convert_leaf(parent regclass, leaf regclass, access_method name default 'columnar', sort_by text[] default null, options jsonb default null, trust_owners boolean default false)` | Convert one leaf on its node; called by `convert_distributed_partition`, not by hand. |
+
+The views are `kingres.timepart_policy`, `kingres.timepart_run`,
+`kingres.timepart_run_action` and `kingres.timepart_policies` (the policy with
+the state of the latest run). The base tables are `timepart_policy_data`,
+`timepart_run_data`, `timepart_run_action_data`, `timepart_lock` and
+`timepart_policy_seal`.
 
 The helpers `timepart_interval_parts`, `timepart_cell_start`, `timepart_cell_of`,
 `timepart_part_name`, `timepart_create_one`, `timepart_retire_one` and the
@@ -452,6 +486,9 @@ operator can set per session, per role, per database or in `postgresql.conf`
 | `kingres_timepart.retry_sleep_min_ms` | 200 | 0 to 60000 | the sleep between attempts is a random time between these two |
 | `kingres_timepart.retry_sleep_max_ms` | 2000 | 0 to 60000 | |
 | `kingres_timepart.action_timeout_ms` | 300000 | 1 to 86400000 | the `statement_timeout` a driver sets for one action (see "Time limit of an action") |
+| `kingres_timepart.convert_default_max_mb` | 256 | 0 to 1048576 | the largest default partition (in MB) with which a conversion by hand is attempted (see "Conversion") |
+| `kingres_timepart.dist_leaf_timeout_ms` | 14400000 | 1000 to 18000000 | the time limit of the conversion of one leaf of a distributed table (see "Distributed tables") |
+| `kingres_timepart.trust_table_owners` | off | boolean | a superuser's session runs the code of table owners who are not superusers (see "Security") |
 
 A value out of range is an error, not a silent clamp. After the last attempt the
 action is recorded as `failed` with detail `lock_timeout: ... (attempt N of N)`.
@@ -978,8 +1015,8 @@ transaction as the swap, so it is true after a crash: an action that is
 unfinished new table are not removed: PostgreSQL does not remove the files
 of a relation that a transaction in flight at a crash had created (they
 belong to no `pg_class` row). A `kill -9` in the middle of a columnar to heap
-copy of 2.5 million rows left a file of 187 MB; a heap to columnar conversion
-writes its data at the commit, so it leaves less. A cancel, an error, a
+copy of millions of rows left a file as large as the data written so far; a heap
+to columnar conversion writes its data at the commit, so it leaves less. A cancel, an error, a
 timeout and `pg_terminate_backend` leave nothing. The files are found by name:
 a file of the database directory whose number is no `pg_class.relfilenode`.
 As a superuser (it lists a directory), after a crash:
@@ -1005,8 +1042,7 @@ the new one, never neither or both, and the same rows after replay
 
 **Cost.** The copy reads at the speed of the heap scan and writes at the speed
 of compression; the new table exists next to the old one until the swap, so the
-tablespace needs room for both. On a 1 million row partition of 60 byte rows
-the copy takes about 1.2 seconds on the test machine (not a benchmark).
+tablespace needs room for both.
 
 ## Dump, restore, rename, drop
 
@@ -1192,11 +1228,17 @@ no distributed table and the functions below see none.
 
 ## Upgrade path
 
+The scripts of the directory are `kingres_timepart--0.1.sql`,
+`kingres_timepart--0.2.sql` and `kingres_timepart--0.3.sql` (install scripts) and
+`kingres_timepart--0.1--0.2.sql` and `kingres_timepart--0.2--0.3.sql` (upgrade
+scripts). The default version is 0.3, and `ALTER EXTENSION kingres_timepart
+UPDATE` from 0.1 goes through 0.2 to 0.3. There is no direct `0.1--0.3` script.
+
 Version 0.3 adds the distributed tables: `ALTER EXTENSION kingres_timepart
 UPDATE` runs `kingres_timepart--0.2--0.3.sql` and a new installation runs
 `kingres_timepart--0.3.sql`, which `mk-install-script.sh` makes from the 0.2
-install script and the 0.2--0.3 script (the TAP test `t/010` fails when it is
-stale; the regression test `upgrade` shows that the upgrade from 0.1 and from
+install script and the 0.2--0.3 script (the TAP test `t/012_install_script_current.pl`
+fails when it is stale; the regression test `upgrade` shows that the upgrade from 0.1 and from
 0.2 gives the catalog of a new installation). It replaces eleven functions
 by `CREATE OR REPLACE` (`timepart__key_info`, `timepart__children`,
 `timepart__create_rows`, `timepart__plan_rows`, `timepart_run_action`,
@@ -1219,27 +1261,26 @@ identity of the installation (`timepart__stamp()`) survive, and that a role
 that was given `timepart_grant_driver` before has the two new functions. The
 tables and views are unchanged. 0.2 replaces eleven functions and procedures by
 `CREATE OR REPLACE` with the signature they had (so their privileges stay),
-adds eight, drops `timepart__no_columnar` (it was executable by superusers
+adds ten (two of them with the fixes below), drops `timepart__no_columnar` (it was executable by superusers
 only; `timepart__need_columnar` replaces it for every caller), and changes one
 visible behaviour: `columnar_options` of a policy is checked when the policy is
 set (only the four keys of `columnar_set_options`; 0.1 accepted any JSON object).
 A policy of 0.1 that holds another key must be set again. A released script is
 not edited: `kingres_timepart--0.1.sql` is as it was.
 
-Version 0.2 itself has not been released (no beta, no tag), so the review of
-the conversion (`kingres/docs/reviews/2026-11-20-kingres-timepart-0.2.md`) was
-fixed, and then the review of those fixes, in `kingres_timepart--0.2.sql` and in
-`kingres_timepart--0.1--0.2.sql`, which still give the same catalog; there is
-no `0.2--0.3` script. The fixes add two functions (`timepart__convert_plan`,
-`timepart__convert_fp`), change `timepart__convert_refusal`,
-`timepart__convert_stmts`, `timepart__special_table` and two lines of
-`timepart_run_action` and `timepart__finish_run` (the retry of `schema_changed`),
-and add one setting (`kingres_timepart.convert_default_max_mb`). A database
-that has installed 0.2 from a development build before that needs `DROP
-EXTENSION` and `CREATE EXTENSION` (the policies are in the extension's own
-tables: dump them first) or the `CREATE OR REPLACE` of those functions from the
-script; once a version is released, a change to its script is a new version
-with an upgrade script.
+Record of version 0.2 (in the wording of its time, shortened): the review of the
+conversion (`kingres/docs/reviews/2026-11-20-kingres-timepart-0.2.md`) was fixed
+in `kingres_timepart--0.2.sql` and in `kingres_timepart--0.1--0.2.sql`, which
+still give the same catalog. The fixes added two functions
+(`timepart__convert_plan`, `timepart__convert_fp`), changed
+`timepart__convert_refusal`, `timepart__convert_stmts`,
+`timepart__special_table` and two lines of `timepart_run_action` and
+`timepart__finish_run` (the retry of `schema_changed`), and added one setting
+(`kingres_timepart.convert_default_max_mb`). A database that installed 0.2 from
+a development build made before those fixes needs `DROP EXTENSION` and
+`CREATE EXTENSION` (the policies are in the extension's own tables: dump them
+first). Once a version is released, a change to its script is a new version with
+an upgrade script.
 
 ## Limits
 
@@ -1290,7 +1331,9 @@ with an upgrade script.
 ## Departures from the design
 
 The design is `kingres/docs/design/analytics-phase12-storage.md`, section 4.4 and
-10. What differs, and why:
+10. What differs, and why. This list is the record of how the design changed
+while the extension was built, in the wording of its time; the current state is
+described in the rest of this file and in the guide:
 
 1. `CREATE TABLE ... (LIKE ...)` and `ATTACH PARTITION` as designed, but no
    helper `CHECK` constraint: the new table is empty, so the attach scans
@@ -1403,8 +1446,9 @@ The design is `kingres/docs/design/analytics-phase12-storage.md`, section 4.4 an
 The distributed tables are tested in `contrib/kingres_shard/t/281_dist_timepart.pl` (a cluster of three
 nodes: creation ahead, conversion, retention, the leaf budget, a claimed group, a leaf that refuses,
 a bucket move of a converted table, retention by detach, the owner who is not a superuser) and, through
-the REST API, in `kingres/control-plane/internal/clustertest/distpart_test.go`. `t/012_install_script_current.pl`
-checks that the install script is what `mk-install-script.sh` makes.
+the REST API, in `kingres/control-plane/internal/clustertest/distpart_test.go`. `t/010_schema_spoof.pl` and `t/011_old_script_schema_check.pl` check the refusal of a
+schema that another role owns or can create in, in every install and upgrade script, and
+`t/012_install_script_current.pl` checks that the install script is what `mk-install-script.sh` makes.
 
 `sql/` and `expected/` hold the pg_regress tests (`timepart_setup`,
 `timepart_grid`, `timepart_create`, `timepart_policy`, `timepart_run`,
@@ -1456,10 +1500,14 @@ rename, comment and storage parameters of an index, each committed while the
 swap waits (the conversion gives way and the change stands); the limit of the
 `REPEATABLE READ` snapshot).
 
-Build and test against a KingresDB installation, out of tree (install
-`kingres_columnar` into the same installation first, with
+Build and test against a KingresDB installation of PostgreSQL 18 or 19, out of
+tree (install `kingres_columnar` into the same installation first, with
 `kingres/dev/ext.sh kingres_columnar build install`):
 
 ```
 KINGRES_WORK=<work area> kingres/dev/ext.sh kingres_timepart all
+KINGRES_PG18=<install> KINGRES_PG19=<install> kingres/dev/ext-majors.sh kingres_timepart   # both majors
 ```
+
+`kingres_timepart.conf` is the configuration of the regression run (it preloads
+`kingres_columnar`). See [`kingres/docs/dev/testing.md`](../../kingres/docs/dev/testing.md).

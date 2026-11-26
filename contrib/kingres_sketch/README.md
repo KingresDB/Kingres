@@ -2,20 +2,52 @@
 <!-- Portions Copyright (c) 2026, RooyeKhat Media Co -->
 # kingres_sketch
 
-Approximate aggregates for KingresDB (a thin fork of PostgreSQL 18.7), version
-1.0: an approximate distinct count (`hll`, HyperLogLog), the most frequent items
-(`topn`, Space-Saving) and approximate percentiles (`tdigest`, a merging
-t-digest). A sketch is a small value of a new type. It can be built with an
-aggregate, stored in a column (for example in a rollup table), united with other
-sketches, and read with a function. The aggregates support PostgreSQL's partial
-aggregation (`COMBINEFUNC`, `SERIALFUNC`, `DESERIALFUNC`, `PARALLEL SAFE`), so a
-parallel aggregate and a partitionwise aggregate over a partitioned table use
-them without any other extension.
+Approximate aggregates for KingresDB (a thin fork of PostgreSQL; one source
+builds and passes its tests on PostgreSQL 18.7 and 19.0), extension version 1.0
+(the only version: `kingres_sketch--1.0.sql`): an approximate distinct count
+(`hll`, HyperLogLog), the most frequent items (`topn`, Space-Saving) and
+approximate percentiles (`tdigest`, a merging t-digest). A sketch is a small
+value of a new type. It can be built with an aggregate, stored in a column (for
+example in a rollup table), united with other sketches, and read with a
+function. The aggregates support PostgreSQL's partial aggregation
+(`COMBINEFUNC`, `SERIALFUNC`, `DESERIALFUNC`, `PARALLEL SAFE`), so a parallel
+aggregate and a partitionwise aggregate over a partitioned table use them
+without any other extension.
+
+What it provides:
+
+- three types, `hll`, `topn` and `tdigest`, with a byte format that is validated
+  on every input (see "Format" and "Untrusted input and limits");
+- functions that build, unite and read them, and aggregates that build and
+  unite them, including `approx_count_distinct` and `approx_percentile`;
+- a limit on the memory that the aggregate states of a backend may hold (the
+  settings `kingres_sketch.state_memory_ceiling` and
+  `kingres_sketch.state_memory_limit`);
+- `self_test()`, a known-answer line that must be equal on every node that
+  exchanges sketches.
+
+Requirements: none beyond the installation. The extension needs no
+`shared_preload_libraries` entry and no restart (preloading is advised, see
+"Installing"), and only a superuser creates it. "Building and testing" at the
+end says how to build it and run its tests on PostgreSQL 18 and 19.
 
 The design is section 9 of
 [`kingres/docs/design/analytics-phase12-queries.md`](../../kingres/docs/design/analytics-phase12-queries.md).
-Pushing the aggregates down to the shard groups of `kingres_shard` is not part
-of this extension and not part of version 1.0.
+The extension itself knows nothing of shard groups. `kingres_shard` uses it:
+when `kingres_shard.count_distinct_mode` is `approximate`, a `count(DISTINCT x)`
+over a hash-distributed table is rewritten to
+`kingres_sketch.approx_count_distinct`, and every shard group answers with a
+small sketch (see [`limitations.md`](../../kingres/docs/guide/limitations.md) and
+[`operator-guide.md`](../../kingres/docs/guide/operator-guide.md) in the guide).
+The control plane installs the extension on every server and compares
+`self_test()`.
+
+Map of this document: "Installing"; "SQL interface" (the reference of the types,
+functions and aggregates); "Aggregates, partial aggregation and NULL"; "Stored
+sketches and rollups"; one section for each sketch ("hll", "topn", "tdigest");
+"Memory of aggregate states and its limit" (the settings); "Format"; "The hash";
+"Untrusted input and limits"; "Security notes"; "Accuracy" (measured errors);
+"Limits and known behaviour"; "Building and testing".
 
 The code is written from the published algorithms, not from another
 implementation:
@@ -39,8 +71,10 @@ Licence: GNU Affero General Public License, version 3 (AGPL-3.0-only).
 ## Installing
 
 The extension has a fixed schema, `kingres_sketch`, and is not relocatable. It
-needs no `shared_preload_libraries` entry and no restart. It has two settings, `kingres_sketch.state_memory_ceiling` (the administrator's, only
-a superuser sets it) and `kingres_sketch.state_memory_limit` (a role's own), with
+needs no `shared_preload_libraries` entry and no restart. It has two settings,
+`kingres_sketch.state_memory_ceiling` (the administrator's, only a superuser
+sets it, default `1GB`) and `kingres_sketch.state_memory_limit` (a role's own,
+default `-1`), with
 defaults that leave ordinary queries alone (see "Memory of aggregate states and
 its limit"). Preloading the library (`shared_preload_libraries`) is not needed,
 but it makes the ceiling hold against every way a role can set it, see there.
@@ -50,7 +84,9 @@ CREATE EXTENSION kingres_sketch;
 SET search_path = public, kingres_sketch;   -- or qualify the names
 ```
 
-The types and functions are not in `public`, so they never shadow or conflict
+`CREATE EXTENSION` refuses a schema `kingres_sketch` that exists already when a
+role that is not a superuser owns it, or when it grants `CREATE` to such a role
+or to `PUBLIC` (SQLSTATE `42501`; see "Security notes"). The types and functions are not in `public`, so they never shadow or conflict
 with another `hll`, `topn` or `tdigest` that is installed. Put `kingres_sketch`
 after `public` in `search_path`, as above, so that tables created without a
 schema name go to `public`.
@@ -58,7 +94,8 @@ schema name go to `public`.
 ## SQL interface
 
 All names are in the schema `kingres_sketch`. Every function is `IMMUTABLE` and
-`PARALLEL SAFE`. A function is strict (a NULL argument gives NULL) unless the
+`PARALLEL SAFE`, except `state_bytes()` and `state_limit()` (`VOLATILE`,
+`PARALLEL RESTRICTED`). A function is strict (a NULL argument gives NULL) unless the
 text says what it does with NULL.
 
 ### Types
@@ -69,8 +106,10 @@ text says what it does with NULL.
 | `topn` | A Space-Saving summary of a multiset of strings, capacity 1 to 100000. | the same |
 | `tdigest` | A t-digest of a multiset of `float8` values, compression 10 to 10000. | the same |
 
-Each type has input, output, `send` and `receive` functions, and explicit casts
-to and from `bytea` that validate the bytes. The binary form (`send`) is the same
+Each type has input, output, `send` and `receive` functions (`hll_in`, `hll_out`, `hll_recv`, `hll_send`, and the same
+for `topn` and `tdigest`), and explicit casts to and from `bytea` that validate
+the bytes (made by the functions `hll_to_bytea` and `bytea_to_hll`, and the same
+for the other two types). The binary form (`send`) is the same
 bytes as the cast to `bytea`. A sketch has no comparison operator and no default
 operator class: it cannot be a key, an index column or a `GROUP BY` column; use a
 function that reads it.
@@ -156,7 +195,7 @@ exact function.
 
 | Function | Meaning |
 |---|---|
-| `self_test()` | One line of text that must be equal on every node that exchanges sketches (see "The hash"; nothing compares it yet). |
+| `self_test()` | One line of text that must be equal on every node that exchanges sketches (see "The hash"; the control plane compares it, and an operator can run it by hand). |
 | `state_bytes()` | The bytes held now by the aggregate states of the calling backend, the counter that the limit bounds (see "Memory of aggregate states and its limit"). `PARALLEL RESTRICTED`: it runs in the leader. |
 | `state_limit()` | The limit in force in the calling backend, in bytes: the smaller of `kingres_sketch.state_memory_ceiling` and `kingres_sketch.state_memory_limit`. |
 | `sketch_kind(bytea)` | The kind (`hll`, `topn`, `tdigest`, or `tdigest_state` for the state of `approx_percentile`) of a byte string that is a valid sketch or aggregate state; error `22023` for any other bytes. It runs the validation of the input and deserial functions. |
@@ -546,12 +585,12 @@ Two values that are equal under the equality of the type have the same hash, so
 `bpchar` values of different lengths, `numeric` values of different scale and the
 two zeros of `float8` are one element.
 
-This was changed before the first release: an earlier build hashed an enum by its
+This was changed before version 1.0 was released: an earlier build hashed an enum by its
 OID (and arrays, ranges and records of enums with it), and hashed arrays, ranges
 and records by PostgreSQL's own functions. Sketches built by that build for those
 types are not comparable with the sketches of this one; sketches of the scalar types
-are unchanged, and the format version stays 1. No migration is needed because the
-extension has not been released.
+are unchanged, and the format version stays 1. No migration is needed because no
+earlier version of the extension was released.
 
 Why this one: a sketch is only meaningful if every node that builds or reads it
 hashes the same element to the same value, on every platform and PostgreSQL
@@ -567,12 +606,10 @@ the bytes of a fixed `tdigest` and a fixed `topn` (each alone and united with a
 second one) built from a formula. A node whose line differs (another major
 version that changed a hash function, a different encoding or byte order, a C
 library that rounds `asin` differently) must not exchange sketches with the
-others. **No component compares the line yet.** The design has the control plane
-run `self_test()` on every node and refuse a cluster whose nodes differ
-(`sketch_hash_mismatch`); that comparison is planned for the control plane and
-does not exist: nothing in this extension or in KingresDB calls `self_test()`
-outside the regression tests, and until it exists the operator compares the line
-by running `SELECT kingres_sketch.self_test()` on every node. The fields: `int2` to `uuid` and `int4[]` the hash of a fixed value;
+others. The control plane runs `self_test()` on every server when it installs or
+verifies the extension (`kingres/control-plane/internal/ops/extensions.go`) and
+refuses a cluster whose servers differ (`409 sketch_hash_mismatch`). An operator
+can also run `SELECT kingres_sketch.self_test()` on every node by hand. The fields: `int2` to `uuid` and `int4[]` the hash of a fixed value;
 `hll` the estimate of a fixed set; `tdigest`, `tdigest_union`, `tdigest_read`
 the bytes of a digest, of the union of two, and the bits of a quantile and a
 rank read from it; `tdigest_scale` the bits of the scale function (`asin`) at
@@ -633,8 +670,18 @@ hash function, the output functions and the types are found by OID), so they
 carry no `search_path` setting: a setting would make PostgreSQL save and restore
 a GUC at every call, and an aggregate calls its state function once per row. The
 regression test `sketch_security` checks that every function is in the schema,
-in C, immutable, parallel safe, not `SECURITY DEFINER` and without a setting. The
-extension is not trusted: only a superuser creates it.
+in C, immutable, parallel safe, not `SECURITY DEFINER` and without a setting
+(`state_bytes()` and `state_limit()` are the two exceptions to "immutable" and
+"parallel safe"). The extension is not trusted: only a superuser creates it.
+
+The extension does not trust its schema. The install script refuses a schema
+`kingres_sketch` that exists already when a role that is not a superuser owns it,
+or when it grants `CREATE` to a role that is not a superuser or to `PUBLIC`
+(`42501`, with a hint to drop the schema or revoke `CREATE`); otherwise that
+role would own what a superuser reads and runs. The test `t/010_schema_spoof.pl`
+checks the refusals and that a schema of a superuser is accepted. The control
+plane makes the same check at run time (`extguard`) before it calls the
+extension.
 
 ## Accuracy
 
@@ -730,27 +777,32 @@ margin of 2.
 
 ## Building and testing
 
-Out of tree, against an installation:
+Out of tree, against an installation of PostgreSQL 18 or 19 (one source builds on
+both):
 
 ```
 make USE_PGXS=1 PG_CONFIG=/path/to/bin/pg_config
 make USE_PGXS=1 PG_CONFIG=/path/to/bin/pg_config install
+make USE_PGXS=1 PG_CONFIG=/path/to/bin/pg_config installcheck   # pg_regress
 ```
 
-With the developer scripts of the repository, which build against the
-installation made by `kingres/dev/build.sh`:
+With the developer scripts of the repository (see
+[`kingres/docs/dev/testing.md`](../../kingres/docs/dev/testing.md)):
 
 ```
-kingres/dev/ext.sh kingres_sketch all
+kingres/dev/ext.sh kingres_sketch all                 # one installation
+KINGRES_PG18=<install> KINGRES_PG19=<install> kingres/dev/ext-majors.sh kingres_sketch   # clean build, both suites, on 18 and 19
 ```
 
-The tests: `sql/` and `expected/` (pg_regress: `sketch_setup`, `sketch_hll`,
-`sketch_topn`, `sketch_tdigest`, `sketch_io`, `sketch_security`, `sketch_memory`)
+The tests: `sql/` and `expected/` (pg_regress: `sketch_setup`, `sketch_hash`,
+`sketch_hll`, `sketch_topn`, `sketch_tdigest`, `sketch_io`, `sketch_security`,
+`sketch_memory`)
 and `t/` (TAP: the accuracy of each sketch, parallel and partitionwise
 aggregation, dump and restore and `COPY`, a fuzz test of corrupted values that
 should be run on a server built with assertions, `008_memory.pl`: the limit
 of the memory of aggregate states, the peak of a backend and parallel workers,
 and `009_memory_ceiling.pl`: every way a role can try to raise the limit, each
 followed by the next session of the role, on a server that preloads the library
-and on one that does not).  The regression tests pass with and without the
+and on one that does not, and `010_schema_spoof.pl`: the refusal of a schema that
+another role owns or can create in).  The regression tests pass with and without the
 library in `shared_preload_libraries`.
