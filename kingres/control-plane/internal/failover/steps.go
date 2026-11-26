@@ -205,6 +205,8 @@ type stepCtx struct {
 	// newServer is the server of the pinned standby when a step knows it from its own state and cannot read it from the group row: after the clean stop of
 	// the map group the system database is the stopped instance (F5-01).
 	newServer string
+	// catDeadline is the end of the wait of this step for a catalog that cannot be read (readCatalog); zero until the first read fails for that reason.
+	catDeadline time.Time
 }
 
 func (s *stepCtx) detail(ctx context.Context, format string, a ...any) {
@@ -1458,7 +1460,7 @@ func (r *Runner) catalogFollows(ctx context.Context, env *task.Env, sc *stepCtx)
 		return fail(CodeBadPromoteTarget, false, "the standby %d has no node in the catalog", nw.ID)
 	}
 	var targets []dbTarget
-	if err := sc.readCatalog(ctx, func() (e error) { targets, e = r.targets(ctx, gr, sc.group); return }); err != nil {
+	if err := sc.readCatalog(ctx, "the nodes of the group in the catalog of every database", func() (e error) { targets, e = r.targets(ctx, gr, sc.group); return }); err != nil {
 		return err
 	}
 	var sysOut PromoteOutcome
@@ -1516,14 +1518,14 @@ func (r *Runner) checkCatalog(ctx context.Context, env *task.Env, sc *stepCtx) e
 		return err
 	}
 	var targets []dbTarget
-	if err := sc.readCatalog(ctx, func() (e error) { targets, e = r.targets(ctx, gr, sc.group); return }); err != nil {
+	if err := sc.readCatalog(ctx, "the nodes of the group in the catalog of every database", func() (e error) { targets, e = r.targets(ctx, gr, sc.group); return }); err != nil {
 		return err
 	}
 	for _, t := range targets {
 		for attempt := 0; ; attempt++ {
 			var nodes []Node
 			var term int64
-			if err := sc.readCatalog(ctx, func() (e error) {
+			if err := sc.readCatalog(ctx, "the nodes and the term of the catalog of database "+t.db, func() (e error) {
 				if nodes, e = r.Cat.Nodes(ctx, t.db); e != nil {
 					return e
 				}
@@ -1608,7 +1610,7 @@ func (r *Runner) repoint(ctx context.Context, env *task.Env, sc *stepCtx) error 
 		return err
 	}
 	var nodes []Node
-	if err := sc.readCatalog(ctx, func() (e error) { nodes, e = r.Cat.Nodes(ctx, SystemDB); return }); err != nil {
+	if err := sc.readCatalog(ctx, "the nodes of the system catalog", func() (e error) { nodes, e = r.Cat.Nodes(ctx, SystemDB); return }); err != nil {
 		return err
 	}
 	port := 0
@@ -1657,7 +1659,7 @@ func (r *Runner) records(ctx context.Context, env *task.Env, sc *stepCtx) error 
 		return err
 	}
 	var nodes []Node
-	if err := sc.readCatalog(ctx, func() (e error) { nodes, e = r.Cat.Nodes(ctx, SystemDB); return }); err != nil {
+	if err := sc.readCatalog(ctx, "the nodes of the system catalog", func() (e error) { nodes, e = r.Cat.Nodes(ctx, SystemDB); return }); err != nil {
 		return err
 	}
 	port := 0

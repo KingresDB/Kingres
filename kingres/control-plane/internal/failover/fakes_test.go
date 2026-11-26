@@ -51,10 +51,16 @@ type world struct {
 	promoteErr     map[string]error // scripted errors for the first calls, by server
 	promoteN       map[string]int
 	catScript      []any
-	// readErrs are the errors that the next reads of the catalog (Nodes) answer, one each, once the promotion happened; readErr is what a read answers after them while readForever is set.
+	// The faults of the reads of the catalog (Nodes and Status) of ONE step: readStep is the key of that step (empty: none), the first readSkip reads of the step
+	// answer, then each read answers the next of readErrs, and every read after them answers readForever (when set). readCalls counts the reads that hit the
+	// step after the skipped ones; curStep is the step that runs now (set by the Fault hook of the runner, see (*world).runner).
+	readStep       string
+	readSkip       int
 	readErrs       []error
 	readForever    error
 	readCalls      int
+	stepReads      int
+	curStep        string
 	catCalls       int
 	catalogFollows bool
 	primaryNames   []int64
@@ -467,20 +473,17 @@ func (c fcat) list(db string) *[]Node {
 func (c fcat) Nodes(_ context.Context, db string) ([]Node, error) {
 	c.w.mu.Lock()
 	defer c.w.mu.Unlock()
-	if c.w.promoted2() {
-		c.w.readCalls++
-		if len(c.w.readErrs) > 0 {
-			e := c.w.readErrs[0]
-			c.w.readErrs = c.w.readErrs[1:]
-			return nil, e
-		}
-		if c.w.readForever != nil {
-			return nil, c.w.readForever
-		}
+	if err := c.w.readFault(); err != nil {
+		return nil, err
 	}
 	return append([]Node(nil), (*c.list(db))...), nil
 }
 func (c fcat) Status(_ context.Context, db string) (int64, bool, error) {
+	c.w.mu.Lock()
+	defer c.w.mu.Unlock()
+	if err := c.w.readFault(); err != nil {
+		return 0, false, err
+	}
 	return c.w.term, false, nil
 }
 func (c fcat) RecoverPrepared(_ context.Context, db string) error {
@@ -754,7 +757,14 @@ func (w *world) runner() *Runner {
 		Sleep:     func(ctx context.Context, d time.Duration) error { return ctx.Err() },
 		LeaseWait: 3 * time.Second, LeasePoll: 10 * time.Millisecond, ReadBound: 3 * time.Second,
 		PromoteNode: PromoteOptions{Pause: time.Millisecond},
-		SyncWait:    time.Millisecond, PreparedWait: time.Millisecond, ClientsWait: time.Millisecond,
+		Fault: func(point string) {
+			if name, ok := strings.CutSuffix(point, ":before"); ok {
+				w.mu.Lock()
+				w.curStep, w.stepReads = name, 0
+				w.mu.Unlock()
+			}
+		},
+		SyncWait: time.Millisecond, PreparedWait: time.Millisecond, ClientsWait: time.Millisecond,
 	}
 }
 
@@ -958,12 +968,20 @@ func (p fpeers) MapRefusal(_ context.Context, _ int64) (string, bool) {
 	return p.w.mapRefusal, p.w.mapRefusal != ""
 }
 
-// promoted2 says that some standby was promoted: the reads of the catalog that the faults of readErrs and readForever hit are the ones after it.
-func (w *world) promoted2() bool {
-	for _, p := range w.promoted {
-		if p {
-			return true
-		}
+// readFault is the error that a read of the catalog answers now (the caller holds w.mu): only the reads of the step readStep are faulted.
+func (w *world) readFault() error {
+	if w.readStep == "" || w.curStep != StepName(1, w.readStep) {
+		return nil
 	}
-	return false
+	w.stepReads++
+	if w.stepReads <= w.readSkip {
+		return nil
+	}
+	w.readCalls++
+	if len(w.readErrs) > 0 {
+		e := w.readErrs[0]
+		w.readErrs = w.readErrs[1:]
+		return e
+	}
+	return w.readForever
 }
