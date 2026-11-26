@@ -469,7 +469,7 @@ and "Results of the spikes and changes made by the code (phase 14c)").
 The server implements revision **0.34.0** of the contract (178 operations, 142
 paths). "Real" means the operation works against PostgreSQL or the local node
 state. An operation that a server does not implement answers, after authentication, CSRF and role checks,
-**HTTP 422 with `code: unsupported_operation`**, which every authenticated operation lists. **All 178 operations are real; none answers so.** The one exception inside an operation is the check `anchors` of `startLedgerVerification`, which answers 422 `unsupported_operation`.
+**HTTP 422 with `code: unsupported_operation`**, which every authenticated operation lists. **178 of 178 operations are real; 0 answer "not yet".** The one exception inside an operation is the check `anchors` of `startLedgerVerification`, which answers 422 `unsupported_operation`.
 
 | Tag | Real | Not yet |
 |---|---|---|
