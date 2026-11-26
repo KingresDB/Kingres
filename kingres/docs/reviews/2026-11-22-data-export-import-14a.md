@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Independent review: phase 14a, table CSV export and import (2026-11-22)
 
 Reviewed: branch dx-cp at 3962c059a1 against its base 04132b6694 (design, ADR 0027, design review). Paths below are relative to the

@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Review of the console for table CSV export and import (phase 14a)
 
 Reviewed: branch `dx-web` at 08e26ebfa5, the console commits since cb4afe3757 (855b88a0fe, de98f0f782, a8d952e806,

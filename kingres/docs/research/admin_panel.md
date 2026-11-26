@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Cluster management panel (web admin console + control plane) for KingresDB, modeled on the Couchbase Server Web Console (state as of Nov 2026)
 
 Research note: about 20 tool calls. Several fetches failed or returned thin pages (see Gaps). Anything not listed under "Cited Findings" is either labeled an inference or a gap. Items marked [background, unverified] come from general knowledge and were not confirmed in this session.

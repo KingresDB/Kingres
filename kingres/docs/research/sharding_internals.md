@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Sharding inside PostgreSQL: implementation-level notes for KingresDB (as of Nov 2026)
 
 Method note: roughly 15 tool calls. Several fetches failed (ECONNRESET / socket hang up): Citus 2017 2PC blog, Citus 14.0 release page, PG partitioning docs, YugabyteDB transactions docs. Items marked "[background knowledge, unverified in this session]" come from the author's prior knowledge of the Citus/PG codebases. They have no URL, so the report writer should treat them as lower confidence and verify them against the cited source tree before relying on them.

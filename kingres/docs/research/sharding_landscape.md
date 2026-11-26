@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # PostgreSQL Sharding / Distribution Landscape (as of November 2026) - input for KingresDB design
 
 Method note: ~22 web searches/fetches. Search-tool answers are summaries; where a claim comes only from my background knowledge (no URL) it is placed under Inferences or Gaps and labelled "unverified". Dates of "last activity" were often not retrievable; those are flagged as gaps.

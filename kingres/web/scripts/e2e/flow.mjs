@@ -634,7 +634,7 @@ export async function runFlow(ctx) {
         throw new Error('failover: no notice that the group has no standby')
       })
     const danger = await page.$$eval('.notice.tone-danger', (e) =>
-      e.map((x) => x.textContent.replace(/s+/g, ' ').slice(0, 100)),
+      e.map((x) => x.textContent.replace(/\s+/g, ' ').slice(0, 100)),
     )
     expect(danger.length === 0, `failover: alarming notice: ${danger.join(' | ')}`)
     await shot('18-failover-refused')
@@ -650,15 +650,15 @@ export async function runFlow(ctx) {
       await ui.navigate('/rebalance')
       await ui.waitForText('Rebalance')
       await ui.waitForText('Idle').catch(async (e) => {
-        throw new Error(`${e.message}: ${(await ui.text()).replace(/s+/g, ' ').slice(0, 700)}`)
+        throw new Error(`${e.message}: ${(await ui.text()).replace(/\s+/g, ' ').slice(0, 700)}`)
       })
       await ui.click('Preview plan')
       await ui.waitForText('Nothing to move').catch(async (e) => {
-        throw new Error(`${e.message}: ${(await ui.text()).replace(/s+/g, ' ').slice(0, 700)}`)
+        throw new Error(`${e.message}: ${(await ui.text()).replace(/\s+/g, ' ').slice(0, 700)}`)
       })
       await ui.click('Start rebalance')
       await ui.waitForText('Nothing to rebalance').catch(async (e) => {
-        throw new Error(`${e.message}: ${(await ui.text()).replace(/s+/g, ' ').slice(0, 700)}`)
+        throw new Error(`${e.message}: ${(await ui.text()).replace(/\s+/g, ' ').slice(0, 700)}`)
       })
       expect(
         (await page.$$eval('.notice.tone-danger', (e) => e.length)) === 0,

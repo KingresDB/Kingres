@@ -89,5 +89,5 @@ case "$cmd" in
     echo "stopped"
     ;;
   datadir) echo "$DATA" ;;
-  *) echo "usage: backend.sh prepare|start|datadir|token|psql|log|stop" >&2; exit 2 ;;
+  *) echo "usage: backend.sh prepare|start|restart|datadir|token|psql|log|stop" >&2; exit 2 ;;
 esac

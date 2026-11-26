@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # kingres_shard: review of the fixes for the step 12 review (P12R-01 to P12R-07)
 
 ## Scope and method

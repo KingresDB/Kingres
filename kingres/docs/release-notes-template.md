@@ -14,6 +14,8 @@ A cluster runs one major. Choose it, and install every server of the cluster fro
 
 ## What is in this release
 
+The links in this list are relative to the directory `kingres/` of the tagged tree.
+
 @CHANGELOG@
 
 ## Files

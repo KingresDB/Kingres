@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Independent review: kingres_shard 0.9, storage part of phase 12 (branch p12-storage, tip fca6e4820d)
 
 Date: 2026-11-22. Compared with p12f-fix (f72ac87392). Reviewer: independent, read-only (no commit, no push).

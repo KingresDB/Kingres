@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Independent review of the fixes P7G-01 to P7G-06 (branch p7f-fix)
 
 ## 1. Scope, method, verdict

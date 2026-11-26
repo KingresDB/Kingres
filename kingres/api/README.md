@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # KingresDB management REST API
 
 `openapi.yaml` (OpenAPI 3.1, version 0.34.0) is the contract between the Go backend (`kingresd`) and the

@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # High availability: design of phase 5
 
 Status: accepted for implementation, 2026-11-14.

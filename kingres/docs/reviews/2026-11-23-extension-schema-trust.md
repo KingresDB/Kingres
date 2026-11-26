@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Security note: the schema of an extension is not trusted by its name (2026-11-23)
 
 Status: fixed in the first part (the helper, the readers listed below, the extension scripts); the other call sites of the control plane are fixed on top of the
