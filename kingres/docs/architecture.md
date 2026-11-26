@@ -18,7 +18,7 @@ This document is the research and the original design. Decisions taken while bui
 | Metrics | A bundled single-binary store (Prometheus or VictoriaMetrics) | No bundled store: `kingresd` keeps a short in-memory history for the panel's charts and exposes `/metrics` for an external Prometheus | [ADR 0020](adr/0020-no-bundled-metrics-store.md) |
 | Panel framework | React | Vue 3 | [ADR 0017](adr/0017-vue-for-the-web-panel.md) |
 | Licence of KingresDB's own code | The PostgreSQL License, as upstream | The GNU Affero General Public License, version 3 only. PostgreSQL's code keeps the PostgreSQL License | [ADR 0024](adr/0024-agpl-for-kingresdb-code.md) |
-| PostgreSQL majors | Based on PostgreSQL 18, with a port to 19 on a new branch later | One source of every extension that builds and is tested against 18 and 19; a product branch per major with the same core patches and the same KingresDB directories. The port to 19 is in progress | [ADR 0023](adr/0023-one-extension-source-for-several-majors.md) |
+| PostgreSQL majors | Based on PostgreSQL 18, with a port to 19 on a new branch later | One source of every extension that builds and is tested against 18 and 19; a product branch per major with the same core patches and the same KingresDB directories. Both majors are built: the first release is made for 18 and 19 at the same time | [ADR 0023](adr/0023-one-extension-source-for-several-majors.md) |
 | Package and unit name | `kingresdb`, `kingresdb.service` | Package `kingres`, unit `kingres.service`; client programs carry a `kingres-` prefix | [packaging/README.md](../packaging/README.md) |
 | Internal traffic between servers | Decided when needed | An internal HTTP API with mutual TLS on its own port, under a cluster certificate authority created at cluster creation | [design/control-plane-3.md](design/control-plane-3.md) |
 | Placement of standbys | Chained: every server hosts one primary and the standby of a neighbor | As proposed; details, including what a two-server cluster can and cannot do, are in the phase 5 design | [design/ha-phase5.md](design/ha-phase5.md) |
@@ -393,7 +393,7 @@ This is the layout that was adopted when implementation started (2026-11-14); it
     control-plane/           # Go: agent, manager, client router, REST API, CLI
     web/                     # Vue 3 + TypeScript panel
     verifier/                # standalone CLI for verifying digests and proofs
-    packaging/               # the single kingres package: deb, rpm, Docker image, systemd unit
+    packaging/               # the single kingres package: deb, Docker image, systemd unit, release script
     dev/                     # build and test scripts
     docs/                    # architecture.md, design/, adr/, dev/, research/, worklog.md
 ```
@@ -404,7 +404,7 @@ This is the layout that was adopted when implementation started (2026-11-14); it
 
 ### Scope of the first release, and the future roadmap (decided 2026-11-15)
 
-The project owner decided what the first release contains: every phase of this roadmap except phase 8, that is phases 0 to 7, 2b and 9 to 13. No beta is published and no release is tagged before all of them are finished. The order of the remaining work is: phase 5 (the high-availability part of the sharding extension, then failover), phase 4 (rebalancing driven by the control plane), phase 2b, phases 9, 10 and 11, the rest of phases 12 and 13, and phase 7. The design of phase 7 (signing, anchoring, tile publication, the aggregate digest and the verifier), written against what of it already exists, is [design/ledger-phase7.md](design/ledger-phase7.md).
+The project owner decided what the first release contains: every phase of this roadmap except phase 8, that is phases 0 to 7, 2b and 9 to 13. Phases 14a, 14b and 14c (export and import of a table and of a database) were added to that list later. All of them are built; the state of every phase is in [../README.md](../README.md). The design of phase 7 (signing, anchoring, tile publication, the aggregate digest and the verifier), written against what of it already exists, is [design/ledger-phase7.md](design/ledger-phase7.md).
 
 **Future roadmap, not part of the first release:** phase 8, a global snapshot across shard groups (CSN or hybrid logical clocks) and a multi-node ledger with consensus (Raft or CometBFT). It stays described in this document as it was researched, and is taken up after the first release if a concrete use case asks for it. Until then the guarantees are the ones stated for the earlier phases: no global snapshot (a statement that spans shard groups reads each group at its own snapshot), and one ledger chain per shard group with the aggregate digest of phase 7.
 
@@ -414,7 +414,7 @@ A comparison with the documentation of Citus 13.0 (2026-11-15) showed what a use
 
 | Phase | What it adds | In the web console | Depends on | Design |
 |---|---|---|---|---|
-| 2b (already planned) | Aggregate, sort and limit pushdown; colocated joins; the row router for multi-row `INSERT`, `INSERT ... SELECT` and `COPY FROM` | `EXPLAIN` in the workbench shows the path taken | phase 2a | [design/shard-phase2b.md](design/shard-phase2b.md) |
+| 2b | Aggregate, sort and limit pushdown; colocated joins; the row router for multi-row `INSERT`, `INSERT ... SELECT` and `COPY FROM` | `EXPLAIN` in the workbench shows the path taken | phase 2a | [design/shard-phase2b.md](design/shard-phase2b.md) |
 | 9 (table lifecycle) | Distributing a table that already has rows; turning a distributed or reference table back into an ordinary table; changing the distribution column, the bucket count or the colocation group of a table; partitioned tables as distributed tables | Tables of a database: distribute, undistribute and alter as tasks with progress | phase 4 (bucket movement), phase 2b (row router) | [design/shard-phase9.md](design/shard-phase9.md) |
 | 10 (elasticity) | Splitting a bucket; rebalancing in the background with a strategy (by bucket count or by disk size) and a threshold; draining a server | Shards page: split; Rebalance page: strategy, threshold, automatic rebalance on or off, progress and history; Servers page: drain and weight | phase 4, phase 5 (standbys follow a move) | [design/shard-phase10.md](design/shard-phase10.md) |
 | 11 (distributed schemas) | Schema-based sharding: every table of a schema lives in one shard group, schemas are placed and moved as units, new schemas can be distributed by default | Database settings: sharding by row or by schema; Schemas list with placement, size and move | phase 4, phase 9 | [design/shard-phase11.md](design/shard-phase11.md) |
@@ -427,9 +427,9 @@ Points the designs leave to be settled when each phase is implemented, because t
 - After a split (phase 10) a bucket has its own modulus. Every place that computes a bucket as `hash % bucket_count`, in the code and in the phase 2b design, has to use the catalog lookup instead; a missed place gives a wrong answer without an error.
 - `colocation.placement_epoch`, a counter, replaces the comparison of placement hashes of version 0.3 in every phase (it also closes review finding S4-01).
 - `CREATE TABLE ... (LIKE ... INCLUDING ALL)` does not carry the access method. Bucket moves, the rebuild of phase 9 and the split of phase 10 create their copies that way and must set the access method of each leaf explicitly once columnar tables exist.
-- A columnar table cannot be moved until `kingres_columnar` supports logical decoding, and cannot be split at all; a ledger table cannot be columnar; a distributed schema that holds a ledger table cannot be moved or drained.
+- A columnar table is moved with logical decoding of inserts (`kingres_columnar` 0.2) and is not split; a ledger table cannot be columnar; a distributed schema that holds a ledger table is pinned and cannot be moved or drained.
 - The phase 2b design needs four corrections before it is implemented: the placement check (epoch instead of a map version in the fragment), `ON CONFLICT DO UPDATE` in a colocated `INSERT ... SELECT` that is shipped whole, an allow-list of extensions whose functions and aggregates may be shipped, and an explicit destination for the batch sender of the row router.
-- Time partition policies run as tasks of the manager leader in `kingresd`, which has no recurring scheduler yet.
+- Time partition policies run as tasks of the manager leader in `kingresd`; its scheduler runs each policy at its interval.
 
 ### Phase 13: configuration from the console (added 2026-11-15)
 
@@ -442,7 +442,13 @@ Requested by the project owner: the settings of PostgreSQL on the servers of a c
 
 The control plane does not set the system clock of a server: that needs the rights of the operating system's administrator and is the job of time synchronization (NTP or chrony). It measures and reports the difference. The design is [design/config-phase13.md](design/config-phase13.md). This phase depends on phase 3 only and is built independently of the sharding phases.
 
-Not requested and therefore not scheduled: isolating one tenant on a bucket of its own (phase 10's split is the mechanism it would use), row-level security on distributed tables, statistics per tenant, distributed functions. The order of implementation is 2b, 9, 10, 11, 12, after phases 4 and 5 are complete; the extension is changed by one line of work at a time, because parallel changes to `contrib/kingres_shard` have conflicted before.
+Not requested and therefore not scheduled: isolating one tenant on a bucket of its own (phase 10's split is the mechanism it would use), row-level security on distributed tables, statistics per tenant, distributed functions. The phases were implemented in the order 2b, 9, 10, 11, 12, after phases 4 and 5 were complete.
+
+### Phases 14 and 15: export and import, and third-party extensions
+
+**Phase 14 (export and import).** 14a exports and imports a table as CSV. 14b exports a whole database as one archive and validates an archive without touching a database. 14c creates a new database from an archive. All three are built and are part of the first release; the transfers are staged encrypted files that run as the role that asked ([ADR 0027](adr/0027-transfers-are-staged-encrypted-files-run-as-the-requesting-role.md)), and the ledger of an imported database starts a new chain ([ADR 0028](adr/0028-ledger-tables-are-carried-as-data-and-restart-their-chain.md)). The design is [design/data-export-import.md](design/data-export-import.md); the operator's view is section 13 of the [operator guide](guide/operator-guide.md#13-export-and-import-of-a-database).
+
+**Phase 15 (management of third-party extensions).** Install and manage extensions that are not part of KingresDB from the console, on every server. It is designed and is not part of the first release: it is merged after 0.1.0, and nothing in this document or in the guide describes it as shipped. Extensions that duplicate a function of KingresDB, such as sharding, are refused.
 
 ### Risks
 
