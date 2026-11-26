@@ -39,9 +39,9 @@ refused with an error that names the setting: `CREATE TABLE ... USING
 columnar`, `INSERT`, `COPY`, `TRUNCATE`, a rewrite into columnar, and
 `columnar_compact`. A server that has ever written columnar WAL needs the
 library for as long as that WAL exists (crash recovery, archive recovery,
-base backups, `pg_rewind`). Resource manager id: 128 (`RM_EXPERIMENTAL_ID`).
-It must be replaced by an id reserved on the public registry before a release,
-because the id is part of the WAL format.
+base backups, `pg_rewind`). Resource manager id: 255, registered as
+`KingresColumnar` on the PostgreSQL wiki list of custom resource managers. The id
+is part of the WAL format and never changes.
 
 ## Use
 

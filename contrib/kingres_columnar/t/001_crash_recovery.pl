@@ -359,7 +359,7 @@ crash_and_restart($node, 'kill9');
 verify($node, 2200, '(h) TRUNCATE and reload replayed with consistency checking');
 
 # pg_waldump cannot load the module, so the resource manager has the generic
-# name custom128.  There must be records of it in the WAL we just wrote.
+# name custom255.  There must be records of it in the WAL we just wrote.
 $node->stop;
 {
 	my $waldir = $node->data_dir . '/pg_wal';
@@ -368,12 +368,12 @@ $node->stop;
 	closedir($dh);
 	my ($out, $err) = ('', '');
 	my $ok = IPC::Run::run(
-		[ 'pg_waldump', '--path', $waldir, '--rmgr', 'custom128',
+		[ 'pg_waldump', '--path', $waldir, '--rmgr', 'custom255',
 		  $segs[0], $segs[-1] ],
 		'>', \$out, '2>', \$err);
 	# pg_waldump may complain at the end of the last segment; the records are
 	# what counts.
-	my $n = () = $out =~ /^rmgr: custom128/mg;
+	my $n = () = $out =~ /^rmgr: custom255/mg;
 	cmp_ok($n, '>', 0, "(h) pg_waldump shows records of the resource manager ($n)");
 }
 $node->start;
