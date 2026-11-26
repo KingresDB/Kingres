@@ -39,7 +39,8 @@ Before a release is tagged, on each branch:
 - the suites of every KingresDB extension pass in tree;
 - the integration suite of the control plane passes against instances of that major;
 - the package tests pass (the Debian package, the image, and the three-node compose cluster);
-- the console's checks pass (they do not depend on the major, and are run once).
+- the console's checks pass (they do not depend on the major, and are run once);
+- the heading of the release in `kingres/CHANGELOG.md` carries its date, set by hand in the commit that is tagged (for example `## [0.1.0] - 2026-12-01` in place of `## [0.1.0] - not released`). The release script reads the changelog from the commit `--commit18` and never edits it, so a heading left as it is would be tagged as it stands. The heading must still start with `## [<version>]`, which is what the script matches, and the section must have no `### Pending` part.
 
 A cluster runs one major: all its servers are installed from the same branch. Moving a cluster from one major to the next is a separate procedure that is not designed yet.
 

@@ -607,7 +607,7 @@ second one) built from a formula. A node whose line differs (another major
 version that changed a hash function, a different encoding or byte order, a C
 library that rounds `asin` differently) must not exchange sketches with the
 others. The control plane runs `self_test()` on every server when it installs or
-verifies the extension (`kingres/control-plane/internal/ops/extensions.go`) and
+verifies the extension (`kingres/control-plane/internal/ops/approx.go`) and
 refuses a cluster whose servers differ (`409 sketch_hash_mismatch`). An operator
 can also run `SELECT kingres_sketch.self_test()` on every node by hand. The fields: `int2` to `uuid` and `int4[]` the hash of a fixed value;
 `hll` the estimate of a fixed set; `tdigest`, `tdigest_union`, `tdigest_read`

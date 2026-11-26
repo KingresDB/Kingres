@@ -360,8 +360,7 @@ Where the architecture document leaves something open, the simplest option was c
 7. **Server groups** are named racks/zones, created and deleted via `/server-groups`; membership is set with
    `PATCH /servers/{id}` (`serverGroup`). Deleting a non-empty group is 409 `server_group_not_empty`; a duplicate
    name is 409 `already_exists`; a name that breaks the pattern is 400.
-8. **Rebalance** has one cluster-wide lock (409 `rebalance_in_progress`). `maxConcurrentMoves` defaults to the
-   cluster setting (4), range 1 to 64, and is accepted and recorded: a run makes one move at a time. The plan preview lists at most `moveLimit` moves and always reports totals.
+8. **Rebalance** has one cluster-wide lock (409 `rebalance_in_progress`). `maxConcurrentMoves` is 1 to 64 and is recorded as 1 when a start leaves it out (the cluster setting `rebalance.maxConcurrentMoves`, default 4, is a default that is shown and changed in the settings, not what a start without the option records); a run makes one move at a time whatever the value. The plan preview lists at most `moveLimit` moves and always reports totals.
    Removing a server and changing replica count do not rebalance implicitly: `DELETE /servers/{id}` removes a server
    that holds no buckets (409 `server_owns_buckets` otherwise); to empty one, drain it (`POST /servers/{id}/drain`) or set `shouldHaveShards: false` and run
    `POST /rebalance` first. `GET /rebalance` reports `progress` only while a run is active and

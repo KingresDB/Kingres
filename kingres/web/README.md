@@ -117,7 +117,7 @@ shows as "n/a" with an accessible label, never as 0.
 npm run dev:backend  # mocks off; Vite proxies /api to http://127.0.0.1:8091
 ```
 
-The proxy target is in `vite.config.ts` (`KINGRES_API_TARGET` overrides it). `VITE_MOCKS=off` turns the mocks off. `npm run dev:backend` runs Vite in the mode `backend`, so it reads `.env.backend`. The repository ignores that file (`.env.*` in `kingres/.gitignore`): create it in `kingres/web` with the line `VITE_MOCKS=off`, or run `VITE_MOCKS=off npm run dev`. The mock layer
+The proxy target is in `vite.config.ts` (`KINGRES_API_TARGET` overrides it). `npm run dev:backend` runs Vite in the mode `backend`, and `vite.config.ts` sets `VITE_MOCKS` to `off` in that mode, so the mocks are off and no `.env.backend` file is needed. `npm run dev` keeps the mocks on; `VITE_MOCKS=off npm run dev` turns them off there too. The mock layer
 is imported only when `import.meta.env.DEV` is true, so it is not in the production build (checked: no `msw`
 string in `dist/`).
 
@@ -153,7 +153,7 @@ an installed KingresDB inside WSL: a PostgreSQL installation that holds the King
 4. drives a headless browser through the real flow (`scripts/e2e/flow.mjs`): wizard with the real setup token and the server's own fingerprint (wrong
    token and wrong data directory first), sign-in, reload, roles (duplicate, disable, a stats-only account), a sharded
    database with the ledger, tables made with psql, distribute and enable-ledger from the panel, workbench query and
-   SQL error, grant, network rule, every page, the failover and rebalance dialogs (the steps of this part were written when the server did not do them yet, see below), the cluster settings, the audit log, drop database, server groups (create, assign, refused delete, unassign,
+   SQL error, grant, network rule, every page, the failover dialog (refused calmly: a cluster of one server has no standby) and the rebalance dialog (idle, an empty plan), the cluster settings, the audit log, drop database, server groups (create, assign, refused delete, unassign,
    delete), the certificate and fingerprint of a server, the add-server dialog (pin or explicit unpinned choice; the server refuses a request without either), a ledger proof (pending
    until a digest, then shown), the proof and digest files compared byte for byte with the server's answer and accepted by
    `kingres-verify`, a ledger verification and its record, local settings (log level, memory quota and the persistent
@@ -164,10 +164,13 @@ an installed KingresDB inside WSL: a PostgreSQL installation that holds the King
 5. prints a report (notes, per-page state, every HTTP error the browser saw) and tears everything down.
 
 The exit code is 0 only if every step passed. Screenshots are in `.e2e/shots/` (ignored by git). `E2E_KEEP_INSTALL=1`
-keeps that copy of the installation for faster re-runs; `E2E_KEEP_RUNNING=1` leaves the processes running. `scripts/e2e/backend.sh` is
-the WSL side (`prepare`, `start`, `restart`, `token`, `psql`, `stop`). `puppeteer-core` is a development dependency.
+keeps that copy of the installation for faster re-runs; `E2E_KEEP_RUNNING=1` leaves the processes running. `puppeteer-core` is a development dependency.
 
-The runner was written for contracts 0.2 to 0.9: its steps do not cover the later parts of the console (data transfer, analytics, the full ledger console), and the steps for the failover and rebalance dialogs were written when the server did not do those operations yet, so check them against the current server before you rely on them. It has steps for contract 0.7.0 (a running statement is cancelled; "Stop waiting" then "Cancel it on the server"; the
+`scripts/e2e/backend.sh` is the WSL side. Its commands are `prepare <kingresd-binary>` (copies the installation and the binary; the installation is `E2E_PG_INSTALL`, else the installation of the control-plane tests when its `kingres_ledger` script of the version in its `.control` file exists, else the first one; the version is read from the `.control` file, no number is written in the script), `start` (a fresh data directory, starts `kingresd`, waits for the health check), `restart` (stops and starts it again on the same data; sessions are lost), `datadir` (prints the data directory of the test server), `token` (prints the setup token), `psql <database> <sql>` (SQL as the cluster administrator; needs `E2E_ADMIN_PASSWORD`), `log` (prints the `kingresd` log) and `stop [--remove-install]` (stops the instances and `kingresd` and removes the data). `flow.mjs` takes the data directory that the wizard is given from `E2E_DATA_DIR` and fails at once when it is not set; `run.mjs` fills the variable from `backend.sh datadir` after `start`, so a normal `npm run e2e` needs nothing. The failover step expects the refusal that a cluster with no standby gets (409 `no_replica_available`, shown as a warning, not an alarm).
+
+**State of the runner.** It has not been run against a current cluster (contract 0.34.0). The run that is recorded below is of contract 0.6.0, and its steps for the later parts of the console are missing. Run it and read its report before you rely on it.
+
+The runner was written for contracts 0.2 to 0.9: its steps do not cover the later parts of the console (data transfer, analytics, the full ledger console), and the steps for the failover and rebalance dialogs only check the refusal and the idle state that a one-server cluster gives. It has steps for contract 0.7.0 (a running statement is cancelled; "Stop waiting" then "Cancel it on the server"; the
 Replication page shows the lease and the commit rule of every group; the server page lists its leases; changing the replica count
 of a one-server cluster), and the audit step expects `cancelStatement`. They were written next to a cluster test of the control plane (three `kingresd` processes), which the runner must not start next to; give the runner its own `E2E_API_PORT` and `E2E_PG_PORT` and run it when the machine is free.
 The selectors the new steps use (`group-lease`, `commit-rule`, `replica-count`, `server-leases`) are the ones the unit tests use.
