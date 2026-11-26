@@ -36,7 +36,7 @@ status) [ -f "$pid" ] && exit 0; exit 3 ;;
 stop)
   echo "$args" >> "$D/stop-args"; date +%s%N > "$D/stop-asked"
   [ -f "$D/failreq" ] && exit 1
-  case " $args " in *" -w "*) while [ -f "$pid" ]; do sleep 0.1; done ;; esac
+  case " $args " in *" -w "*) n=0; while [ -f "$pid" ] && [ $n -lt 30 ]; do sleep 0.1; n=$((n+1)); done; [ -f "$pid" ] && exit 1 ;; esac
   [ -f "$D/slow" ] || rm -f "$pid"
   exit 0 ;;
 esac
@@ -222,6 +222,11 @@ func TestAStoppedInstanceIsNeitherAnErrorNorAStandDown(t *testing.T) {
 // as a primary.
 func TestAnInstanceInBothListsIsAskedOnceAsAPrimary(t *testing.T) {
 	m, data := stopAllFixture(t, 5*time.Second)
+	touch(t, data[1], "slow") // the instance stays up for a while, so a second request for it would run pg_ctl again
+	go func() {
+		time.Sleep(600 * time.Millisecond)
+		_ = os.Remove(filepath.Join(data[1], "postmaster.pid"))
+	}()
 	var told []int
 	if err := m.StopAllForShutdown(context.Background(), []int{1, 101}, []int{1}, func(id int, _ string) { told = append(told, id) }); err != nil {
 		t.Fatal(err)

@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,7 +20,7 @@ import (
 )
 
 // stopFixture is a service whose instances 1, 101 and 102 have a live fake postmaster (a copy of sleep named postgres) and a fake pg_ctl that
-// removes the pid file on "stop" and says "running" for as long as it exists.
+// records every "stop" in the file stop-asked of the data directory, removes the pid file (unless the directory has a file named slow) and says "running" for as long as it exists.
 func stopFixture(t *testing.T) (svc *Service, data map[int]string) {
 	t.Helper()
 	sleep, err := exec.LookPath("sleep")
@@ -42,7 +43,7 @@ while [ $# -gt 0 ]; do if [ "$1" = "-D" ]; then D=$2; fi; shift; done
 pid="$D/postmaster.pid"
 case "$cmd" in
 status) [ -f "$pid" ] && exit 0; exit 3 ;;
-stop) rm -f "$pid"; exit 0 ;;
+stop) echo asked >> "$D/stop-asked"; [ -f "$D/slow" ] || rm -f "$pid"; exit 0 ;;
 esac
 exit 0
 `
@@ -124,12 +125,23 @@ func TestTheOrderlyStopOfAServerWithoutAPrimaryStandsDownTheHomeInstanceOnce(t *
 			t.Fatal(err)
 		}
 	}
+	if err := os.WriteFile(filepath.Join(data[1], "slow"), nil, 0o600); err != nil { // stays up for a while: a second request would run pg_ctl again
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(600 * time.Millisecond)
+		_ = os.Remove(filepath.Join(data[1], "postmaster.pid"))
+	}()
 	var told []int
 	if err := svc.StopInstanceForShutdown(context.Background(), func(id int, _ string) { told = append(told, id) }); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(told, []int{NodeID}) {
 		t.Errorf("stand-down for %v, want the home instance only, once", told)
+	}
+	b, _ := os.ReadFile(filepath.Join(data[1], "stop-asked"))
+	if n := strings.Count(string(b), "\n"); n != 1 {
+		t.Errorf("the home instance was asked %d times, want once", n)
 	}
 	for id, d := range data {
 		if running(d) {
