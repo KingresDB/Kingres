@@ -4,7 +4,7 @@
 // The failover of contract 0.10.0 in the mock (design `ha-phase5-part2.md`, 8.7): plans, runs with one block of steps per
 // group, the pause for a decision, refusals, a failure at a step, a cancel, the map group's bootstrap, the state of the
 // old primary, and a report for every run that is paused, failed, cancelled or done. The mock is the contract's
-// executable form: what the real server refuses for now (the planned switchover, the map group) it refuses here too,
+// executable form: what the mock refuses by default (the planned switchover, the map group, which the real server does) it refuses here too,
 // unless a URL switch (switches.ts) turns it on for trying the console that will need it.
 import type { components } from '@/api/schema'
 import type { Task } from '@/api/types'
@@ -120,8 +120,7 @@ function dataLossOf(mode: string, chosen: string | null, forced = false): S['Dat
 const stepsOf = (mode: string): string[] => (mode === 'graceful' ? GRACEFUL_STEPS : HARD_STEPS)
 
 /**
- * What a failover of `serverId` would do, for the groups the request names (default: all it is primary of). It refuses as
- * the real server does for now: the planned switchover and the map group answer 422 `unsupported_operation` unless the
+ * What a failover of `serverId` would do, for the groups the request names (default: all it is primary of). By default it refuses: the planned switchover and the map group answer 422 `unsupported_operation` unless the
  * URL switches (`graceful`, `map`) turn them on.
  */
 export function failoverPlan(
