@@ -813,38 +813,45 @@ func (m *Manager) StopForShutdown(ctx context.Context, id int, requested func(po
 }
 
 // StopAllForShutdown is the orderly stop of the service for all instances of the server. The fast shutdown is asked
-// of every instance first, the standbys before the primaries, and only then are the instances awaited. The lease
+// of every instance first, the primaries before the standbys, and only then are the instances awaited. The lease
 // watchdog of a primary fences it with an immediate shutdown a few seconds after kingresd stopped renewing the lease,
 // unless the stop was requested and the watchdog told to stand down (requested, called with the instance id and the
-// postmaster asked), so the request for one primary must never wait for the end of another instance's shutdown: a
-// standby that is slow to stop (one in crash recovery on a slow disk) or an earlier primary with a long shutdown
-// checkpoint would otherwise cost the next primary a crash recovery. The first error is returned after every instance
-// was handled.
+// postmaster asked), so the request for a primary must never wait for anything else: not for the end of another
+// instance's shutdown (a standby in crash recovery on a slow disk, an earlier primary with a long shutdown
+// checkpoint) and not for the requests for the standbys, which come after it. An instance that is in both lists is
+// asked once, as a primary. Every failure is returned, joined, each with the id of its instance; a failure of one
+// instance never keeps the others from being asked and awaited.
 func (m *Manager) StopAllForShutdown(ctx context.Context, standbys, primaries []int, requested func(id int, postmaster string)) error {
-	var first error
-	keep := func(err error) {
-		if err != nil && first == nil {
-			first = err
-		}
-	}
+	var errs []error
+	seen := map[int]bool{}
 	var asked []*ShutdownRequest
-	for _, id := range standbys {
+	ask := func(id int, primary bool) {
+		if seen[id] {
+			return
+		}
+		seen[id] = true
 		r, err := m.RequestShutdown(ctx, id)
-		keep(err)
-		asked = append(asked, r)
-	}
-	for _, id := range primaries {
-		r, err := m.RequestShutdown(ctx, id)
-		keep(err)
-		if r != nil && requested != nil {
+		if err != nil {
+			errs = append(errs, fmt.Errorf("instance %d: %w", id, err))
+			return
+		}
+		if r != nil && primary && requested != nil {
 			requested(id, r.Postmaster)
 		}
 		asked = append(asked, r)
 	}
-	for _, r := range asked {
-		keep(m.AwaitShutdown(ctx, r))
+	for _, id := range primaries {
+		ask(id, true)
 	}
-	return first
+	for _, id := range standbys {
+		ask(id, false)
+	}
+	for _, r := range asked {
+		if err := m.AwaitShutdown(ctx, r); err != nil {
+			errs = append(errs, fmt.Errorf("instance %d: %w", r.ID, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // postmasterIdentity is the process id and the start time of the postmaster, the

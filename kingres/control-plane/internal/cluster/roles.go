@@ -311,7 +311,7 @@ func (s *Service) writeIdentAll(osUser string, roles []string) error {
 	return nil
 }
 
-// stopStandbys stops every local instance that is not a primary (a server stops
+// stopStandbys stops every local instance that is not a primary (StopInstance; the orderly stop of the service does not use it) (a server stops
 // its standbys first, so that nothing replicates from a primary that is going
 // away), and returns the first error.
 func (s *Service) stopStandbys(ctx context.Context) error {

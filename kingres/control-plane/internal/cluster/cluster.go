@@ -319,16 +319,16 @@ func (s *Service) StopInstance(ctx context.Context) error {
 }
 
 // StopInstanceForShutdown is StopInstance for the orderly stop of the service
-// (kingresd -stop-instances): the primary instance is asked for a fast shutdown
-// without waiting, requested is called with the identity of the postmaster that
-// was asked, and only then the stop is awaited (instance.Manager.StopAllForShutdown). The standbys are asked first and
-// awaited together with the primaries.
+// (kingresd -stop-instances): every instance is asked for a fast shutdown without
+// waiting, the primaries first (requested is called for each with the identity of
+// the postmaster that was asked), then the standbys, and only then are they all
+// awaited (instance.Manager.StopAllForShutdown).
 func (s *Service) StopInstanceForShutdown(ctx context.Context, requested func(id int, postmaster string)) error {
 	if !s.Enabled() || !s.mgr.Exists(NodeID) {
 		return nil
 	}
-	// Every instance is asked before any is awaited: a standby that is slow to stop must not delay the request for the
-	// primary, after which its lease watchdog stands down.
+	// Every instance is asked before any is awaited, so nothing delays the request for a primary, after which its lease
+	// watchdog stands down.
 	var standbys []int
 	for _, li := range s.LocalInstances() {
 		if !li.Role.Writable() {
