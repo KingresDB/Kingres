@@ -187,7 +187,7 @@ func (e *env) runTrustShow(args []string) int {
 		"tsa_roots": len(f.TSARoots), "client_keys": len(f.ClientKeys),
 	}
 	if len(f.TSARoots) > 0 || len(f.ClientKeys) > 0 {
-		r.notes = append(r.notes, fmt.Sprintf("time-stamp authority roots (%d) and client keys (%d) are read and validated but no command uses them yet", len(f.TSARoots), len(f.ClientKeys)))
+		r.notes = append(r.notes, fmt.Sprintf("time-stamp authority roots (%d) are used when anchors are checked, and client keys (%d) when client signatures are checked", len(f.TSARoots), len(f.ClientKeys)))
 	}
 	r.notes = append(r.notes, "compare the fingerprints with the ones the cluster's console shows, by a channel other than this file")
 	if usable == 0 {

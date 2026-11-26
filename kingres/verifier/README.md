@@ -550,9 +550,8 @@ says that it is enforced and how (below). A file that is well formed but in whic
 no key can be used at that time is reported as such and ends with status 2,
 because every verifying command would refuse it; a file with no key at all is
 refused when it is read. The time-stamp authority roots and client keys of the
-file are validated and counted. The output of `trust show` still adds a note that "no command
-uses them yet"; that note is out of date: `anchors` and `bundle verify` use the `tsa_roots`, and
-`attestation` and `bundle verify` use the `client_keys` (`internal/cli/cli_trust.go`).
+file are validated and counted, and a note says what they are for: `anchors` and `bundle verify` use the
+`tsa_roots`, and `attestation` and `bundle verify` use the `client_keys`.
 
 **Validity of a key** (design 14, correction 14). A checkpoint carries no time that
 can be trusted, so the verifier can enforce what the data proves (a tree size) and
