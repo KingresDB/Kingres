@@ -71,7 +71,10 @@ func (m *Manager) Adopt(group int32, kind string) error {
 	// the role files still name primary for the group from being started by this server, which now holds the lease of
 	// the group as the fence holder or as the holder-to-be. Only Attach (the instance of this adoption is the primary)
 	// and Unrelinquish (a cancelled hand-over) remove it.
+	wasRelinquished := m.relinq[group]
 	delete(m.relinq, group)
+	// An adoption that exists is only given its kind: the flag above is cleared, but the rounds are kept (a Relinquish never gave the lease away, so
+	// what the rounds say is still true).
 	if cur := m.adopted[group]; cur != nil {
 		if cur.attached {
 			return nil
@@ -80,7 +83,16 @@ func (m *Manager) Adopt(group int32, kind string) error {
 		return nil
 	}
 	m.adopted[group] = &adoption{kind: kind}
-	delete(m.groups, group) // a new adoption is judged from its own first round
+	// A new adoption is judged from its own first round, not from the rounds of a lease that was given up. A group that the cached topology names to
+	// this server loses its adoption at every renewal pass (the renewal goes on by the catalog), so a step that asks again every second makes a new
+	// adoption each time: the state is wiped only when the group was given up (it is renewed again from this call on) or the topology does not name it,
+	// or the rounds that the pass just ran would be wiped by the next ask, the status read after it would never see a held lease and the wait would end
+	// with the lease held by nobody. Kept state is still judged by its clock and its lost flag (Held), never taken as held by itself; Rounds and
+	// RefusedBy are those of the last rounds, which may be older than this call (the step reads them only after its own wait has run out).
+	// A cached topology that is out of date only keeps state that is true or wipes state, as before.
+	if wasRelinquished || !m.namedByCatalogLocked(group) {
+		delete(m.groups, group)
+	}
 	return nil
 }
 
@@ -364,24 +376,32 @@ func (m *Manager) ReleaseGroup(ctx context.Context, group int32) (TransferResult
 	req := Request{Group: group, DurationMs: m.c.Duration.Milliseconds(), Release: true}
 	rctx, cancel := context.WithTimeout(ctx, m.c.Duration-m.c.Margin)
 	defer cancel()
-	results := make(chan bool, len(members))
+	type answer struct {
+		server string
+		ok     bool
+		why    string
+	}
+	results := make(chan answer, len(members))
 	for _, s := range members {
 		m.fl.add(group)
 		go func() {
 			defer m.fl.done(group)
 			if s == m.c.Self {
 				r, err := m.c.Grantor.Release(group, m.c.Self)
-				results <- err == nil && releaseDone(r)
+				results <- answer{s, err == nil && releaseDone(r), releaseWhy(r, err)}
 				return
 			}
 			r, err := m.c.Voter.Grant(rctx, s, req)
-			results <- err == nil && releaseDone(r)
+			results <- answer{s, err == nil && releaseDone(r), releaseWhy(r, err)}
 		}()
 	}
 	granted := 0
+	var refused []string
 	for i := 0; i < len(members); i++ {
-		if <-results {
+		if a := <-results; a.ok {
 			granted++
+		} else {
+			refused = append(refused, a.server+": "+a.why)
 		}
 		if granted >= need {
 			break
@@ -397,7 +417,8 @@ func (m *Manager) ReleaseGroup(ctx context.Context, group int32) (TransferResult
 			_ = os.Remove(MarkerPath(m.c.Dir, RelinquishedMarker, group))
 		}
 		m.mu.Unlock()
-		return res, fmt.Errorf("lease: only %d of the %d grantors needed released the lease of shard group %d", granted, need, group)
+		sort.Strings(refused)
+		return res, fmt.Errorf("lease: only %d of the %d grantors needed released the lease of shard group %d (%s)", granted, need, group, strings.Join(refused, "; "))
 	}
 	m.mu.Lock()
 	m.relinq[group] = true
@@ -444,6 +465,18 @@ func transferDone(r Reply, to string) bool { return r.Holder == to }
 // releaseDone reads the answer of a grantor to a release: the lease is free there, so no holder is named. A
 // grantor of the version before the release answers a plain grant for the caller and names it (FO-06).
 func releaseDone(r Reply) bool { return r.Granted && r.Holder == "" }
+
+// releaseWhy says in a word why a grantor did not release: the error, the other holder it named, or that it answered a grant for the caller.
+func releaseWhy(r Reply, err error) string {
+	switch {
+	case err != nil:
+		return "error: " + err.Error()
+	case !r.Granted:
+		return "refused, held by " + r.Holder
+	default:
+		return "answered a grant for " + r.Holder
+	}
+}
 
 // primaryRunning refuses a hand-over of the lease while an instance of the group runs on this server (FO-07): the
 // primary would go on acting with a lease that is another server's now, until the watchdog stopped it. The caller
@@ -555,4 +588,18 @@ func (m *Manager) Candidate(group int32) string {
 // ForgetCandidate removes the record.
 func (m *Manager) ForgetCandidate(group int32) {
 	_ = os.Remove(MarkerPath(m.c.Dir, CandidateMarker, group))
+}
+
+// namedByCatalogLocked says that the cached topology of the catalog lists the group as one this server runs the primary of: it is renewed from the topology,
+// and an adoption of it is dropped at the next renewal pass.
+func (m *Manager) namedByCatalogLocked(group int32) bool {
+	if !m.haveT {
+		return false
+	}
+	for _, g := range m.topo.Groups {
+		if g == group {
+			return true
+		}
+	}
+	return false
 }

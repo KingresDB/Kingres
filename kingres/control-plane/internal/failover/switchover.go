@@ -275,6 +275,13 @@ func (r *Runner) drain(ctx context.Context, env *task.Env, sc *stepCtx) error {
 	}
 }
 
+// DemoteCallBound is how long the call that stops the old primary of a switchover may take (the peer client cancels it after this). The lease of the task
+// of the map group is made to cover it before the stop, because the store of that task is the instance that is being stopped.
+const DemoteCallBound = 90 * time.Second
+
+// MapRollbackBound bounds the rollback of the map group after a stop that failed or was not clean.
+const MapRollbackBound = 4 * time.Minute
+
 // stopClean marks the position, waits until the new primary has replayed the mark, and stops the old primary with a fast shutdown (design
 // S4 and S5). The call that stops it releases the lease and answers the position of the shutdown checkpoint.
 func (r *Runner) stopClean(ctx context.Context, env *task.Env, sc *stepCtx) error {
@@ -327,16 +334,42 @@ func (r *Runner) stopClean(ctx context.Context, env *task.Env, sc *stepCtx) erro
 	} else if st, serr := r.Peers.State(ctx, sc.old(), sc.group); !IsCode(merr, "not_primary") && !(serr == nil && len(st.OutOfRecovery()) == 0) {
 		return sc.rollbackFailed(ctx, CodeStandbyBehind, true, "the position of the old primary of shard group %d could not be marked: %v", sc.group, merr)
 	}
+	restoreLease := func() {}
+	if sc.group == 0 {
+		// The lease of this task is a row of the system database, and the clean stop shuts that database down: no renewal can reach it for as long as the
+		// shutdown checkpoint lasts, and the lease guard of the engine would cancel this step (and with it the stop) after a third of the lease. The lease is
+		// lengthened in the store first, while the database still answers, to cover the longest stop that the call allows; the run then trusts it exactly that
+		// long, and no other server can take the task over before it. A stop that outlasts even that is cancelled and rolled back as a stop that was not clean.
+		restore, lerr := env.ExtendLease(ctx, orDur(r.MapStopCover, DemoteCallBound))
+		if lerr != nil {
+			if errors.Is(lerr, ErrLeaseLost) {
+				return lerr
+			}
+			return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the lease of the task could not be lengthened for the stop of the map group, so nothing was stopped: %v", lerr)
+		}
+		restoreLease = restore
+		defer restore() // a safety net: the call below is the normal place, and the restore runs once
+	}
 	ans, err := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "fast", ExpectedTerm: run.ExpectedTerm, Candidate: sc.candidateOf(nw)})
+	// The rollback of the map group runs on a context that the lease guard cannot cancel (its store is the instance that was stopped, so the guard is not
+	// raised again), with a bound of its own: starting the old primary again may wait for a postmaster that is still shutting down. The lease stays extended
+	// until the rollback has returned (the deferred restore); on the clean path it is restored at once, below.
+	rbctx := ctx
+	if sc.group == 0 {
+		var cancelRB context.CancelFunc
+		rbctx, cancelRB = context.WithTimeout(context.WithoutCancel(ctx), MapRollbackBound)
+		defer cancelRB()
+	}
 	if err != nil {
 		if IsCode(err, "stale_term") {
-			return sc.rollbackFailed(ctx, CodeSuperseded, false, "another failover changed the catalog term of the cluster")
+			return sc.rollbackFailed(rbctx, CodeSuperseded, false, "another failover changed the catalog term of the cluster")
 		}
-		return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the old primary of shard group %d could not be stopped cleanly: %v", sc.group, err)
+		return sc.rollbackFailed(rbctx, CodeSwitchoverUnproven, true, "the old primary of shard group %d could not be stopped cleanly: %v", sc.group, err)
 	}
 	if !ans.Stopped || ans.ClusterState != "shut down" || ans.Checkpoint == "" || !ans.Released {
-		return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the stop of the old primary of shard group %d was not clean (state %q, released %v)", sc.group, ans.ClusterState, ans.Released)
+		return sc.rollbackFailed(rbctx, CodeSwitchoverUnproven, true, "the stop of the old primary of shard group %d was not clean (state %q, released %v)", sc.group, ans.ClusterState, ans.Released)
 	}
+	restoreLease() // the clean stop is over: the lease is brought back to its normal length at once, not after the verdict wait
 	sc.event(ctx, "stoppedClean", map[string]any{"checkpoint": ans.Checkpoint, "clusterState": ans.ClusterState})
 	if sc.group == 0 {
 		// The old leader is stopped: nothing can be recorded by this task until the new leader's engine claims it. The proof goes to the candidate, which
@@ -400,11 +433,13 @@ func (r *Runner) verify(ctx context.Context, env *task.Env, sc *stepCtx) error {
 	} else if handed {
 		return task.Skip("the map group was handed over already")
 	}
-	// Read the shutdown checkpoint again (the stop is idempotent): it is what the proof is made of.
-	ans, err := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "fast", ExpectedTerm: run.ExpectedTerm, Candidate: sc.candidateOf(nw)})
+	// Read the shutdown checkpoint again: it is what the proof is made of. Only the proof is asked for: the lease was released by the stop, and a release
+	// now (after a replay that follows the lease step) would give away the lease that this task has seen held.
+	ans, err := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "fast", ExpectedTerm: run.ExpectedTerm, Candidate: sc.candidateOf(nw), ProofOnly: true})
 	if err != nil || !ans.Stopped || ans.ClusterState != "shut down" || ans.Checkpoint == "" {
 		return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the shutdown checkpoint of the old primary of shard group %d cannot be read (%v)", sc.group, err)
 	}
+	sc.noteProofAnswer(ans)
 	deadline := r.now().Add(orDur(r.VerifyWait, 30*time.Second))
 	for {
 		v, verr := r.Peers.Verify(ctx, nw.Server, VerifyRequest{Group: sc.group, InstanceID: nw.InstanceID, Checkpoint: ans.Checkpoint, ClusterState: ans.ClusterState})
@@ -632,4 +667,12 @@ func (sc *stepCtx) candidateOf(nw StandbyRec) string {
 		return ""
 	}
 	return nw.Server
+}
+
+// noteProofAnswer warns when the server of the old primary answered a request for the proof alone with the answer of a full stop: it is of a version
+// that does not know the flag, so its repeated stop released the lease again (a rolling upgrade; the guide says no switchover is made during one).
+func (sc *stepCtx) noteProofAnswer(ans DemoteAnswer) {
+	if !ans.ProofOnly {
+		sc.r.log().Warn("failover: the server of the old primary did not honour the request for the proof alone (it is of an older version): its repeated stop may have released the lease", "group", sc.group, "server", sc.old())
+	}
 }

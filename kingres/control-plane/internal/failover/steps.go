@@ -89,6 +89,7 @@ type Runner struct {
 	DrainWait          time.Duration // the wait for prepared transactions of a switchover (default 1 min)
 	DrainEvery         time.Duration // (default 10 s)
 	MarkWait           time.Duration // the wait for the standby to replay the mark (default 10 s)
+	MapStopCover       time.Duration // the time the lease of the task must be trusted from the clean stop of the map group (default DemoteCallBound)
 	VerifyWait         time.Duration // the proof is repeated this long (default 30 s)
 	OldServerWait      time.Duration // the calls to the old primary's server after the promotion wait this long (default 15 s)
 	MapVerdictWait     time.Duration // the old leader of a planned switchover of the map group waits this long for the candidate to promote or to refuse (default 6 min)
@@ -1226,10 +1227,12 @@ func (r *Runner) promote(ctx context.Context, env *task.Env, sc *stepCtx) error 
 	if sc.in.graceful() {
 		if st, serr := r.Peers.State(ctx, nw.Server, sc.group); !(serr == nil && len(st.OutOfRecovery()) > 0) {
 			// Not promoted yet: the proof is made again in the call (F4-07). The shutdown checkpoint is read again from the stopped old primary.
-			ans, derr := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "fast", ExpectedTerm: run.ExpectedTerm})
+			// Only the proof is asked for: the lease was released by the stop and is the fence holder's or the candidate's now, and a release here would give it away.
+			ans, derr := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "fast", ExpectedTerm: run.ExpectedTerm, ProofOnly: true})
 			if derr != nil || !ans.Stopped || ans.ClusterState != "shut down" || ans.Checkpoint == "" {
 				return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the shutdown checkpoint of the old primary of shard group %d cannot be read before the promotion (%v)", sc.group, derr)
 			}
+			sc.noteProofAnswer(ans)
 			req.Checkpoint, req.ClusterState = ans.Checkpoint, ans.ClusterState
 		}
 	}
@@ -1797,6 +1800,12 @@ func (r *Runner) unfreeze(ctx context.Context, env *task.Env, sc *stepCtx) error
 		term := int64(-1)
 		if run, rerr := sc.runRow(ctx); rerr == nil {
 			term = run.ExpectedTerm
+		}
+		// The promotion of this group raised the catalog term (promote_node), and the term of the run row is raised only by the groups that ran before: the
+		// call carries the term that the promotion made, or the old server (when it can read its catalog) refuses it as stale, keeps its hold and its flag that
+		// the group is quiesced. The calls of the later steps that carry a term (the repoint) are not judged by it.
+		if gr, found, gerr := sc.rows.Group(ctx, sc.group); gerr == nil && found && gr.TermAfter != nil && *gr.TermAfter > term {
+			term = *gr.TermAfter
 		}
 		if err := sc.oldUnquiesce(ctx, term); err != nil && !errors.Is(err, ErrUnreachable) && !IsCode(err, "no_instance") {
 			r.log().Warn("failover: putting the access rules back", "group", sc.group, "error", err)

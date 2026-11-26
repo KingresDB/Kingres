@@ -62,6 +62,7 @@ func TestSwitchoverOfAGroup(t *testing.T) {
 	c, port, pool, leader, g, old, nw, w := e.c, e.port, e.pool, e.leader, e.g, e.old, e.nw, e.w
 	id := swRequest(t, leader, old, nw, g)
 	swWait(t, e, id, 8*time.Minute)
+	noStaleUnquiesce(t, c)
 	if host := swPrimaryHost(t, leader, g); host != nw.Host {
 		t.Fatalf("the primary of group %d is on %s, want %s", g, host, nw.Host)
 	}
@@ -239,7 +240,7 @@ func swWait(t *testing.T, e swEnv, id any, d time.Duration) map[string]any {
 			t.Logf("failover status: %v", e.leader.Expect(200, "GET", "/failover", nil))
 			t.Logf("leader log: %s", e.leader.LogTail(12000))
 			for _, n := range e.c.Nodes {
-				t.Logf("the lease, fence and stop lines of %s: %s", n.Host, leaseLines(n.LogTail(8000000)))
+				t.Logf("the lease, fence and stop lines of %s: %s", n.Host, leaseLines(n.Log()))
 			}
 		}
 	}()
@@ -392,6 +393,52 @@ func TestSwitchoverOfTheMapGroup(t *testing.T) {
 	body := nw.Expect(200, "GET", "/cluster", nil)
 	if ml, _ := body["managerLeader"].(map[string]any); ml == nil || ml["serverId"] != nw.Host {
 		t.Fatalf("the manager leader is %v, want %s", body["managerLeader"], nw.Host)
+	}
+	before := w.count()
+	until(t, 3*time.Minute, "writes after the switchover", func() bool { return w.count() > before+30 })
+	acked := w.Stop()
+	have := foReadIDs(t, nw, port, pool)
+	for rid := range acked {
+		if !have[rid] {
+			t.Errorf("acknowledged row %d is missing when read through %s", rid, nw.Host)
+			break
+		}
+	}
+}
+
+// The clean stop of the map group's primary outlasts the lease of the task (the fault keeps the call open for 25 s after the instance is down; the task lease
+// is 30 s with a margin of 10 s, and the lease is a row of the very system database that is stopped, so no renewal can reach it): a shutdown checkpoint of
+// a large instance does this. The task lease is lengthened before the stop, so the stop is not cut short by the guard of the engine and the switchover ends
+// done on the new leader, with the new leader as the primary of the map group and nothing acknowledged lost.
+func TestSwitchoverOfTheMapGroupSurvivesACleanStopThatOutlastsTheTaskLease(t *testing.T) {
+	_, port, pool, leader, nw, w := mapSwitchoverEnv(t)
+	leader.SetFaults(fault.Spec{FailoverPoint: "demote:longstop", FailoverMode: "slow"})
+	id := mapSwitchoverRequest(t, leader, nw)
+	var task map[string]any
+	defer func() {
+		if t.Failed() {
+			t.Logf("task %v: %v", id, task)
+			t.Logf("new leader log: %s", quietLog(nw.LogTail(60000)))
+			t.Logf("old leader log: %s", quietLog(leader.LogTail(60000)))
+		}
+	}()
+	until(t, 10*time.Minute, "the task to end on the new leader", func() bool {
+		st, body := nw.Do("GET", fmt.Sprintf("/tasks/%v", id), nil, nil)
+		if st != 200 {
+			return false
+		}
+		if s, _ := body["state"].(string); s == "failed" || s == "done" {
+			task = body
+			return true
+		}
+		return false
+	})
+	if task["state"] != "done" {
+		t.Fatalf("the task ended %v: %v", task["state"], task["error"])
+	}
+	hosts, _ := primaryOf(t, nw)
+	if hosts[0] != nw.Host {
+		t.Fatalf("the primary of the map group is on %s, want %s", hosts[0], nw.Host)
 	}
 	before := w.count()
 	until(t, 3*time.Minute, "writes after the switchover", func() bool { return w.count() > before+30 })
@@ -597,7 +644,7 @@ func leaseLines(log string) string {
 			continue
 		}
 		low := strings.ToLower(l)
-		if !(strings.Contains(low, "lease") || strings.Contains(low, "fenc") || strings.Contains(low, "watchdog") || strings.Contains(low, "stopp")) || strings.Contains(l, "internal call failed") {
+		if !(strings.Contains(low, "lease") || strings.Contains(low, "fenc") || strings.Contains(low, "watchdog") || strings.Contains(low, "stopp") || strings.Contains(low, "failover:") || strings.Contains(low, "rollback")) || strings.Contains(l, "internal call failed") {
 			continue
 		}
 		if len(l) > 320 {
@@ -658,6 +705,20 @@ func TestSwitchoverEndsWhenTheOldServerForgotTheLeader(t *testing.T) {
 			if !have[rid] {
 				t.Errorf("acknowledged row %d is missing when read through %s", rid, n.Host)
 				break
+			}
+		}
+	}
+}
+
+// The access rules of the old primary were put back with the term of the promotion: no server refused the call as stale (it would then keep its hold and
+// its flag that the group is quiesced, and the entry point would not route to the group if it came back to that server). The warning is logged by the
+// server that runs the task.
+func noStaleUnquiesce(t *testing.T, c *clustertest.Cluster) {
+	t.Helper()
+	for _, n := range c.Nodes {
+		for _, l := range strings.Split(n.Log(), "\n") {
+			if strings.Contains(l, "failover: putting the access rules back") && strings.Contains(l, "stale_term") {
+				t.Errorf("the unquiesce of an old primary was refused as stale (stale_term) after the promotion (log of %s): %s", n.Host, l)
 			}
 		}
 	}

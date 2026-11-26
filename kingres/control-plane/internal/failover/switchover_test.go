@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -1054,5 +1055,251 @@ func TestTheCleanStopOfTheMapGroupNamesTheCandidate(t *testing.T) {
 		if c != "" {
 			t.Fatalf("the clean stop of an ordinary group names %q: %v", c, g.stopCandidates)
 		}
+	}
+}
+
+// The lease of the task of the map group is a row of the system database that the clean stop shuts down, so the step lengthens it before the stop: at the
+// moment of the stop the run holds the task for much longer than the lease of the engine (here 30 s), and for an ordinary group it does not.
+func TestTheStopOfTheMapGroupIsAskedForOnALeaseThatOutlastsTheStop(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		world func() *world
+		in    func() Input
+		long  bool
+	}{
+		{"map group", mapWorld, mapGracefulInput, true},
+		{"ordinary group", gracefulWorld, gracefulInput, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := tc.world()
+			r := w.runner()
+			w.fakeClock(r)
+			st := task.NewMemStore()
+			eng, err := task.NewEngine(st, []task.Definition{r.Definition(nil)}, task.Options{Holder: "A", Lease: 30 * time.Second, StoreTries: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			tk, err := eng.Submit(ctx, KindFailover, task.Subject{Type: "server", ID: "s1"}, tc.in(), "tester")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var left time.Duration
+			w.beforeStop = func() {
+				got, _ := st.Get(ctx, tk.ID)
+				left = time.Until(got.LeaseExpires)
+			}
+			if _, err := eng.RunOnce(ctx); err != nil {
+				t.Fatalf("run: %v\n%s", err, strings.Join(w.log, "\n"))
+			}
+			if left == 0 {
+				t.Fatalf("the stop was not asked for:\n%s", strings.Join(w.log, "\n"))
+			}
+			if tc.long && left < 100*time.Second {
+				t.Errorf("the task lease has %v left at the stop of the map group, want it lengthened to cover the stop", left)
+			}
+			if !tc.long && left > 31*time.Second {
+				t.Errorf("the task lease has %v left at the stop of an ordinary group, want the lease of the engine", left)
+			}
+		})
+	}
+}
+
+// A lease that cannot be lengthened for the stop of the map group stops the switchover before anything is stopped: no clean stop is asked for, the
+// bootstrap of the candidate is given up and the task ends failed.
+func TestTheMapGroupIsNotStoppedWhenTheLeaseCannotBeLengthened(t *testing.T) {
+	w := mapWorld()
+	r := w.runner()
+	w.fakeClock(r)
+	st := task.NewMemStore()
+	eng, err := task.NewEngine(st, []task.Definition{r.Definition(nil)}, task.Options{Holder: "A", Lease: 30 * time.Second, StoreTries: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	tk, err := eng.Submit(ctx, KindFailover, task.Subject{Type: "server", ID: "s1"}, mapGracefulInput(), "tester")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.FailOn(func(op string) error {
+		if op == "renew" {
+			return errors.New("the store is unreachable")
+		}
+		return nil
+	})
+	_, _ = eng.RunOnce(ctx)
+	log := strings.Join(w.log, "\n")
+	if strings.Contains(log, "demote-fast") {
+		t.Errorf("the old primary was stopped although the lease could not be lengthened:\n%s", log)
+	}
+	got, _ := st.Get(ctx, tk.ID)
+	if got.State != task.Failed {
+		t.Errorf("the task is %s, want failed:\n%s", got.State, log)
+	}
+}
+
+func TestTheRollbackOfALeaseThatCannotBeLengthenedGivesTheBootstrapUpAndResumesTheOldLeader(t *testing.T) {
+	w := mapWorld()
+	r := w.runner()
+	w.fakeClock(r)
+	st := task.NewMemStore()
+	eng, err := task.NewEngine(st, []task.Definition{r.Definition(nil)}, task.Options{Holder: "A", Lease: 30 * time.Second, StoreTries: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	tk, _ := eng.Submit(ctx, KindFailover, task.Subject{Type: "server", ID: "s1"}, mapGracefulInput(), "tester")
+	st.FailOn(func(op string) error {
+		if op == "renew" {
+			return errors.New("the store is unreachable")
+		}
+		return nil
+	})
+	_, _ = eng.RunOnce(ctx)
+	log := strings.Join(w.log, "\n")
+	got, _ := st.Get(ctx, tk.ID)
+	if got.State != task.Failed || got.Error == nil || got.Error.Code != CodeSwitchoverUnproven {
+		t.Errorf("the task: %s %+v\n%s", got.State, got.Error, log)
+	}
+	if w.count("map-abandon s2") != 1 {
+		t.Errorf("the bootstrap of the candidate was not given up exactly once:\n%s", log)
+	}
+	if w.count("resume s1") < 1 {
+		t.Errorf("the old leader was not resumed:\n%s", log)
+	}
+}
+
+// The step context of the map group is cancelled by the lease guard once the stop has failed (its store is the instance that was stopped). The rollback
+// of a stop that failed or was not clean must still give the bootstrap up and resume the old leader: it runs on a context of its own.
+func TestTheRollbackOfAFailedStopOfTheMapGroupOutlivesTheContextOfTheStep(t *testing.T) {
+	for name, set := range map[string]func(w *world){
+		"the stop fails":      func(w *world) { w.stopErr = errors.New("the stop failed") },
+		"the stop is unclean": func(w *world) { w.stopState = "in production" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := mapWorld()
+			set(w)
+			r := w.runner()
+			w.fakeClock(r)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			w.onDemote = cancel // the guard cancels the step as the stop is asked for
+			raw, _ := json.Marshal(mapGracefulInput())
+			steps, err := r.steps(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, s := range steps {
+				err := s.Run(ctx, &task.Env{Task: task.Task{ID: 1, Input: raw}})
+				var sk *task.SkipError
+				if errors.As(err, &sk) {
+					continue
+				}
+				if err != nil {
+					break
+				}
+			}
+			log := strings.Join(w.log, "\n")
+			if w.count("map-abandon s2") != 1 || w.count("resume s1") < 1 {
+				t.Errorf("the rollback did not run on a context of its own:\n%s", log)
+			}
+		})
+	}
+}
+
+// The lease of the task stays extended while the rollback of a failed stop of the map group runs (the rollback may wait for a postmaster that is still
+// shutting down), and is brought back only when the step returns. On the clean path it is brought back at once (TestTheStopOfTheMapGroupIsAskedForOnALeaseThatOutlastsTheStop).
+func TestTheLeaseStaysExtendedWhileTheRollbackOfAFailedStopRuns(t *testing.T) {
+	w := mapWorld()
+	w.stopErr = errors.New("the stop failed")
+	r := w.runner()
+	w.fakeClock(r)
+	st := task.NewMemStore()
+	eng, err := task.NewEngine(st, []task.Definition{r.Definition(nil)}, task.Options{Holder: "A", Lease: 30 * time.Second, StoreTries: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	tk, _ := eng.Submit(ctx, KindFailover, task.Subject{Type: "server", ID: "s1"}, mapGracefulInput(), "tester")
+	var left time.Duration
+	w.onResume = func() {
+		got, _ := st.Get(ctx, tk.ID)
+		left = time.Until(got.LeaseExpires)
+	}
+	_, _ = eng.RunOnce(ctx)
+	if left == 0 {
+		t.Fatalf("the old leader was not resumed:\n%s", strings.Join(w.log, "\n"))
+	}
+	if left < 100*time.Second {
+		t.Errorf("the task lease has %v left while the rollback runs, want it still extended", left)
+	}
+}
+
+// The clean stop that makes the proof again (the Verify step, and the Promote step that follows the Lease step) asks only for the proof: a release then would
+// give away the lease of the fence holder or of the candidate, and the warning "0 of 2 grantors released" that it caused was this release being refused.
+// Only the first request, the stop, releases.
+func TestTheVerifyAndPromoteStepsAskOnlyForTheProofOfTheStop(t *testing.T) {
+	w := gracefulWorld()
+	r := w.runner()
+	w.fakeClock(r)
+	if name, err := runAll(t, r, gracefulInput()); err != nil {
+		t.Fatalf("%s: %v\n%s", name, err, strings.Join(w.log, "\n"))
+	}
+	w.mu.Lock()
+	got := append([]bool(nil), w.stopProofOnly...)
+	w.mu.Unlock()
+	if len(got) != 3 || got[0] || !got[1] || !got[2] {
+		t.Fatalf("the clean stop requests (ProofOnly) are %v, want [false true true]: the stop releases, the proofs only read", got)
+	}
+}
+
+// The access rules of the old primary are put back after the promotion with the term that the promotion made: the callee refuses a term that is below
+// the catalog's, and the old server would keep its hold and its flag that the group is quiesced (the entry point would not route to the group if it
+// came back to that server).
+func TestTheAccessRulesOfTheOldPrimaryArePutBackWithTheTermOfThePromotion(t *testing.T) {
+	w := gracefulWorld()
+	r := w.runner()
+	w.fakeClock(r)
+	w.quiesced = true
+	if name, err := runAll(t, r, gracefulInput()); err != nil {
+		t.Fatalf("%s: %v\n%s", name, err, strings.Join(w.log, "\n"))
+	}
+	w.mu.Lock()
+	stale, quiesced, term := w.unquiesceStale, w.quiesced, w.term
+	w.mu.Unlock()
+	if stale != 0 || quiesced {
+		t.Fatalf("the unquiesce of the old primary was refused as stale %d times (the flag is %v, the catalog term is %d): %v", stale, quiesced, term, w.undoTerms)
+	}
+}
+
+// A server of an older version ignores the flag of the request for the proof alone and does a full stop: the caller says so in its log.
+func TestAnOldServerThatDoesNotHonourTheProofOnlyRequestIsLogged(t *testing.T) {
+	for _, old := range []bool{false, true} {
+		w := gracefulWorld()
+		w.oldCalleeIgnoresProofOnly = old
+		var buf strings.Builder
+		r := w.runner()
+		r.Log = slog.New(slog.NewTextHandler(&buf, nil))
+		w.fakeClock(r)
+		if name, err := runAll(t, r, gracefulInput()); err != nil {
+			t.Fatalf("%s: %v\n%s", name, err, strings.Join(w.log, "\n"))
+		}
+		if got := strings.Count(buf.String(), "did not honour the request for the proof alone"); (old && got != 2) || (!old && got != 0) {
+			t.Errorf("old callee %v: the warning was logged %d times (want 2 for an old server, 0 for a new one)", old, got)
+		}
+	}
+}
+
+// A proof that finds the old primary running again (the rollback or an operator started it) is not a proof: the switchover rolls back and the
+// new primary is never asked to promote.
+func TestSwitchoverRollsBackWhenTheRepeatedProofFindsTheOldPrimaryRunning(t *testing.T) {
+	w := gracefulWorld()
+	w.proofNotStopped = true
+	r := w.runner()
+	w.fakeClock(r)
+	_, err := runAll(t, r, gracefulInput())
+	failedWith(t, w, err, CodeSwitchoverUnproven)
+	if w.index("promote s") >= 0 || w.index("resume s1") < 0 {
+		t.Errorf("\n%s", strings.Join(w.log, "\n"))
 	}
 }
