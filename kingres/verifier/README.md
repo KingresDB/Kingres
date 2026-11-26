@@ -12,8 +12,21 @@ documentation (`contrib/kingres_ledger/README.md` and
 exported from a real server (see "Cross-check against the server").
 
 It is standard library Go only, no third-party modules, so that an auditor can
-read all of it (about 14,000 lines outside the tests) and build it with one
+read all of it (about 19,000 lines outside the tests) and build it with one
 command.
+
+**What it provides.** The commands are `proof`, `row-hash`, `digest-chain` and `blocks` (the
+ledger of one database: inclusion proofs, row hashes, digests, block headers); `checkpoint`,
+`consistency`, `aggregate`, `anchors`, `bundle verify` and `bundle fetch`, `monitor` and `attestation` (what
+`kingresd` publishes: signed checkpoints and tiles, aggregates, anchor evidence, bundles, client
+attestations); `trust init`, `trust show` and `trust follow` (the trust file); `release verify` (the
+release of the verifier itself); and `version` and `--help`. Every command has the exit statuses of
+"Exit statuses" and an optional `--json` output. **Test it** with `go test ./...` in this directory
+(no database is needed). The guide for operators and auditors is in
+[../docs/guide/README.md](../docs/guide/README.md). The sections whose titles start with
+"Findings" are the record of how the verifier was built and reviewed, in the wording of their time
+("not built yet", step and round numbers, the findings and what was changed); the other sections
+describe the current behaviour.
 
 ## What it can and cannot prove
 
@@ -150,7 +163,7 @@ builds all four files in each with `release.sh --unsigned`, and compares every b
 Run it on a clean checkout before a release. On Linux with `go` on the `PATH`:
 
 ```
-scripts/repro-check.sh [--work DIR] [--targets "linux/amd64 windows/amd64"]
+scripts/repro-check.sh [--work DIR] [--targets "linux/amd64 windows/amd64"] [--version TAG]
 ```
 
 **The copy on the server.** The Debian package installs a copy of `kingres-verify` in
@@ -1038,8 +1051,7 @@ the proof is empty and no tile is read; the output says "no tile was needed". A 
 size smaller than the old one fails (the log went back). A tile that is absent gives
 status 3; a tile that is present and wrong gives status 1.
 
-**Sources and files.** A source is a directory (a tar file and an HTTP source are
-not built yet). Every file the verifier reads goes through one helper
+**Sources and files.** A source is a directory, a `.tar.gz` file or an `https://` address (see `internal/pubsrc`; the limits of each kind are in the section on `aggregate`, "Phase 7, step 7 and step 18"). Every file the verifier reads goes through one helper
 (`internal/safefile`): it opens without blocking (a named pipe cannot hang it),
 requires a regular file after the open, and bounds the size before and while
 reading. In a source directory **no symbolic link or Windows reparse point is
@@ -1106,7 +1118,7 @@ Formats, with the specification they follow:
   must equal the first 16 bytes of the SHA-256 of the key), and `witnesses`,
   which must be empty. Unknown members are rejected.
 
-Not built yet (later steps of the design): `anchors`, `release verify`. The text of this section is the contract of step 1; where
+`anchors` and `release verify` are built and described in their own sections. The text of this section is the contract of step 1; where
 the design and the specification differ, the specification was followed (see
 "Findings about the phase 7 design").
 
@@ -1415,7 +1427,7 @@ server's `ledger_row_hash`, that the recomputed block chain equals the server's
 digests and the headers inside the proofs, and (in `internal/proof`) that every
 single-field and every single-byte mutation of a fixture proof is rejected.
 
-Fuzz targets (kept): `FuzzParse` (jsonx, rowfile), `FuzzDecodeHex`, `FuzzEncodeRow`
+Fuzz targets (the list that follows is not complete; `grep -rn "^func Fuzz" internal` lists them all): `FuzzParse` (jsonx, rowfile), `FuzzDecodeHex`, `FuzzEncodeRow`
 (format), `FuzzParseDigest`, `FuzzParseBlocks` (chain), `FuzzVerify` (proof), and for phase 7 `FuzzParse` (signednote, trust), `FuzzVerify` (checkpoint), `FuzzParseTilePath` and `FuzzParseTile` (tlog), `FuzzParseLogSpec` (cli), `FuzzCleanRel` (safefile: the relative paths the source directory accepts). `scripts/fuzz.sh [seconds]` runs every target for a short bounded time; the seeds (the published vectors) also run in `go test ./...`.
 Run one with `go test ./internal/proof -run '^$' -fuzz '^FuzzVerify$' -fuzztime 30s`.
 
@@ -1443,6 +1455,14 @@ Run one with `go test ./internal/proof -run '^$' -fuzz '^FuzzVerify$' -fuzztime 
 | `internal/pubsrc` | a publication as a directory, a `.tar.gz` or an HTTP(S) address, bounded and untrusted |
 | `internal/bundleidx` | `bundle.json`, read strictly and never believed |
 | `internal/attest` | the client attestation: the 136-byte message, the rows of the attestation and revocation tables, the block-height rule |
+| `internal/anchorev` | the anchor evidence files `a/<id>/anchors/<size>/<target>.json`, read strictly |
+| `internal/wormv` | the check of the evidence of a WORM anchor: an object under Object Lock that holds a signed checkpoint |
+| `internal/tsatoken` | the time-stamp authority token (RFC 3161): signature, certificate chain, `genTime` |
+| `internal/otsproof` | the OpenTimestamps fragments of an anchor and the check of a Bitcoin attestation against a block header the auditor supplies |
+| `internal/logsjson` | `logs.json`, the list of the logs of a publication, read strictly and never believed |
+| `internal/release` | the sums file and the release note of `release verify` (the verifier never signs; signing is `cmd/kingres-release-tool`) |
+| `internal/anchortest` | helpers shared by the tests of the anchor packages; nothing but tests imports it |
+| `internal/crosscheck` | the tests against fixtures exported from a real server (`scripts/gen-fixtures.sh`) |
 | `internal/cli` | the command line (`cmd/kingres-verify` is a thin `main`) |
 
 ## Decisions where the documentation is silent
@@ -1466,6 +1486,8 @@ These readings were made and are enforced; each is a finding below.
   that says `D` but whose entry is an `I` (or the reverse) fails at `entry-path`.
 
 ## Findings about the format documentation
+
+This section and the other "Findings" sections that follow are the record of how the verifier was built and reviewed, in the wording of their time. The current behaviour is described in the sections above.
 
 The ledger README and the design note were enough to write a working verifier:
 the first run of the cross-check against the real server matched on every row
