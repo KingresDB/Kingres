@@ -1,21 +1,73 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <!-- Portions Copyright (c) 2026, RooyeKhat Media Co -->
 # kingres_ledger
 
-Tamper-evident ledger tables for KingresDB (a thin fork of PostgreSQL 18.7),
-version 0.3. Version 0.1 (phase 6, first increment) has append-only tables;
-version 0.2 adds updatable ledger tables with a history table, background
-workers that build the blocks, and the records an operator needs (recorded
-digests and verifications and a status view); version 0.3 (the extension work of
-phase 7) adds, in part A, three read-only functions for tile publication (see
-"Reading the chain for publication") and, in part B, client signatures: a
-registry of client keys, the attestation of a ledger entry with an Ed25519
-signature and a signature policy of a table (see "Client signatures"). The designs are
+Tamper-evident ledger tables for KingresDB (a thin fork of PostgreSQL; one source
+builds and passes its tests on PostgreSQL 18.7 and 19.0), extension version 0.3
+(`default_version` in `kingres_ledger.control`; install script
+`kingres_ledger--0.3.sql`).
+
+What it provides:
+
+- **Ledger tables.** A table put under ledger control with `kingres.ledger_enable`
+  is **append-only** (the default) or **updatable** (rows can be inserted,
+  updated and deleted, every old version stays provable, in a history table).
+  Every change is hashed and recorded in a hash chain of blocks.
+- **Blocks, digests and proofs.** Background workers build the blocks; a digest of
+  the latest block, kept outside the database, lets anyone check the chain later;
+  an inclusion proof shows that one row version is part of the ledger.
+- **Verification and records for operators.** `ledger_verify`,
+  `ledger_verify_digest`, `ledger_verify_recorded` and the view `ledger_status`.
+- **Reads for publication.** Three read-only functions (`ledger_head`,
+  `ledger_blocks_entries`, `ledger_block_preimage`) that the control plane uses
+  to publish the blocks as a tile log (see "Reading the chain for publication").
+- **Client signatures.** A registry of client keys, the attestation of a ledger
+  entry with an Ed25519 signature, and a signature policy per table (see "Client
+  signatures").
+- **Protection and guard.** The ledger cannot be switched off or written by hand
+  by any role that is not a superuser (see "Who can write the ledger tables",
+  "What a role that is not a superuser can stop or remove" and "Protection
+  against being switched off").
+
+The extension does not sign blocks and does not anchor digests. The control plane
+(`kingresd`) does that: signed checkpoints of a transparency (tile) log, an
+aggregate log per database, anchoring of checkpoints (a WORM object store, an RFC
+3161 time-stamp authority or OpenTimestamps) and the signing keys are described in
+the guide ([`operator-guide.md`](../../kingres/docs/guide/operator-guide.md),
+section "Ledger, anchoring and the verifier"), and the independent verifier
+(`kingres/verifier`, binary `kingres-verify`) checks proofs, digests, tile logs,
+anchors and proof bundles without trusting the server.
+
+**Requirements.** `shared_preload_libraries = 'kingres_ledger'` (a restart), and
+a superuser creates the extension and must stay its owner (see "Installation").
+Settings are in "Using it" and in the table of GUCs below. Client signatures need
+a server built with OpenSSL. "Build and test" says how to build the extension and
+run its tests on PostgreSQL 18 and 19.
+
+**Map of this document.** "What the ledger guarantees, and what it does not";
+"Build and test"; "Installation" (with the upgrades from 0.1 and 0.2 and the
+interface changes of 0.3); "Using it", "Updatable tables" (the functions, the
+records, the settings and the errors); "Privileges"; "How it works"; "Reading the
+chain for publication"; "Client signatures"; "Hash format version 1" (the byte
+formats, for independent verifiers); "Who can write the ledger tables"; "What a
+role that is not a superuser can stop or remove"; "Protection against being
+switched off"; "Where a reviewer should attack first"; "Limitations of this
+version". The sections that carry review ids (`L9-01`, `L21-02`, ...) are the
+record of how the guard was built, in the wording of its time; the current state
+is the rule each of them states and what the guide says.
+
+The designs are
 [`kingres/docs/design/ledger-mvp.md`](../../kingres/docs/design/ledger-mvp.md)
-(0.1, including its implementation notes) and
+(0.1, including its implementation notes),
 [`kingres/docs/design/ledger-0.2.md`](../../kingres/docs/design/ledger-0.2.md)
-(0.2, with its "Implementation notes and deviations"). The findings of the
-independent review of version 0.1 and what was done about them are in
+(0.2, with its "Implementation notes and deviations") and
+[`kingres/docs/design/ledger-phase7.md`](../../kingres/docs/design/ledger-phase7.md)
+(0.3: tile publication and client signatures). Version 0.1 had append-only
+tables; version 0.2 added updatable tables, the workers and the records for
+operators; version 0.3 added the reads for publication and the client signatures.
+The findings of the independent review of version 0.1 and what was done about them
+are in
 [`kingres/docs/reviews/2026-11-14-kingres-ledger-0.1.md`](../../kingres/docs/reviews/2026-11-14-kingres-ledger-0.1.md)
 and in the notes at the end of the 0.1 design document.
 
@@ -83,7 +135,8 @@ cannot stop" lists every way that is known.
 **Enabling the ledger on a table is permanent, and so is its mode.** There is
 deliberately no function that switches it off, and an append-only table cannot
 be made updatable or the reverse (`ledger_enable` on a ledger table with the
-other mode is rejected with "not supported yet"). Once a table is under ledger
+other mode is rejected with SQLSTATE `0A000`, the message says "converting it
+... is not supported yet" and the hint says the mode is permanent). Once a table is under ledger
 control:
 
 - `DROP TABLE` of it is rejected, and so is `DROP SCHEMA ... CASCADE` of a
@@ -105,11 +158,11 @@ administrative decision (see "Privileges").
 
 ## Build and test
 
-In the PostgreSQL tree (autoconf): `make -C contrib/kingres_ledger` and
-`make -C contrib/kingres_ledger check` (needs
-`--enable-tap-tests` for the TAP tests). With meson the extension is built
-when `subdir('kingres_ledger')` is added to `contrib/meson.build` and
-`kingres_ledger` to `contrib/Makefile` (done by the integrator).
+The extension builds on PostgreSQL 18 and 19 from one source. In the PostgreSQL
+tree (autoconf): `make -C contrib/kingres_ledger` and
+`make -C contrib/kingres_ledger check` (needs `--enable-tap-tests` for the TAP
+tests). With meson the extension is in `contrib/meson.build`
+(`subdir('kingres_ledger')`).
 
 Against an installed server, with PGXS:
 
@@ -118,14 +171,18 @@ make USE_PGXS=1 PG_CONFIG=/path/to/pg_config
 make USE_PGXS=1 PG_CONFIG=/path/to/pg_config install
 ```
 
-The developer helper `kingres/dev/ext.sh` does this in WSL2 and runs all
-tests:
+The developer helper `kingres/dev/ext.sh` builds and runs all tests against one
+installation, and `kingres/dev/ext-majors.sh` runs a clean build and the tests
+against PostgreSQL 18 and 19, one after the other (see
+[`kingres/docs/dev/testing.md`](../../kingres/docs/dev/testing.md)):
 
 ```
 kingres/dev/ext.sh kingres_ledger all     # sync build install regress tap
+KINGRES_PG18=<install> KINGRES_PG19=<install> kingres/dev/ext-majors.sh kingres_ledger
 ```
 
-Tests: nineteen pg_regress tests and thirty-four TAP tests under `t/`.
+Tests: nineteen pg_regress tests (`REGRESS` in the `Makefile`) and forty-two TAP
+tests under `t/` (there is no `024`).
 
 | Test | What it covers |
 |---|---|
@@ -187,6 +244,9 @@ Tests: nineteen pg_regress tests and thirty-four TAP tests under `t/`.
 | `038_public_key_check` | L21-01: the eight small-order points, their other encodings, values that are not on the curve (`22023` at registration), a good key accepted with one identifier, and `ledger_attest` refusing a small-order key that a row holds already (`KL012`), on every call of the session (two transactions, three savepoints, the identity key and the all-zero key; L22-03); L22-02: twelve keys in rotation in one session are judged twelve times (the server writes a `DEBUG1` message per judgment, the test counts them), a refused key on every call, and a revoked key is refused by the table though the cache has judged it |
 | `039_signature_paths` | `COPY` into a `required` table (`KL010` unattested, committed attested), partitioned tables (a ledger table cannot be one), and logical replication apply into a `required` table (the subscriber cannot hold it: `KL010`, no row, no entry) next to one with the policy optional that is fed |
 | `040_columnar_refused` | rule L1: `ledger_enable` refuses a columnar table (both modes) and leaves it alone, a heap table is a ledger table as before, `SET ACCESS METHOD columnar` on a ledger table is rejected and the ledger still verifies; skipped when `kingres_columnar` is not installed |
+| `041_schema_spoof` | `CREATE EXTENSION` fails when a role that is not a superuser made the schema `kingres` in advance, or when the schema grants `CREATE` to such a role or to `PUBLIC`; the schema of a superuser is used as before |
+| `042_catalog_trust` | the relations of the schema `kingres` that the library finds by name (the ledger registry and the catalog of `kingres_shard`) are trusted only when they are the ones of the extensions that own them: look-alike relations in a database without the extension, a schema given to a role that is not a superuser, no function of the tenant runs, no crash |
+| `043_old_script_schema_check` | the check of the schema runs in every install script and every upgrade script of the extension, not only in the default version |
 
 The regress tests need `shared_preload_libraries = 'kingres_ledger'` (the
 in-tree `check` target and `kingres/dev/ext.sh` set it).
@@ -228,6 +288,17 @@ of this extension, so `DROP EXTENSION` never removes a schema another
 extension also uses. All objects of the extension are named `ledger_*`.
 `USAGE` on the schema is granted to `PUBLIC`.
 
+**The extension does not trust its schema or its catalog.** Every install script
+and every upgrade script refuses a schema `kingres` that exists already when a role
+that is not a superuser owns it, or when it grants `CREATE` to such a role or to
+`PUBLIC` (`insufficient_privilege`, `42501`, with a hint; tests `t/041` and `t/043`).
+The library is preloaded, so its hooks run in every database: it reads the registry
+of the ledger (and the catalog of `kingres_shard`) by name only when the extension
+is installed in the database, the schema is a superuser's and closed, and the
+relation is a member of the extension that owns it; otherwise it reads nothing,
+runs no function of the schema, and `ledger_enable` and the guard refuse with a
+message that says why (`guard.c`, `kingres_ledger.c`; test `t/042`).
+
 Note: a role named `kingres` puts the schema `kingres` first in the default
 `search_path` (through `"$user"`), so unqualified `CREATE TABLE` by that role
 creates the table there; `ledger_enable` refuses tables in schema `kingres`.
@@ -251,8 +322,8 @@ or 0.2 the library refuses what the old functions write and says to run `ALTER
 EXTENSION kingres_ledger UPDATE` (see "Who can write the ledger tables"); the
 capture trigger keeps working, the block builder does not until the update.
 
-**A development database of 0.3 from before the fifth review.** 0.3 is not
-released, and its scripts were changed in place, as the rounds went on (the
+**A development database of 0.3 from before the fifth review.** The scripts of
+0.3 were changed in place while it was built, as the rounds went on (the
 columns `database_droppers`, `database_droppable_by_non_superuser` and
 `database_potential_droppers` of `ledger_status`, the warnings of
 `ledger_enable`, the index `ledger_removed_digest_idx`, the SQLSTATE `KL006`,
@@ -269,8 +340,8 @@ CREATE DATABASE dev OWNER <superuser role>;
 -- in dev: CREATE EXTENSION kingres_ledger; then create the tables and call ledger_enable again
 ```
 
-**Interface changes of 0.3 that a caller can see.** 0.3 is not released and its
-scripts were changed in place; this is the list for a caller that has used a
+**Interface changes of 0.3 that a caller can see.** The scripts of 0.3 were
+changed in place while it was built; this is the list for a caller that has used a
 development version or reads the rounds of the guard. The first four are the
 ones that change what a program of a role that is not a superuser does.
 
@@ -480,7 +551,7 @@ last argument.
 | `kingres.ledger_blocks_entries(from_height bigint, max_count int) returns table (height bigint, entry bytea)` | **0.3.** The block preimages from `from_height`, in height order, at most `min(max_count, 10000)` of them. Every block returned is checked first: hash version 1, lengths, no gap and no repeat, the link to the block before (the genesis hash for block 0; for a range that starts later, the block before it is read and its hash recomputed), the chain identity against block 0, and `SHA-256(entry) = block_hash`; the first failure is an error `XX001` and no row is returned. It does not see blocks removed from the end: use `ledger_head`. `STABLE`, `SECURITY DEFINER` (it reads `ledger_blocks` and `ledger_chain` only). | granted roles |
 | `kingres.ledger_hook_active()` | True when the library was loaded through `shared_preload_libraries`. | PUBLIC |
 
-Internal functions (`ledger_capture`, `ledger_register_table`, `ledger_lock_table`,
+Internal functions (`ledger_capture`, `ledger_block_modify`, `ledger_register_table`, `ledger_register_internal`, `ledger_lock_table`, `ledger_merkle_accum`, `ledger_merkle_final`,
 `ledger_history_sync`, `ledger_history_acl_sync`, `ledger_worker_state` (read by
 the view `ledger_status`, whose readers need `EXECUTE` on it; see
 "Privileges"), and the helpers `ledger_all_defects`,
@@ -1385,46 +1456,27 @@ extension that way and checks it.
 
 ### Cost
 
-One Ed25519 verification (about 90 microseconds with OpenSSL 3 on the machine of the
-measurement), one row of about 250 bytes and its entry. Measured on PostgreSQL 18
-(cassert off, debugoptimized build, one session, `synchronous_commit = off`, 3000
-rows a run, three runs): inserting a row in a ledger table takes about 30
-microseconds in the server (the capture trigger included), and the same insert with
-`ledger_attest` about 200: **`ledger_attest` adds about 175 microseconds** (170 to
-185 in the three runs), of which the verification is about 90; the rest is the
-search of the entry, the read of the key, the row and its capture. As a whole
-statement stream from `psql` (`BEGIN; INSERT; COMMIT` against `BEGIN; INSERT;
-SELECT ledger_attest(...); COMMIT`, which also adds a round trip) the time per
-transaction goes from about 315 to about 790 microseconds with `synchronous_commit =
-off`, and from about 3.1 to about 3.9 milliseconds with `synchronous_commit = on`
-(the flush dominates). Writes without an attestation are unchanged, except that the
-first write of a table in a transaction reads the policy together with the
-identifier with a snapshot of now (one statement, as before, and one call of
-`GetLatestSnapshot` more) and the check of the key at `ledger_attest` is remembered
-per session (the judgment of a key costs about three milliseconds, and a session pays
-it once for each key it uses, for up to 4096 keys: a pooled service session that signs
-for many clients does not pay it again; the memory of the cache is fixed, about 270
-kilobytes, and it holds nothing about revocation, which is read from the table on every
-call; a refused key is judged again every time; `client_min_messages = debug1` shows each
-judgment as a message with the count of the session). Measured against the version before the switch was ordered with the writers
-(`L21-02`), same server build with assertions, `synchronous_commit = off`, `fsync = off`,
-one client, 20000 single-row transactions a run, three runs of each, two rounds: a
-ledger table with the policy optional, 5420 to 5820 transactions a second before and 5470
-to 5770 after (the rounds vary by more than the difference); a ledger table with the
-policy `required` and an attestation in every transaction (`BEGIN; INSERT; SELECT
-ledger_attest(...); COMMIT` from `psql`, 3000 rows a run), 757 to 784 microseconds a
-transaction before and 772 to 849 after (about 30 microseconds, 4 percent, which is
-the second snapshot of the first write of each of the two tables). The switch takes
-its lock once, at the switch. The statements of `ledger_attest` are prepared once per
-session; the first version ran them as text and took about 400 microseconds.
+`ledger_attest` costs one Ed25519 verification with OpenSSL, one row of about 250
+bytes and its entry, and a search of the entry and a read of the key. Writes
+without an attestation are unchanged, except that the first write of a table in a
+transaction reads the policy together with the identifier with a snapshot of now
+(one statement). The check of a key at `ledger_attest` is remembered per session:
+the judgment of a key costs a few milliseconds, and a session pays it once for each
+key it uses, for up to 4096 keys, so a pooled service session that signs for many
+clients does not pay it again. The cache holds nothing about revocation, which is
+read from the table on every call, and a refused key is judged again every time;
+`client_min_messages = debug1` shows each judgment as a message with the count of
+the session. The switch to the policy `required` takes its lock once, at the
+switch. The statements of `ledger_attest` are prepared once per session.
 
 ## Hash format version 1
 
 All hashes are SHA-256 (the `pg_cryptohash` API). All integers in hash inputs
 are unsigned and big-endian unless stated. `||` is concatenation. The format is
 selected by `hash_version` (1); a later format must not change how existing
-hashes are computed. Nothing has been released, so version 1 was changed in
-place by the hardening described here.
+hashes are computed. Before the first release version 1 was changed in
+place by the hardening described here; the format of this section is the one that
+every released version uses.
 
 **Merkle trees (RFC 6962).**
 `leaf_hash(data) = SHA256(0x00 || data)`;
@@ -2131,7 +2183,7 @@ application table.
    locks go with it, so a procedure cannot keep a lock across its own
    transactions, and one that takes a lock again after a `COMMIT` starts a new
    hold with a new period). **Why the timer cannot be lost while the lock is
-   held** (the source is PostgreSQL 18.7 and 19rc2, `src/backend`): the only code
+   held** (the source is PostgreSQL 18.7 and 19.0, `src/backend`): the only code
    that disables every timeout of the backend is the error handler of the main
    loop, `PostgresMain` (`disable_all_timeouts`), and it runs when an error
    reaches the main loop, where the transaction is aborted next, which for an
@@ -2478,7 +2530,7 @@ and its instances), by what the statement *reaches*, not by what it names:
 without a lock, and `LOCK` looks it up again when it runs; with two schemas on
 the `search_path` and a second session that creates a view over a catalog table in
 the first one at exactly that moment, the second lookup could land on the view.
-114,000 attempts in 90 seconds did not hit it once: the interval is two
+A stress run of many attempts did not hit it: the interval is two
 syscache lookups. It is left because it cannot be closed from the hook for
 what it costs: the hook cannot hand the OID it resolved to `LOCK` (the statement
 is resolved again by core, and rewriting the statement for a cached utility
@@ -2657,8 +2709,9 @@ string that `CREATE EXTENSION` and `ALTER EXTENSION UPDATE` pass for each of
 its statements, which a statement of an event trigger or a function never has),
 and only while that script runs. A statement that an event trigger, a function
 or a default expression runs meanwhile goes through every check. A chain of
-upgrade scripts in one command would need that rule extended (only one step
-exists).
+upgrade scripts in one command is trusted for its first script only; that is why
+the directory has the combined script `kingres_ledger--0.1--0.3.sql`, so that an
+update from 0.1 is one script.
 
 A table is "under ledger control" for the hook when it is registered in
 `kingres.ledger_table` or its capture trigger is `ENABLE ALWAYS` (`ledger_enable`
@@ -2898,9 +2951,12 @@ it has been looked at, not by how likely it is to be wrong.
 
 ## Limitations of this version
 
-- No server signatures, no external anchoring, no per-shard aggregate digest
-  (phase 7; client signatures are in "Client signatures"; `ledger_verify` does not
-  verify them, the standalone verifier does). No conversion between the modes of a table, no
+- The extension itself makes no server signatures, no external anchors and no
+  aggregate digest over several chains: `kingresd` does (signed tile-log
+  checkpoints, anchoring, the aggregate log; see the guide). Client signatures
+  are in "Client signatures"; `ledger_verify` does not verify them, the standalone
+  verifier does. There is one chain per shard group and no multi-node ledger
+  (phase 8, future). No conversion between the modes of a table, no
   partitioned or inheriting tables, `TRUNCATE` is rejected for both modes.
 - A history table's name is `<table>_ledger_history` and must fit in 63 bytes.
   An `UPDATE` that changes nothing writes two entries and a history row.

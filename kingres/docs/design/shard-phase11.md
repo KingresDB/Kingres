@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # kingres_shard: design of phase 11 (distributed schemas: schema-based sharding)
 
 Status: Proposed design, 2026-11-15; not implemented.

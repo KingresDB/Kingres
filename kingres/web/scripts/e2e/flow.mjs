@@ -9,7 +9,15 @@ import { join } from 'node:path'
 import { helpers, openBrowser, sleep } from './browser.mjs'
 
 export const ADMIN = { user: 'admin', password: 'E2e-Passw0rd-12' }
-const DATA_DIR = '/home/kingres/kw-web/data'
+// The data directory that the wizard is given: the one backend.sh uses inside WSL. run.mjs reads it from backend.sh when the variable is not set.
+function dataDir() {
+  const dir = process.env.E2E_DATA_DIR
+  if (!dir)
+    throw new Error(
+      'E2E_DATA_DIR is not set: it is the data directory of the test server inside WSL (backend.sh datadir prints it)',
+    )
+  return dir
+}
 
 /**
  * @param {{ baseUrl: string, setupToken: () => string, psql: (db: string, sql: string) => string,
@@ -113,7 +121,7 @@ export async function runFlow(ctx) {
     'create the cluster with the right data directory and follow the progress',
     async () => {
       if (!(await ui.text()).includes('Creating the cluster')) {
-        await ui.fill('Data directory', DATA_DIR)
+        await ui.fill('Data directory', dataDir())
         await ui.click('Create cluster')
       }
       await ui.waitForText('Creating the cluster', 10000)
@@ -605,29 +613,25 @@ export async function runFlow(ctx) {
     },
   )
 
-  // ---- 9. what the server does not do yet must be calm, not alarming; the cluster settings are real ----
-  await step('failover (not implemented yet) answers with a calm notice', async () => {
+  // ---- 9. a refused failover is explained; the cluster settings are real ----
+  // Failover and the planned switchover are implemented. A cluster of one server has no standby to promote, so the server refuses
+  // with 409 no_replica_available and the dialog shows the refusal of that code (the console gives it the danger tone, because
+  // promoting would leave the group without a copy of its data).
+  await step('failover on a cluster without a standby is refused and explained', async () => {
     await ui.navigate('/servers')
     await ui.waitForText('Create server group')
     await ui.click('Failover')
     await ui.waitForText('Failover mode')
     await ui.click('Graceful failover', { within: '[role=dialog] .dlg-foot' })
     await page
-      .waitForFunction(
-        () =>
-          [...document.querySelectorAll('[role=dialog] .notice')].some((n) =>
-            /not available on this server version yet/i.test(n.textContent),
-          ),
+      .waitForSelector(
+        '[role=dialog] [data-testid=failover-refusal][data-code=no_replica_available]',
         { timeout: 15000 },
       )
       .catch(() => {
-        throw new Error('failover: no "not available yet" notice')
+        throw new Error('failover: no refusal that says the group has no standby')
       })
-    const danger = await page.$$eval('.notice.tone-danger', (e) =>
-      e.map((x) => x.textContent.replace(/s+/g, ' ').slice(0, 100)),
-    )
-    expect(danger.length === 0, `failover: alarming notice: ${danger.join(' | ')}`)
-    await shot('18-unsupported-failover')
+    await shot('18-failover-refused')
     await ui.click('Cancel', { within: '[role=dialog]' })
   })
 
@@ -640,15 +644,15 @@ export async function runFlow(ctx) {
       await ui.navigate('/rebalance')
       await ui.waitForText('Rebalance')
       await ui.waitForText('Idle').catch(async (e) => {
-        throw new Error(`${e.message}: ${(await ui.text()).replace(/s+/g, ' ').slice(0, 700)}`)
+        throw new Error(`${e.message}: ${(await ui.text()).replace(/\s+/g, ' ').slice(0, 700)}`)
       })
       await ui.click('Preview plan')
       await ui.waitForText('Nothing to move').catch(async (e) => {
-        throw new Error(`${e.message}: ${(await ui.text()).replace(/s+/g, ' ').slice(0, 700)}`)
+        throw new Error(`${e.message}: ${(await ui.text()).replace(/\s+/g, ' ').slice(0, 700)}`)
       })
       await ui.click('Start rebalance')
       await ui.waitForText('Nothing to rebalance').catch(async (e) => {
-        throw new Error(`${e.message}: ${(await ui.text()).replace(/s+/g, ' ').slice(0, 700)}`)
+        throw new Error(`${e.message}: ${(await ui.text()).replace(/\s+/g, ' ').slice(0, 700)}`)
       })
       expect(
         (await page.$$eval('.notice.tone-danger', (e) => e.length)) === 0,

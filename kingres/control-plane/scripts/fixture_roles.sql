@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- Copyright (c) 2026, RooyeKhat Media Co
 --
 -- Cluster-wide part of the integration test fixture: roles and databases.
 -- Run as the instance superuser by scripts/pg-test-instance.sh. Passwords are

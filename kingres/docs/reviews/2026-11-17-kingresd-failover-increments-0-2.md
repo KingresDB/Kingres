@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # kingresd failover, increments 0 to 2: independent review
 
 ## Scope and method

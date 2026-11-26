@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package ha holds the small interfaces through which the features of high
 // availability know each other: liveness (heartbeats), leases, standbys and the

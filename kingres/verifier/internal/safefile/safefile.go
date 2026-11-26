@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package safefile reads the files the verifier is given, and nothing else.
 //

@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # kingres_shard and kingresd: design of phase 10 (splitting buckets, background rebalancing with strategies, draining a server)
 
 Status: Proposed design, 2026-11-15; not implemented.

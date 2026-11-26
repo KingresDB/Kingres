@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # KingresDB management REST API
 
 `openapi.yaml` (OpenAPI 3.1, version 0.34.0) is the contract between the Go backend (`kingresd`) and the
@@ -356,15 +358,13 @@ Where the architecture document leaves something open, the simplest option was c
 6. **Ledger per shard group.** A sharded database has one chain per shard group; status and blocks are per chain
    (`chains[]`, `shardGroupId`), and a digest contains every chain head plus an `aggregateHash` for sharded
    databases. Digest generation is synchronous (201); verification is a task and also a resource
-   (`/ledger/verifications/{id}`). Digest anchoring targets are modeled (`anchors[]`) but empty until anchoring
-   exists (phase 7). Generating digests and verifying need `kingres_ops`; no operation can turn the ledger off.
+   (`/ledger/verifications/{id}`). Digest anchoring targets are listed in `anchors[]` (anchoring exists since phase 7). Generating digests and verifying need `kingres_ops`; no operation can turn the ledger off.
 7. **Server groups** are named racks/zones, created and deleted via `/server-groups`; membership is set with
    `PATCH /servers/{id}` (`serverGroup`). Deleting a non-empty group is 409 `server_group_not_empty`; a duplicate
    name is 409 `already_exists`; a name that breaks the pattern is 400.
-8. **Rebalance** has one cluster-wide lock (409 `rebalance_in_progress`). `maxConcurrentMoves` defaults to the
-   cluster setting (4), range 1 to 64. The plan preview lists at most `moveLimit` moves and always reports totals.
+8. **Rebalance** has one cluster-wide lock (409 `rebalance_in_progress`). `maxConcurrentMoves` is 1 to 64 and is recorded as 1 when a start leaves it out (the cluster setting `rebalance.maxConcurrentMoves`, default 4, is a default that is shown and changed in the settings, not what a start without the option records); a run makes one move at a time whatever the value. The plan preview lists at most `moveLimit` moves and always reports totals.
    Removing a server and changing replica count do not rebalance implicitly: `DELETE /servers/{id}` removes a server
-   that holds no buckets (409 `server_owns_buckets` otherwise); to empty one, set `shouldHaveShards: false` and run
+   that holds no buckets (409 `server_owns_buckets` otherwise); to empty one, drain it (`POST /servers/{id}/drain`) or set `shouldHaveShards: false` and run
    `POST /rebalance` first. `GET /rebalance` reports `progress` only while a run is active and
    always `lastReport`, the nullable summary of the most recent finished, stopped or failed run.
 9. **Auto-failover** settings live in `/settings/cluster` (`enabled`, `timeoutSeconds` 1 to 3600 default 120,
@@ -378,7 +378,7 @@ Where the architecture document leaves something open, the simplest option was c
 12. **Query workbench** executes exactly one statement per request as the signed-in role; SQL errors are 422
     `sql_error` with `sqlState`. Large integers beyond 2^53 and bytea are returned as strings.
 13. **Metrics** are one endpoint (`GET /metrics/query`) with a closed metric-name enum; max 5000 points per series.
-    The backend answers from the bundled metrics store.
+    The backend answers from a short in-memory history that `kingresd` keeps (there is no bundled metrics store).
 14. **Health.** `/healthz` and `/readyz` have no authentication and live under `/api/v1` like everything else. An
     uninitialized node is ready.
 15. **Setup.** `GET /setup/state` is unauthenticated, tells the panel whether to show the wizard and reports the

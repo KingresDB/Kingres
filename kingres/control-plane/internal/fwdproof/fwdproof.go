@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package fwdproof proves, to the server that runs a forwarded or gathered
 // operation, that the forwarding server really holds a session of the user it

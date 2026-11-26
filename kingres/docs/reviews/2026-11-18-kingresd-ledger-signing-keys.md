@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 
 # Independent review of the signing keys of the ledger in kingresd (phase 7, steps 3 and 4)
 

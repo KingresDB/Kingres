@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package mapgroup is the bootstrap that promotes the standby of the map group when the manager leader and the primary of the map
 // group are lost together (design ha-phase5-part2.md, 3.4). The system database, the task engine and the leader are on the map

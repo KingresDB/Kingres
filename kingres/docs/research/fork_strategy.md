@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Forking PostgreSQL into KingresDB: Upstream State, Mechanics, Legal, Rebranding, Prior Art, Extensibility, Builds
 
 Research date: 2026-11-14. Items without a URL are not in this file as facts; they appear only under Gaps or Inferences.

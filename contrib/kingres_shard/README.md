@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # kingres_shard
 
 `kingres_shard` is the sharding extension of KingresDB. It turns ordinary
@@ -6,23 +7,60 @@ tables into hash-distributed tables placed across several PostgreSQL
 instances ("nodes", grouped into "shard groups"), keeps small tables on every
 node as reference tables, and makes every statement correct on a cluster with
 several groups: a statement that touches one key goes to the group that owns
-it, and a statement that spans groups is answered by reading the other groups.
+it, and a statement that spans groups is answered by reading the other groups
+(the distributed scan, which stays the fallback of every read, ADR 0022) or, when
+that is cheaper, by running it on the groups (pushdown).
 
-This is version 0.9 (0.9 is columnar storage in the sharding extension and the approximate `count(DISTINCT)` of phase 12, see "Columnar storage (version 0.9)"; 0.8 is the bucket layout of phase 10, see "The bucket layout (version 0.8)", and the schemas of phase 11; 0.7 is the table lifecycle of phase 9 on top of 0.6; 0.6 is the version of phase 2b; 0.3 added moving buckets, phase 2a made every statement correct, 0.4 is the fix round of the reviews of 0.2 and 0.3, 0.5 is high availability: standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; see "High availability" below; 0.6 is phase 2b and adds no SQL object, see "Installation" for why the version is raised). Phase 2b makes the common
-statements fast. The designs are in
-[`kingres/docs/design/shard-mvp.md`](../../kingres/docs/design/shard-mvp.md)
-(phase 1) and
-[`kingres/docs/design/shard-phase2a.md`](../../kingres/docs/design/shard-phase2a.md)
-(this version, with its "Implementation notes and deviations"); this file
-describes what is implemented and how to use it.
+This is version 0.9 (`default_version` of `kingres_shard.control`). It builds on
+PostgreSQL 18.7 and 19.0 from one source (ADR 0023; the differences are in
+`src/pg_compat.h`). What it provides:
 
-Version 0.7 (phase 9, [`shard-phase9.md`](../../kingres/docs/design/shard-phase9.md),
-increments 9.1 and 9.2) starts the table lifecycle: `create_distributed_table` and
-`create_reference_table` accept a table that already holds rows and carry its owner,
-privileges, comments, sequences and foreign keys; `kingres.table_change_report()` says what
-stands in the way of a change of a table before it is tried; and the catalog holds what the
-rest of the phase needs (see "The table lifecycle (version 0.7)"). Increment 9.4 adds the blocking
-`undistribute_table` and `alter_distributed_table`. The online variants of those two are the next increments and are not in this version.
+- **Distribution and routing**: `create_distributed_table`, `create_reference_table`,
+  the planner and utility hooks, DDL on distributed tables, and two-phase commit across nodes
+  with recovery.
+- **Pushdown (phase 2b)**: bulk writes through the row router, colocated `INSERT ... SELECT`,
+  closed queries, partial aggregation, sorted streams with a limit, join rows, and the
+  objects of extensions (`kingres_sketch`).
+- **Table lifecycle (phase 9)**: tables that already hold rows, `table_change_report`, the online
+  variants (`..._concurrently`), `undistribute_table`, `alter_distributed_table`, tables partitioned
+  by the user, dependent views and storage parameters.
+- **Moving buckets and elasticity (phases 4 and 10)**: `move_bucket`, `rebalance_plan` and
+  `plan_rebalance` with weights and drain, `split_bucket`, several moves at once, the lock of one
+  (colocation group, bucket) for the start of a move, `check_cluster`.
+- **High availability (phase 5)**: standby nodes, `promote_node`, prepared transactions across a
+  failover, distributed deadlock detection, coordinated restore points.
+- **Distributed schemas (phase 11)**: a schema as the unit of placement (one tenant per schema).
+- **Analytics (phase 12)**: the repartitioned join, `MERGE`, columnar distributed tables, time
+  partitions and approximate `count(DISTINCT)`.
+- **Trust checks**: the catalog is trusted only when the extension is installed in the database and
+  its relations are members of it (see "Security notes").
+
+The designs are in [`kingres/docs/design/`](../../kingres/docs/design/)
+(`shard-mvp.md`, `shard-phase2a.md`, `shard-phase2b.md`, `shard-phase4.md`, `ha-phase5.md`,
+`shard-phase9.md`, `shard-phase10.md`, `shard-phase11.md`, `analytics-phase12-queries.md`,
+`analytics-phase12-storage.md`); the operator's view is the
+[guide](../../kingres/docs/guide/README.md) ([install](../../kingres/docs/guide/install.md),
+[operator guide](../../kingres/docs/guide/operator-guide.md),
+[upgrade](../../kingres/docs/guide/upgrade.md),
+[limitations](../../kingres/docs/guide/limitations.md)). This file describes what is implemented and how
+to use it.
+
+**Requirements in short.** On every node `shared_preload_libraries = 'kingres_shard'` (the library
+installs hooks and a background worker; `CREATE EXTENSION` fails otherwise) and
+`max_prepared_transactions` greater than zero; `wal_level = logical` for bucket moves; one PostgreSQL major
+and one extension version in a cluster. See "Requirements and installation" and "Settings".
+
+**Build and test in short.** Out of tree with PGXS (`make USE_PGXS=1 PG_CONFIG=... install`), tests with
+`kingres/dev/ext.sh kingres_shard all` (pg_regress and TAP) and, on both majors,
+`kingres/dev/ext-majors.sh kingres_shard`. See "Building and testing".
+
+**Map of this document.** "How it works in one page", "Guarantees", "Requirements and installation",
+"Building and testing", "Quick start" and "SQL interface" describe the extension as it is. The
+sections "The table lifecycle" to "Reference tables" and "The distributed scan" to "Approximate
+`count(DISTINCT x)`" describe each part; "Moving buckets and rebalancing" to "Splitting a bucket"
+describe elasticity; "High availability" describes failover, with the SQLSTATEs (`KS001` to
+`KS022`) and the sequences of the control plane. Several sections were written increment by increment;
+each of them says so at its start and the wording of its time is kept.
 
 ## How it works in one page
 
@@ -35,10 +73,10 @@ rest of the phase needs (see "The table lifecycle (version 0.7)"). Increment 9.4
 - A **reference table** is an ordinary table that every node holds in full.
   Reads are local; writes run on every node in one distributed transaction.
 - The **catalog** (`kingres.node`, `colocation`, `dist_table`, `bucket_map`,
-  `map_version`, `local_node`) is authoritative on the primary of the *map
+  `map_version`, `local_node`, `dist_partition`, `dist_schema`, `sharding_settings`) is authoritative on the primary of the *map
   group* (group 0, node 1) and is copied to every other node. Changes to it are
-  made on all nodes in one two-phase transaction. Two node-local tables are not
-  copied: `kingres.dtx_log` (commit decisions) and `kingres.pending_node`.
+  made on all nodes in one two-phase transaction. The node-local tables are not
+  copied (`kingres.dtx_log` with the commit decisions, `kingres.pending_node`, the records of moves, splits and table operations; the list is under "SQL interface").
 - The **planner hook** looks at each statement. Without distributed tables, or
   on a cluster with one shard group, nothing changes. Otherwise:
   - every distributed table restricted to one key (`dist_column = constant or
@@ -127,7 +165,7 @@ rest of the phase needs (see "The table lifecycle (version 0.7)"). Increment 9.4
   The local buckets are read with the statement snapshot taken at the start,
   the remote ones with the snapshot of the later `DECLARE`. It cannot invent
   data that was never committed (every row read is committed), and it
-  disappears when a global snapshot exists (a later phase). Read statements
+  disappears when a global snapshot exists (phase 8, future roadmap: there is none in 0.9). Read statements
   that need one state of several tables from one node should read them in one
   scan node (a join of colocated tables on the key is routed to one group).
   `SERIALIZABLE` is serializable per node only.
@@ -189,8 +227,8 @@ rest of the phase needs (see "The table lifecycle (version 0.7)"). Increment 9.4
   DDL, the two-phase commit and its recovery on a new connection. Statements that need
   only the nodes of the same major keep working, and `check_cluster()` (which asks over
   control sessions that are not refused) names the node. The library of a node is built
-  for one major, so a node cannot disagree with itself. **How an operator upgrades a
-  cluster from 18 to 19 is not designed yet.** What is certain: do not leave nodes of two
+  for one major, so a node cannot disagree with itself. **There is no procedure to upgrade a
+  cluster from 18 to 19** (see the upgrade chapter of the guide). Do not leave nodes of two
   majors running side by side except for the short time of an upgrade of the whole
   cluster that has stopped the traffic; to go from 18 to 19, build a new cluster of 19 nodes and move the
   data (the supported way). A rolling in-place
@@ -206,24 +244,26 @@ rest of the phase needs (see "The table lifecycle (version 0.7)"). Increment 9.4
   in the catalog. SSL options are set with `kingres_shard.node_conninfo`.
 - `CREATE EXTENSION kingres_shard` installs version 0.9 (the `default_version` of the control file);
   `ALTER EXTENSION kingres_shard UPDATE` upgrades a 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7 or 0.8 installation
-  (the chain is 0.1 -> 0.2 -> 0.3 -> 0.4 -> 0.5 -> 0.6 -> 0.7 -> 0.8 -> 0.9, and the catalog is identical to a
-  fresh 0.9 one; the `upgrade` regression test compares the two). Transactions that 0.4
+  (the files are `kingres_shard--0.1.sql` to `kingres_shard--0.9.sql`, the install scripts of each version, and
+  `kingres_shard--0.1--0.2.sql` to `kingres_shard--0.8--0.9.sql`, one upgrade script for each step; the chain is
+  0.1 -> 0.2 -> 0.3 -> 0.4 -> 0.5 -> 0.6 -> 0.7 -> 0.8 -> 0.9, and the catalog is identical to a
+  fresh 0.9 one; the `upgrade` regression test compares the two). Earlier versions were never released: 0.1.0 is the
+  first release of KingresDB and ships 0.9, so a new installation starts at 0.9 and the older scripts
+  exist for the chain and for the test. Transactions that 0.4
   prepared and that are pending at the upgrade are resolved in the old identifier format
   (see "Prepared transactions across a failover").
-- **Version 0.6 adds no table, view, function or column.** `kingres_shard--0.5--0.6.sql` holds
+- **Version 0.6 added no table, view, function or column.** `kingres_shard--0.5--0.6.sql` holds
   one statement, which makes the check of the node versions before a bucket move ask for 0.6
   (the function exists already; only its text names the version). The version is raised
   because the nodes of a cluster must run the same protocol between them (the fragments that
   phase 2b sends), and `add_node`, the placement check and `move_bucket()` refuse a node that
   runs another version.
-- **Rolling upgrade from 0.5 to 0.6.** Nodes of 0.6 and nodes of 0.5 cannot cooperate on the
-  new fragments. Until the last node is upgraded, set `kingres_shard.enable_pushdown`,
-  `kingres_shard.enable_bulk_routing` and `kingres_shard.enable_copy_routing` to `off` on
-  every node (per session or in `postgresql.conf`), and set them back to `on` when the last
-  node is upgraded. Of these, `enable_bulk_routing` and `enable_copy_routing` exist today;
-  `enable_pushdown` comes with the step of phase 2b that adds pushdown, and until then there
-  is nothing to switch off for it. Then upgrade as described under "Upgrade order" below.
-- **Changes made to the 0.5 scripts in place.** 0.5 is not released, so its install script and its
+- **Rolling upgrade (any version to the next).** Nodes of two versions cannot cooperate on the fragments that
+  pushdown sends. Until the last node is upgraded, set `kingres_shard.enable_pushdown`,
+  `kingres_shard.enable_bulk_routing`, `kingres_shard.enable_copy_routing` and
+  `kingres_shard.enable_colocated_insert_select` to `off` on every node (per session or in `postgresql.conf`), and set them
+  back to `on` when the last node is upgraded. Then upgrade as described under "Upgrade order" below.
+- **Changes made to the 0.5 scripts in place (a note of the time of 0.5; no database of that build exists in a release).** 0.5 was not released, so its install script and its
   `0.4--0.5` script change as the reviews find things, and the version stays 0.5 (0.6 does not repair such a database either). A database that
   installed an earlier build of 0.5 has no update path to the later one (`ALTER EXTENSION ... UPDATE`
   does nothing for the same version). What changed in place, and what such a database needs:
@@ -256,12 +296,12 @@ rest of the phase needs (see "The table lifecycle (version 0.7)"). Increment 9.4
   new files on every node, restart them one after the other, run `ALTER EXTENSION
   ... UPDATE` on every node at once and soon after, and do not start a bucket move
   before it is done: `move_bucket()` refuses unless every active primary reports
-  extension version 0.6, and names the node that does not. An older library does not
+  extension version 0.9 (the version of the install script), and names the node that does not. An older library does not
   accept the session of a newer one (the proof of a node-to-node session differs between
   versions), which looks like a lost connection; `check_cluster()` and `move_bucket()`
   ask for the version over a session that claims nothing when that happens, so they name
   both versions (`extension_version_differs`, "has kingres_shard 0.4, a bucket move needs
-  0.6") and do not call the node unreachable (review finding S6-06). A node that cannot
+  0.9") and do not call the node unreachable (review finding S6-06). A node that cannot
   be asked either is `node_unreachable`.
 
 ## Building and testing
@@ -277,12 +317,21 @@ In the source tree the extension builds with the tree's own build system
 (`contrib/kingres_shard/meson.build` and `Makefile` list the same sources,
 data files and tests).
 
-Tests, using the development helper from the repository root (WSL2):
+Tests, using the development helper from the repository root (Linux or WSL2). `KINGRES_PG` names the installation
+(a `pg_config` or an installation directory) of one major; the extension builds and the tests pass on PostgreSQL 18 and 19
+from the one source:
 
 ```
 kingres/dev/ext.sh kingres_shard all          # sync build install regress tap
 PROVE_TESTS=t/013_dist_scan.pl kingres/dev/ext.sh kingres_shard tap
+KINGRES_PG18=/path/to/pg18 KINGRES_PG19=/path/to/pg19 kingres/dev/ext-majors.sh kingres_shard   # both majors
 ```
+
+The regression suite is the `REGRESS` list of the `Makefile` (25 tests in `sql/`, run with `make installcheck` against a
+server that has the extension preloaded, `kingres_shard.conf`), and the TAP suite is the `t/*.pl` files (243 scripts, each starts its own
+nodes). The tests of `kingres_columnar` and `kingres_timepart` are built and installed before the TAP tests that use them. The two lists below
+are the record of how the tests grew, increment by increment, in the wording of their time; the files are the authority. They
+name a test by its number, and every `t/NNN` mentioned in this document is a file in `t/`.
 
 - `sql/` and `expected/`: pg_regress tests on one node (`version`, `catalog`,
   `bucket_for`, `bucket_lookup` (the bucket of boundary values, NULL and values of every
@@ -526,9 +575,32 @@ schema through `"$user"`; qualify names or fix `search_path`.
 | `kingres.bucket_for(relation regclass, value anyelement) returns int` | The bucket of a key of a distributed table. |
 | `kingres.bucket_for(colocation_id int, value anyelement) returns int` | The bucket of a key in a colocation group. |
 
-Views: `kingres.nodes` (`kingres.node` plus `is_local`) and
-`kingres.buckets` (table, bucket, partition name, group, owning node, state,
-and the partition size where the partition exists on this node).
+The table above is the first group of functions. Every other public function of the 0.9 install script is
+listed here with the section that describes it (all are for superusers unless the section says otherwise; the
+`internal_*` functions are helpers that the extension and the nodes call, are revoked from `PUBLIC`, and are not an interface):
+
+| Function | Section |
+|---|---|
+| `create_distributed_table_concurrently(relation, dist_column, colocate_with, bucket_count) returns bigint`, `create_reference_table_concurrently(relation) returns bigint`, `undistribute_table_concurrently(relation, cascade_via_foreign_keys, target_group) returns bigint`, `alter_distributed_table_concurrently(relation, distribution_column, bucket_count, colocate_with, cascade_to_colocated) returns bigint` | "The online variants" |
+| `begin_table_operation(kind, relation, options jsonb) returns bigint`, `table_operation_advance(op_id, to_phase, timeout_ms) returns text`, `cancel_table_operation(op_id)`, `resume_table_operations() returns int`, `cleanup_table_operations(force) returns int` | "The online variants (increment 9.3)" (the phases of an operation; the control plane calls them) |
+| `create_partition(parent, partition_name, bound, if_not_exists)`, `drop_partition(parent, partition_name, missing_ok)`, `detach_partition(parent, partition_name)`, `attach_partition(parent, partition, bound)`, `partition_leaves(parent, partition_name)` | "User-partitioned tables" |
+| `partition_leaf_budget(parent)`, `partition_leaf_storage(parent)`, `begin_leaf_conversion(parent, partition_name, target, holder_pid) returns bigint`, `renew_leaf_conversion(op_id)`, `end_leaf_conversion(op_id, reason)` | "Time partitions of distributed tables" |
+| `move_bucket(colocation_id, bucket, target_group) returns bigint`, `cancel_bucket_move(move_id)`, `resume_bucket_moves() returns int`, `cleanup_moved_buckets(force) returns int`, `check_cluster(p_prepared_older_than interval)`, `rebalance_plan(max_moves)`, `set_node_property(node_id, should_have_shards [, weight])` | "Moving buckets and rebalancing" |
+| `bucket_range(colocation_id, bucket) returns table(modulus, remainder)` | "The bucket layout" |
+| `plan_rebalance(strategy, threshold, max_moves, drain_only, extra_load, exclude_groups, colocation_ids)`, `group_load(strategy, extra_load, exclude_groups)`, `move_progress()`, `drain_status()` | "Weights and the plan of a rebalance", "Several moves at once, and the progress of a move" |
+| `split_bucket(colocation_id, bucket, parts, verify) returns bigint`, `cancel_bucket_split(split_id)`, `resume_bucket_splits() returns int`, `cleanup_bucket_splits(force) returns int` | "Splitting a bucket" |
+| `set_sharding_mode(mode, distribute_new_schemas)`, `distribute_schema(nsp, group_id) returns int`, `undistribute_schema(nsp)`, `alter_distributed_schema(nsp, ship_functions)`, `move_schema(nsp, target_group) returns bigint`, `schema_inventory(nsp)`, `schemas_on_group(group_id)` | "Distributed schemas" |
+| `map_version_bump()` (the statement trigger of the catalog tables that raises the map version and invalidates the caches), `forget_dropped_tables()` (the `sql_drop` event trigger) | "Security notes" |
+
+Views: `kingres.nodes` (`kingres.node` plus `is_local`), `kingres.buckets` (table, bucket, partition name, group,
+owning node, state, modulus, and the partition size where the partition exists on this node), `kingres.catalog_status`,
+`kingres.bucket_move_status`, `kingres.table_operations`, `kingres.partitions` and `kingres.schemas`.
+
+Tables of the schema `kingres`. The catalog, authoritative on the map group primary and copied to every node: `node`,
+`colocation`, `dist_table`, `bucket_map`, `map_version`, `local_node`, `dist_partition`, `dist_schema`, `sharding_settings`
+and the sequence `colocation_id_seq`. Node-local, readable by superusers only: `dtx_log`, `dtx_applied`, `dtx_epoch`,
+`dtx_incident`, `dtx_unconfirmed`, `pending_node`, `cluster_secret`, `bucket_move`, `bucket_split`, `move_marker`,
+`table_operation`, `table_operation_item`, `table_operation_lock`, `table_old_copy` and `add_node_progress`.
 
 `create_distributed_table` takes an ordinary, permanent, table (or one partitioned by RANGE or LIST: see "User-partitioned tables")
 that may hold rows, without inheritance, triggers, rules, row-level security (enabled, forced or with a
@@ -555,14 +627,14 @@ nodes, and so are its foreign keys to other reference tables.
 
 ## The table lifecycle (version 0.7)
 
-This section is phase 9 of [`shard-phase9.md`](../../kingres/docs/design/shard-phase9.md),
-increments 9.1, 9.2 and 9.3 (what the catalog and the report are, the blocking
-`create_distributed_table` of a table with rows, and the rebuild engine with
-`create_distributed_table_concurrently` and `create_reference_table_concurrently`). The design
-calls its version "0.6"; the phase is 0.7 because phase 2b is 0.6 (a version with no object
-change). Increment 9.4 adds `undistribute_table` and `alter_distributed_table` (blocking). Not in this version: their online
-variants, user partitions of distributed tables, the control plane and the console. `table_change_report` already
-reports for those kinds what it can know today (see the codes).
+This section is phase 9 of [`shard-phase9.md`](../../kingres/docs/design/shard-phase9.md), built in increments 9.1 to 9.9 and in the
+extension since version 0.7. It is the record of how the phase was built, in the wording of its time (an increment may say "not in this
+version" of what a later one added); everything it describes is in 0.9, and the current set of functions is in "SQL interface".
+The increments are the report and the catalog, the blocking `create_distributed_table` of a table with rows (9.1, 9.2), the rebuild engine with
+`create_distributed_table_concurrently` and `create_reference_table_concurrently` (9.3), `undistribute_table` and `alter_distributed_table`, blocking
+and online (9.4), user-partitioned tables (9.5), dependent views (9.8) and storage parameters (9.9). The control plane and the console drive
+these functions (see their documents). The design calls its version "0.6"; the phase is 0.7 because phase 2b is 0.6 (a version with no object
+change).
 
 ### What a creation with rows does
 
@@ -720,7 +792,7 @@ order). A writer that has locks on the next node and waits for the lock that the
 PostgreSQL cannot see; `kingres.detect_distributed_deadlocks()` (and the pass of the recovery worker) cancels one of the two. Under writers that
 never pause between transactions that touch several nodes a blocking call can wait for minutes, and an online variant can fail to take its switch
 locks within `rebuild_switch_timeout` (it is undone, nothing is lost); give the call a quiet moment, or use the online variant, which waits for each node
-for a bounded time only (review P9C-13: with six such writers both online alters gave up after about a minute and the blocking alter waited until the deadlock detector was called by hand; with 30 ms between the transactions all five calls finished).
+for a bounded time only (review P9C-13, `t/197`).
 
 **Limits of this increment.** All rows of a rebuild pass through the session of the map group primary (a distributed scan there, the batch
 sender to the destinations): the cost is the size of the table, not what it moves between nodes. Writers wait for the whole copy; the online
@@ -847,14 +919,14 @@ source (`LIKE ... INCLUDING ALL` does not copy them). A reference table keeps it
 
 ### What 0.7 adds to the catalog
 
-`kingres.dist_table.partition_method` and `partition_key` (empty in this version), `kingres.dist_partition` (synchronized
-with the rest; nothing writes it yet), the sequence `kingres.colocation_id_seq` (a colocation id is never used twice; the
+`kingres.dist_table.partition_method` and `partition_key` (empty for a table that the user did not partition; set by 9.5), `kingres.dist_partition` (synchronized
+with the rest; written by the partition functions of 9.5), the sequence `kingres.colocation_id_seq` (a colocation id is never used twice; the
 update starts it at the highest id, and a node that applies a catalog keeps it above the ids it sees), and four node-local
 tables, readable by superusers only: `table_operation`, `table_operation_item`, `table_operation_lock` and `table_old_copy`
 (written by the online variants of increment 9.3; `internal_begin_move` and the DDL guard already refuse a colocation group
 that has a row in `table_operation_lock`). The views `kingres.table_operations` and `kingres.partitions` are readable by
 `pg_monitor` and show no error text and no node address. `kingres.internal_copy_routed()` copies the rows of a table to a
-placement, to every node or to one node for the rebuild engine to come; `kingres.internal_require_version()` is the
+placement, to every node or to one node (used by the rebuild engine); `kingres.internal_require_version()` is the
 handshake. All new functions are revoked from `PUBLIC`; one is `SECURITY DEFINER`:
 `kingres.internal_capture_trigger()` of the online variants (below), the second of the extension after
 `forget_dropped_tables`.
@@ -929,7 +1001,7 @@ old copy overdue by an hour) and `table_verification_failed`.
 
 **Cost to writers.** One more insert into the log per changed row while the operation runs (the table is a plain table on the map group
 primary until the swap), and a wait from the first lock of the switch to its commit, bounded by the drain threshold and
-`rebuild_switch_timeout`. `t/145` measures a reader during the operation (under a second) and checks the table against a model of four
+`rebuild_switch_timeout`. `t/145` runs a reader during the operation and checks the table against a model of four
 writers (inserts, updates, deletes, `COPY`).
 
 **Disk and WAL.** While an operation runs the destination servers hold a second copy of the table with its indexes (about twice the
@@ -1021,6 +1093,22 @@ the files of the extension, because the dump creates the extension.
 | `kingres_shard.enable_copy_routing` | on | Off: `COPY ... FROM` into a distributed table of a cluster with several groups is refused as in 0.5. `USERSET`. |
 | `kingres_shard.insert_batch_rows` | 1000 | Rows per batch that the row router sends to one group (1 to 100000). |
 | `kingres_shard.insert_batch_bytes` | 1MB | Text bytes per batch per group, the sum of the lengths of the values (16kB to 64MB). The memory of a bulk write is about two batches per group, whatever the number of rows. |
+| `kingres_shard.enable_repartition_join` | on | `off`, `on` or `force`. Whether a join of distributed tables on columns other than their distribution column may be run by moving the rows of one table to the groups (see "The repartitioned join"); `on` lets the planner choose it when it is cheaper, `force` takes it whenever the statement qualifies (for tests). `USERSET`. |
+| `kingres_shard.repartition_max_bytes` | 64MB | The most that this node holds of the rows of a table that a repartitioned join moves (1MB to 512MB, in the unit kB); a statement that would hold more fails. `USERSET`. |
+| `kingres_shard.count_distinct_mode` | exact | `exact` or `approximate`: whether `count(DISTINCT x)` on a distributed table is counted exactly or from sketches (see "Approximate `count(DISTINCT x)`"). `USERSET`. |
+| `kingres_shard.count_distinct_error_rate` | 0.01 | The relative standard error asked of `count_distinct_mode = approximate` (0.0005 to 0.1). `USERSET`. |
+| `kingres_shard.enable_schema_routing` | on | Off: a statement on a distributed schema is not run whole on the group that holds the schema; it is planned with the distributed scan, and a write to a schema of another group is refused (see "Distributed schemas"). `USERSET`. |
+| `kingres_shard.distribute_new_schemas` | default | `default`, `on` or `off`: whether a new schema of the session becomes a distributed schema; `default` follows the setting of the database. `SUSET`. |
+| `kingres_shard.schema_placement_group` | -1 | The shard group that receives the next distributed schema the session creates; -1 lets the extension choose. `SUSET`. |
+| `kingres_shard.max_distributed_schemas` | 10000 | Upper bound on the number of distributed schemas of a database (1 to 1000000). `sighup`. |
+| `kingres_shard.add_node_batch_statements` | 100 | How many statements one transaction of `add_node()` runs on the new node when it makes the distributed schemas (1 to 100000; a schema is never split). `SUSET`. |
+| `kingres_shard.catalog_incremental` | on | Off: every change of the catalog invalidates every distributed table (the fallback); on: only the tables that the change touches. `SUSET`. |
+| `kingres_shard.shipped_scope` | off | Set by the origin of a statement that is run whole on the owner of a distributed schema; not for users (hidden from `SHOW ALL`). |
+| `kingres_shard.move_catchup_threshold` | 1MB | How close the copy of a bucket move must be to the source (lag of the replication slot) before the switch is attempted. `USERSET`. |
+| `kingres_shard.move_switch_timeout` | 10s | The longest the tables of a moving bucket are locked by one switch attempt (100ms to 1h). `USERSET`. |
+| `kingres_shard.move_switch_attempts` | 20 | How many times a move tries to switch before it gives up (1 to 1000). `USERSET`. |
+| `kingres_shard.move_cleanup_delay` | 10min | How long the orphan tables of a moved bucket are kept on the old group. `USERSET`. |
+| `kingres_shard.min_bucket_cost` | 1MB | The smallest cost of a bucket in a rebalance plan by disk size (`plan_rebalance`). `USERSET`. |
 | `kingres_shard.dependent_views` | refuse | `refuse` or `recreate`: what a table operation does with the plain views that use the table (see "Dependent views"). `USERSET`. |
 | `kingres_shard.max_partition_leaves` | 8192 | Most leaves (buckets times user partitions) one distributed table may have; a user-partitioned table over the limit is refused, and from 0.9 so are `create_partition` and `attach_partition` of the partition that would pass it. `USERSET`. |
 | `kingres_shard.rebuild_batch_rows` | 10000 | Rows per chunk of the copy and of the replay of an online table operation (one transaction on every group it writes). `USERSET`. |
@@ -1040,6 +1128,7 @@ the files of the extension, because the dump creates the extension.
 | `kingres_shard.node_timeout` | 60s | The longest the phases that cannot be left waiting may wait for a node (`COMMIT PREPARED`, the cleanup after an abort, savepoint rollbacks and releases, the recovery worker), the longest any statement of a control-plane call (`promote_node`, `add_node`, `remove_node`, `sync_catalog`, `rotate_secret`, `recover_prepared_transactions`, `create_distributed_table`) waits for a node, and the longest such a call waits for another call that changes the catalog (then `KS008`); the node's own lock wait in such a call ends at three quarters of it (README, "Bounds that apply to every call"). And, as `tcp_user_timeout` and keepalives, the time after which a connection to a node that does not answer at all is dead. The cancel request sent when a wait runs out is bounded too (a third of this value, at most `node_connect_timeout`, at least a second), so a node whose postmaster is stopped delays the committing session by `node_timeout` plus that, not until it resumes (S3-07). The recovery worker takes the value of the server configuration, whatever `ALTER DATABASE ... SET` says (S3-16); so for `node_connect_timeout`. |
 | `kingres_shard.forwarded` | off | Set by the router on the sessions it opens, together with `kingres_shard.forward_token`; fixed at connection time (`PGC_BACKEND`). A client that sets it without the token is refused. See "The forwarded flag" below. |
 | `kingres_shard.forward_token` | hidden | The proof of a forwarded session; never shown. |
+| `kingres_shard.forward_dtx`, `kingres_shard.forward_origin`, `kingres_shard.forward_term` | hidden | Set by the router on the remote transactions of a node (the distributed transaction, the node that sends the statement and the term of its catalog); not for users. |
 | `kingres_shard.fault_injection` | empty | Developer setting, superuser only: fails the commit protocol at a named point (`<point>:kill`, `:error`, `:wait:<file>`, `:waitinv:<file>` (the same, and then the backend takes the invalidations that committed meanwhile: a test changes the catalog of the node behind the statement); points `before_prepare`, `after_first_prepare`, `after_prepare`, `after_log`, `after_commit`, `between_commit_prepared`; 0.5 adds `commit_waits_for_barrier`, `promote_before_change`, `promote_after_first_push`, `promote_after_push`, `restore_barrier_up`, `restore_all_quiet` and `recovery_before_resolve` (recovery has decided and is about to send COMMIT PREPARED or ROLLBACK PREPARED); `server_major:value:<n>` and `peer_major:value:<n>` make this node, or the nodes it connects to, report another PostgreSQL major to the checks that keep one major per cluster). Used by the tests; it adds no capability a superuser does not have. |
 
 ### Node connection options
@@ -1234,7 +1323,7 @@ distributed or reference table is handled by the ProcessUtility hook:
   `LOCK`, `EXPLAIN`.
 - **Refused** with `<statement> is not supported on distributed tables yet`:
   everything else, among them `ALTER COLUMN ... TYPE`, `SET SCHEMA`, `ATTACH`
-  and `DETACH PARTITION`, triggers, rules, policies, statistics objects,
+  and `DETACH PARTITION` of a table that is not user-partitioned (see "User-partitioned tables"), triggers, rules, policies, statistics objects,
   `CLUSTER`, `CREATE INDEX CONCURRENTLY`, `COPY ... FROM` into a reference table or a bucket partition (into a distributed table it is routed, see "Bulk writes through the row router"), row-level security,
   storage parameters, `ALTER INDEX`.
 - A statement that mixes distributed and other tables (`DROP TABLE a, b`,
@@ -1267,7 +1356,7 @@ it is a built-in immutable function or operator on built-in types: `now()`,
 `random()`, `nextval()` (a `serial` default) and user-defined functions are
 rejected ("cannot be run on every node"), and it may read only reference tables.
 A statement that writes a reference table and reads a distributed table is not
-supported yet. Which foreign keys exist, and what they do, is under "Foreign keys that
+supported. Which foreign keys exist, and what they do, is under "Foreign keys that
 point at a reference table" below. `COPY ... FROM` into a reference table is refused on a
 cluster with several groups.
 
@@ -1469,7 +1558,7 @@ parameters; every restriction is applied again here to the rows fetched. The
 scan is not parallel-aware and supports rescan (it runs the remote queries
 again). Partitionwise join and aggregation are switched off while such a
 statement is planned. `EXPLAIN` shows the number of remote groups and the
-remote SQL. Not supported yet: row locking (`FOR UPDATE`) on a statement that
+remote SQL. Not supported: row locking (`FOR UPDATE`) on a statement that
 spans groups, system columns of a distributed table (`ctid`, `tableoid`).
 
 Since step 2 of phase 2b the scan has these properties as well (design:
@@ -1594,7 +1683,7 @@ change of nothing (the placement of the groups is checked when the statement sta
 statement can be repeated. A group refuses a `MERGE` fragment that is not of a shape its own analysis accepts, and a text that
 claims to be one is never run.
 
-Limits of this increment: M3 and M5 need the source to be one relation (a `USING` join is written as a sub-select); a key
+Limits: M3 and M5 need the source to be one relation (a `USING` join is written as a sub-select); a key
 restriction in `ON` does not prune the groups of an M1 statement (every group owning buckets of the target runs it, which is
 always correct); `merge_max_source_bytes` bounds the rows that the origin holds, and for M5 every node receives all of them;
 a `MERGE` on a hot standby is refused as every write is.
@@ -1648,7 +1737,7 @@ broadcast table the share of one group.  The planner does not choose a moved sid
 executor stops a statement that would hold more with an error that names the setting (the one place where a read fails instead of
 falling back, because the plan cannot change once it runs).  Fault points: `rp_after_ship`, `rp_before_fragment`.
 
-**Not done (the complete scan answers them).**
+**Limits (the complete scan answers these statements).**
 
 * A preserved side that moves (`o LEFT JOIN c` with `o` moved, `c` staying).  It can be made correct: every `o` row goes to the group
   of its key, a NULL key goes once to one group, a condition of the ON clause that names only `o` stays in the text (it decides the
@@ -2020,10 +2109,10 @@ query and of a partial aggregation only; the scan, the writes and the colocated 
 ## Distributed schemas (phase 11, version 0.8)
 
 Design: [`shard-phase11.md`](../../kingres/docs/design/shard-phase11.md).  A **distributed schema** is a schema whose tables all live
-in one shard group (one tenant, or one microservice, per schema).  The design is built in increments; this is what exists so far.
+in one shard group (one tenant, or one microservice, per schema).  Phase 11 is built.  The increments below are the record of how it was built, in the wording of their time (an increment may say "not yet" of what a later one added); "Using distributed schemas, and what they cannot do" at the end of this section is the current state.
 
-**Increment 1: the catalog, the views and the inventory.**  No statement is routed by schema and no schema is made distributed by the
-product yet: these are the objects the later increments use, tested with rows made by hand.
+**Increment 1: the catalog, the views and the inventory.**  At this increment no statement was routed by schema and no schema was made distributed by the
+product: these are the objects the later increments use, tested with rows made by hand.
 
 - `kingres.colocation.kind` is `hash` (the buckets of hash-distributed tables) or `schema` (one bucket: the one group that holds a distributed
   schema; `dist_column_type` is then null and `bucket_count` is 1).  `kingres.dist_table.method` gains `schema` (a table of a distributed
@@ -2116,8 +2205,7 @@ hold rows and the marker table, a subscription that copies into the existing tab
 bounded attempts), a marker proves the copy complete, the state of the sequences is read on the source and set on the target in the switch's transaction, and the owner
 and the placement epoch change in the two-phase transaction.  Nothing is attached or detached.  A writer that meets the switch gets `KS001` and repeats.  The old copy is emptied by
 the cleaning phase after `move_cleanup_delay` (`cleanup_moved_buckets(true)` at once).  A move that fails before the switch is undone (the shells of the target are emptied
-again), resume and cancel work as for a bucket.  A schema without a table is not moved by a copy.  `rebalance_plan` (phase 4) does not move a schema; `plan_rebalance` of 0.8 plans schemas as items (see "The schemas in the rebalance, the drain and check_cluster")
-yet; the bucket of a schema counts in the load of its group.
+again), resume and cancel work as for a bucket.  A schema without a table is not moved by a copy.  `rebalance_plan` (phase 4) does not move a schema; `plan_rebalance` of 0.8 plans schemas as items (see "The schemas in the rebalance, the drain and check_cluster"); the bucket of a schema counts in the load of its group.
 
 **Increment 6: a schema with data becomes distributed, `kingres.undistribute_schema(nsp)`, several schemas on one group.**  `kingres.distribute_schema(nsp, group_id)` also takes a schema that already
 has objects and rows (superuser, map group primary, READ COMMITTED).  The node that runs it keeps the rows and its group becomes the owner; a `group_id` of another group is refused while a table holds a row
@@ -2179,8 +2267,7 @@ phase of a switch can hand out a number the new owner hands out again (use the s
 table, a hash-distributed table or a catalog, so a function cannot silently read the owner's own copy of a plain local table; the same holds for the batches of the row router.  `UNION ALL` with an
 expression column works through the distributed scan.  `CREATE TABLE IF NOT EXISTS ... AS` gives the notice, `CREATE TABLE AS EXECUTE` is refused.  A user trigger named `kingres_ledger_*` is an ordinary
 trigger (the ledger's own are known by their functions).  `ALTER TABLE ... SET SCHEMA` locks the table before it looks for rows.  The verification of a bucket split must fit in `move_switch_timeout`
-(see "Sizing of the verification"), and `verify 'full'` writes only the rows that differ.  Measured with `t/245_schema_scale_cluster.pl` (the numbers are in the design notes): the cost of a DDL statement
-grows with the number of distributed schemas (23 ms at 200 schemas, 174 ms on average at 2000) and `add_node` of a cluster with 2000 schemas fails for lack of locks; both are for step 12.
+(see "Sizing of the verification"), and `verify 'full'` writes only the rows that differ.  `t/245_schema_scale_cluster.pl` showed that the cost of a DDL statement grows with the number of distributed schemas and that `add_node` of a cluster with 2000 schemas ran out of locks; step 12 below answers both.
 
 **Step 12: the incremental cache of the catalog.**  A backend no longer reads every distributed schema and schema table when it loads the catalog: it counts them,
 and makes the entry of a schema table or a schema when a statement asks for it (one index scan of `kingres.dist_table` or `kingres.dist_schema`; "not a schema
@@ -2201,7 +2288,7 @@ complete, and a failure leaves nothing that the nodes of the cluster can see (th
 reads a reference table (a foreign key to it, a view over it) cannot be made before the reference tables are, so it is made in the last transaction: many of those would meet the lock limit
 again.  The tables of a distributed schema are empty shells on the new node: add_node no longer copies them as if they were reference tables.
 
-Measured with `t/245_schema_scale_cluster.pl` (three nodes, one machine; the full table is in the design notes): at 2000 schemas of 5 tables a DDL statement takes 52 ms on average (174 ms before step 12), the first statement of a new backend 9 to 15 ms (55 to 112 ms), the cache of a backend 0.7 MB (3.3 MB), a routed single-row INSERT 1.2 ms (5.8 ms), and `add_node` passes in 39 s in 500 batches (it failed for lack of locks); at 200 schemas the cost of a DDL statement is that of the two-phase commit (26 ms, as before).
+`t/245_schema_scale_cluster.pl` runs a cluster with 2000 schemas of 5 tables (the cost of a DDL statement, of the first statement of a new backend, of the cache of a backend and of `add_node` is in the design notes, not here).
 
 
 **The schemas in the rebalance, the drain and `check_cluster`** (design 9.9 and 9.10).
@@ -2227,7 +2314,7 @@ To use them: on the map group primary, `SELECT kingres.set_sharding_mode('schema
 service.  A new schema is placed on the group that holds the fewest schemas for its weight (`kingres_shard.schema_placement_group` or the `group_id` of `distribute_schema` overrides) and its tables are made on
 every node, empty except on the owner.  Connect to any node: a statement on the schema is shipped whole to its owner; a statement that mixes schemas of two owners, local, hash or reference tables is answered by
 the distributed scan.  `kingres.move_schema(schema, group)` moves a schema online; `kingres.distribute_schema(schema)` and `kingres.undistribute_schema(schema)` convert an existing schema in place; the control plane
-and the panel of the product (branch cp-1011, not part of this extension's tree) run the same operations as tasks.
+(`kingresd`) and the console run the same operations as tasks.
 
 Limits of this version:
 
@@ -2256,7 +2343,7 @@ The tests of this phase are `t/230` to `t/251`; the numbers of the measured cost
 
 ## Limitations in phase 2a
 
-Read these first; each is a reviewed boundary, not an accident.
+Read these first; each is a reviewed boundary, not an accident. The list was begun in phase 2a, in the wording of that time, and each item was checked again for 0.9: where a later phase lifted a boundary (pushdown, the row router, `MERGE`, the repartitioned join) the item says so, and what remains is a limit of 0.9.
 
 - **No global snapshot** (see Guarantees). The distributed scan is slow for
   large tables by design: it moves rows. Since phase 2b the planner can run a closed query, an
@@ -2357,7 +2444,7 @@ Read these first; each is a reviewed boundary, not an accident.
   type `money` (or an array of it) is never shipped to another node, so an `UPDATE`
   or `DELETE` that spans groups, or a reference-table write, that uses one is
   refused. `ON CONFLICT` actions other than `DO NOTHING` and `DO UPDATE` (PostgreSQL
-  19's `DO SELECT`) are refused until they are designed.
+  19's `DO SELECT`) are refused.
 - **Settings of the session that change what a write does** (review finding S6-04). A
   statement that runs on another node runs in a session that this node opened, with the
   settings below and the defaults of that node for everything else. Every setting that
@@ -2485,7 +2572,7 @@ A bucket of a columnar distributed table moves like any other (design 9.3 and 11
 - The switch, the old copy kept until `move_cleanup_delay` and `check_cluster` are the same as for a heap bucket.  The switch of a user-partitioned bucket publishes the root with
   `publish_via_partition_root`; a columnar leaf is delivered to the target's tree like a heap leaf (`t/274`: rows inserted during the move into both kinds of leaf).
 
-Not done: the design has the move call `columnar_compact` on the copy before the switch, to merge the small stripes that the apply worker makes; version 0.9 does not
+Limit: the design has the move call `columnar_compact` on the copy before the switch, to merge the small stripes that the apply worker makes; version 0.9 does not
 (the stripes of the initial copy are full; the stripes of the changes of the move are as many as the source transactions: run `kingres.columnar_compact` on the bucket partition
 afterwards when many small transactions wrote during a long move).  Test: `t/274_columnar_move`.
 
@@ -2723,7 +2810,7 @@ milliseconds; the measurement is in the design note):
 | `kingres.resume_bucket_moves() returns int` | undo the moves interrupted before the switch, finish those after it; the recovery worker calls it |
 | `kingres.cancel_bucket_move(move_id)` | stop and undo a move that has not reached *switching*; it says that the move was stopped, or fails with "passed the point where it can be stopped"; a move that was asked to stop never enters its switch (S5-05) |
 | `kingres.cleanup_moved_buckets(force default false) returns int` | drop the orphan tables whose delay is over (all with `force`) |
-| `kingres.check_cluster(older_than default '5 minutes')` | one row per inconsistency |
+| `kingres.check_cluster(p_prepared_older_than default '5 minutes')` | one row per inconsistency |
 
 Settings: `kingres_shard.move_catchup_threshold` (1MB), `kingres_shard.move_switch_timeout`
 (10s), `kingres_shard.move_switch_attempts` (20: how many times a move tries to switch before it fails, see "What a move blocks"), `kingres_shard.move_cleanup_delay` (10min).
@@ -2828,8 +2915,7 @@ needs `cleanup_moved_buckets(true)` after the move (review finding S4-10).
 
 ### Limits
 
-- One bucket per call; no splitting, no change of the bucket count, no move between
-  colocation groups. A bucket move whose source primary is replaced
+- One bucket per call (splitting a bucket is `split_bucket`, and a change of the bucket count or of the colocation group is `alter_distributed_table`; a move never changes either). A bucket move whose source primary is replaced
   fails and is undone (the replication slot of the move does not survive a
   failover), unless its switch had been decided, in which case recovery finishes it.
   When the target primary is replaced, the subscription of the move is on its
@@ -2880,7 +2966,7 @@ needs `cleanup_moved_buckets(true)` after the move (review finding S4-10).
 ## The bucket layout (version 0.8, phase 10, increment P10.1)
 
 [`shard-phase10.md`](../../kingres/docs/design/shard-phase10.md) lets one bucket be split into several without touching the others.
-Version 0.8 prepares the catalog and every place that routes by bucket for it; nothing in this version splits a bucket yet.
+Version 0.8 prepares the catalog and every place that routes by bucket for it; the split itself is the next section, "Splitting a bucket".
 
 - **A bucket is a hash partition `(MODULUS m, REMAINDER r)`, and its number is its remainder `r`.** `kingres.bucket_map` has a `modulus`
   column for it; `kingres.colocation.bucket_count` stays what a new table of the group asks for (the base modulus), and the number of
@@ -2891,7 +2977,7 @@ Version 0.8 prepares the catalog and every place that routes by bucket for it; n
   slot (the same idea as `boundinfo->indexes` of PostgreSQL), and `kingres_shard_bucket_for_hash()` reads it. Everything that routes (the planner,
   the row router, `COPY`, the pushdown, `kingres.bucket_for()`) goes through it; the code that creates or attaches a bucket partition asks
   `kingres_shard_bucket_modulus()`. A key whose slot no bucket covers is an error that names the slot, never a wrong bucket.
-- **`kingres.colocation.placement_epoch`** counts the switches of a group (a move now, a split later), in the transaction that changes the
+- **`kingres.colocation.placement_epoch`** counts the switches of a group (a move or a split), in the transaction that changes the
   partitions. The placement hash that a scan compares before and after it starts includes it, so a bucket that moves away and comes back
   inside the window of a statement no longer restores the hash (review finding S4-01).
 - **`kingres.bucket_range(colocation_id, bucket)`** returns the modulus and the remainder; `kingres.buckets` has a `modulus` column.
@@ -2956,7 +3042,7 @@ tables on the same node apart (design 6.3), because a retry is a cost, not becau
 What a move costs the nodes, per move: on the map group primary the session that runs `move_bucket()` and its control sessions; on the source a WAL sender,
 a replication slot and a publication; on the target a subscription with its apply worker and, during the copy, a table synchronization worker. So
 `max_connections`, `max_wal_senders`, `max_replication_slots`, `max_logical_replication_workers` and `max_worker_processes` have to leave room for the
-number of moves that are allowed at once (`rebalance.maxConcurrentMoves`, default 4) on top of what the databases use; a node that runs out of
+number of moves that are allowed at once (the `maxConcurrentMoves` option of a rebalance in the control plane: recorded as 1 when a start leaves it out, 1 to 64 otherwise; the control plane runs one move at a time whatever the value, so one move is what to plan for today) on top of what the databases use; a node that runs out of
 connections makes the move fail with "too many clients" and the move is undone.
 
 - **`kingres.move_progress()`** (superusers; it asks the nodes) returns one row per unfinished move: `move_id`, `colocation_id`, `bucket`, `source_group`,
@@ -3036,7 +3122,7 @@ unfinished split with the bucket map: between the owner's switch and the catalog
 (`lpad` cuts), so a split whose new buckets would be numbered 10000 or more is refused with a message before anything is recorded. A group starts with at most 4096 buckets, so a
 group of 8 buckets can be split about three times in 16 parts.  A group of 4096 buckets (the largest start) can be split once in 2 (its new remainders go up to 8191; the buckets of that result have the modulus 8192, and a second split of one of them would need remainders up to 16383, which the limit refuses), and a split in 4 or more is refused for most of its buckets (P10F-03): the limit comes from the naming of the partitions and a single naming function that prints longer numbers in full would lift it. The greatest modulus of a group, 65536, is checked by `split_bucket()` and is not a setting.
 
-Not done: a split of a user-partitioned table or of a columnar table (refused), a split by `parts` other than 2, 4, 8 or 16, the merge of buckets, and the split of several buckets of a group at once (one split per
+Limits: a split of a user-partitioned table or of a columnar table (refused), a split by `parts` other than 2, 4, 8 or 16, the merge of buckets, and the split of several buckets of a group at once (one split per
 colocation group at a time).
 
 What the control plane calls: the record of a split is `kingres.bucket_split`, not a row of `bucket_move`, so `resume_bucket_moves()`, `cancel_bucket_move()` and `cleanup_moved_buckets()` do not
@@ -3052,7 +3138,8 @@ row, a deadlock with a writer, a writer that keeps the switch out) and the regre
 
 Version 0.5 is the part of high availability that lives in the extension
 ([`kingres/docs/design/ha-phase5.md`](../../kingres/docs/design/ha-phase5.md),
-part C; the design calls it 0.4, a number that a fix round used first). The
+part C; the design calls it 0.4, a number that a fix round used first). The part was
+built in 0.5 and reviewed in rounds (S7 to S14) whose findings are named in the text; the functions and rules below are those of the 0.9 install script. The
 control plane creates the standbys (`pg_basebackup`, streaming replication),
 decides when a primary is gone, **fences** it and promotes a standby in
 PostgreSQL; the extension is what makes the cluster's catalog, routing and
@@ -3534,6 +3621,16 @@ What it does not give:
 
 ### What the control plane calls
 
+The control plane (`kingresd`) runs these sequences itself: the tasks `server.failover` (manual and automatic
+failover, switchover, hard and graceful failover of the map group) and `replication.restorePreferredPrimaries`
+fence the old primary (stop it, wait for its lease), choose the standby, promote it, make the catalog follow,
+re-point the other standbys and resolve prepared transactions, with the calls below; it rebuilds the old primary
+as a standby when it comes back. How an operator uses this is in section 6 "Failover and switchover" of the
+operator guide ([../../kingres/docs/guide/operator-guide.md](../../kingres/docs/guide/operator-guide.md)). This
+section is the contract of the calls themselves: what each one answers and what it leaves behind. It is for a
+person who runs a sequence by hand or who writes another controller. The extension does no fencing and holds no
+lease of its own.
+
 Everything below is a single SQL call on a named node, and every call is safe to repeat.
 Where a sequence says "answers", the list is complete for what a test has produced: a call can
 end in one of those ways and in no other except a connection that breaks or a timeout of the
@@ -3596,7 +3693,7 @@ the control plane (fix a list, wait for PostgreSQL, stop and ask a human, run re
 refusals that all say "this is the wrong node" ask the same (call another node), so they share
 `KS010`. `KS007` and `55P03` are told apart because the first must never be repeated against the
 same node and the second may be, once the lock is gone. The remaining `55000` answers are errors of
-the input, which a human reads. The `KS003` slot is not used; `KS022` is the last code of the series that is in use (`KS0C1` is outside the numbered series: it is a deliberate non-`57014` code); the next free code is `KS023`.
+the input, which a human reads. `KS003` is raised only inside the SQL loop of a bucket move that was cancelled ("bucket move N was cancelled", after `cancel_bucket_move`), which catches it and ends the move as cancelled, so no caller sees it and it has no row above; `KS022` is the last code of the series that is in use (`KS0C1` is outside the numbered series: it is a deliberate non-`57014` code); the next free code is `KS023`.
 
 Since 0.9 the control plane (`kingresd`) decides on these refusals by SQLSTATE and never by the wording: `KS017` to `KS022` were given to the refusals that it used to recognise by text, and `0A000` (`feature_not_supported`) and `42710` (`duplicate_object`), which the distributed-schema and bucket-split functions raise for an unsupported object, a table without a primary key and a schema that is distributed already, are the codes it reads for those. The control plane keeps a fallback on the old text only where the released extension 0.8 can answer, and says so in a comment.
 
@@ -3718,15 +3815,9 @@ assert the bound with it:
 **Which cells are in the default run.** `t/102` and `t/103` together take a few minutes by default: every call
 with **one** slow node at **0.9 x T** (the case of the finding: a healthy slow node never gets `KS007`), and the
 copy of 60000 rows once. The cells with two and four slow nodes and the cells at 0.5 x T run only with
-`KINGRES_LONG_TESTS=1` in the environment (about 22 minutes for `t/102` and 6 for `t/103` per major); a skipped
-cell is announced by a `note` that names the variable. The measured times of the long run (T = 2 s) were, for
-one / two / four slow nodes: `sync_catalog` 13.7 / 24.7 / 46.7 s at 0.5 x T and 23.4 / 43.1 / 84.5 s at 0.9 x T;
-`rotate_secret` 12.7 / 21.1 / 44.4 and 19.9 / 41.2 / 75.5; `create_distributed_table` 9.5 / 13.2 / 27.0 and
-12.8 / 25.2 / 46.9; `create_reference_table` 9.9 / 15.2 / 30.9 and 14.6 / 28.9 / 55.7;
-`recover_prepared_transactions` 6.0 / 13.7 / 24.0 and 12.5 / 21.6 / 46.4; `add_node` 15.1 / 23.8 / 37.8 and
-28.9 / 41.5 / 68.4; `remove_node` 8.1 / 16.8 / 30.8 and 14.5 / 28.8 / 55.8; `promote_node` 21.7 / 30.9 / 50.2
-and 37.6 / 55.4 / 87.8; the copy of 60000 rows 13.8 (0.5) and 25.9 (0.9) with one node. Every one is within
-`s x T` summed over the slow nodes. Only the one-node cells at 0.9 x T are in the default run.
+`KINGRES_LONG_TESTS=1` in the environment (they take long); a skipped
+cell is announced by a `note` that names the variable. Every call must finish within
+`s x T` summed over the slow nodes (the tests assert it). Only the one-node cells at 0.9 x T are in the default run.
 
 So the time of `create_reference_table` for a node that answers every statement at 0.9 x `T` is
 `(7 + batches) x 0.9 x T`, and a control plane that copies a large table sets its client timeout
@@ -3760,7 +3851,8 @@ transactions and the nodes, and repeats each call). Per phase:
    `-m immediate` when it hangs), or power it off, or cut every client off at the
    network. (For a **planned switchover** the stop must be a clean one: `-m immediate` is a
    failover, not a switchover, because nothing then proves that NEW has what OLD wrote; sequence 5.)
-   The extension does not fence. `promote_node` tells OLD about the new
+   The extension does not fence (`kingresd` does: its steps "Stop the old primary" and "Wait for the old lease"
+   come before "Promote the standby"; operator guide, section 6). `promote_node` tells OLD about the new
    catalog when it can reach it, and from then on OLD routes the statements of
    distributed tables to NEW and refuses forwarded ones; that is a courtesy, not a
    fence: OLD still accepts writes of ordinary (not distributed) tables, and a client
@@ -3813,8 +3905,7 @@ transactions and the nodes, and repeats each call). Per phase:
    `move_bucket`) run one at a time on the map group primary. A second caller waits for the first
    for at most `node_timeout` and then gets `KS008` having changed nothing (`t/086`); two
    controllers that call at once therefore do no damage, but the one that is refused must not read
-   the refusal as "the cluster is broken": it repeats later. Run one controller, or give them a
-   lease.
+   the refusal as "the cluster is broken": it repeats later. Run one controller at a time.
 
 #### Postconditions (every sequence ends with these)
 

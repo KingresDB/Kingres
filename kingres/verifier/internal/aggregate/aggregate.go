@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package aggregate reads the leaf of an aggregate log (ledger-phase7.md 5.2). It is written from
 // that text: integers big endian, a tag 0x23, a u16 format, a u64 seq that equals the leaf

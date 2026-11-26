@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Command kingresd is the control-plane server of KingresDB. It serves the
 // management REST API (kingres/api/openapi.yaml) and the web panel.
@@ -55,13 +56,14 @@ import (
 
 // version is the KingresDB version; release builds set it with
 // -ldflags "-X main.version=...".
-var version = "0.2.0-dev"
+var version = "0.1.0-dev"
 
 // commit is the build commit, injected with -ldflags "-X main.commit=...".
 var commit = "unknown"
 
-// contractRevision is the revision of kingres/api/openapi.yaml implemented.
-const contractRevision = "0.8.0"
+// contractRevision is the revision of kingres/api/openapi.yaml implemented. It is the constant that the database archives name in their
+// manifest too; a test fails when it differs from info.version of the contract.
+const contractRevision = ops.ContractRevision
 
 func main() {
 	hardenProcess()

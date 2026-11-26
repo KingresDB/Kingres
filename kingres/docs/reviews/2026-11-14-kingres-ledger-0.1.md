@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Independent security and correctness review: kingres_ledger 0.1
 
 Date: 2026-11-14. Reviewer: independent reviewer (not the author).

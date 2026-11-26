@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # The internal API of kingresd
 
 Status: version 1 (internal protocol version, independent of the public contract

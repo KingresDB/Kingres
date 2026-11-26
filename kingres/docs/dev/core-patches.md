@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Core patch register
 
 This file lists every change KingresDB makes to files that exist in upstream PostgreSQL (outside `contrib/kingres_shard/` and `contrib/kingres_ledger/`). The reason for the register is in the architecture document: deep forks fall behind upstream, and a small, documented patch set is what keeps the rebase cost low ("The pattern of existing forks: a small patch set plus extensions").

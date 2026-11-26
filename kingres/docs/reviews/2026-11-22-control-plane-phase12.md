@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Review of the control plane of phase 12 (branch p12-cp, 7d43a79a3f..ac408d28bd)
 
 Reviewed on a detached worktree at ac408d28bd. Go unit tests of partsched, ops, httpapi and instance pass. PostgreSQL-backed probes ran on PG 18 and PG 19

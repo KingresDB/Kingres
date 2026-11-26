@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # ADR 0024: KingresDB's own code is licensed under the GNU Affero General Public License, version 3
 
 - Status: Accepted

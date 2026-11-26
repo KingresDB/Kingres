@@ -16,7 +16,10 @@ kingres: library-not-linked-against-libc [opt/kingres/lib/postgresql/*]
 kingres: shared-library-lacks-prerequisites [opt/kingres/lib/postgresql/*]
 kingres: shared-library-lacks-prerequisites [opt/kingres/bin/kingresd]
 kingres: shared-library-lacks-prerequisites [opt/kingres/bin/kingres-watchdog]
-kingres: shared-library-lacks-prerequisites [opt/kingres/bin/kingres-verify]
+# kingres-verify is built by its own script (kingres/verifier/scripts/build-one.sh) as a static
+# executable that is not position-independent: lintian reports it as a statically linked binary.
+# That is on purpose, as for the other Go programs: it runs on any Ubuntu release.
+kingres: statically-linked-binary [opt/kingres/bin/kingres-verify]
 # The environment file may contain secrets (a database password): root only.
 kingres: non-standard-file-perm 0600 != 0644 [etc/kingres/kingresd.env]
 # This is not an upload to the Debian archive; there is no bug to close.

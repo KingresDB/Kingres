@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- Copyright (c) 2026, RooyeKhat Media Co
 -- kingres_cp 13: the exclusion of a stop or restart during a failover covers every instance of the server, and
 -- a config restart (review FO-11).
 -- Applied inside one transaction by internal/sysdb; do not add BEGIN/COMMIT.

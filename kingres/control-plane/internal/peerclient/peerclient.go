@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package peerclient is the client side of the internal API: it calls another
 // server of the cluster over TLS 1.3 with this server's certificate as the

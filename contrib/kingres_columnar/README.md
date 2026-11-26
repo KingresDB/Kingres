@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <!-- Portions Copyright (c) 2026, RooyeKhat Media Co -->
 # kingres_columnar
 
@@ -9,19 +10,43 @@ query with a filter can skip whole stripes and chunk groups with the stored
 minimum and maximum. It is meant for append-only analytic data: time series,
 events, logs, and old partitions of such data. The design is in
 `kingres/docs/design/analytics-phase12-storage.md`; this file says what version
-0.1 does.
+0.2 (the default version, `kingres_columnar--0.2.sql`) does.
 
-Version 0.1 was "increments C1 to C4" of the design: insert-only, no indexes,
-serial scan, codecs `none`, `pglz`, `lz4` and `zstd`, `VACUUM`, `VACUUM FULL`,
-standby reads; the parallel scan (C5) came after it with no change to the files.
-Version 0.2 is increments C6a to C6c of the road to B-tree indexes: a write buffer
-can **reserve row numbers when a row is inserted**, so that the row's TID exists
-then ("Reserved row numbers" below); a table can have **B-tree indexes**, unique
-ones included, which find rows by that TID ("B-tree indexes" below), and `VACUUM`
-cleans them.  It changes nothing for a table that has no index and a session that
-does not ask for reservation (a table with an index asks for it by itself; the
-developer setting does it for the tests).  It adds no core patch and bundles no
-third-party code.
+It runs on PostgreSQL 18.7 and 19.0 from one source. It adds no core patch and
+bundles no third-party code.
+
+What it provides:
+
+- the table access method `columnar`: append-only, compressed (codecs `none`,
+  `pglz`, `lz4`, `zstd`), with chunk-group statistics that let a scan skip data,
+  a Columnar Scan with column projection, and a parallel scan;
+- B-tree indexes, unique ones included (since 0.2), found by TID through
+  row numbers that a write buffer reserves when a row is inserted;
+- `VACUUM`, `VACUUM FULL`, reuse of free space, standby reads, base backup,
+  logical decoding of inserts and `amcheck` of the indexes;
+- the functions `kingres.columnar_*` (options, information, compaction, checks)
+  and the settings `kingres_columnar.*` (see "Functions" and "Settings").
+
+What it refuses is listed in "What is refused, and why": `UPDATE`, `DELETE`,
+row locks, foreign keys, non-B-tree indexes, temporary and unlogged tables.
+
+Requirements: the library has to be in `shared_preload_libraries` on every node
+that writes, replays or restores columnar data (see "Installing"), and the
+extension needs a superuser to create it. `kingres_timepart` uses it to convert
+old partitions, and the control plane installs it with the database.
+
+Build and test: see "Building and testing" at the end. The extension is built and
+tested on PostgreSQL 18 and 19.
+
+Map of this document: "Installing" and "Use" (functions, settings, `EXPLAIN`);
+"On-disk format"; "B-tree indexes"; "Reserved row numbers"; "Parallel scan";
+"What is refused, and why"; "VACUUM and space"; "Backup, restore, upgrade";
+"Converting"; "Isolation, transaction ages, names"; "Limits" (memory and costs,
+and the rules for writes while a transaction ends); "Security"; "Building and
+testing". The sections that carry increment names (C1 to C14) and review ids
+(`C10-01`, ...) are the record of how the extension was built, in the wording of
+its time; the current state is what this file says as a whole and what the guide
+says.
 
 ## Installing
 
@@ -39,9 +64,10 @@ refused with an error that names the setting: `CREATE TABLE ... USING
 columnar`, `INSERT`, `COPY`, `TRUNCATE`, a rewrite into columnar, and
 `columnar_compact`. A server that has ever written columnar WAL needs the
 library for as long as that WAL exists (crash recovery, archive recovery,
-base backups, `pg_rewind`). Resource manager id: 128 (`RM_EXPERIMENTAL_ID`).
-It must be replaced by an id reserved on the public registry before a release,
-because the id is part of the WAL format.
+base backups, `pg_rewind`). Resource manager id: 255, registered as
+`KingresColumnar` on the PostgreSQL wiki list of custom resource managers
+(<https://wiki.postgresql.org/wiki/CustomWALResourceManagers>). The id
+is part of the WAL format and never changes.
 
 ## Use
 
@@ -72,6 +98,7 @@ and use `kingres.columnar_compact` afterwards.
 | `kingres.columnar_reconcile()` | Superuser. Deletes catalog rows of files no relation uses (it reads the first block of every columnar file of the database) and returns how many. A row that another session is deleting or has deleted is left to it, never an error. **It returns NULL, with a WARNING that gives the reason, when it did nothing** because a relation has an access method that cannot be classified or a columnar file has an unreadable metapage (C12-01): `0` means "looked, nothing to delete", NULL means "did not look".  `VACUUM` does the same work and stays quiet; its only trace is the log line. |
 | `kingres.columnar_write_paths(reset)` | Superuser (grantable). How often each path of the write side was taken in this session (`late_commit`, `late_window`, `pressure_flush`, `own_flush`, `handover_flush`, `size_flush`, `prepared_skip`, `ceiling_write`, `ceiling_handover`, `refused_ending`, `orphans_cleaned`, `refused_live`, `lost_raised`) and, as `bytes_held` and `orphans_kept`, two numbers that are not counts: the memory the write buffers are charged for now, and the files the backend's last commit noted for its next transaction to clean up after; with `reset` the counts start again. A diagnostic, and what the tests of those paths read. |
 | `kingres.columnar_is_columnar_am(amoid)` | Superuser only by default (the install script's event trigger runs it as the owner). Whether an access method is this extension's, by what its handler returns: the one definition that every C path uses.  The DDL guard (foreign keys, `AFTER ROW` triggers, publications) asks it, so an access method over any SQL function that has the extension's C entry point is guarded like the one over `kingres.columnar_handler` (C12-03). |
+| `kingres.columnar_handler(internal)`, `kingres.columnar_finish_rewrites()` | The handler of the access method (not called from SQL), and the function that the event triggers call to remove the stripe rows of the files a command dropped (see "VACUUM and space"); `EXECUTE` is revoked from `PUBLIC`. |
 | `kingres.columnar_identity(rel)`, `kingres.columnar_creating_xid(rel)`, `kingres.columnar_table_xid(rel)` | The identity of the stored content, the id of the transaction that created the file (2 once frozen) and the id that stands for the creation of the table (0 when it is not known, 2 once frozen): what the metapage holds (see "On-disk format"). |
 
 `SELECT` privilege on the table is needed for `columnar_options`,
@@ -98,7 +125,7 @@ denied for table", tested in `columnar_security`).  `columnar_set_options` and
 | `kingres_columnar.check_gate`, `kingres_columnar.check_gate_orphans`, `kingres_columnar.check_gate_claims` | 0 | Developer settings, superuser only (a role that was given `GRANT SET ON PARAMETER` could set them too, and can do nothing with them): the first integer of an advisory lock `pg_advisory_lock(key, 0)` that `columnar_check` and `columnar_check_clean` wait on, the first at the start of the look at each table (after the list of tables is made), the second in the orphan step between its first snapshot and its read of `pg_class`, the third between that read and its second snapshot, until the lock is no longer held, so that `t/036` can drop or make a table, commit DDL, or cancel the call, at that moment and not at one it can only hope for.  0 is no gate.  **They exist in every build** (the tests that use them run on production builds, which skip fewer tests than assertion builds).  So that they cannot be used to hold up an administrator's check (any role can take any advisory lock), a gate waits **only for an advisory lock that a session of a superuser holds**; the wait is bounded (two minutes) and can be cancelled.  A check run with a gate set by an administrator (`ALTER ROLE ... SET`) can therefore wait only for another administrator's session. |
 | `kingres_columnar.vacuum_truncate_lock_timeout` | 5s | Developer setting, superuser only: how long the truncation of a `VACUUM` asks for its exclusive lock (every 50 ms) before it gives up for this visit.  The default is heap's 5 seconds; the tests raise it so that a verdict does not depend on how fast the machine is, or lower it to see the give-up quickly. |
 | `kingres_columnar.max_stripe_rows` | 10000000 | Developer setting, superuser only: lowers the most rows the writer puts in one stripe (and the size above which `columnar_check` reports a stripe), so the limit can be tested with a few thousand rows. It cannot raise the compiled limit and does not touch the reader, so no value can make a table unreadable. |
-| `kingres_columnar.reserve_row_numbers` | off | Developer setting, superuser only, for tests (0.2, C6a): the session reserves row numbers when it inserts (see "Reserved row numbers"). A row then has its TID when the insert returns, `INSERT ... RETURNING ctid` shows it, and it is the TID the row keeps. Off: nothing changes, the same stripes and the same row numbers as 0.1. It decides per buffer, when the buffer is made: set it before the first write of a transaction. It is ignored for a table whose file is of format version 2 (written by 0.1) and while the stripe catalog is the one of 0.1. Until a table with an index switches the reservation on by itself (C6b) this is the only way to get it. |
+| `kingres_columnar.reserve_row_numbers` | off | Developer setting, superuser only, for tests (0.2, C6a): the session reserves row numbers when it inserts (see "Reserved row numbers"). A row then has its TID when the insert returns, `INSERT ... RETURNING ctid` shows it, and it is the TID the row keeps. Off: nothing changes, the same stripes and the same row numbers as 0.1. It decides per buffer, when the buffer is made: set it before the first write of a transaction. It is ignored for a table whose file is of format version 2 (written by 0.1) and while the stripe catalog is the one of 0.1. A buffer for a table that has an index reserves by itself (C6b); the setting makes the sessions of the tests reserve for a table without one. |
 | `kingres_columnar.reserve_min_rows` | 64 | Developer setting, superuser only (0.2, C13-02): how many row numbers a writer reserves at first for a table that has an index; the reservation grows in place while its buffer fills, up to the stripe size.  0: a whole stripe's worth, as 0.2 did before C13 (the tests of C6a that describe that layout set it).  It can be set in `postgresql.conf` (the extension's settings of the write path could not be before C13: they were defined after the extension's prefix was reserved, so a line in the file was dropped with a warning). |
 | `kingres_columnar.vacuum_compact_stripes` | 128 | Superuser only (0.2, C13-05): `VACUUM` merges the small stripes of a table when at least this many are smaller than a sixteenth of the stripe size; 0 turns it off.  The merge is the last step of the `VACUUM`, is skipped when 90 percent of the table's row numbers are used, and an error in it is a WARNING, not a failed `VACUUM` (C14-02). |
 | `kingres_columnar.vacuum_compact_rows` | 1000000 | Superuser only (0.2, C14-03): the most rows one `VACUUM` copies when it merges small stripes (only stripes smaller than a sixteenth of the stripe size are merged); the rest is merged by the next `VACUUM`.  0: no limit.  See "Subtransactions" below for what the merge costs the rest of the cluster. |
@@ -109,8 +136,10 @@ denied for table", tested in `columnar_security`).  `columnar_set_options` and
 
 ### Changes made in place to the 0.1 interface in the tenth round
 
-Version 0.1 is not released, so its interface is changed in place; this round
-changed:
+The three sections "Changes made in place ..." are the record of the review rounds
+of version 0.1, in the wording of their time: 0.1 was not released then, so its
+interface was changed in place. The interface described in this file is the
+current one; what a round changed is part of it. This round changed:
 
 * `columnar_check(fix)` and `columnar_check_clean()` read the stripe catalog as of
   now, not through the caller's snapshot (C10-01); they report a table dropped,
@@ -582,8 +611,8 @@ transaction has not yet written shows the same TIDs.
   such a buffer could never be written by size or by memory; its rows do not reserve
   and have their numbers when their stripes are written, as without the setting (the
   target of such a statement is new and cannot have an index).
-* **What is still as in 0.1.**  There is no index and a row still cannot be fetched by
-  TID (C6b).  `columnar_compact` gives the rows it copies new numbers, so the TIDs of a
+* **What is as in 0.1.**  A TID scan (`WHERE ctid = ...`) is refused; a row is fetched by
+  TID only through an index (see "B-tree indexes").  `columnar_compact` gives the rows it copies new numbers, so the TIDs of a
   table change when it is compacted, as they do when it is rewritten (and the indexes get
   entries for the new numbers, see "Compaction of a table with indexes"). `reserved_row_left` is a new row of `columnar_check`: a reserved row that a
   **committed** transaction left (no code path does; a writer replaces it before it commits
@@ -688,7 +717,8 @@ All with SQLSTATE `0A000`.
   logged with the value a scan returns for those rows, the default, not NULL (C13-03, `t/064`); a heap row is decoded as
   it was when it was inserted, with no such column, and a subscriber gives it its own default.  Tested in
   `t/061_logical.pl` against a subscriber row by row.
-* A row cannot be fetched by TID (C6b). `ctid` shows a number made from the row's
+* A TID scan (`WHERE ctid = ...`, a `Tid Scan`) is refused, and a row is fetched
+  by TID only through an index. `ctid` shows a number made from the row's
   position; without reserved row numbers it is not stable and means nothing, and
   with them (0.2, "Reserved row numbers") it is the TID the insert returned, until
   `columnar_compact` or a rewrite gives the rows new numbers.
@@ -985,7 +1015,7 @@ Set `search_path` explicitly, or create the tables in another schema.
 
 Append-only, B-tree indexes only (unique ones too), no TOAST (values up to the 1 GB limit of one value are
 stored inline), at most about 8.8 x 10^12 rows per table, 150000-row stripes
-mean small transactions make small stripes, serial scans only, no vectorised
+mean small transactions make small stripes, serial and parallel scans of the table (no bitmap, index-only or parallel index scans), no vectorised
 execution, skipping is not in the cost estimate, logical decoding covers inserts only (there is
 no update or delete) and doubles the log of a load at `wal_level = logical`, and a hostile or damaged file can
 give a clean error but not always the right data.
@@ -1097,14 +1127,14 @@ Memory and costs worth knowing:
   transaction whatever the order of the libraries; a `COPY` or a multi-row
   insert is one stripe per batch, and a single row (an `INSERT`, or each row of
   an `INSERT ... SELECT`) is a stripe of one row.  That is correct and rare, and
-  it has a price, measured with 100 000 rows written one at a time by a callback
-  at pre-commit: 100 000 stripes and 819 200 000 bytes on disk (8 192 bytes, one
-  page, for each row of 4 bytes), written in 2.6 s, read by a full scan in 0.52 s
-  where the same rows in one stripe take 0.006 s (`t/030_late_stripes.pl` pins
-  the shape with 5 000 rows).  `VACUUM` joins them when at least 128 are
+  it has a price: 100 000 rows written one at a time by a callback at
+  pre-commit make 100 000 stripes and 819 200 000 bytes on disk (8 192 bytes, one
+  page, for each row of 4 bytes), and a full scan reads them far more slowly than
+  the same rows in one stripe (`t/030_late_stripes.pl` pins the shape with 5 000
+  rows).  `VACUUM` joins them when at least 128 are
   smaller than a sixteenth of the stripe (since C13-05; an earlier version of this paragraph said it does not, and `t/030` runs
-  with the merge turned off to pin the shape); `columnar_compact` does at once (0.9 s for those
-  100 000 rows, to one stripe of 245 760 bytes), but the pages of the old
+  with the merge turned off to pin the shape); `columnar_compact` does at once (the 100 000 rows
+  of that example become one stripe of 245 760 bytes), but the pages of the old
   stripes stay in the file until `VACUUM FULL` returns them.  An operator whose
   module writes late runs `columnar_compact` and, to return the space, `VACUUM
   FULL`; the module's own remedy is to write its rows with `COPY` or one
@@ -1209,7 +1239,7 @@ Memory and costs worth knowing:
   What heap does at the same moments was found with a module that writes a row
   with `table_tuple_insert` into a table it holds open at the event a setting
   names (`t/kcevents/kcevents.c`), run on a heap table against a server built
-  with assertions and one built without (PostgreSQL 18.7 and 19rc2, both load
+  with assertions and one built without (PostgreSQL 18.7 and 19, both load
   orders); the access method's column is `t/027_ending_writes.pl`, which
   compares with a heap twin only at the moments where heap writes without
   stopping the server:
@@ -1258,7 +1288,12 @@ Memory and costs worth knowing:
   | `relation_nontransactional_truncate` (C8-01, C10-05) | guarded; **only for a relation made, or given a new file, in the current subtransaction (C11-04)** | warning, nothing changed: not the half of a truncate (a file shortened with the stripe rows left, or the other way round).  Where an error is allowed, for a relation that was not created, or given a new file, in the current subtransaction (neither `rd_createSubid` nor `rd_newRelfilelocatorSubid` is the current subtransaction id, as `ExecuteTruncateGuts` compares them; a table of an outer subtransaction is refused: an abort of the child would not remove its file) it is an error, `cannot truncate columnar table "t" in place: it was not created or given a new file in the current (sub)transaction`: PostgreSQL itself calls it only for such a relation (`TRUNCATE` of a table of the transaction, and a temporary table, which a columnar table cannot be), and it is the only case where an abort removes the file anyway; for any other table the cut file and the reset metapage are not undone by an abort while the deleted catalog rows come back, and the table cannot be read.  For a relation of the transaction it deletes the catalog rows, shortens the file and resets the metapage, in that order: an error in the first step is undone with the transaction and leaves a readable table (`t/031`, `t/033`, `t/034`). |
   | `relation_set_new_filelocator`, `relation_copy_data`, `relation_copy_for_cluster` | guarded | warning; no file is made, nothing copied, the returned ids name nothing |
   | `relation_vacuum` | guarded | warning, skipped (the next vacuum does the same work; no failure of the transaction) |
-  | `index_fetch_begin`, `index_fetch_tuple`, `tuple_fetch_row_version`, `tuple_tid_valid`, `index_delete_tuples`, `index_build_range_scan`, `index_validate_scan`, `scan_sample_next_block`, `scan_sample_next_tuple` | guarded | warning and the answer "nothing" (no index can exist on a columnar table, so PostgreSQL never calls these; where an error is allowed they raise the errors they always did) |
+  | `index_fetch_begin`, `index_fetch_tuple` | guarded | the fetch of a B-tree index scan (B-tree indexes exist since 0.2); where an error is allowed they work; here a warning, and `index_fetch_tuple` answers "nothing" |
+  | `index_delete_tuples` | guarded | bottom-up deletion answers none and `VACUUM` removes the entries; a warning |
+  | `index_build_range_scan` | guarded | reads the rows for the entries of a new index (`CREATE INDEX`, `REINDEX`, and the read of `amcheck` `heapallindexed`); a warning here. `CREATE INDEX CONCURRENTLY` and `REINDEX CONCURRENTLY` are refused here with an error where one is allowed (`kc_am.c`: "CREATE INDEX CONCURRENTLY and REINDEX CONCURRENTLY are not supported on columnar tables") |
+  | `index_validate_scan` | guarded | the second pass of `CREATE INDEX CONCURRENTLY`, which the build above already refuses, so it is a second guard: an error ("indexes on columnar tables are not supported in this version"), or a warning here |
+  | `tuple_fetch_row_version`, `tuple_tid_valid` | guarded | fetching a row by its TID and a TID scan are refused: an error, or a warning here |
+  | `scan_sample_next_block`, `scan_sample_next_tuple` | guarded | `TABLESAMPLE` is refused: an error, or a warning here |
   | `scan_begin`, `scan_getnextslot`, `scan_rescan`, `scan_end`, `scan_analyze_next_block`, `scan_analyze_next_tuple`, `relation_size`, `relation_estimate_size` | reads | work wherever PostgreSQL lets a heap table be read (the relation cache asserts a transaction in progress, and the buffer pin of any table access method fails in a release phase of a resource owner: PostgreSQL's rule, the same for heap) |
   | `slot_callbacks`, `parallelscan_*`, `index_fetch_reset`, `index_fetch_end`, `tuple_get_latest_tid`, `tuple_satisfies_snapshot`, `relation_needs_toast_table`, `relation_toast_am` | nostorage | nothing to do |
   | the object access hook (a drop of a relation) | guarded | warning, the file is not noted (its leftover rows are removed by `VACUUM` and `columnar_check(true)`) |
@@ -1290,7 +1325,7 @@ Memory and costs worth knowing:
   function manager (1).  `t/031` skips each of them with its reason and prints how
   many it skipped, for each order of loading, at the end of its output.  They are run
   on a server built without assertions, where the function manager and the relation
-  cache accept them: on production builds of PostgreSQL 18.7 and 19rc2 `t/031` ran
+  cache accept them: on production builds of PostgreSQL 18.7 and 19 `t/031` ran
   all of them but three cells for each order of loading (6 in all), the scan of a table
   in the three phases of the release of a resource owner, which PostgreSQL itself
   forbids there (the buffer pin needs the resource owner that is being released, for
@@ -1364,7 +1399,7 @@ Memory and costs worth knowing:
   and `columnar_check` share), keeping a short tail buffered when more rows are
   coming.  The reader accepts exactly what the writer can write, 10000000 rows a
   stripe, and refuses a larger row count in a catalog row before it allocates
-  anything from it (version 0.1 is not released and no build since the limit
+  anything from it (no build since the limit
   exists writes more); `columnar_check` reports a stripe above a lowered
   `max_stripe_rows` as `stripe_over_row_limit`: it is readable, and `VACUUM
   FULL` writes it again within the limit.  A scan holds the buffers it reads
@@ -1388,8 +1423,7 @@ Memory and costs worth knowing:
 * The identity of a file is 63 random bits, redrawn when the catalog already
   holds it. `DROP TABLE`, `VACUUM` and `columnar_check` remove catalog rows of
   files no relation uses any more, which reads the first block of every
-  columnar relation file of the database (linear in their number: 0.02 s for
-  1500 tables). A table access method has no callback at drop and PostgreSQL
+  columnar relation file of the database (linear in their number). A table access method has no callback at drop and PostgreSQL
   keeps no identity in `pg_class` for it, so there is nothing to look up
   instead; a database with very many columnar partitions pays this on every
   such command.  A rewrite, `VACUUM FULL`, `TRUNCATE` and `ALTER TABLE` do not:
@@ -1398,18 +1432,48 @@ Memory and costs worth knowing:
   crash the server (the structure of a jsonb container is not validated, as it
   is not for heap); the checksums cover damage, not malice.
 
+## Security
+
+The library is preloaded, so its code runs in every database of the server, and
+it finds the stripe catalog by name in the schema of the extension. The
+extension therefore does not trust a schema that another role can write to, nor
+a catalog that is not its own:
+
+- **The schema.** Every install script and every upgrade script refuses a schema
+  `kingres` that exists already when a role that is not a superuser owns it, or
+  when it grants `CREATE` to such a role or to `PUBLIC` (`insufficient_privilege`,
+  `42501`, with a hint). Tests: `t/071_schema_spoof.pl` and
+  `t/073_old_script_schema_check.pl`.
+- **The stripe catalog.** The library uses `kingres.columnar_stripe` only when the
+  catalog table and its primary key index are members of the installed extension,
+  have the shape this build needs, and the schema is owned by a superuser and
+  grants `CREATE` to no role that is not one (`kc_catalog.c`). In a database
+  without the extension, or with a look-alike relation, an attempt to make or write
+  a columnar table is refused with an error that says why, and nothing is written
+  to the look-alike. Test: `t/072_catalog_trust.pl`.
+- **Functions.** `EXECUTE` is revoked from `PUBLIC` on every function except the
+  read-only inspection functions that need `SELECT` on the table (see
+  "Functions"). The functions that are `SECURITY DEFINER` carry a fixed
+  `search_path`.
+
 ## Building and testing
 
-Out of tree against an installation (`pg_config` on the path):
+Out of tree against an installation of PostgreSQL 18 or 19 (`pg_config` on the
+path):
 
 ```
 make USE_PGXS=1 && make USE_PGXS=1 install
 make USE_PGXS=1 installcheck       # needs a server with the library preloaded
 ```
 
-or `kingres/dev/ext.sh kingres_columnar` and `kingres/dev/ext-majors.sh
-kingres_columnar` for PostgreSQL 18 and 19. The tests are fourteen `pg_regress`
-files (`sql/`, `expected/`) and fifty TAP files in `t/`: crash recovery,
+or `kingres/dev/ext.sh kingres_columnar` for one installation and
+`KINGRES_PG18=<install> KINGRES_PG19=<install> kingres/dev/ext-majors.sh
+kingres_columnar` for both majors (see
+[`kingres/docs/dev/testing.md`](../../kingres/docs/dev/testing.md)). The tests are
+seventeen `pg_regress` files (`sql/`, `expected/`; the list is `REGRESS` in the
+`Makefile`) and seventy-four TAP files in `t/` (`t/067` to `t/073` cover the merge
+of small stripes by `VACUUM`, the give-back of space, and the two security tests
+above; `t/074` checks the resource manager id): crash recovery,
 standby and `pg_rewind`, backup/restore/dump, concurrent writers, corruption,
 a randomised comparison against heap (`KC_COMPARE_SEED`, `KC_COMPARE_STEPS`),
 older snapshots, array validation, serializable isolation against heap twins,

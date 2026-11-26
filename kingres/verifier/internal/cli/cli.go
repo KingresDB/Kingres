@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package cli implements the kingres-verify command line on top of the
 // library packages. Run is the only entry point; it never calls os.Exit.

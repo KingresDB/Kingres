@@ -1,3 +1,6 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+--
 -- sketch_hash: the hash of an element depends on the value only, never on an
 -- object identifier, so a sketch is the same in another database or after a
 -- restore.  Enums hash by label, containers by their elements, and the types

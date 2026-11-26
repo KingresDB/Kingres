@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package anchor is the library half of anchoring a signed checkpoint of the
 // ledger at an outside party (design: kingres/docs/design/ledger-phase7.md,

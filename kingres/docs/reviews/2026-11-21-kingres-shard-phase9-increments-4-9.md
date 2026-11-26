@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 
 # Review of kingres_shard phase 9, increments 9.4, 9.5, 9.8 and 9.9
 

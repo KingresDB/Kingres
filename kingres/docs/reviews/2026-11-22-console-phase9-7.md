@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Independent review: console of phase 9, increment 9.7 (commit bab67e6b2e, contract 0.14.0)
 
 ## Scope and method

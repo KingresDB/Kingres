@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package journal is the local record of the bootstrap that promotes the map group (design ha-phase5-part2.md, 3.4). The
 // system database, the task engine and the leader are on the map group, so while it is being promoted no task row can be

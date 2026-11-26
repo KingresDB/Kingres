@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # ADR 0016: Go backend and React/TypeScript frontend, OpenAPI first
 
 - Status: Accepted; the frontend-framework part is superseded by [ADR 0017](0017-vue-for-the-web-panel.md)

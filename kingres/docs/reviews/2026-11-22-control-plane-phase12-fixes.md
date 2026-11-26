@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Review of the fixes of the control plane of phase 12 (branch p12-cp, bdd4fc2f4b, c68226f22a, 22a40eb52f on ac408d28bd)
 
 Reviewed on a detached worktree at 22a40eb52f. Paths are relative to kingres/control-plane unless they start with kingres/.

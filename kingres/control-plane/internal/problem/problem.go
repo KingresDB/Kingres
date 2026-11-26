@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package problem implements the error model of the REST API: RFC 9457
 // "problem details" documents served as application/problem+json, exactly as

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026, RooyeKhat Media Co
 #
 # Three-server smoke run inside WSL, driven only through the HTTP APIs (curl) and
 # psql: it forms a cluster of three kingresd processes on 127.0.0.2, .3 and .4,

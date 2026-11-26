@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Fifth independent review of the guard of kingres_ledger 0.3 (the fixes for L15)
 
 Reviewer: an independent reviewer. Date: 2026-11-18.

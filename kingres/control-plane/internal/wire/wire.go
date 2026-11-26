@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package wire holds the request and answer types of the internal API calls
 // that create, configure and remove a server's membership of a cluster

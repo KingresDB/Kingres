@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # kingres_ledger, kingresd and the verifier: design of phase 7 (signing, anchoring, tile publication, the standalone verifier, the per-shard ledger with an aggregate digest)
 
 Status: Proposed design, 2026-11-15; not implemented. Nothing in this document is built. Where it

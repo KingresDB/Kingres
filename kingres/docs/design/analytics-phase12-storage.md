@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # KingresDB: design of phase 12, part 2 (columnar storage, time partitioning and retention)
 
 Status: Proposed design, 2026-11-15; not implemented.
@@ -253,7 +254,7 @@ links either library).
 | Need | Interface, with the place in the 18.7 source | Use |
 |---|---|---|
 | Store and scan a table | `TableAmRoutine`, `src/include/access/tableam.h`; `CREATE ACCESS METHOD columnar TYPE TABLE HANDLER ...`; the handler returns the struct | Section 6 |
-| Durable, replicated, crash-safe data pages | A custom resource manager: `RegisterCustomRmgr` from `_PG_init`, only while `shared_preload_libraries` is processed (`rmgr.c`: "Custom resource manager must be registered while initializing modules in shared_preload_libraries"), ids 128 to 255, `RM_EXPERIMENTAL_ID` (128) during development, a reserved id before release (documentation and `rmgr.h`) | Section 7.3. Generic WAL is the alternative; it has at most `MAX_GENERIC_XLOG_PAGES` buffers per record (`XLR_NORMAL_MAX_BLOCK_ID`, 4) and "Generic WAL records are ignored during Logical Decoding" (18 documentation), so it cannot serve section 9.3 |
+| Durable, replicated, crash-safe data pages | A custom resource manager: `RegisterCustomRmgr` from `_PG_init`, only while `shared_preload_libraries` is processed (`rmgr.c`: "Custom resource manager must be registered while initializing modules in shared_preload_libraries"), ids 128 to 255; `kingres_columnar` uses 255, registered as `KingresColumnar` on the PostgreSQL list of custom resource managers (`RM_EXPERIMENTAL_ID`, 128, is the id for development only; documentation and `rmgr.h`) | Section 7.3. Generic WAL is the alternative; it has at most `MAX_GENERIC_XLOG_PAGES` buffers per record (`XLR_NORMAL_MAX_BLOCK_ID`, 4) and "Generic WAL records are ignored during Logical Decoding" (18 documentation), so it cannot serve section 9.3 |
 | Logical decoding of columnar inserts | `rm_decode` of the resource manager. `LogicalDecodingProcessRecord` (`decode.c`) calls it for the records of a custom rmgr; a custom rmgr without `rm_decode` only has its xid noted and its changes are silently ignored (`decode.c` lines 115 to 120) | Section 9.3 |
 | Read pushdown (columns, skipping) | `set_rel_pathlist_hook` plus a `CustomPath` and `CustomScan` (`extensible.h`, `ExplainCustomScan`). A plain `table_beginscan` carries no column list and no qualifiers (the `scan_rescan` key argument is unused by the executor), so the table AM alone cannot push anything down | Section 8 |
 | Stripe visibility, rollback, standby reads | Heap rows of a catalog table, read with the scan's snapshot | Section 7.1 |
@@ -775,10 +776,10 @@ with the transaction, as for any uncommitted change.
 
 ### 7.3 WAL and crash safety
 
-**Resource manager** `KingresColumnar`, id `RM_EXPERIMENTAL_ID` (128) during
-development and an id reserved on the registry named by the 18 documentation
-before the first release (**[Recommendation]**; the id is part of the WAL format
-forever). Records:
+**Resource manager** `KingresColumnar`, id 255, registered on the
+PostgreSQL wiki list of custom resource managers
+(<https://wiki.postgresql.org/wiki/CustomWALResourceManagers>; the id is part of the
+WAL format and never changes). Records:
 
 | Record | Content | Redo |
 |---|---|---|
@@ -2477,7 +2478,7 @@ make the combination of columnar storage, moves and time partitioning complete.
 | 2 | Default codec | `zstd` level 3 where built in, then `lz4`, then `pglz`; a table's codec is fixed at creation in its metapage and changed only for new stripes |
 | 3 | Stripe and chunk sizes | 150 000 and 10 000 rows (the documented defaults of an existing columnar product, taken as a starting point); tune in C3 with a benchmark on a time series of 20 columns |
 | 4 | `UPDATE` and `DELETE` | Not in phase 12 (7.7); a deletion-vector design is a separate later phase if demand appears |
-| 5 | Resource manager id | `RM_EXPERIMENTAL_ID` in development; reserve a real id on the registry before the first release; record it in the extension README, because it is part of the WAL format |
+| 5 | Resource manager id | Decided: id 255, registered as `KingresColumnar` on the PostgreSQL wiki list of custom resource managers; recorded in the extension README, because it is part of the WAL format |
 | 6 | Is `shared_preload_libraries` acceptable for `kingres_columnar` | Yes. It is required by the resource manager, the other two extensions already require it, and the package default lists all three |
 | 7 | Retention default | `drop`, with no default retention value (a policy without `retention` keeps everything), the table name typed in the console to confirm, and a preview of the data it would delete |
 | 8 | Converting a plain (non-partitioned) table without blocking | Not in this part: `ALTER TABLE ... SET ACCESS METHOD` with a clear warning. Build-and-swap needs dependent views, foreign keys, publications and privileges handled; revisit if users ask. The recommended path for large tables is to partition them by time first |

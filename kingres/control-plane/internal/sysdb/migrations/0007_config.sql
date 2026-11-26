@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- Copyright (c) 2026, RooyeKhat Media Co
 -- kingres_cp 7: configuration from the console (design: config-phase13.md, "Data model").
 -- Applied inside one transaction by internal/sysdb; do not add BEGIN/COMMIT.
 

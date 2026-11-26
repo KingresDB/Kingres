@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package transfer holds what the data transfer of the control plane (table CSV export and import, design
 // kingres/docs/design/data-export-import.md) shares: the codes of a failed transfer, the one function that makes every error of a

@@ -322,7 +322,7 @@ done
 # What every server has is the distributed table orders and the extensions.
 shop_shared_data() { # shop_shared_data PREFIX
     check_eq "$1: row of orders (distributed)" acme "$(psql_run -d shop -Atc 'select customer from public.orders where id = 7' 2>/dev/null)"
-    check_eq "$1: both extensions present" "kingres_ledger kingres_shard" \
+    check_eq "$1: the extensions are present (shard and ledger by the options of the database, columnar and timepart with every database)" "kingres_columnar kingres_ledger kingres_shard kingres_timepart" \
         "$(psql_run -d shop -Atc "select string_agg(extname, ' ' order by extname) from pg_extension where extname like 'kingres%'" 2>/dev/null)"
 }
 
@@ -353,7 +353,7 @@ mesh_bucket_counts() {
     local n c=""
     for n in 1 2 3; do
         use_node "${n}"
-        c="${c}$(api GET /databases/mesh | sed -n 's/.*"sharding":{"enabled":true,"bucketCount":\([0-9a-z]*\)}.*/\1/p') "
+        c="${c}$(api GET /databases/mesh | sed -n 's/.*"sharding":{"enabled":true,"bucketCount":\([0-9a-z]*\)[,}].*/\1/p') "
     done
     [ "${c}" = "32 32 32 " ]
 }

@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Independent review of the fixes for the first failover increments and for the second review of rebalancing in kingresd
 
 Reviewer: an independent reviewer. Date: 2026-11-18.

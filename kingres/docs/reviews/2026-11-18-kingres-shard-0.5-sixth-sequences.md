@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Sixth independent review of the call sequences of kingres_shard 0.5 (the fixes for S13)
 
 Reviewer: an independent reviewer. Date: 2026-11-18.

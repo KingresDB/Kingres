@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- Copyright (c) 2026, RooyeKhat Media Co
 -- kingres_cp 12: the mark of a move is kept with its row (review ST-05).
 -- Applied inside one transaction by internal/sysdb; do not add BEGIN/COMMIT.
 

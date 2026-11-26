@@ -1,11 +1,12 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # ADR 0028: Ledger tables are carried as data, and the imported ledger starts a new chain
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-22
 - Source: [../design/data-export-import.md](../design/data-export-import.md) ("Ledger tables"), `contrib/kingres_ledger/README.md` ("Dump, restore and replication", "Updatable tables", "Copies of the database")
 
-Scope: this decision applies to the database export and import of phase 14c, which is not built and comes after the first release; it is not implemented in the first release.
+Scope: this decision applies to the database export and import of phase 14c, which is built and ships in 0.1.0; this ADR is its design.
 
 ## Context
 

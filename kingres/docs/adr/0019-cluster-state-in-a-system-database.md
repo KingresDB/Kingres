@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # ADR 0019: Control-plane state lives in a system database with embedded migrations
 
 - Status: Accepted

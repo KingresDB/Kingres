@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package ledgerlog builds the logs that KingresDB publishes for its ledger
 // (design ledger-phase7.md, sections 4.1 to 4.4, 4.6, 4.10 and 5.2, with the

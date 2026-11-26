@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package contracttest validates real responses against the schemas of the
 // REST contract (kingres/api/openapi.yaml) with a JSON Schema 2020-12

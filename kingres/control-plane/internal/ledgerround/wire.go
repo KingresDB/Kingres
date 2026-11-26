@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package ledgerround is the collector of the publication of the ledger (design ledger-phase7.md, 4.5, 4.7, 5.2 to 5.5, 6.7 and 8.3, with the
 // corrections of section 14 and the decisions of internal/ledgerround/README in the control plane README): it reads the head and the blocks

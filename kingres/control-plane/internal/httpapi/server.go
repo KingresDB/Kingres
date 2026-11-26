@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package httpapi is the HTTP layer of kingresd: it routes every operation
 // of the contract (internal/contract), enforces node-state gating,

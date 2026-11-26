@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- Copyright (c) 2026, RooyeKhat Media Co
 -- kingres_cp 31: the publication of the ledger, tiles and the digests of every group (design ledger-phase7.md, 4.5, 4.7, 5.4 and 8.2;
 -- steps 5 and 6 of the plan). Applied inside one transaction by internal/sysdb; do not add BEGIN/COMMIT.
 

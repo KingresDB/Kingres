@@ -1,3 +1,6 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+--
 -- sketch_security: what the extension installs, and that none of it is
 -- SECURITY DEFINER or outside the schema.
 SELECT count(*) AS functions_not_in_schema

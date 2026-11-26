@@ -1,3 +1,6 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+--
 -- kingres.bucket_for() must return the partition PostgreSQL really stores a
 -- row in, for every supported key type.
 SET search_path = public;

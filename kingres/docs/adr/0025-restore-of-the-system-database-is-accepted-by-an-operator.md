@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # ADR 0025: A restored system database is accepted by an operator, and the acceptance is a signed event
 
 - Status: Accepted

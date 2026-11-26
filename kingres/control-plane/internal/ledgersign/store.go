@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package ledgersign is the daemon side of the signing keys of the ledger
 // (design ledger-phase7.md, 3.2 to 3.4, 6.7, 8.2 to 8.4, 9.1 to 9.3, and the

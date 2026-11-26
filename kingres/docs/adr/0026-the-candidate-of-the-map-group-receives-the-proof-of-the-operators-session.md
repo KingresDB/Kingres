@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # ADR 0026: The candidate of a map group failover receives the proof of the operator's session
 
 - Status: Accepted

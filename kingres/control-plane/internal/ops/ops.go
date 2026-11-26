@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package ops implements the operations of the contract that change the
 // cluster: roles, grants, databases, tables, ledger and the query workbench.

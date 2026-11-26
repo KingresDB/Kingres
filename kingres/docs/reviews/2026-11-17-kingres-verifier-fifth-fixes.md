@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 
 # Review of the fifth fix round of `kingres/verifier` (the stand-alone verifier of the ledger)
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026, RooyeKhat Media Co
 #
 # Runs Linux test binaries inside WSL against the private KingresDB
 # installation in ~/kw-cp/install. Called by run-integration.ps1; arguments:

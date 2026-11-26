@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package ots anchors the digest of a signed checkpoint with OpenTimestamps
 // calendars (section 6.5 of the phase 7 design): it submits the digest to

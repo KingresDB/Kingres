@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package trust reads, validates and writes the trust file (trust.json,
 // ledger-phase7.md section 7.2): the keys and the name prefix an auditor

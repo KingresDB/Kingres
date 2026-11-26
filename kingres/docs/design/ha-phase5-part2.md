@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # kingresd: design of high availability, part 2 (failover, switchover, the old primary, preferred primaries)
 
 Status: Proposed design, 2026-11-16; not implemented. Where it says "exists", it describes the working

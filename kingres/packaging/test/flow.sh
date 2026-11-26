@@ -115,7 +115,7 @@ flow_check_data() {
     local p="$1"
     check_eq "${p}: row of orders" acme "$(psql_run -d shop -Atc 'select customer from public.orders where id = 7' 2>/dev/null)"
     check_eq "${p}: row of audit_rows" first "$(psql_run -d shop -Atc 'select note from public.audit_rows where id = 1' 2>/dev/null)"
-    check_eq "${p}: both extensions present" "kingres_ledger kingres_shard" \
+    check_eq "${p}: the extensions are present (shard and ledger by the options of the database, columnar and timepart with every database)" "kingres_columnar kingres_ledger kingres_shard kingres_timepart" \
         "$(psql_run -d shop -Atc "select string_agg(extname, ' ' order by extname) from pg_extension where extname like 'kingres%'" 2>/dev/null)"
 }
 
@@ -220,21 +220,32 @@ flow_check_extension_versions() {
     for e in kingres_shard kingres_ledger kingres_timepart kingres_columnar; do
         check "${p}: ALTER EXTENSION ${e} UPDATE" svc -d ext_upgrade -v ON_ERROR_STOP=1 -c "alter extension ${e} update"
     done
-    check_eq "${p}: every extension is at the default version of this package" \
-        "kingres_columnar 0.2 kingres_ledger 0.3 kingres_shard 0.8 kingres_sketch 1.0 kingres_timepart 0.2" \
+    check_eq "${p}: every extension is at the default version of this package (the control files of the source tree)" \
+        "$(source_extension_versions_plain)" \
         "$(svc -d ext_upgrade -Atc "select string_agg(extname || ' ' || extversion, ' ' order by extname) from pg_extension where extname like 'kingres%'" 2>/dev/null)"
     check "${p}: the updated kingres_timepart has the conversion procedure of 0.2" \
         svc -d ext_upgrade -v ON_ERROR_STOP=1 -c "select 'kingres.convert_partition'::regproc" -c "select 'kingres.table_change_report'::regproc"
     check "${p}: drop the scratch database ext_upgrade" svc -d postgres -v ON_ERROR_STOP=1 -c 'drop database ext_upgrade'
-    # the step of this release: kingres_shard 0.7 (the previous package) to 0.8 (distributed schemas, the bucket layout, splits)
-    check "${p}: create the scratch database ext_upgrade78" svc -d postgres -v ON_ERROR_STOP=1 -c 'create database ext_upgrade78'
-    check "${p}: install kingres_shard 0.7" svc -d ext_upgrade78 -v ON_ERROR_STOP=1 -c "create extension kingres_shard version '0.7'"
-    check "${p}: ALTER EXTENSION kingres_shard UPDATE (0.7 to 0.8)" svc -d ext_upgrade78 -v ON_ERROR_STOP=1 -c "alter extension kingres_shard update"
-    check_eq "${p}: kingres_shard is at 0.8" "kingres_shard 0.8" \
-        "$(svc -d ext_upgrade78 -Atc "select extname || ' ' || extversion from pg_extension where extname = 'kingres_shard'" 2>/dev/null)"
-    check "${p}: the 0.8 objects are there (schemas view, distribute_schema, split_bucket)" svc -d ext_upgrade78 -v ON_ERROR_STOP=1 \
-        -c "select 'kingres.schemas'::regclass" -c "select 'kingres.distribute_schema'::regproc" -c "select 'kingres.split_bucket'::regproc"
-    check "${p}: drop the scratch database ext_upgrade78" svc -d postgres -v ON_ERROR_STOP=1 -c 'drop database ext_upgrade78'
+    # every update script of the source tree, one at a time: install the
+    # version it starts from, run the update to the version it ends at.
+    local from to
+    check "${p}: create the scratch database ext_steps" svc -d postgres -v ON_ERROR_STOP=1 -c 'create database ext_steps'
+    for e in ${KINGRES_EXTENSIONS}; do
+        while read -r from to; do
+            [ -n "${from}" ] || continue
+            check "${p}: ${e} ${from} to ${to}: install, ALTER EXTENSION UPDATE TO, version" flow_update_step "${e}" "${from}" "${to}"
+        done < <(source_update_steps "${e}")
+    done
+    check "${p}: drop the scratch database ext_steps" svc -d postgres -v ON_ERROR_STOP=1 -c 'drop database ext_steps'
+}
+
+# flow_update_step EXT FROM TO: in the database ext_steps, create EXT at FROM,
+# update it to TO, and fail unless the catalog says TO; the extension is dropped
+# again.
+flow_update_step() {
+    svc -d ext_steps -v ON_ERROR_STOP=1 -c "create extension $1 version '$2'" -c "alter extension $1 update to '$3'" || return 1
+    [ "$(svc -d ext_steps -Atc "select extversion from pg_extension where extname = '$1'")" = "$3" ] || return 1
+    svc -d ext_steps -v ON_ERROR_STOP=1 -c "drop extension $1"
 }
 
 # flow_check_distribute_rows PREFIX: create_distributed_table of a table that

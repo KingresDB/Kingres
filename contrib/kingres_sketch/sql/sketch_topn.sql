@@ -1,3 +1,6 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+--
 -- sketch_topn: the type topn (Space-Saving), its functions and aggregates.
 SET search_path = public, kingres_sketch;
 

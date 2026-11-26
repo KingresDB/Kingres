@@ -12,8 +12,21 @@ documentation (`contrib/kingres_ledger/README.md` and
 exported from a real server (see "Cross-check against the server").
 
 It is standard library Go only, no third-party modules, so that an auditor can
-read all of it (about 14,000 lines outside the tests) and build it with one
+read all of it (about 19,000 lines outside the tests) and build it with one
 command.
+
+**What it provides.** The commands are `proof`, `row-hash`, `digest-chain` and `blocks` (the
+ledger of one database: inclusion proofs, row hashes, digests, block headers); `checkpoint`,
+`consistency`, `aggregate`, `anchors`, `bundle verify` and `bundle fetch`, `monitor` and `attestation` (what
+`kingresd` publishes: signed checkpoints and tiles, aggregates, anchor evidence, bundles, client
+attestations); `trust init`, `trust show` and `trust follow` (the trust file); `release verify` (the
+release of the verifier itself); and `version` and `--help`. Every command has the exit statuses of
+"Exit statuses" and an optional `--json` output. **Test it** with `go test ./...` in this directory
+(no database is needed). The guide for operators and auditors is in
+[../docs/guide/README.md](../docs/guide/README.md). The sections whose titles start with
+"Findings" are the record of how the verifier was built and reviewed, in the wording of their time
+("not built yet", step and round numbers, the findings and what was changed); the other sections
+describe the current behaviour.
 
 ## What it can and cannot prove
 
@@ -137,7 +150,7 @@ and says in capitals that the result is not a release.
 to an older release is not detectable from them). Compare the version with the project's announcement of the newest release, which you must get from the project and not from the place the
 files came from. When the sums list no `RELEASE` file the output says so. When the signed `RELEASE` file says the commit or its date is `unknown` (a set that `release.sh --dry-run` signed from a tree that was not clean or not at the tag), the verdict is `VERIFIED (NOT A RELEASE)` and the exit status is 5, so that a script that tests only the status does not take it for a release; `--accept-dry-run` gives status 0 for whoever wants such a set (the verdict word stays).
 
-`release.sh` makes a **signed** release only from a clean checkout whose `HEAD` is exactly the tag of the version (`--tag NAME`, default `v<version>`, as in `v0.1.0`): it refuses a tree
+`release.sh` makes a **signed** release only from a clean checkout whose `HEAD` is exactly the tag of the version (`--tag NAME`, default `v<version>`, as in `v0.1.0`; a KingresDB release makes no separate `v` tag, so its verifier is cut with `--tag kingres-<version>-pg18`): it refuses a tree
 with any change, tracked or not, a tag that does not exist, a `HEAD` that is not the tag, and a directory that is not a git checkout, and it never creates a tag. `--dry-run` (with `--key-file`) makes and
 signs the files anyway for a trial, says in capitals that the result is **not a release**, and records the commit in `RELEASE` as `unknown`. `build-one.sh` sets `GOENV=off` and unsets
 `GOEXPERIMENT`, `GOFIPS140` and `GODEBUG`, so that a setting made with `go env -w` on the machine of the releaser cannot change the bytes; `repro-check.sh` builds one more binary under a hostile Go environment (a
@@ -150,7 +163,7 @@ builds all four files in each with `release.sh --unsigned`, and compares every b
 Run it on a clean checkout before a release. On Linux with `go` on the `PATH`:
 
 ```
-scripts/repro-check.sh [--work DIR] [--targets "linux/amd64 windows/amd64"]
+scripts/repro-check.sh [--work DIR] [--targets "linux/amd64 windows/amd64"] [--version TAG]
 ```
 
 **The copy on the server.** The Debian package installs a copy of `kingres-verify` in
@@ -472,9 +485,8 @@ digest's hash and `block_closed_at`). The chain id comes from the digest or from
 `--chain-id` (the export has no chain id; without either, status 2).
 
 The export is read line by line and only one header is kept, so memory does not grow
-with the file: a measured run over 1.2 million blocks (a 400 MB file) used 12 MB of
-resident memory, where reading the whole file and all headers (the earlier version) used
-1.15 GB (2.9 times the file). A line is at most 1 MiB and the file at most 1 GiB. The
+with the file (an earlier version read the whole file and all headers, which took 2.9 times
+the size of the file). A line is at most 1 MiB; the size of the file has no limit. The
 first problem in file order is reported, so a later damage is found only if no earlier
 one stops the run (a parse failure and a chain failure are both status 1, because the
 export is the thing under test). A read error, a line over the limit or a line that is
@@ -538,7 +550,8 @@ says that it is enforced and how (below). A file that is well formed but in whic
 no key can be used at that time is reported as such and ends with status 2,
 because every verifying command would refuse it; a file with no key at all is
 refused when it is read. The time-stamp authority roots and client keys of the
-file are validated and counted, and the output says that no command uses them yet.
+file are validated and counted, and a note says what they are for: `anchors` and `bundle verify` use the
+`tsa_roots`, and `attestation` and `bundle verify` use the `client_keys`.
 
 **Validity of a key** (design 14, correction 14). A checkpoint carries no time that
 can be trusted, so the verifier can enforce what the data proves (a tree size) and
@@ -820,21 +833,13 @@ not take the lock or holds a lock on another file, cannot replace a newer state 
 What is left is the time between that read and the rename, for a writer that ignores the lock; no call of the
 file system closes it without a lock. Since L14-04 the new state is written and flushed in a temporary file
 first (`statefile.Prepare`) and the state is read again only then, immediately before the rename
-(`Commit`); before, the read came first and the window was the whole write of the temporary file, which this
-README called "a few microseconds". The window is measured, not argued: a second writer that ignores the lock
-(temporary file and rename, no flush) starts at a random time between 0 and twice the duration of the call, and a
-run is lost when the call returned nil and the rival's bytes are gone. Linux (WSL2, ext4, a call takes about
-40 ms), 1,200 attempts for each version: before 265 of 1,200 lost, after 1 of 1,200 lost, 169 of 1,200 refused
-because the rival was seen. Windows 11 (NTFS, a call takes about 9 ms), 3,000 attempts: before 1,346 of 3,000
-lost, after 189 of 3,000 lost, 1,084 of 3,000 refused. These are counts, from one machine, one file system for
-each system (WSL2 ext4, NTFS) and one model of the rival (the writer described above, which does not flush and
-starts uniformly in 0 to twice the call); they are not rates of anything and no rate is claimed. One of 1,200 is
-one event: it shows that the window is not closed, and an interval for it is wide (about 0.002 to 0.5 percent at 95
-percent, by the usual interval for one event in 1,200), so "after 1 of 1,200" must not be read as "0.08 percent"
-of what a real second writer does. The Windows count is high because the rename asks for a
-write through to disk (`MOVEFILE_WRITE_THROUGH`, the only way to ask for the flush of the directory there) and
-the rename call takes about as long as the window: on Windows the window is the rename, milliseconds and not
-microseconds, and a state that matters must not be written by a program that ignores the lock.
+(`Commit`); before, the read came first and the window was the whole write of the temporary file, which an earlier text of this
+README called "a few microseconds". The window was measured when it was shrunk, with a second writer that ignores the lock (temporary file and rename,
+no flush) and starts at a random time between 0 and twice the duration of the call; a run is lost when the call
+returned nil and the rival's bytes are gone. The window is not closed: it is the rename call, which is longer on
+Windows because the rename asks for a write through to disk (`MOVEFILE_WRITE_THROUGH`, the only way to ask for the
+flush of the directory there) and takes about as long as the window. A state that matters must not be written by a
+program that ignores the lock. No rate is claimed.
 `TestMeasureTheWindowOfAWriterThatIgnoresTheLock` repeats it
 (`KINGRES_WINDOW_ATTEMPTS=N go test -run Measure -v ./internal/statefile`, a few minutes for a few thousand).
 What `MoveFileEx` answers was measured on Windows 11 (`TestRenameErrorCodes`; its documentation lists no error
@@ -1038,8 +1043,7 @@ the proof is empty and no tile is read; the output says "no tile was needed". A 
 size smaller than the old one fails (the log went back). A tile that is absent gives
 status 3; a tile that is present and wrong gives status 1.
 
-**Sources and files.** A source is a directory (a tar file and an HTTP source are
-not built yet). Every file the verifier reads goes through one helper
+**Sources and files.** A source is a directory, a `.tar.gz` file or an `https://` address (see `internal/pubsrc`; the limits of each kind are in the section on `aggregate`, "Phase 7, step 7 and step 18"). Every file the verifier reads goes through one helper
 (`internal/safefile`): it opens without blocking (a named pipe cannot hang it),
 requires a regular file after the open, and bounds the size before and while
 reading. In a source directory **no symbolic link or Windows reparse point is
@@ -1096,8 +1100,8 @@ Formats, with the specification they follow:
   tile has 1 to 255 hashes; the width at level l for size s is
   `floor(s / 256^l) mod 256`. Paths are parsed canonically (no leading zeros,
   no `..`); a tile of any other length is rejected. Entry bundles
-  (`tile/entries/<N>`, big-endian `u16` length prefixes) can be parsed and are
-  not used yet.
+  (`tile/entries/<N>`, big-endian `u16` length prefixes) are parsed and checked by
+  `bundle verify` and mirrored by `bundle fetch`.
 - **Trust file** (design 7.2): strict JSON; `format` 1, `origin_prefix`, `keys`
   (`name` label, `public_key` base64, `fingerprint` that must equal the
   SHA-256 of the key, `not_before`, `not_after` as RFC 3339 UTC or null, `revoked` true or
@@ -1106,7 +1110,7 @@ Formats, with the specification they follow:
   must equal the first 16 bytes of the SHA-256 of the key), and `witnesses`,
   which must be empty. Unknown members are rejected.
 
-Not built yet (later steps of the design): `anchors`, `release verify`. The text of this section is the contract of step 1; where
+`anchors` and `release verify` are built and described in their own sections. The text of this section is the contract of step 1; where
 the design and the specification differ, the specification was followed (see
 "Findings about the phase 7 design").
 
@@ -1244,7 +1248,7 @@ audited, the digest of the text of each event seen and the chains retired. Each 
 state, then the entries not audited yet, then **all events**. Findings (status 1): `rollback`, `fork` (also of the aggregate, also across two
 polls: the case of the review P8-01), `events` (an event number whose text changed, or that is gone), `retired-continues` (the log of a chain that a verified
 chain-retired event ended has more blocks), `retired-reappears` (a member flagged retired is a member of a later round), `entries`, `tiles`.
-Status 3: the publication cannot be reached. Without `--once` it polls every `--interval` until `--polls` (default: until stopped) and stops at the first finding.
+Status 3: the publication cannot be reached. Without `--once` it polls every `--interval` (default 60 s) until `--polls` (default: until stopped) and stops at the first finding.
 **The first run says so (V8-07):** a state directory that holds no `monitor.json` is an error (status 2), because what was seen is what makes a rollback
 visible and a record that was deleted would otherwise be taken for "nothing seen yet"; `--init` declares a first run, and is refused when the directory
 already holds a record or any `<log>.state` file (move them away to forget them on purpose). A record that is cut or emptied (`{"format":1}`, a member
@@ -1333,10 +1337,11 @@ elements from the block of the row towards the digest and keeps one header. Two 
 member `chain` may come before the member `block` in the file. The hash of the second reading must equal
 the first (a file that changed in between is refused, status 1, step `parse`), nothing is reported as
 verified before the second reading ended, and the verdict is about the bytes that were parsed. The cost is
-time: a proof is read twice, about 22 seconds for the 1.06 GB proof of a row of one year below. There is no
+time: a proof is read twice (22 seconds for the 1.06 GB proof of a row of one year, on the machine of the measurement below). There is no
 size that is refused; a file that does not end is read until the disk does.
 
-Measured on Linux, peak resident set of a child process (VmHWM; a run of `version` is 6 MiB),
+The table is the record of one measurement on one Linux machine when the limits were set; no test
+repeats these figures, and the tests that follow it check the bound. It gives the peak resident set of a child process (VmHWM; a run of `version` was 6 MiB),
 the worst of ten hostile shapes (zeros in an array, a nesting of 16 million, a million members, a
 million equal keys, one string of the whole file, a file of white space or of newlines, and a file
 of `{}` lines, and one element of a proof's chain made of strings of 65,000 bytes) for each command that reads a file, at the largest size the command accepts and at 16 MiB:
@@ -1415,7 +1420,7 @@ server's `ledger_row_hash`, that the recomputed block chain equals the server's
 digests and the headers inside the proofs, and (in `internal/proof`) that every
 single-field and every single-byte mutation of a fixture proof is rejected.
 
-Fuzz targets (kept): `FuzzParse` (jsonx, rowfile), `FuzzDecodeHex`, `FuzzEncodeRow`
+Fuzz targets (the list that follows is not complete; `grep -rn "^func Fuzz" internal` lists them all): `FuzzParse` (jsonx, rowfile), `FuzzDecodeHex`, `FuzzEncodeRow`
 (format), `FuzzParseDigest`, `FuzzParseBlocks` (chain), `FuzzVerify` (proof), and for phase 7 `FuzzParse` (signednote, trust), `FuzzVerify` (checkpoint), `FuzzParseTilePath` and `FuzzParseTile` (tlog), `FuzzParseLogSpec` (cli), `FuzzCleanRel` (safefile: the relative paths the source directory accepts). `scripts/fuzz.sh [seconds]` runs every target for a short bounded time; the seeds (the published vectors) also run in `go test ./...`.
 Run one with `go test ./internal/proof -run '^$' -fuzz '^FuzzVerify$' -fuzztime 30s`.
 
@@ -1443,6 +1448,14 @@ Run one with `go test ./internal/proof -run '^$' -fuzz '^FuzzVerify$' -fuzztime 
 | `internal/pubsrc` | a publication as a directory, a `.tar.gz` or an HTTP(S) address, bounded and untrusted |
 | `internal/bundleidx` | `bundle.json`, read strictly and never believed |
 | `internal/attest` | the client attestation: the 136-byte message, the rows of the attestation and revocation tables, the block-height rule |
+| `internal/anchorev` | the anchor evidence files `a/<id>/anchors/<size>/<target>.json`, read strictly |
+| `internal/wormv` | the check of the evidence of a WORM anchor: an object under Object Lock that holds a signed checkpoint |
+| `internal/tsatoken` | the time-stamp authority token (RFC 3161): signature, certificate chain, `genTime` |
+| `internal/otsproof` | the OpenTimestamps fragments of an anchor and the check of a Bitcoin attestation against a block header the auditor supplies |
+| `internal/logsjson` | `logs.json`, the list of the logs of a publication, read strictly and never believed |
+| `internal/release` | the sums file and the release note of `release verify` (the verifier never signs; signing is `cmd/kingres-release-tool`) |
+| `internal/anchortest` | helpers shared by the tests of the anchor packages; nothing but tests imports it |
+| `internal/crosscheck` | the tests against fixtures exported from a real server (`scripts/gen-fixtures.sh`) |
 | `internal/cli` | the command line (`cmd/kingres-verify` is a thin `main`) |
 
 ## Decisions where the documentation is silent
@@ -1466,6 +1479,8 @@ These readings were made and are enforced; each is a finding below.
   that says `D` but whose entry is an `I` (or the reverse) fails at `entry-path`.
 
 ## Findings about the format documentation
+
+This section and the other "Findings" sections that follow are the record of how the verifier was built and reviewed, in the wording of their time. The current behaviour is described in the sections above.
 
 The ledger README and the design note were enough to write a working verifier:
 the first run of the cross-check against the real server matched on every row
@@ -2036,7 +2051,8 @@ gaps. This round changes no verdict and no exit status.
 - No new flag, no new JSON member, no new exit status.
 ## Decisions of steps 7 and 18 (proposed corrections 160 onwards of the design)
 
-The design is silent or open on these points; each decision takes the stricter behaviour.
+This section is the record of the decisions made when steps 7 and 18 were built, in the wording of their time; the current
+behaviour is described in the sections above. The design was silent or open on these points; each decision takes the stricter behaviour.
 
 - **160 (7.4, attestation): the inputs.** The proof of the attestation row is a format 1 proof like any other, so it is a file of its
   own (`--attestation`), with the columns file of the row (`--attestation-columns`); the verifier cannot know which table is
@@ -2073,11 +2089,11 @@ The design is silent or open on these points; each decision takes the stricter b
 - **167 (correction 155): the three tests** (canonical encoding, on the curve, not of small order) are applied to every public key the verifier reads: the pinned
   server keys, the client keys, and the key of a key-added event. Written from the definitions with integers (`internal/edkey`) and tested with the vectors of
   `contrib/kingres_ledger/t/038_public_key_check.pl`.
-- **168 (3.3): a revoked key is revoked.** The rule that a revoked key's old checkpoints may stay good when an anchor dates them needs anchors (steps 11 to 15). Until
-  then `trust follow` writes `revoked`, and a held checkpoint rests on the rules of corrections 55 and 69.
+- **168 (3.3): a revoked key is revoked.** The rule that a revoked key's old checkpoints may stay good when an anchor dates them needs anchors (steps 11 to 15, built since). The rule is still not
+  applied (see "Correction 168 and revoked keys" under "Anchors"): `trust follow` writes `revoked`, and a held checkpoint rests on the rules of corrections 55 and 69.
 - **169 (4.10, 7.4): the log leg.** A block at a height the signed chain log does not cover is a failure. `--log-leg aggregate` shows the block through the member of the
   last leaf of the signed aggregate; its root of trust is the signature on the aggregate checkpoint and the output says that no anchor was checked.
-- **170 (4.6, 7.4): `bundle fetch`** needs the logs named (`--log`): `logs.json` is optional and has no format yet. A partial tile that is gone is not an error (tlog-tiles).
+- **170 (4.6, 7.4): `bundle fetch`** needed the logs named (`--log`) when this was decided; `logs.json` has a format since (format 1, see `bundle fetch` above). A partial tile that is gone is not an error (tlog-tiles).
   Without `--trust` nothing is verified, and the word is `FETCHED`, not `VERIFIED`.
 
 ### What the verifier relies on in what `kingresd` publishes (today's format)
@@ -2138,7 +2154,7 @@ Its findings were about what a VERIFIED left out. Each fix has a test that fails
 and proofs) are signed by keys of the trust file he pinned that **no verified event of the same publication revoked or limited below the size of the
 checkpoint**; that every event counted as verified was signed by a key the trust chain authorises; that every member flag of the last aggregate round was
 judged by the table. **Not** that no revocation exists (an event that is withheld, or sits after the point where an HTTP source stops, is invisible), not the
-time of anything (no anchor was read by these commands), and not that a key that an event added is trusted (use `trust follow`).
+time of anything (the anchors that `bundle verify` reads are the subject of "Epochs and anchors in `bundle verify`", the other commands read none), and not that a key that an event added is trusted (use `trust follow`).
 
 ## Epochs and anchors in `bundle verify` (phase 7, step 21)
 
@@ -2227,8 +2243,8 @@ exit status of a failure does not change.
 
 **Tests and what is not tested here.** The tests build the whole publication of a restore from the documents (`epoch_test.go`: the aggregate rounds 0 to 3, the event, the frozen log of epoch 1
 and the log of epoch 2 with another history, a held checkpoint) and not from the code of `kingresd`; every case of the table above is a test, with the sign of the cases that must stay failures.
-The cluster test of step 20 (`ledgerepoch_test.go`) was not run for this step (it needs a cluster and the integration mutex), so **no byte of a real closed-epoch publication was read**: a
-real one can be added the way `testdata/publication` was made (a cluster test run with `KINGRES_PUBLICATION_FIXTURES`), and the epoch test of step 20 does not write one yet; the line formats above were taken from the
+The cluster test of step 20 (`kingres/control-plane/internal/clustertest/ledgerepoch_test.go`) needs a cluster and is not part of the tests of this module, and `testdata/publication` holds no `events/` directory, so **no byte of a real closed-epoch publication is read by a test here**: a
+real one can be added the way `testdata/publication` was made (a cluster test run with `KINGRES_PUBLICATION_FIXTURES`); the line formats above were taken from the
 code that writes the event (`ledgerround/epoch.go`, `ledgersign/publish.go`) and from the aggregate rules in `ledgerround/aggregate.go`. Fuzz target: `FuzzEpochClosedEvent`.
 
 **Mutants of step 21** (one line each, the tests named run; `killed` means a test failed): the member's size and root against the event, `--accept-epoch-closed` accepting any number, the held head not proved a prefix of the frozen log (the consistency proof and the equal size), a later epoch that needs no event, the closed log in the bundle not compared with the event, a refused finding dropped from the failure, the order of the epochs in which a proof is shown, the check that a note is of another epoch, the count of `--require-anchors`, an unmet anchor that is not a note, the note of a closed epoch in `checkpoint`, the note of the new epoch alone, the minimum final size, a second event for one epoch, the bound of the common height, an event that no authorised key signed: 22 of 22 (with those of V8 above) killed.

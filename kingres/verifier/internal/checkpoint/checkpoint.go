@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package checkpoint parses and verifies transparency log checkpoints as C2SP
 // "tlog-checkpoint" defines them (https://c2sp.org/tlog-checkpoint): a signed

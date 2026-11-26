@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package format builds the byte strings that the KingresDB ledger hashes
 // (hash format version 1). Each kind of hash input is built in exactly one

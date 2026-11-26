@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package chain parses and checks block headers, digests and the block hash
 // chain of a KingresDB ledger.

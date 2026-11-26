@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package tsa anchors the digest of a signed checkpoint at an RFC 3161
 // time-stamp authority (design 6.4) and verifies, in full, the token that

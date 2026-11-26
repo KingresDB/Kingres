@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Blockchain / ledger models on PostgreSQL and other relational databases (as of November 2026) - for KingresDB
 
 Terminology used throughout (the term "blockchain model" is ambiguous):

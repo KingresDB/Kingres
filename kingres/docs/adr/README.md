@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Architecture decision records
 
 An ADR records one decision: the context, the decision, its consequences and the alternatives that were rejected. The design itself is in [../architecture.md](../architecture.md); ADRs record that a recommendation in it has become a decision, and why. The rules for what goes where are in [../dev/documentation.md](../dev/documentation.md).
@@ -34,7 +35,7 @@ An ADR records one decision: the context, the decision, its consequences and the
 | [0025](0025-restore-of-the-system-database-is-accepted-by-an-operator.md) | A restored system database is accepted by an operator, and the acceptance is a signed event | Accepted | 2026-11-23 | - |
 | [0026](0026-the-candidate-of-the-map-group-receives-the-proof-of-the-operators-session.md) | The candidate of a map group failover receives the proof of the operator's session | Accepted | 2026-11-23 | - |
 | [0027](0027-transfers-are-staged-encrypted-files-run-as-the-requesting-role.md) | Exports are staged encrypted files, and transfers run as the role that asked | Accepted | 2026-11-23 | - |
-| [0028](0028-ledger-tables-are-carried-as-data-and-restart-their-chain.md) | Ledger tables are carried as data, and the imported ledger starts a new chain | Proposed | 2026-11-22 | - |
+| [0028](0028-ledger-tables-are-carried-as-data-and-restart-their-chain.md) | Ledger tables are carried as data, and the imported ledger starts a new chain | Accepted | 2026-11-22 | - |
 "Open decision #" refers to the table "Open decisions" in architecture.md.
 
 ## Statuses

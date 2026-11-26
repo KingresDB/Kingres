@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
 -- sketch_memory: the memory that the aggregate states of one backend hold,
 -- the setting kingres_sketch.state_memory_limit that bounds it, and the
 -- counter state_bytes() that must come back to zero on every path.

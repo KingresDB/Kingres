@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package release holds what the release of the verifier is made of and what
 // "kingres-verify release verify" checks: the sums text (the format of

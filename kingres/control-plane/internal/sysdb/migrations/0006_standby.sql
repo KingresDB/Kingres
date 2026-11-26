@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- Copyright (c) 2026, RooyeKhat Media Co
 -- kingres_cp 6: the standbys kingresd manages (high availability, part 1).
 -- Applied inside one transaction by internal/sysdb; do not add BEGIN/COMMIT.
 

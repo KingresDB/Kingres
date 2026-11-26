@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Configuration from the console: design of phase 13
 
 Status: accepted for implementation, 2026-11-15.

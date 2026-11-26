@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package failover is the manual failover of an ordinary shard group (design
 // ha-phase5-part2.md, sections 3.3 and 3.6, increment 3): the task server.failover,

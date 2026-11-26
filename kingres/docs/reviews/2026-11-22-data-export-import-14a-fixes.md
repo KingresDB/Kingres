@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Review of the fixes of phase 14a (DX14-01 to DX14-12), branch dx-cp, commits 3b87662784, 63e8de8d88, 97976b3c44
 
 ## Summary
