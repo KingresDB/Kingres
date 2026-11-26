@@ -23,6 +23,13 @@ func TestSwitchoverAndBack(t *testing.T) {
 	e := swCluster(t)
 	c, port, pool, leader, g, old, nw, w := e.c, e.port, e.pool, e.leader, e.g, e.old, e.nw, e.w
 	var plan map[string]any
+	// The warnings about the lease of every server are logged on every end of the test (the release of the repeated stop that answers refused is one of them),
+	// so that a run that passes shows them as well.
+	defer func() {
+		for _, n := range c.Nodes {
+			t.Logf("lease warnings of %s: %s", n.Host, leaseLines(n.LogTail(8000000)))
+		}
+	}()
 	defer func() {
 		if t.Failed() {
 			t.Logf("the last plan: %v", plan)
@@ -58,6 +65,7 @@ func TestSwitchoverAndBack(t *testing.T) {
 	}
 	id := swRequest(t, leader, old, nw, g)
 	swWait(t, e, id, 8*time.Minute)
+	noStaleUnquiesce(t, c)
 	if host := swPrimaryHost(t, leader, g); host != nw.Host {
 		t.Fatalf("the primary of group %d is on %s, want %s", g, host, nw.Host)
 	}
@@ -125,6 +133,7 @@ func TestSwitchoverAndBack(t *testing.T) {
 		}
 	}()
 	swWait(t, e, rid, 8*time.Minute)
+	noStaleUnquiesce(t, c)
 	if host := swPrimaryHost(t, leader, g); host != old.Host {
 		t.Fatalf("after the restore the primary of group %d is on %s, want %s", g, host, old.Host)
 	}

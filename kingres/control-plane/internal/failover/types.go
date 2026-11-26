@@ -288,6 +288,10 @@ type DemoteRequest struct {
 	// Candidate is the server that a planned switchover of the map group hands the group to (mode fast, group 0): the old leader records it before it stops, and resumes
 	// its primary later only on that server's word (F7-01).
 	Candidate string `json:"candidate,omitempty"`
+	// ProofOnly (mode fast) asks only for the proof of a stop that was made: the instance is read, never stopped, and the lease is not touched (not held back, not
+	// released, not relinquished). The Verify step asks again after the Lease step may have run (a task that is resumed or replayed), when this server
+	// holds the lease of the group again as the fence holder: a release then would give it away.
+	ProofOnly bool `json:"proofOnly,omitempty"`
 }
 
 // DemoteAnswer is the answer of POST /failover/demote.
@@ -298,6 +302,9 @@ type DemoteAnswer struct {
 	// Checkpoint is "Latest checkpoint location" of pg_controldata, read after a clean stop; Released says that the lease was released.
 	Checkpoint string `json:"checkpoint,omitempty"`
 	Released   bool   `json:"released,omitempty"`
+	// ProofOnly echoes the request: a callee of an older version does not know the flag, ignores it and stops and releases as before, and the caller then sees
+	// that its request for the proof alone was not honoured.
+	ProofOnly bool `json:"proofOnly,omitempty"`
 }
 
 // The calls of the planned switchover (design 5.2). The same group number, task and epoch rules as the other calls apply.

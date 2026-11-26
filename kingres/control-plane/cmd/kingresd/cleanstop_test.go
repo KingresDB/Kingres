@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -86,4 +87,48 @@ func TestTheCheckpointIsGivenOnlyForAHeldBackStoppedPrimary(t *testing.T) {
 	callErr(t, err, 409, "not_stopped")
 	_, err = mapCheckpoint(ctx, &fakeStopper{running: false, cdErr: errors.New("no pg_controldata")}, 1, true, true)
 	callErr(t, err, 503, "unavailable")
+}
+
+// The proof of a stop that was made is read without a stop and without any call on the lease: it is asked for again after the lease step (a resumed or
+// replayed task), when this server holds the lease again as the fence holder and a release would give it away.
+func TestTheProofOfAStopTouchesNoLeaseAndStopsNothing(t *testing.T) {
+	ctx := context.Background()
+	st := &fakeStopper{running: false, state: "shut down"}
+	ans, err := stopProof(ctx, st, nil, 1)
+	if a, ok := ans.(failover.DemoteAnswer); err != nil || !ok || !a.Stopped || a.ClusterState != "shut down" || a.Checkpoint != "0/6000028" || a.Released {
+		t.Fatalf("the proof of a stopped instance: %v %+v", err, ans)
+	}
+	// An instance that runs is not stopped by a request for the proof: the answer says it is not stopped.
+	run := &fakeStopper{running: true, state: "shut down"}
+	ans, err = stopProof(ctx, run, nil, 1)
+	if a, ok := ans.(failover.DemoteAnswer); err != nil || !ok || a.Stopped || !run.running {
+		t.Fatalf("the proof of an instance that runs: %v %+v running=%v", err, ans, run.running)
+	}
+	// The control data that cannot be read is an error, not a proof.
+	if _, err = stopProof(ctx, &fakeStopper{running: false, cdErr: errors.New("no pg_controldata")}, nil, 1); err == nil {
+		t.Fatal("an unreadable control data was answered as a proof")
+	}
+}
+
+// The request of the repeated stop reaches the proof and not the stop: the flag is read from the body of the call under its name, and the dispatch of the
+// callee honours it. A request without the flag stops and releases as before.
+func TestAProofOnlyRequestReachesTheProofAndNotTheCleanStop(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var proof, full failover.DemoteRequest
+	if err := json.Unmarshal([]byte(`{"group":1,"mode":"fast","expectedTerm":3,"proofOnly":true}`), &proof); err != nil || !proof.ProofOnly {
+		t.Fatalf("the flag is not read from the body of the call: %v %+v", err, proof)
+	}
+	if err := json.Unmarshal([]byte(`{"group":1,"mode":"fast","expectedTerm":3}`), &full); err != nil || full.ProofOnly {
+		t.Fatalf("a request without the flag is a proof only: %v %+v", err, full)
+	}
+	lm := &fakeLeases{}
+	ans, err := demoteOf(context.Background(), &fakeStopper{running: false, state: "shut down"}, lm, nil, log, 1, proof)
+	if a, ok := ans.(failover.DemoteAnswer); err != nil || !ok || !a.Stopped || !a.ProofOnly || lm.holdBack+lm.relinquish+lm.release != 0 {
+		t.Fatalf("a proof only request touched the lease or was not answered as one: %v %+v holdBack %d relinquish %d release %d", err, ans, lm.holdBack, lm.relinquish, lm.release)
+	}
+	lm = &fakeLeases{}
+	ans, err = demoteOf(context.Background(), &fakeStopper{running: true, state: "shut down"}, lm, nil, log, 1, full)
+	if a, ok := ans.(failover.DemoteAnswer); err != nil || !ok || !a.Stopped || !a.Released || a.ProofOnly || lm.holdBack != 1 || lm.release != 1 {
+		t.Fatalf("a request without the flag did not stop and release: %v %+v holdBack %d release %d", err, ans, lm.holdBack, lm.release)
+	}
 }

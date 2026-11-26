@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -1231,5 +1232,74 @@ func TestTheLeaseStaysExtendedWhileTheRollbackOfAFailedStopRuns(t *testing.T) {
 	}
 	if left < 100*time.Second {
 		t.Errorf("the task lease has %v left while the rollback runs, want it still extended", left)
+	}
+}
+
+// The clean stop that makes the proof again (the Verify step, and the Promote step that follows the Lease step) asks only for the proof: a release then would
+// give away the lease of the fence holder or of the candidate, and the warning "0 of 2 grantors released" that it caused was this release being refused.
+// Only the first request, the stop, releases.
+func TestTheVerifyAndPromoteStepsAskOnlyForTheProofOfTheStop(t *testing.T) {
+	w := gracefulWorld()
+	r := w.runner()
+	w.fakeClock(r)
+	if name, err := runAll(t, r, gracefulInput()); err != nil {
+		t.Fatalf("%s: %v\n%s", name, err, strings.Join(w.log, "\n"))
+	}
+	w.mu.Lock()
+	got := append([]bool(nil), w.stopProofOnly...)
+	w.mu.Unlock()
+	if len(got) != 3 || got[0] || !got[1] || !got[2] {
+		t.Fatalf("the clean stop requests (ProofOnly) are %v, want [false true true]: the stop releases, the proofs only read", got)
+	}
+}
+
+// The access rules of the old primary are put back after the promotion with the term that the promotion made: the callee refuses a term that is below
+// the catalog's, and the old server would keep its hold and its flag that the group is quiesced (the entry point would not route to the group if it
+// came back to that server).
+func TestTheAccessRulesOfTheOldPrimaryArePutBackWithTheTermOfThePromotion(t *testing.T) {
+	w := gracefulWorld()
+	r := w.runner()
+	w.fakeClock(r)
+	w.quiesced = true
+	if name, err := runAll(t, r, gracefulInput()); err != nil {
+		t.Fatalf("%s: %v\n%s", name, err, strings.Join(w.log, "\n"))
+	}
+	w.mu.Lock()
+	stale, quiesced, term := w.unquiesceStale, w.quiesced, w.term
+	w.mu.Unlock()
+	if stale != 0 || quiesced {
+		t.Fatalf("the unquiesce of the old primary was refused as stale %d times (the flag is %v, the catalog term is %d): %v", stale, quiesced, term, w.undoTerms)
+	}
+}
+
+// A server of an older version ignores the flag of the request for the proof alone and does a full stop: the caller says so in its log.
+func TestAnOldServerThatDoesNotHonourTheProofOnlyRequestIsLogged(t *testing.T) {
+	for _, old := range []bool{false, true} {
+		w := gracefulWorld()
+		w.oldCalleeIgnoresProofOnly = old
+		var buf strings.Builder
+		r := w.runner()
+		r.Log = slog.New(slog.NewTextHandler(&buf, nil))
+		w.fakeClock(r)
+		if name, err := runAll(t, r, gracefulInput()); err != nil {
+			t.Fatalf("%s: %v\n%s", name, err, strings.Join(w.log, "\n"))
+		}
+		if got := strings.Count(buf.String(), "did not honour the request for the proof alone"); (old && got != 2) || (!old && got != 0) {
+			t.Errorf("old callee %v: the warning was logged %d times (want 2 for an old server, 0 for a new one)", old, got)
+		}
+	}
+}
+
+// A proof that finds the old primary running again (the rollback or an operator started it) is not a proof: the switchover rolls back and the
+// new primary is never asked to promote.
+func TestSwitchoverRollsBackWhenTheRepeatedProofFindsTheOldPrimaryRunning(t *testing.T) {
+	w := gracefulWorld()
+	w.proofNotStopped = true
+	r := w.runner()
+	w.fakeClock(r)
+	_, err := runAll(t, r, gracefulInput())
+	failedWith(t, w, err, CodeSwitchoverUnproven)
+	if w.index("promote s") >= 0 || w.index("resume s1") < 0 {
+		t.Errorf("\n%s", strings.Join(w.log, "\n"))
 	}
 }

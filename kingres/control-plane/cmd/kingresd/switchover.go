@@ -299,13 +299,49 @@ func handleFailoverResume(ctx context.Context, d *haDeps, body []byte) (any, err
 
 // demoteClean is the stop of a switchover (mode fast): the lease is given up, the instance stops with a fast shutdown, the shutdown
 // checkpoint and the state of the cluster are read from pg_controldata, and the lease is released at the grantors (it is free at once).
-// It is idempotent: a stopped instance is read again, which is how the proof is asked for twice.
+// A request that asks for the proof alone (ProofOnly: the Verify and Promote steps, which repeat the call) is answered by stopProof, which stops nothing and
+// touches no lease; only the first request of a switchover stops and releases.
 func demoteClean(ctx context.Context, d *haDeps, r failover.DemoteRequest) (any, error) {
 	li, ok := d.Svc.PrimaryOf(r.Group)
 	if !ok {
 		return nil, &internalapi.CallError{Status: http.StatusConflict, Code: "not_primary", Message: "This server runs no primary of the shard group."}
 	}
-	return cleanStop(ctx, d.Svc.Manager(), d.LeaseMgr, d.Fault, d.Log, li.ID, r.Group)
+	return demoteOf(ctx, d.Svc.Manager(), d.LeaseMgr, d.Fault, d.Log, li.ID, r)
+}
+
+// demoteOf chooses between the stop and the proof alone for the instance id (a test stands in for the parts).
+func demoteOf(ctx context.Context, mgr stopManager, lm stopLeases, fh *fault.Hook, log *slog.Logger, id int, r failover.DemoteRequest) (any, error) {
+	if r.ProofOnly {
+		return stopProof(ctx, mgr, fh, id)
+	}
+	return cleanStop(ctx, mgr, lm, fh, log, id, r.Group)
+}
+
+// stopProof reads the proof of a clean stop that was made (the state of the cluster and the shutdown checkpoint from pg_controldata) and does nothing else: it
+// never stops an instance and never touches the lease, so a repeat of it after the lease step (a task that is resumed or replayed) cannot release the lease
+// that this server holds again as the fence holder. An instance that runs is answered as not stopped.
+// A running instance is not relinquished here (cleanStop does that when its own stop fails): the stop that came before released the lease and left the
+// marker that keeps the primary from starting, the watchdog enforces the lease, and the caller rolls the switchover back on "not stopped", which resumes it.
+func stopProof(ctx context.Context, mgr stopManager, fh *fault.Hook, id int) (any, error) {
+	out := failover.DemoteAnswer{ProofOnly: true}
+	running, err := mgr.Running(ctx, id)
+	out.Stopped = err == nil && !running
+	if !out.Stopped {
+		return out, nil
+	}
+	cd, err := mgr.ControlData(ctx, id)
+	if fh.FailoverInjection("demote:controldata") == "fail" {
+		cd, err = nil, errors.New("injected: pg_controldata failed")
+	}
+	if err != nil {
+		return nil, &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "pg_controldata cannot be read: " + err.Error()}
+	}
+	out.ClusterState = cd["Database cluster state"]
+	if fh.FailoverInjection("demote:state") == "fail" {
+		out.ClusterState = "in production"
+	}
+	out.Checkpoint = cd["Latest checkpoint location"]
+	return out, nil
 }
 
 // The parts of the instance manager and of the lease manager that the clean stop uses, so that a test can stand in for them.

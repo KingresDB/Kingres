@@ -62,51 +62,55 @@ type world struct {
 	rows           *memRows
 	prepared       int
 	// the switchover
-	oldHolds           bool // the old primary's server holds the lease of its group
-	quiesceCalls       int  // calls of Quiesce that answer "sessions remain" before it succeeds
-	quiesceFail        bool // Quiesce never succeeds
-	oldPrepared        int  // prepared transactions on the old primary (decreasing by recovery)
-	markReplayed       bool // the standby has replayed the mark
-	stopState          string
-	stopStates         []string
-	stopN              int
-	promoteReqs        []PromoteRequest
-	oldPreparedUnknown bool // the old primary does not report a count of prepared transactions
-	mapGroup           bool // the group of the world is the map group (0), not 1
-	mapStarts          []MapStartRequest
-	mapProofs          []MapProofRequest
-	noPromoteOnProof   bool
-	mapProofErr        error
-	stateDown          map[string]bool // the calls to this server fail (a transient error on the state read)
-	mapAbandonErr      error           // the candidate answers the abandon with this (a 409 conflict: it promoted)
-	mapRefusal         string
-	mapStartErr        error
-	liveErr            error            // the primary of the map group cannot be asked
-	live2              *LiveReplication // what it says (nil: what the recorded facts say)
-	liveReads          int
-	onMapStart         func()  // runs inside the call that starts the bootstrap of the candidate (a test changes the facts there)
-	markErr            error   // the answer of the mark call
-	undoTerms          []int64 // the terms of the quiesce, unquiesce and resume calls
-	stopErr            error   // the answer of the clean stop call
-	dbDownAfterStop    bool    // the rows cannot be read after the clean stop (the map group: its system database is the stopped instance)
-	onResume           func()  // called when the old primary is resumed by a rollback (a test reads the lease of the task at that moment)
-	onDemote           func()  // called when the clean stop is asked for, before anything else (a test cancels the context of the step)
-	beforeStop         func()  // called when the clean stop is asked for, before it is done (a test reads what the task lease is at that moment)
-	afterStop          func()  // called when the clean stop is done (a test cancels the context of the step, as the engine does when the task lease cannot be renewed)
-	notReleased        bool    // the clean stop does not release the lease
-	markTerms          []int64
-	stopTerms          []int64
-	stopCandidates     []string // the Candidate of every clean stop request
-	promoteRefuse      error    // the answer of a promote call that carries a proof (the callee refuses it)
-	verifyAnswers      []bool   // the answers of the proof, in order (the last one repeats)
-	verifyErr          error
-	verifyN            int
-	quiesced           bool
-	immediate          []DemoteRequest // the immediate stops that were asked for
-	hardLate           int             // a hard failover of the map group: the candidate shows as promoted after this many reads of its state (0: at once)
-	hardPending        string          // the candidate that promotes late
-	oldSrv             string          // the server whose primary is handed over (default s1)
-	self               string          // the leader's server (default s2)
+	oldHolds                  bool // the old primary's server holds the lease of its group
+	quiesceCalls              int  // calls of Quiesce that answer "sessions remain" before it succeeds
+	quiesceFail               bool // Quiesce never succeeds
+	oldPrepared               int  // prepared transactions on the old primary (decreasing by recovery)
+	markReplayed              bool // the standby has replayed the mark
+	stopState                 string
+	stopStates                []string
+	stopN                     int
+	promoteReqs               []PromoteRequest
+	oldPreparedUnknown        bool // the old primary does not report a count of prepared transactions
+	mapGroup                  bool // the group of the world is the map group (0), not 1
+	mapStarts                 []MapStartRequest
+	mapProofs                 []MapProofRequest
+	noPromoteOnProof          bool
+	mapProofErr               error
+	stateDown                 map[string]bool // the calls to this server fail (a transient error on the state read)
+	mapAbandonErr             error           // the candidate answers the abandon with this (a 409 conflict: it promoted)
+	mapRefusal                string
+	mapStartErr               error
+	liveErr                   error            // the primary of the map group cannot be asked
+	live2                     *LiveReplication // what it says (nil: what the recorded facts say)
+	liveReads                 int
+	onMapStart                func()  // runs inside the call that starts the bootstrap of the candidate (a test changes the facts there)
+	markErr                   error   // the answer of the mark call
+	undoTerms                 []int64 // the terms of the quiesce, unquiesce and resume calls
+	unquiesceStale            int     // the unquiesce calls that were refused as stale (the catalog term is higher than the call's, as the callee judges it)
+	stopErr                   error   // the answer of the clean stop call
+	dbDownAfterStop           bool    // the rows cannot be read after the clean stop (the map group: its system database is the stopped instance)
+	onResume                  func()  // called when the old primary is resumed by a rollback (a test reads the lease of the task at that moment)
+	onDemote                  func()  // called when the clean stop is asked for, before anything else (a test cancels the context of the step)
+	beforeStop                func()  // called when the clean stop is asked for, before it is done (a test reads what the task lease is at that moment)
+	afterStop                 func()  // called when the clean stop is done (a test cancels the context of the step, as the engine does when the task lease cannot be renewed)
+	notReleased               bool    // the clean stop does not release the lease
+	markTerms                 []int64
+	stopTerms                 []int64
+	stopCandidates            []string // the Candidate of every clean stop request
+	stopProofOnly             []bool   // ProofOnly of every clean stop request, in the order they were made
+	oldCalleeIgnoresProofOnly bool     // the old server is of a version that does not know the flag: it answers a full stop
+	proofNotStopped           bool     // the instance of the old primary runs again when the proof alone is asked for
+	promoteRefuse             error    // the answer of a promote call that carries a proof (the callee refuses it)
+	verifyAnswers             []bool   // the answers of the proof, in order (the last one repeats)
+	verifyErr                 error
+	verifyN                   int
+	quiesced                  bool
+	immediate                 []DemoteRequest // the immediate stops that were asked for
+	hardLate                  int             // a hard failover of the map group: the candidate shows as promoted after this many reads of its state (0: at once)
+	hardPending               string          // the candidate that promotes late
+	oldSrv                    string          // the server whose primary is handed over (default s1)
+	self                      string          // the leader's server (default s2)
 }
 
 func newWorld() *world {
@@ -293,9 +297,13 @@ func (p fpeers) Demote(_ context.Context, server string, r DemoteRequest) (Demot
 		if p.w.onDemote != nil {
 			p.w.onDemote()
 		}
+		if r.ProofOnly && p.w.proofNotStopped {
+			return DemoteAnswer{Stopped: false, ProofOnly: true}, nil
+		}
 		p.w.mu.Lock()
 		p.w.stopTerms = append(p.w.stopTerms, r.ExpectedTerm)
 		p.w.stopCandidates = append(p.w.stopCandidates, r.Candidate)
+		p.w.stopProofOnly = append(p.w.stopProofOnly, r.ProofOnly)
 		p.w.mu.Unlock()
 		if p.w.stopErr != nil {
 			return DemoteAnswer{}, p.w.stopErr
@@ -326,7 +334,7 @@ func (p fpeers) Demote(_ context.Context, server string, r DemoteRequest) (Demot
 		if p.w.afterStop != nil {
 			p.w.afterStop()
 		}
-		return DemoteAnswer{Stopped: true, ClusterState: state, Checkpoint: "0/6000028", Released: !p.w.notReleased}, nil
+		return DemoteAnswer{Stopped: true, ClusterState: state, Checkpoint: "0/6000028", Released: !p.w.notReleased, ProofOnly: r.ProofOnly && !p.w.oldCalleeIgnoresProofOnly}, nil
 	}
 	p.w.mu.Lock()
 	p.w.immediate = append(p.w.immediate, r)
@@ -810,9 +818,16 @@ func (p fpeers) Quiesce(_ context.Context, server string, r QuiesceRequest) (Qui
 func (p fpeers) Unquiesce(_ context.Context, server string, r QuiesceRequest) error {
 	p.w.mu.Lock()
 	p.w.undoTerms = append(p.w.undoTerms, r.ExpectedTerm)
+	stale := r.ExpectedTerm >= 0 && r.ExpectedTerm < p.w.term
+	if stale {
+		p.w.unquiesceStale++
+	}
 	p.w.mu.Unlock()
 	if err := p.unreach(server); err != nil {
 		return err
+	}
+	if stale {
+		return &CallError{Status: 409, Code: "stale_term", Message: "The catalog has a newer term than the failover knows."}
 	}
 	p.w.rec("unquiesce %s", server)
 	p.w.mu.Lock()
