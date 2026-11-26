@@ -51,6 +51,18 @@ type world struct {
 	promoteErr     map[string]error // scripted errors for the first calls, by server
 	promoteN       map[string]int
 	catScript      []any
+	// The faults of the reads of the catalog (Nodes and Status) of ONE step: readStep is the key of that step (empty: none), the first readSkip reads of the step
+	// answer, then each read answers the next of readErrs, and every read after them answers readForever (when set). readCalls counts the reads that hit the
+	// step after the skipped ones; curStep is the step that runs now (set by the Fault hook of the runner, see (*world).runner).
+	readStep       string
+	readSkip       int
+	readErrs       []error
+	readForever    error
+	readCalls      int
+	stepReads      int
+	curStep        string
+	alertOn        map[string]bool // kind|subject of the alerts that are raised now
+	stepRuns       map[string]int  // how many times each step ran
 	catCalls       int
 	catalogFollows bool
 	primaryNames   []int64
@@ -463,9 +475,17 @@ func (c fcat) list(db string) *[]Node {
 func (c fcat) Nodes(_ context.Context, db string) ([]Node, error) {
 	c.w.mu.Lock()
 	defer c.w.mu.Unlock()
+	if err := c.w.readFault(); err != nil {
+		return nil, err
+	}
 	return append([]Node(nil), (*c.list(db))...), nil
 }
 func (c fcat) Status(_ context.Context, db string) (int64, bool, error) {
+	c.w.mu.Lock()
+	defer c.w.mu.Unlock()
+	if err := c.w.readFault(); err != nil {
+		return 0, false, err
+	}
 	return c.w.term, false, nil
 }
 func (c fcat) RecoverPrepared(_ context.Context, db string) error {
@@ -580,9 +600,13 @@ func (p fplan) SyncNamesOf(context.Context, string, int32) (string, int, bool) {
 func (p fplan) Alert(_ context.Context, kind, sev, subject, msg string, raise bool) {
 	p.w.mu.Lock()
 	defer p.w.mu.Unlock()
+	if p.w.alertOn == nil {
+		p.w.alertOn = map[string]bool{}
+	}
 	if raise {
 		p.w.alerts = append(p.w.alerts, kind)
 	}
+	p.w.alertOn[kind+"|"+subject] = raise
 }
 func (p fplan) Audit(_ context.Context, action string, g int32, d map[string]any) {
 	p.w.rec("audit %s", action)
@@ -739,7 +763,18 @@ func (w *world) runner() *Runner {
 		Sleep:     func(ctx context.Context, d time.Duration) error { return ctx.Err() },
 		LeaseWait: 3 * time.Second, LeasePoll: 10 * time.Millisecond, ReadBound: 3 * time.Second,
 		PromoteNode: PromoteOptions{Pause: time.Millisecond},
-		SyncWait:    time.Millisecond, PreparedWait: time.Millisecond, ClientsWait: time.Millisecond,
+		Fault: func(point string) {
+			if name, ok := strings.CutSuffix(point, ":before"); ok {
+				w.mu.Lock()
+				w.curStep, w.stepReads = name, 0
+				if w.stepRuns == nil {
+					w.stepRuns = map[string]int{}
+				}
+				w.stepRuns[name]++
+				w.mu.Unlock()
+			}
+		},
+		SyncWait: time.Millisecond, PreparedWait: time.Millisecond, ClientsWait: time.Millisecond,
 	}
 }
 
@@ -941,4 +976,22 @@ func (p fpeers) MapRefusal(_ context.Context, _ int64) (string, bool) {
 	p.w.mu.Lock()
 	defer p.w.mu.Unlock()
 	return p.w.mapRefusal, p.w.mapRefusal != ""
+}
+
+// readFault is the error that a read of the catalog answers now (the caller holds w.mu): only the reads of the step readStep are faulted.
+func (w *world) readFault() error {
+	if w.readStep == "" || w.curStep != StepName(1, w.readStep) {
+		return nil
+	}
+	w.stepReads++
+	if w.stepReads <= w.readSkip {
+		return nil
+	}
+	w.readCalls++
+	if len(w.readErrs) > 0 {
+		e := w.readErrs[0]
+		w.readErrs = w.readErrs[1:]
+		return e
+	}
+	return w.readForever
 }
