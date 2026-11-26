@@ -161,6 +161,7 @@ async function main() {
     rmSync(staged, { force: true })
   }
   wsl(['start'])
+  if (!process.env.E2E_DATA_DIR) process.env.E2E_DATA_DIR = wsl(['datadir'], { quiet: true }).trim()
   await waitFor(`http://127.0.0.1:${API_PORT}/api/v1/healthz`, 'kingresd')
 
   const baseUrl = `http://127.0.0.1:${API_PORT}`

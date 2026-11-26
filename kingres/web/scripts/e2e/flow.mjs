@@ -9,7 +9,12 @@ import { join } from 'node:path'
 import { helpers, openBrowser, sleep } from './browser.mjs'
 
 export const ADMIN = { user: 'admin', password: 'E2e-Passw0rd-12' }
-const DATA_DIR = '/home/kingres/kw-web/data'
+// The data directory that the wizard is given: the one backend.sh uses inside WSL. run.mjs reads it from backend.sh when the variable is not set.
+function dataDir() {
+  const dir = process.env.E2E_DATA_DIR
+  if (!dir) throw new Error('E2E_DATA_DIR is not set: it is the data directory of the test server inside WSL (backend.sh datadir prints it)')
+  return dir
+}
 
 /**
  * @param {{ baseUrl: string, setupToken: () => string, psql: (db: string, sql: string) => string,
@@ -113,7 +118,7 @@ export async function runFlow(ctx) {
     'create the cluster with the right data directory and follow the progress',
     async () => {
       if (!(await ui.text()).includes('Creating the cluster')) {
-        await ui.fill('Data directory', DATA_DIR)
+        await ui.fill('Data directory', dataDir())
         await ui.click('Create cluster')
       }
       await ui.waitForText('Creating the cluster', 10000)

@@ -8,6 +8,7 @@
 #   backend.sh prepare <kingresd-binary>   copy the installed server and the binary (once)
 #   backend.sh start                        fresh data directory, start kingresd, wait for /healthz
 #   backend.sh restart                      stop and start kingresd again on the same data (sessions are lost)
+#   backend.sh datadir                      print the data directory of the test server
 #   backend.sh token                        print the one-time setup token
 #   backend.sh psql <database> <sql>        run SQL as the cluster administrator (needs E2E_ADMIN_PASSWORD)
 #   backend.sh log                          print the kingresd log
@@ -84,5 +85,6 @@ case "$cmd" in
     if [ "${1:-}" = "--remove-install" ]; then rm -rf "$ROOT"; fi
     echo "stopped"
     ;;
-  *) echo "usage: backend.sh prepare|start|token|psql|log|stop" >&2; exit 2 ;;
+  datadir) echo "$DATA" ;;
+  *) echo "usage: backend.sh prepare|start|datadir|token|psql|log|stop" >&2; exit 2 ;;
 esac
