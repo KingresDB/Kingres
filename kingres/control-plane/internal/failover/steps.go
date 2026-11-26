@@ -1509,6 +1509,10 @@ func (r *Runner) catalogFollows(ctx context.Context, env *task.Env, sc *stepCtx)
 // asks the operator when it persists. An old primary that was not reached and still
 // runs here is stopped now (the fence of last resort).
 func (r *Runner) checkCatalog(ctx context.Context, env *task.Env, sc *stepCtx) error {
+	return sc.clearBlockedWhenDone(ctx, r.checkCatalogRun(ctx, env, sc))
+}
+
+func (r *Runner) checkCatalogRun(ctx context.Context, env *task.Env, sc *stepCtx) error {
 	run, err := sc.runRow(ctx)
 	if err != nil {
 		return err
@@ -1601,6 +1605,10 @@ func catalogMatches(nodes []Node, newID, oldID int32, term, termBefore int64) (b
 // F8 to F13
 
 func (r *Runner) repoint(ctx context.Context, env *task.Env, sc *stepCtx) error {
+	return sc.clearBlockedWhenDone(ctx, r.repointRun(ctx, env, sc))
+}
+
+func (r *Runner) repointRun(ctx context.Context, env *task.Env, sc *stepCtx) error {
 	run, err := sc.runRow(ctx)
 	if err != nil {
 		return err
@@ -1654,6 +1662,10 @@ func (r *Runner) repoint(ctx context.Context, env *task.Env, sc *stepCtx) error 
 }
 
 func (r *Runner) records(ctx context.Context, env *task.Env, sc *stepCtx) error {
+	return sc.clearBlockedWhenDone(ctx, r.recordsRun(ctx, env, sc))
+}
+
+func (r *Runner) recordsRun(ctx context.Context, env *task.Env, sc *stepCtx) error {
 	nw, gr, err := sc.pinnedStandby(ctx)
 	if err != nil {
 		return err

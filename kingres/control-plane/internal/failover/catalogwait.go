@@ -107,3 +107,13 @@ func (sc *stepCtx) readPause(ctx context.Context, what string, err error) error 
 	return &PauseError{Reason: fmt.Sprintf("The step %q of shard group %d cannot read %s (%v). The group was promoted and holds the lease; repair what the message names, then repeat the request.",
 		sc.key, sc.group, what, err)}
 }
+
+// clearBlockedWhenDone ends the alert failoverBlocked of the group when a step after the promotion ends well: the step may have paused before for a catalog that
+// could not be read (readPause) or that did not show the promotion, and the repeated request that ran it again is what ends the block. The alert is the one that the
+// end of "Make the catalog follow" ends too.
+func (sc *stepCtx) clearBlockedWhenDone(ctx context.Context, err error) error {
+	if err == nil {
+		sc.r.Plan.Alert(ctx, "failoverBlocked", "critical", subjectOf(sc.group, sc.old()), "", false)
+	}
+	return err
+}

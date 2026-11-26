@@ -61,6 +61,8 @@ type world struct {
 	readCalls      int
 	stepReads      int
 	curStep        string
+	alertOn        map[string]bool // kind|subject of the alerts that are raised now
+	stepRuns       map[string]int  // how many times each step ran
 	catCalls       int
 	catalogFollows bool
 	primaryNames   []int64
@@ -598,9 +600,13 @@ func (p fplan) SyncNamesOf(context.Context, string, int32) (string, int, bool) {
 func (p fplan) Alert(_ context.Context, kind, sev, subject, msg string, raise bool) {
 	p.w.mu.Lock()
 	defer p.w.mu.Unlock()
+	if p.w.alertOn == nil {
+		p.w.alertOn = map[string]bool{}
+	}
 	if raise {
 		p.w.alerts = append(p.w.alerts, kind)
 	}
+	p.w.alertOn[kind+"|"+subject] = raise
 }
 func (p fplan) Audit(_ context.Context, action string, g int32, d map[string]any) {
 	p.w.rec("audit %s", action)
@@ -761,6 +767,10 @@ func (w *world) runner() *Runner {
 			if name, ok := strings.CutSuffix(point, ":before"); ok {
 				w.mu.Lock()
 				w.curStep, w.stepReads = name, 0
+				if w.stepRuns == nil {
+					w.stepRuns = map[string]int{}
+				}
+				w.stepRuns[name]++
 				w.mu.Unlock()
 			}
 		},
