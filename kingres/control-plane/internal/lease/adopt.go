@@ -71,6 +71,7 @@ func (m *Manager) Adopt(group int32, kind string) error {
 	// the role files still name primary for the group from being started by this server, which now holds the lease of
 	// the group as the fence holder or as the holder-to-be. Only Attach (the instance of this adoption is the primary)
 	// and Unrelinquish (a cancelled hand-over) remove it.
+	wasRelinquished := m.relinq[group]
 	delete(m.relinq, group)
 	if cur := m.adopted[group]; cur != nil {
 		if cur.attached {
@@ -80,7 +81,13 @@ func (m *Manager) Adopt(group int32, kind string) error {
 		return nil
 	}
 	m.adopted[group] = &adoption{kind: kind}
-	delete(m.groups, group) // a new adoption is judged from its own first round
+	// A new adoption is judged from its own first round, not from the rounds of a lease that was given up. A group the catalog names to this server
+	// loses its adoption at every renewal pass (the renewal goes on by the catalog), so a step that asks again every second makes a new adoption each
+	// time: the state is wiped only when the group was given up (it is renewed again from this call on), or the rounds that the pass just ran would be
+	// wiped by the next ask, the status read after it would never see a held lease and the wait would end with the lease held by nobody.
+	if wasRelinquished || !m.namedByCatalogLocked(group) {
+		delete(m.groups, group)
+	}
 	return nil
 }
 
@@ -555,4 +562,18 @@ func (m *Manager) Candidate(group int32) string {
 // ForgetCandidate removes the record.
 func (m *Manager) ForgetCandidate(group int32) {
 	_ = os.Remove(MarkerPath(m.c.Dir, CandidateMarker, group))
+}
+
+// namedByCatalogLocked says that the catalog's topology lists the group as one this server runs the primary of: it is renewed from the topology,
+// and an adoption of it is dropped at the next renewal pass.
+func (m *Manager) namedByCatalogLocked(group int32) bool {
+	if !m.haveT {
+		return false
+	}
+	for _, g := range m.topo.Groups {
+		if g == group {
+			return true
+		}
+	}
+	return false
 }

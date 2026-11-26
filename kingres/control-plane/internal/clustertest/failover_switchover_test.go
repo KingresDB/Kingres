@@ -643,7 +643,7 @@ func leaseLines(log string) string {
 			continue
 		}
 		low := strings.ToLower(l)
-		if !(strings.Contains(low, "lease") || strings.Contains(low, "fenc") || strings.Contains(low, "watchdog") || strings.Contains(low, "stopp")) || strings.Contains(l, "internal call failed") {
+		if !(strings.Contains(low, "lease") || strings.Contains(low, "fenc") || strings.Contains(low, "watchdog") || strings.Contains(low, "stopp") || strings.Contains(low, "failover:") || strings.Contains(low, "rollback")) || strings.Contains(l, "internal call failed") {
 			continue
 		}
 		if len(l) > 320 {
