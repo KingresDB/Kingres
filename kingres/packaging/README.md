@@ -733,7 +733,8 @@ dead weight in the package without it. What it costs every backend, from reading
   the size of the shared segment, to `max_worker_processes` or to the start time beyond
   loading one library. The postmaster loads it once; backends inherit it.
 - **One resource manager id (255, `KingresColumnar`)**, registered at start. The id is
-  registered on the PostgreSQL wiki list of custom resource managers and is part of the
+  registered on the PostgreSQL wiki list of custom resource managers
+  (<https://wiki.postgresql.org/wiki/CustomWALResourceManagers>) and is part of the
   WAL format; it never changes.
 - **Hooks in every backend**: `object_access_hook` (every drop of a relation costs one
   `pg_class` syscache lookup and a test of its access method); `ProcessUtility_hook` (looks

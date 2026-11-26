@@ -777,8 +777,9 @@ with the transaction, as for any uncommitted change.
 ### 7.3 WAL and crash safety
 
 **Resource manager** `KingresColumnar`, id 255, registered on the
-PostgreSQL wiki list of custom resource managers (the id is part of the WAL format
-and never changes). Records:
+PostgreSQL wiki list of custom resource managers
+(<https://wiki.postgresql.org/wiki/CustomWALResourceManagers>; the id is part of the
+WAL format and never changes). Records:
 
 | Record | Content | Redo |
 |---|---|---|

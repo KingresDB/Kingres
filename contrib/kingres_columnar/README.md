@@ -65,7 +65,8 @@ columnar`, `INSERT`, `COPY`, `TRUNCATE`, a rewrite into columnar, and
 `columnar_compact`. A server that has ever written columnar WAL needs the
 library for as long as that WAL exists (crash recovery, archive recovery,
 base backups, `pg_rewind`). Resource manager id: 255, registered as
-`KingresColumnar` on the PostgreSQL wiki list of custom resource managers. The id
+`KingresColumnar` on the PostgreSQL wiki list of custom resource managers
+(<https://wiki.postgresql.org/wiki/CustomWALResourceManagers>). The id
 is part of the WAL format and never changes.
 
 ## Use

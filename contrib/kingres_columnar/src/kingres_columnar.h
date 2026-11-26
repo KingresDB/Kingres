@@ -35,8 +35,9 @@
 
 /*
  * The resource manager id: 255, registered for "KingresColumnar" on the
- * PostgreSQL wiki list of custom resource managers.  It is part of the WAL
- * format and never changes (README, "Resource manager id").
+ * PostgreSQL wiki list of custom resource managers,
+ * https://wiki.postgresql.org/wiki/CustomWALResourceManagers.  It is part of
+ * the WAL format and never changes (README, "Installing").
  */
 #define KC_RMGR_ID			255
 #define KC_EXTENSION_NAME	"kingres_columnar"
