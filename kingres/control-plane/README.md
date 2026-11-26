@@ -2266,7 +2266,7 @@ is paused the watchdog does its job. A step of the system clock does not matter 
    checkpoint, a backend that does not end, a walsender that must send its WAL), and the watchdog, which outlives
    kingresd, then stopped the instance with an immediate shutdown in the middle of the clean stop (measured by
    `TestOrderlyStopOutlastingTheLeaseIsNotFencedByTheWatchdog`: a stopped backend keeps the shutdown waiting for 12 s with
-   a lease of 6 s; the watchdog fenced after about 4 s). `-stop-instances` therefore asks the primary instance for the fast
+   a lease of 6 s; the watchdog fenced after about 4 s). `-stop-instances` therefore asks every instance of the node, the primaries first, for the fast
    shutdown without waiting (`pg_ctl stop -m fast -W`), and **after** PostgreSQL has accepted the request writes
    `<data-dir>/lease/standdown` with the process id and start time of that postmaster (lines 1 and 3 of `postmaster.pid`),
    and only then waits. From the request on PostgreSQL admits no new session and ends the existing ones, so no write can
@@ -2392,7 +2392,7 @@ Multi-server, in WSL (`internal/clustertest/standby_test.go`): `TestStandbysAreC
    only the streaming ones, so that a standby that falls behind stays a candidate of the quorum.
 6. A one-server cluster raises no `groupUnderReplicated` (it is the development arrangement). With two servers or more it does,
    also when fewer standbys can be placed than the count asks for; the message says so.
-7. Standby instances are not stopped by a stop of kingresd (like the primary instance); `-stop-instances` stops them first.
+7. Standby instances are not stopped by a stop of kingresd (like the primary instance); `-stop-instances` asks every instance for its fast shutdown at once, the primaries first, and then waits for each.
 8. kingresd reaches a standby by peer authentication on its private unix socket, never by a password.
 
 **Limits**: a cluster created before this version has no replication lines in `pg_hba.conf` until its trust rules are written
@@ -2818,7 +2818,7 @@ never had a failover every answer is what it was (instance 1), which is what the
   by the copy of the rules (`SyncAccess` from `AccessSourceID`); reads (`CollectRoles`, `CollectGlobals`, the sign-in verifier, the
   proxy's role connections) go to `ConnectID` (the map primary if local, else the first primary). The start, stop and restart operations
   of "this server's instance" act on every primary the server runs (standbys stay the agent's business, as before); the orderly stop
-  of the service stops every standby first, then every primary, and the watchdog of each is told to stand down.
+  of the service asks every instance for its fast shutdown at once, the primaries first (an earlier version stopped every standby first and waited for each; a slow standby then delayed the request for the primary until the lease ran out), writes the stand-down of the watchdog of each primary after PostgreSQL accepted the request, and only then waits for each; the stop of the service is `Service.StopInstanceForShutdown`.
 - Decisions: the managed settings of an instance other than the home one keep their own port and recovery settings (only the
   certificate paths are rewritten); `cluster.NodeID` stays the name of the home instance; a server whose home instance is a standby and that
   runs no primary uses the home instance for what it must read.

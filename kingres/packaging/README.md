@@ -252,6 +252,19 @@ data directory of one major does not start under the other.
   a new container on the same volume bring the same database back without crash
   recovery (tested). `docker kill` or a host crash is a crash like any other:
   PostgreSQL recovers from its WAL at the next start.
+- **A stop cut short by the lease fence.** An orderly stop asks every instance
+  for its fast shutdown at once and tells the lease watchdog of each primary to
+  stand down, so the stop does not depend on the lease. If a stop is not orderly
+  (the container is killed after the stop timeout, `kingresd` hung or was killed,
+  the node lost its network for longer than the lease), the watchdog stops the
+  primary with an immediate shutdown when its lease has run out. The logs then
+  show `received immediate shutdown request` in the PostgreSQL log and
+  `kingres-watchdog: the lease has run out, stopping the instance` on the
+  standard error of the watchdog (the container log, or the journal of the
+  service). This is safe: no acknowledged commit is lost, and the next start
+  costs one crash recovery from the WAL (`database system was not properly shut
+  down; automatic recovery in progress`). A primary whose group has a ready
+  standby then waits for its lease before it serves.
 - Health check: `GET /api/v1/readyz` (HTTP 200; an uninitialized node is ready).
 - Runs with `--read-only --tmpfs /tmp --cap-drop ALL --security-opt
   no-new-privileges` (the tests do). Sockets are in the volume, never in `/tmp`.
