@@ -70,6 +70,53 @@ fail() { printf 'FAIL  %s\n' "$1"; failed=$((failed + 1)); }
 # new extension has to be added here on purpose.
 KINGRES_EXTENSIONS="kingres_columnar kingres_ledger kingres_shard kingres_sketch kingres_timepart"
 
+# The source tree this test belongs to (kingres/packaging/test is three levels
+# below its root); the extensions are in contrib/.  KINGRES_SRC overrides it.
+KINGRES_SRC="${KINGRES_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
+
+# source_extension_version EXT: default_version of contrib/EXT/EXT.control.
+source_extension_version() {
+    sed -n "s/^default_version[[:space:]]*=[[:space:]]*'\\([^']*\\)'.*/\\1/p" "${KINGRES_SRC}/contrib/$1/$1.control"
+}
+
+# source_extension_versions: "kingres_columnar 0.2, kingres_ledger 0.3, ..." in
+# the order of KINGRES_EXTENSIONS, the way BUILD-INFO lists them.
+source_extension_versions() {
+    local e out=""
+    for e in ${KINGRES_EXTENSIONS}; do
+        out="${out:+${out}, }${e} $(source_extension_version "${e}")"
+    done
+    printf '%s\n' "${out}"
+}
+
+# source_extension_versions_plain: "kingres_columnar 0.2 kingres_ledger 0.3 ..."
+# (the form of the pg_extension catalog check, in the same order).
+source_extension_versions_plain() {
+    source_extension_versions | sed 's/,//g'
+}
+
+# source_extension_scripts: the name (without .sql) of every install and update
+# script in the contrib directory of every extension.
+source_extension_scripts() {
+    local e f
+    for e in ${KINGRES_EXTENSIONS}; do
+        for f in "${KINGRES_SRC}/contrib/${e}/${e}"--*.sql; do
+            basename "${f}" .sql
+        done
+    done
+}
+
+# source_update_steps EXT: "FROM TO" of every update script of EXT.
+source_update_steps() {
+    local f b
+    for f in "${KINGRES_SRC}/contrib/$1/$1"--*--*.sql; do
+        [ -e "${f}" ] || continue
+        b="$(basename "${f}" .sql)"
+        b="${b#"$1"--}"
+        printf '%s %s\n' "${b%%--*}" "${b##*--}"
+    done | sort -V
+}
+
 # check_extension_files PREFIX COMMAND...: every extension is installed in the
 # tree under /opt/kingres that COMMAND... looks into (for example: docker exec NAME).
 check_extension_files() {
@@ -86,8 +133,7 @@ check_extension_files() {
     check_eq "${p}: BUILD-INFO lists the extensions" "${KINGRES_EXTENSIONS}" \
         "$("$@" sed -n 's/^kingres extensions: //p' /opt/kingres/share/BUILD-INFO 2>/dev/null)"
     # The versions: BUILD-INFO says what each control file says, and the
-    # install script of that version and every update script an earlier package
-    # needed (0.6 of kingres_shard, 0.1 of kingres_timepart and kingres_columnar)
+    # install script of that version and every update script of the source tree
     # are in the tree.
     local want=""
     for e in ${KINGRES_EXTENSIONS}; do
@@ -95,11 +141,14 @@ check_extension_files() {
     done
     check_eq "${p}: BUILD-INFO lists the version of every extension, as its control file says" "${want}" \
         "$("$@" sed -n 's/^kingres extension versions: //p' /opt/kingres/share/BUILD-INFO 2>/dev/null)"
-    check_eq "${p}: the versions of this release (shard 0.8, ledger 0.3, sketch 1.0, timepart 0.2, columnar 0.2)" \
-        "kingres_columnar 0.2, kingres_ledger 0.3, kingres_shard 0.8, kingres_sketch 1.0, kingres_timepart 0.2" "${want}"
-    for e in kingres_shard--0.6--0.7 kingres_shard--0.7--0.8 kingres_shard--0.6 kingres_shard--0.7 kingres_shard--0.8 kingres_timepart--0.1--0.2 kingres_timepart--0.1 \
-        kingres_columnar--0.1--0.2 kingres_columnar--0.1 kingres_ledger--0.2--0.3; do
-        check "${p}: ${e}.sql is installed" "$@" test -f "${share}/${e}.sql"
+    # The versions of this release are the ones of the control files of the
+    # source tree the package was built from, so this test does not go stale
+    # with a version bump; every install and update script of the source tree
+    # must be in the package.
+    check_eq "${p}: the versions of this release are the ones of the source tree" "$(source_extension_versions)" "${want}"
+    local f
+    for f in $(source_extension_scripts); do
+        check "${p}: ${f}.sql is installed" "$@" test -f "${share}/${f}.sql"
     done
     check_postgres_modules "${p}" "$@"
 }
