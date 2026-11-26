@@ -3620,6 +3620,16 @@ What it does not give:
 
 ### What the control plane calls
 
+The control plane (`kingresd`) runs these sequences itself: the tasks `server.failover` (manual and automatic
+failover, switchover, hard and graceful failover of the map group) and `replication.restorePreferredPrimaries`
+fence the old primary (stop it, wait for its lease), choose the standby, promote it, make the catalog follow,
+re-point the other standbys and resolve prepared transactions, with the calls below; it rebuilds the old primary
+as a standby when it comes back. How an operator uses this is in section 6 "Failover and switchover" of the
+operator guide ([../../kingres/docs/guide/operator-guide.md](../../kingres/docs/guide/operator-guide.md)). This
+section is the contract of the calls themselves: what each one answers and what it leaves behind. It is for a
+person who runs a sequence by hand or who writes another controller. The extension does no fencing and holds no
+lease of its own.
+
 Everything below is a single SQL call on a named node, and every call is safe to repeat.
 Where a sequence says "answers", the list is complete for what a test has produced: a call can
 end in one of those ways and in no other except a connection that breaks or a timeout of the
@@ -3682,7 +3692,7 @@ the control plane (fix a list, wait for PostgreSQL, stop and ask a human, run re
 refusals that all say "this is the wrong node" ask the same (call another node), so they share
 `KS010`. `KS007` and `55P03` are told apart because the first must never be repeated against the
 same node and the second may be, once the lock is gone. The remaining `55000` answers are errors of
-the input, which a human reads. The `KS003` slot is not used; `KS022` is the last code of the series that is in use (`KS0C1` is outside the numbered series: it is a deliberate non-`57014` code); the next free code is `KS023`.
+the input, which a human reads. `KS003` is raised only inside the SQL loop of a bucket move that was cancelled ("bucket move N was cancelled", after `cancel_bucket_move`), which catches it and ends the move as cancelled, so no caller sees it and it has no row above; `KS022` is the last code of the series that is in use (`KS0C1` is outside the numbered series: it is a deliberate non-`57014` code); the next free code is `KS023`.
 
 Since 0.9 the control plane (`kingresd`) decides on these refusals by SQLSTATE and never by the wording: `KS017` to `KS022` were given to the refusals that it used to recognise by text, and `0A000` (`feature_not_supported`) and `42710` (`duplicate_object`), which the distributed-schema and bucket-split functions raise for an unsupported object, a table without a primary key and a schema that is distributed already, are the codes it reads for those. The control plane keeps a fallback on the old text only where the released extension 0.8 can answer, and says so in a comment.
 
@@ -3840,7 +3850,8 @@ transactions and the nodes, and repeats each call). Per phase:
    `-m immediate` when it hangs), or power it off, or cut every client off at the
    network. (For a **planned switchover** the stop must be a clean one: `-m immediate` is a
    failover, not a switchover, because nothing then proves that NEW has what OLD wrote; sequence 5.)
-   The extension does not fence. `promote_node` tells OLD about the new
+   The extension does not fence (`kingresd` does: its steps "Stop the old primary" and "Wait for the old lease"
+   come before "Promote the standby"; operator guide, section 6). `promote_node` tells OLD about the new
    catalog when it can reach it, and from then on OLD routes the statements of
    distributed tables to NEW and refuses forwarded ones; that is a courtesy, not a
    fence: OLD still accepts writes of ordinary (not distributed) tables, and a client
@@ -3893,8 +3904,7 @@ transactions and the nodes, and repeats each call). Per phase:
    `move_bucket`) run one at a time on the map group primary. A second caller waits for the first
    for at most `node_timeout` and then gets `KS008` having changed nothing (`t/086`); two
    controllers that call at once therefore do no damage, but the one that is refused must not read
-   the refusal as "the cluster is broken": it repeats later. Run one controller, or give them a
-   lease.
+   the refusal as "the cluster is broken": it repeats later. Run one controller at a time.
 
 #### Postconditions (every sequence ends with these)
 
