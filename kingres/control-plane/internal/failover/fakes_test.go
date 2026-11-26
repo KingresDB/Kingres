@@ -97,6 +97,7 @@ type world struct {
 	markTerms          []int64
 	stopTerms          []int64
 	stopCandidates     []string // the Candidate of every clean stop request
+	stopProofOnly      []bool   // ProofOnly of every clean stop request, in the order they were made
 	promoteRefuse      error    // the answer of a promote call that carries a proof (the callee refuses it)
 	verifyAnswers      []bool   // the answers of the proof, in order (the last one repeats)
 	verifyErr          error
@@ -296,6 +297,7 @@ func (p fpeers) Demote(_ context.Context, server string, r DemoteRequest) (Demot
 		p.w.mu.Lock()
 		p.w.stopTerms = append(p.w.stopTerms, r.ExpectedTerm)
 		p.w.stopCandidates = append(p.w.stopCandidates, r.Candidate)
+		p.w.stopProofOnly = append(p.w.stopProofOnly, r.ProofOnly)
 		p.w.mu.Unlock()
 		if p.w.stopErr != nil {
 			return DemoteAnswer{}, p.w.stopErr

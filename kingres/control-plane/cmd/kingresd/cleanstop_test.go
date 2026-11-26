@@ -87,3 +87,24 @@ func TestTheCheckpointIsGivenOnlyForAHeldBackStoppedPrimary(t *testing.T) {
 	_, err = mapCheckpoint(ctx, &fakeStopper{running: false, cdErr: errors.New("no pg_controldata")}, 1, true, true)
 	callErr(t, err, 503, "unavailable")
 }
+
+// The proof of a stop that was made is read without a stop and without any call on the lease: it is asked for again after the lease step (a resumed or
+// replayed task), when this server holds the lease again as the fence holder and a release would give it away.
+func TestTheProofOfAStopTouchesNoLeaseAndStopsNothing(t *testing.T) {
+	ctx := context.Background()
+	st := &fakeStopper{running: false, state: "shut down"}
+	ans, err := stopProof(ctx, st, nil, 1)
+	if a, ok := ans.(failover.DemoteAnswer); err != nil || !ok || !a.Stopped || a.ClusterState != "shut down" || a.Checkpoint != "0/6000028" || a.Released {
+		t.Fatalf("the proof of a stopped instance: %v %+v", err, ans)
+	}
+	// An instance that runs is not stopped by a request for the proof: the answer says it is not stopped.
+	run := &fakeStopper{running: true, state: "shut down"}
+	ans, err = stopProof(ctx, run, nil, 1)
+	if a, ok := ans.(failover.DemoteAnswer); err != nil || !ok || a.Stopped || !run.running {
+		t.Fatalf("the proof of an instance that runs: %v %+v running=%v", err, ans, run.running)
+	}
+	// The control data that cannot be read is an error, not a proof.
+	if _, err = stopProof(ctx, &fakeStopper{running: false, cdErr: errors.New("no pg_controldata")}, nil, 1); err == nil {
+		t.Fatal("an unreadable control data was answered as a proof")
+	}
+}

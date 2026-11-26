@@ -433,8 +433,9 @@ func (r *Runner) verify(ctx context.Context, env *task.Env, sc *stepCtx) error {
 	} else if handed {
 		return task.Skip("the map group was handed over already")
 	}
-	// Read the shutdown checkpoint again (the stop is idempotent): it is what the proof is made of.
-	ans, err := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "fast", ExpectedTerm: run.ExpectedTerm, Candidate: sc.candidateOf(nw)})
+	// Read the shutdown checkpoint again: it is what the proof is made of. Only the proof is asked for: the lease was released by the stop, and a release
+	// now (after a replay that follows the lease step) would give away the lease that this task has seen held.
+	ans, err := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "fast", ExpectedTerm: run.ExpectedTerm, Candidate: sc.candidateOf(nw), ProofOnly: true})
 	if err != nil || !ans.Stopped || ans.ClusterState != "shut down" || ans.Checkpoint == "" {
 		return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the shutdown checkpoint of the old primary of shard group %d cannot be read (%v)", sc.group, err)
 	}

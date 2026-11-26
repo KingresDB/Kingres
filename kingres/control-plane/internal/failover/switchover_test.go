@@ -1233,3 +1233,21 @@ func TestTheLeaseStaysExtendedWhileTheRollbackOfAFailedStopRuns(t *testing.T) {
 		t.Errorf("the task lease has %v left while the rollback runs, want it still extended", left)
 	}
 }
+
+// The clean stop that makes the proof again (the Verify step, and the Promote step that follows the Lease step) asks only for the proof: a release then would
+// give away the lease of the fence holder or of the candidate, and the warning "0 of 2 grantors released" that it caused was this release being refused.
+// Only the first request, the stop, releases.
+func TestTheVerifyAndPromoteStepsAskOnlyForTheProofOfTheStop(t *testing.T) {
+	w := gracefulWorld()
+	r := w.runner()
+	w.fakeClock(r)
+	if name, err := runAll(t, r, gracefulInput()); err != nil {
+		t.Fatalf("%s: %v\n%s", name, err, strings.Join(w.log, "\n"))
+	}
+	w.mu.Lock()
+	got := append([]bool(nil), w.stopProofOnly...)
+	w.mu.Unlock()
+	if len(got) != 3 || got[0] || !got[1] || !got[2] {
+		t.Fatalf("the clean stop requests (ProofOnly) are %v, want [false true true]: the stop releases, the proofs only read", got)
+	}
+}

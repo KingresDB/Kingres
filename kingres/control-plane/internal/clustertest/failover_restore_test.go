@@ -23,6 +23,13 @@ func TestSwitchoverAndBack(t *testing.T) {
 	e := swCluster(t)
 	c, port, pool, leader, g, old, nw, w := e.c, e.port, e.pool, e.leader, e.g, e.old, e.nw, e.w
 	var plan map[string]any
+	// The warnings about the lease of every server are logged on every end of the test (the release of the repeated stop that answers refused is one of them),
+	// so that a run that passes shows them as well.
+	defer func() {
+		for _, n := range c.Nodes {
+			t.Logf("lease warnings of %s: %s", n.Host, leaseLines(n.LogTail(8000000)))
+		}
+	}()
 	defer func() {
 		if t.Failed() {
 			t.Logf("the last plan: %v", plan)

@@ -1227,7 +1227,8 @@ func (r *Runner) promote(ctx context.Context, env *task.Env, sc *stepCtx) error 
 	if sc.in.graceful() {
 		if st, serr := r.Peers.State(ctx, nw.Server, sc.group); !(serr == nil && len(st.OutOfRecovery()) > 0) {
 			// Not promoted yet: the proof is made again in the call (F4-07). The shutdown checkpoint is read again from the stopped old primary.
-			ans, derr := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "fast", ExpectedTerm: run.ExpectedTerm})
+			// Only the proof is asked for: the lease was released by the stop and is the fence holder's or the candidate's now, and a release here would give it away.
+			ans, derr := r.Peers.Demote(ctx, sc.old(), DemoteRequest{Group: sc.group, Mode: "fast", ExpectedTerm: run.ExpectedTerm, ProofOnly: true})
 			if derr != nil || !ans.Stopped || ans.ClusterState != "shut down" || ans.Checkpoint == "" {
 				return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the shutdown checkpoint of the old primary of shard group %d cannot be read before the promotion (%v)", sc.group, derr)
 			}
