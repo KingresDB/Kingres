@@ -46,7 +46,7 @@ The commands below are the standard ones for each tool. There is no CI: GitHub A
 Every extension must pass its regression and TAP suites on every supported major, 18 and 19 (ADR 0023).  The extension scripts build and test out of tree with PGXS against an installed server, so a second major is a second installation; the server itself is not rebuilt for an extension change.
 
 1. **A PostgreSQL 18 installation** is the one `kingres/dev/build.sh` makes (`$KINGRES_WORK/install`).
-2. **A PostgreSQL 19 installation** is the one `kingres/dev/build.sh` makes from a checkout of `kingres-19`, which is on `REL_19_0` since 2026-11-22. Before `kingres-19` existed it was built from an upstream tag in a scratch tree (see [upstream-sync.md](upstream-sync.md), "A new major version"); the steps, first run on `REL_19_RC2` and valid for `REL_19_0`, with `$W` as the work directory:
+2. **A PostgreSQL 19 installation** is the one `kingres/dev/build.sh` makes from a checkout of `kingres-19`, which is on `REL_19_0` since 2026-11-22. Before `kingres-19` existed it was built from an upstream tag in a scratch tree (see [upstream-sync.md](upstream-sync.md), "A new major version"); the steps for `REL_19_0`, with `$W` as the work directory:
 
    ```sh
    git clone --depth 1 --branch REL_19_0 https://github.com/postgres/postgres.git $W/src

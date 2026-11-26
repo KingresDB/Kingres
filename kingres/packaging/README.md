@@ -716,7 +716,7 @@ Verified by the tests against the commit built:
 
 ## The preload of `kingres_columnar`
 
-**What the product does now (phase 12, control plane).** `kingresd` writes
+**What the product does.** `kingresd` writes
 `shared_preload_libraries = 'kingres_shard,kingres_ledger,kingres_columnar,pg_stat_statements'` for every instance
 (`instance.PreloadLibraries`; `EnsureConfig` brings an older `kingres-managed.conf` up to date at the start of
 `kingresd` and reloads a running instance, and the list takes effect at a restart). An optional library (`kingres_columnar`, `pg_stat_statements`) is left out when
@@ -766,27 +766,18 @@ dead weight in the package without it. What it costs every backend, from reading
   to start or to replay. So the preload is a property of the whole cluster, and it must
   never be taken away from an instance that holds columnar data.
 
-**Done (phase 12 control plane):** `RenderManaged` has the new list (`instance.PreloadLibraries`), `EnsureConfig` re-renders
-`kingres-managed.conf` when its list differs, the tests and `managed.go` follow, and the flow test of this directory expects the new list. The paragraph below is the analysis that led to it, in the wording of its time (the list then had three libraries; `pg_stat_statements` was added later).
+**Preload behaviour.** `kingresd` writes `shared_preload_libraries` as `kingres_shard`, `kingres_ledger`,
+`kingres_columnar` and `pg_stat_statements` (in this order; `kingres_shard` stays first) for every instance it makes.
+The last two are left out when the installation has no library file for them. `kingres_columnar` is kept in the list
+of an instance that has had it, even when the file is missing, because the instance may hold columnar WAL that it can
+replay only with the library. `EnsureConfig` re-renders `kingres-managed.conf` at the start of `kingresd` when its list
+differs from the one rendered now, so an instance made by an earlier package gets the new list at its next restart.
 
-**Upgrade of an existing cluster.** `kingres-managed.conf` is written when an instance is
-created and rewritten only by `WriteManaged` (a settings change); `EnsureConfig` at the start
-of `kingresd` rewrites it only when the include of the override file is missing. A package or
-image upgrade therefore leaves an old instance with `kingres_shard,kingres_ledger` unless
-`kingresd` is changed to bring the preload line up to date at start. The exact change is
-listed in the report of the round that wrote this section: `RenderManaged` gets the new list
-(`kingres_shard,kingres_ledger,kingres_columnar`; the order keeps `kingres_shard` first),
-`EnsureConfig` also re-renders when the rendered `shared_preload_libraries` differs from the
-file, the tests that name the old value (`manager_test.go`, `render_test.go`) and the
-description in `managed.go` change, and **the flow test of this directory then expects the new
-list** (`flow_check_extensions` already branches on the list it finds: with the library
-preloaded it tests the conversion in both directions and a B-tree index on a columnar table,
-without it the refusals above). The new list takes effect at the restart that an upgrade does
-anyway. On a rolling upgrade of a cluster with standbys, upgrade the standbys first: a primary
-that has begun to write columnar WAL under the new list would otherwise be ahead of a standby
-that cannot replay it. The working path (preload on, conversion
-both ways, indexed columnar table) is tested in the throw-away server of `pg-smoke.sh`, on
-both majors, with the files of the package.
+**Upgrade of an existing cluster.** The new list takes effect at the restart that a package or image upgrade does
+anyway. On a rolling upgrade of a cluster with standbys, upgrade the standbys first: a primary that has begun to write
+columnar WAL under the new list would otherwise be ahead of a standby that cannot replay it. The working path (preload
+on, conversion both ways, indexed columnar table) is tested in the throw-away server of `pg-smoke.sh`, on both majors,
+with the files of the package, and the flow test of this directory expects the new list.
 
 ## What is not included
 
