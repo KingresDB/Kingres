@@ -302,6 +302,9 @@ type DemoteAnswer struct {
 	// Checkpoint is "Latest checkpoint location" of pg_controldata, read after a clean stop; Released says that the lease was released.
 	Checkpoint string `json:"checkpoint,omitempty"`
 	Released   bool   `json:"released,omitempty"`
+	// ProofOnly echoes the request: a callee of an older version does not know the flag, ignores it and stops and releases as before, and the caller then sees
+	// that its request for the proof alone was not honoured.
+	ProofOnly bool `json:"proofOnly,omitempty"`
 }
 
 // The calls of the planned switchover (design 5.2). The same group number, task and epoch rules as the other calls apply.

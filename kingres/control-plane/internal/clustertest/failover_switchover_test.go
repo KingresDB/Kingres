@@ -62,6 +62,7 @@ func TestSwitchoverOfAGroup(t *testing.T) {
 	c, port, pool, leader, g, old, nw, w := e.c, e.port, e.pool, e.leader, e.g, e.old, e.nw, e.w
 	id := swRequest(t, leader, old, nw, g)
 	swWait(t, e, id, 8*time.Minute)
+	noStaleUnquiesce(t, c)
 	if host := swPrimaryHost(t, leader, g); host != nw.Host {
 		t.Fatalf("the primary of group %d is on %s, want %s", g, host, nw.Host)
 	}
@@ -704,6 +705,20 @@ func TestSwitchoverEndsWhenTheOldServerForgotTheLeader(t *testing.T) {
 			if !have[rid] {
 				t.Errorf("acknowledged row %d is missing when read through %s", rid, n.Host)
 				break
+			}
+		}
+	}
+}
+
+// The access rules of the old primary were put back with the term of the promotion: no server refused the call as stale (it would then keep its hold and
+// its flag that the group is quiesced, and the entry point would not route to the group if it came back to that server). The warning is logged by the
+// server that runs the task.
+func noStaleUnquiesce(t *testing.T, c *clustertest.Cluster) {
+	t.Helper()
+	for _, n := range c.Nodes {
+		for _, l := range strings.Split(n.LogTail(8000000), "\n") {
+			if strings.Contains(l, "failover: putting the access rules back") {
+				t.Errorf("the unquiesce of an old primary was refused after the promotion (log of %s): %s", n.Host, l)
 			}
 		}
 	}

@@ -1232,6 +1232,7 @@ func (r *Runner) promote(ctx context.Context, env *task.Env, sc *stepCtx) error 
 			if derr != nil || !ans.Stopped || ans.ClusterState != "shut down" || ans.Checkpoint == "" {
 				return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the shutdown checkpoint of the old primary of shard group %d cannot be read before the promotion (%v)", sc.group, derr)
 			}
+			sc.noteProofAnswer(ans)
 			req.Checkpoint, req.ClusterState = ans.Checkpoint, ans.ClusterState
 		}
 	}
@@ -1799,6 +1800,12 @@ func (r *Runner) unfreeze(ctx context.Context, env *task.Env, sc *stepCtx) error
 		term := int64(-1)
 		if run, rerr := sc.runRow(ctx); rerr == nil {
 			term = run.ExpectedTerm
+		}
+		// The promotion of this group raised the catalog term (promote_node), and the term of the run row is raised only by the groups that ran before: the
+		// call carries the term that the promotion made, or the old server (when it can read its catalog) refuses it as stale, keeps its hold and its flag that
+		// the group is quiesced. The calls of the later steps that carry a term (the repoint) are not judged by it.
+		if gr, found, gerr := sc.rows.Group(ctx, sc.group); gerr == nil && found && gr.TermAfter != nil && *gr.TermAfter > term {
+			term = *gr.TermAfter
 		}
 		if err := sc.oldUnquiesce(ctx, term); err != nil && !errors.Is(err, ErrUnreachable) && !IsCode(err, "no_instance") {
 			r.log().Warn("failover: putting the access rules back", "group", sc.group, "error", err)

@@ -439,6 +439,7 @@ func (r *Runner) verify(ctx context.Context, env *task.Env, sc *stepCtx) error {
 	if err != nil || !ans.Stopped || ans.ClusterState != "shut down" || ans.Checkpoint == "" {
 		return sc.rollbackFailed(ctx, CodeSwitchoverUnproven, true, "the shutdown checkpoint of the old primary of shard group %d cannot be read (%v)", sc.group, err)
 	}
+	sc.noteProofAnswer(ans)
 	deadline := r.now().Add(orDur(r.VerifyWait, 30*time.Second))
 	for {
 		v, verr := r.Peers.Verify(ctx, nw.Server, VerifyRequest{Group: sc.group, InstanceID: nw.InstanceID, Checkpoint: ans.Checkpoint, ClusterState: ans.ClusterState})
@@ -666,4 +667,12 @@ func (sc *stepCtx) candidateOf(nw StandbyRec) string {
 		return ""
 	}
 	return nw.Server
+}
+
+// noteProofAnswer warns when the server of the old primary answered a request for the proof alone with the answer of a full stop: it is of a version
+// that does not know the flag, so its repeated stop released the lease again (a rolling upgrade; the guide says no switchover is made during one).
+func (sc *stepCtx) noteProofAnswer(ans DemoteAnswer) {
+	if !ans.ProofOnly {
+		sc.r.log().Warn("failover: the server of the old primary did not honour the request for the proof alone (it is of an older version): its repeated stop may have released the lease", "group", sc.group, "server", sc.old())
+	}
 }

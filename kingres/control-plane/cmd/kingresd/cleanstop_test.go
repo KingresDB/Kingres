@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -106,5 +107,28 @@ func TestTheProofOfAStopTouchesNoLeaseAndStopsNothing(t *testing.T) {
 	// The control data that cannot be read is an error, not a proof.
 	if _, err = stopProof(ctx, &fakeStopper{running: false, cdErr: errors.New("no pg_controldata")}, nil, 1); err == nil {
 		t.Fatal("an unreadable control data was answered as a proof")
+	}
+}
+
+// The request of the repeated stop reaches the proof and not the stop: the flag is read from the body of the call under its name, and the dispatch of the
+// callee honours it. A request without the flag stops and releases as before.
+func TestAProofOnlyRequestReachesTheProofAndNotTheCleanStop(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var proof, full failover.DemoteRequest
+	if err := json.Unmarshal([]byte(`{"group":1,"mode":"fast","expectedTerm":3,"proofOnly":true}`), &proof); err != nil || !proof.ProofOnly {
+		t.Fatalf("the flag is not read from the body of the call: %v %+v", err, proof)
+	}
+	if err := json.Unmarshal([]byte(`{"group":1,"mode":"fast","expectedTerm":3}`), &full); err != nil || full.ProofOnly {
+		t.Fatalf("a request without the flag is a proof only: %v %+v", err, full)
+	}
+	lm := &fakeLeases{}
+	ans, err := demoteOf(context.Background(), &fakeStopper{running: false, state: "shut down"}, lm, nil, log, 1, proof)
+	if a, ok := ans.(failover.DemoteAnswer); err != nil || !ok || !a.Stopped || !a.ProofOnly || lm.holdBack+lm.relinquish+lm.release != 0 {
+		t.Fatalf("a proof only request touched the lease or was not answered as one: %v %+v holdBack %d relinquish %d release %d", err, ans, lm.holdBack, lm.relinquish, lm.release)
+	}
+	lm = &fakeLeases{}
+	ans, err = demoteOf(context.Background(), &fakeStopper{running: true, state: "shut down"}, lm, nil, log, 1, full)
+	if a, ok := ans.(failover.DemoteAnswer); err != nil || !ok || !a.Stopped || !a.Released || a.ProofOnly || lm.holdBack != 1 || lm.release != 1 {
+		t.Fatalf("a request without the flag did not stop and release: %v %+v holdBack %d release %d", err, ans, lm.holdBack, lm.release)
 	}
 }

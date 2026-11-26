@@ -65,6 +65,7 @@ func TestSwitchoverAndBack(t *testing.T) {
 	}
 	id := swRequest(t, leader, old, nw, g)
 	swWait(t, e, id, 8*time.Minute)
+	noStaleUnquiesce(t, c)
 	if host := swPrimaryHost(t, leader, g); host != nw.Host {
 		t.Fatalf("the primary of group %d is on %s, want %s", g, host, nw.Host)
 	}
@@ -132,6 +133,7 @@ func TestSwitchoverAndBack(t *testing.T) {
 		}
 	}()
 	swWait(t, e, rid, 8*time.Minute)
+	noStaleUnquiesce(t, c)
 	if host := swPrimaryHost(t, leader, g); host != old.Host {
 		t.Fatalf("after the restore the primary of group %d is on %s, want %s", g, host, old.Host)
 	}
