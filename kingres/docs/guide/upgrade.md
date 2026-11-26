@@ -31,7 +31,7 @@ A database keeps the SQL objects of the version it was created with. After the n
 | `kingres_shard` | 0.9 | 0.1 to 0.2 to 0.3 to 0.4 to 0.5 to 0.6 to 0.7 to 0.8 to 0.9, one `ALTER EXTENSION kingres_shard UPDATE` takes any of them to 0.9 | See the order below |
 | `kingres_ledger` | 0.3 | 0.1 to 0.2, 0.2 to 0.3, and 0.1 to 0.3 in one step | See the note below |
 | `kingres_columnar` | 0.2 | 0.1 to 0.2 | Update it before `kingres_timepart` converts an indexed partition |
-| `kingres_timepart` | 0.2 | 0.1 to 0.2 | Adds the conversion of old partitions to columnar storage |
+| `kingres_timepart` | 0.3 | 0.1 to 0.2, 0.2 to 0.3; one `ALTER EXTENSION kingres_timepart UPDATE` takes any of them to 0.3 | 0.2 adds the conversion of old partitions to columnar storage; 0.3 adds policies on user-partitioned distributed tables, which need `kingres_shard` 0.9 |
 | `kingres_sketch` | 1.0 | none (one version) | |
 
 `kingres_shard` 0.8 is phases 10 and 11 (splitting a bucket, weights, plans by disk size, distributed schemas); 0.9 adds columnar tables, the refusal of ledger tables by `create_distributed_table`, approximate `count(DISTINCT)`, and schemas in the rebalance plan and in `check_cluster`. Repartitioned joins and `MERGE` on distributed tables add no SQL object. The version check of a bucket move asks for 0.9 on every active primary.
