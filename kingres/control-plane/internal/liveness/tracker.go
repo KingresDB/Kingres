@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package liveness tracks which other servers of the cluster are alive, from the
 // heartbeats they send and the answers to the heartbeats this server sends.

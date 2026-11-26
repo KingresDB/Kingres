@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package ledgerpub is the storage and the serving of the publication of the ledger (design ledger-phase7.md, 4.4 to
 // 4.7 and 8.2, with the corrections of section 14): the logs, their tiles, bundles, frontiers and checkpoints in

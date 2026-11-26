@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package membership is the leader's side of servers joining a cluster and
 // leaving it (design control-plane-3.md, D4 and D5), and the receiving side of

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026, RooyeKhat Media Co
 #
 # Builds one kingres-verify binary with the flags that make the build
 # reproducible (design ledger-phase7.md, 7.7). It is the one place where those

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package ledgerkeys holds the Ed25519 server keys that sign the checkpoints of
 // the ledger logs of KingresDB (design ledger-phase7.md, sections 3.2 and 3.3,

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package pubsrc reads a publication (ledger-phase7.md 4.6) from a directory, a .tar.gz file or an
 // HTTP(S) base URL through one interface, so that every command reads the three the same way.

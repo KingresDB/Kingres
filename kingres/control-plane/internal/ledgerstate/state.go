@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package ledgerstate keeps what the publisher of the ledger has published, outside the system database (design ledger-phase7.md, 9.4, with
 // the correction 171 of the review of the collector, P8-01): the highest size and root of every log that has a signed checkpoint, and the

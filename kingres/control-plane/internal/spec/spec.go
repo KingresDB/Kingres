@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package spec loads the OpenAPI 3.1 contract (kingres/api/openapi.yaml) and
 // extracts what the server needs from it: the list of operations with their

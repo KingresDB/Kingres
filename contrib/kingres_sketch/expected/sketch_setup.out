@@ -1,3 +1,6 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+--
 -- sketch_setup: install the extension; check where it lives and the
 -- self-test line that is compared between nodes.
 CREATE EXTENSION kingres_sketch;

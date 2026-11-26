@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026, RooyeKhat Media Co
 #
 # Builds kingres_shard, kingres_ledger and the analytics extensions kingres_columnar, kingres_timepart and
 # kingres_sketch from a COMMIT (not from the working

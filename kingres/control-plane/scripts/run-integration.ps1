@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026, RooyeKhat Media Co
 #
 # Runs the integration tests of the control plane inside WSL2 against the
 # private KingresDB installation in ~/kw-cp/install. kingresd and its tests are

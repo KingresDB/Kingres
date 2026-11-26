@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package pki is the certificate authority of a cluster (design
 // control-plane-3.md, D1). The CA signs only server certificates of its own

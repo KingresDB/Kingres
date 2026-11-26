@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package ledgeranchor is the wiring of the anchoring libraries (internal/anchor and its subpackages) into the
 // control plane (design ledger-phase7.md, 6, 8.2 to 8.4 and 9, with the corrections of section 14; step 10 of

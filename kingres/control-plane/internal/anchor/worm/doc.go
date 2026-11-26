@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package worm anchors a signed checkpoint by writing it to an S3 compatible
 // store under Object Lock (design 6.3, with corrections 60 to 65, 81 to 84 and

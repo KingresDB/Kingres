@@ -1,3 +1,6 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+--
 -- ledger_hash: hash primitives, RFC 6962 vectors and canonical row hashing.
 --
 -- Everything computed by the C code is compared with an independent

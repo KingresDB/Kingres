@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package proof parses ledger inclusion proofs and verifies them against a
 // trusted digest, following the verification steps of

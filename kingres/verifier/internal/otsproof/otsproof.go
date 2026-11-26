@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package otsproof reads the OpenTimestamps fragments of an anchor and checks a Bitcoin attestation against a block
 // header the auditor supplies. It is written from the description of the format in the design (ledger-phase7.md 6.5)

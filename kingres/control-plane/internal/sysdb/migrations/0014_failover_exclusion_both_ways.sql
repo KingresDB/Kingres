@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- Copyright (c) 2026, RooyeKhat Media Co
 -- kingres_cp 14: a failover (or a restore of the preferred primaries) is refused while an instance stop, an instance
 -- restart or a config restart is pending or running (KX005): the exclusion of migration 0013 worked in one direction only
 -- (review F2-09). The rest of the function is the one of migration 0013.

@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- Copyright (c) 2026, RooyeKhat Media Co
 --
 -- Per-database part of the integration test fixture: the kingres catalog of
 -- kingres/docs/design/shard-mvp.md and ledger-mvp.md, written from the

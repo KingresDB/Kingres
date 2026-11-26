@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- Copyright (c) 2026, RooyeKhat Media Co
 -- kingres_cp 30: the ledger of phase 7, signing keys, events and the logs they sign
 -- (design ledger-phase7.md, 3.2, 3.3, 6.7 and 8.2; steps 3 and 4 of the plan).
 -- Applied inside one transaction by internal/sysdb; do not add BEGIN/COMMIT.

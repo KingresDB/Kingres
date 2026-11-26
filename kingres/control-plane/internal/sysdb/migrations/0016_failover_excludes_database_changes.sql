@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- Copyright (c) 2026, RooyeKhat Media Co
 -- kingres_cp 16: a failover is refused while a database is created or dropped or a table is distributed, and those operations
 -- are refused while a failover is unfinished (review F3-04): the catalogs of the databases are what the failover changes
 -- node by node, and a database that appears or goes between the check of the task and the end of it leaves them half moved.

@@ -134,7 +134,7 @@ export const mockConfig = {
    * 0.10.0, the console of the failover (every one has a URL switch, see switches.ts): `needs-decision` pauses the task at
    * "Choose the standby" (the verdict turned "possible" while it ran, as after a restart of the leader); `blocked` makes a
    * request refuse for that reason; `failStep` ends the task failed at that step; `slow` makes steps take three times as
-   * long; `map` and `graceful` switch on what the real server refuses for now (the map group, the switchover); `old` sets
+   * long; `map` and `graceful` switch on what the mock refuses by default (the map group, the switchover); `old` sets
    * the state of the old primary in the report; `limit` puts the counter at its maximum; `readiness` overrides what a group's
    * card says about failover (`window.__kingresMock.setReadiness`).
    */

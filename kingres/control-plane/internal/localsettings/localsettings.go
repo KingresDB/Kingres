@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package localsettings implements getThisServerSettings and
 // updateThisServerSettings: the settings that belong to one server (memory

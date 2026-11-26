@@ -36,8 +36,8 @@
 //                                 fail:<step>[:<group>]   the task ends failed at that step (check, freeze, stop, lease, choose, handover,
 //                                                         promote, catalog, repoint, lift, verify, pause, report)
 //                                 slow             steps take about three times as long (time to cancel and to see the phases)
-//                                 map              the map group can be failed over (the real server refuses it for now): the bootstrap, no task id at first
-//                                 graceful         the planned switchover is accepted (the real server refuses it for now)
+//                                 map              the map group is failed over with the bootstrap and no task id at first (as the real server does; the default of the mock is to refuse it)
+//                                 graceful         the planned switchover is accepted (the real server does it; the default of the mock is to refuse it)
 //                                 old:rebuilding | old:waiting | old:running | old:failed   the state of the old primary in the report
 //                                 auto:<server>    an automatic failover of that server is under way (trigger automatic)
 //                                 limit            the counter of automatic failovers is at its maximum
@@ -127,7 +127,7 @@ function applyTablesSwitch(entry: string, s: MockState): void {
   if (entry === 'diffme') mockConfig.tableVerifyFails = true
   if (entry === 'pending') mockConfig.tablePending = true
   if (entry === 'undo:fail') mockConfig.tableUndoFails = true
-  const undo = /^undo:(d{1,6})$/.exec(entry)
+  const undo = /^undo:(\d{1,6})$/.exec(entry)
   if (undo) mockConfig.tableUndoMs = Number(undo[1])
   const fk = /^fk:(.+)$/.exec(entry)
   if (fk) mockConfig.tableForeignKeys.push(fk[1] as string)

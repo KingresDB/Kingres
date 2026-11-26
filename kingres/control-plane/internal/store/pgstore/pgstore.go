@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package pgstore implements store.Store on PostgreSQL. It reads the
 // KingresDB catalog (schema kingres, specified in

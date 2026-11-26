@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package rebalance runs the rebalance of a cluster as one task of the task
 // engine (design shard-phase10.md, section 6; first increment: the strategy "by

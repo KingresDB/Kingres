@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package tlog reads Merkle tree hashes out of tiles as C2SP "tlog-tiles"
 // defines them (https://c2sp.org/tlog-tiles) and builds and checks the

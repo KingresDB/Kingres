@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package scram computes PostgreSQL SCRAM-SHA-256 password verifiers. A role
 // is given its password as a verifier, so the clear text never appears in a

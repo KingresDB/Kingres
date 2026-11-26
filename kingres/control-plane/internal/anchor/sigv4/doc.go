@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package sigv4 implements AWS Signature Version 4 with signing by header, for
 // the requests that package worm makes to an S3 compatible store (PutObject,

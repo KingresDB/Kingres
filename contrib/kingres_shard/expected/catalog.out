@@ -1,3 +1,6 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+--
 -- Catalog creation, constraints, map_version triggers and GUCs.
 CREATE EXTENSION kingres_shard;
 SELECT c.relname

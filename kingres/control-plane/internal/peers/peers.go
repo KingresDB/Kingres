@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package peers keeps the directory of the other servers of the cluster: for
 // every server id (the host name registered in the shard catalog and the

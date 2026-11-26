@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package bundleidx reads bundle.json, the index of a bundle (ledger-phase7.md 7.3). The index
 // is a convenience and is not trusted: nothing in it is believed, every fact is re-derived from the

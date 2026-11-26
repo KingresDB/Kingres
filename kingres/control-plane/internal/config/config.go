@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package config parses the configuration of kingresd from, in increasing
 // order of precedence: built-in defaults, an optional JSON config file,

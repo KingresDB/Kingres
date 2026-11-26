@@ -26,7 +26,9 @@ function mswWorker(): Plugin {
   }
 }
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
+  // `npm run dev:backend` runs in the mode "backend": the mocks are off there, without any file that git ignores.
+  define: mode === 'backend' ? { 'import.meta.env.VITE_MOCKS': '"off"' } : {},
   plugins: [vue(), mswWorker()],
   resolve: { alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) } },
   server: {
@@ -64,4 +66,4 @@ export default defineConfig({
     // large machine they miss their default 1 s wait now and then. Fewer workers keep them stable.
     maxWorkers: 6,
   },
-})
+}))

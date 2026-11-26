@@ -1,3 +1,6 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+--
 -- Core patch KP-0001: the product version is visible next to the PostgreSQL
 -- version, without changing any PostgreSQL version symbol.
 CREATE EXTENSION kingres_shard;

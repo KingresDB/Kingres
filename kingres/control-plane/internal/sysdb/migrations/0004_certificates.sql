@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- Copyright (c) 2026, RooyeKhat Media Co
 -- kingres_cp 4: every server certificate the CA issued, and the revocation of a server's certificates
 -- (certificate renewal and revocation, contract 0.5.0).
 -- Applied inside one transaction by internal/sysdb; do not add BEGIN/COMMIT.

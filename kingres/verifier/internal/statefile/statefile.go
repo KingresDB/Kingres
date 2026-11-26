@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package statefile keeps the auditor's own record of the last checkpoint
 // they verified: a lock so that two runs cannot move it backwards, an atomic

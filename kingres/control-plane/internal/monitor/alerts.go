@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package monitor runs the periodic health checks (design D6) that raise and
 // clear alerts in kingres_cp.alert, and samples metrics into a bounded ring

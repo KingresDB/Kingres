@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package logsjson reads logs.json, the list of the logs of a publication (ledger-phase7.md 4.6, correction 178):
 //

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package anchorev reads the evidence file of an anchor, a/<aggregate id>/anchors/<size>/<target id>.json
 // (ledger-phase7.md 6.2 and corrections 179 to 186; the formats are the ones of the documentation of the

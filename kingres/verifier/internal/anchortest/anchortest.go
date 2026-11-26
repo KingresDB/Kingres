@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package anchortest builds anchor evidence for the tests of the verifier: RFC 3161 tokens made by a local test authority,
 // OpenTimestamps fragments written byte by byte, and evidence files in the formats of the publisher's anchor library

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package pgtest starts throwaway PostgreSQL instances for integration tests,
 // created and managed by the instance manager itself. A test calls Start; it

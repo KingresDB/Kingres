@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package pgconfig implements phase 13 of KingresDB (design config-phase13.md): the PostgreSQL
 // parameters of the servers, set at the cluster, server group, server and database level from the

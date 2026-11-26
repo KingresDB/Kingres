@@ -1,3 +1,6 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+--
 -- ledger_protect: the ProcessUtility hook.  Every statement that would switch
 -- the ledger off is rejected with SQLSTATE KL002, also for superusers and for
 -- the owner of the table; ordinary DDL keeps working.

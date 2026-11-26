@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- Copyright (c) 2026, RooyeKhat Media Co
 -- kingres_cp 8: rebalancing (phase 4 of the control plane; design shard-phase10.md, section 6.5).
 -- Applied inside one transaction by internal/sysdb; do not add BEGIN/COMMIT.
 

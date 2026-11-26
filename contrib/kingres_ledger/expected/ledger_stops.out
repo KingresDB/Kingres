@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
 --
 -- ledger_stops: the second invariant (L11-01 to L11-05).  A role that is not a
 -- superuser cannot stop the block builder or the capture of rows for longer

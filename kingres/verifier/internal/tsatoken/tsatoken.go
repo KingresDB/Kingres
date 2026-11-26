@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package tsatoken verifies an RFC 3161 time-stamp token. It is written from RFC 3161 (the time-stamp protocol),
 // RFC 5652 (the Cryptographic Message Syntax, section 5 for SignedData and section 5.4 for the signed attributes),

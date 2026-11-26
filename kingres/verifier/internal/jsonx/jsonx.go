@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package jsonx is a strict JSON reader for ledger files. It rejects what
 // encoding/json accepts silently: duplicate object keys, invalid UTF-8,

@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- Copyright (c) 2026, RooyeKhat Media Co
 -- kingres_cp 15: the old primary after a failover (design ha-phase5-part2.md, 6.2 and 6.5; increment 4).
 -- Applied inside one transaction by internal/sysdb; do not add BEGIN/COMMIT.
 
