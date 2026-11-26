@@ -34,11 +34,11 @@
 #include "pg_compat.h"
 
 /*
- * The resource manager id.  RM_EXPERIMENTAL_ID is for development; an id
- * reserved on the public registry replaces it before a release, and it is
- * part of the WAL format for ever (README, "Resource manager id").
+ * The resource manager id: 255, registered for "KingresColumnar" on the
+ * PostgreSQL wiki list of custom resource managers.  It is part of the WAL
+ * format and never changes (README, "Resource manager id").
  */
-#define KC_RMGR_ID			RM_EXPERIMENTAL_ID
+#define KC_RMGR_ID			255
 #define KC_EXTENSION_NAME	"kingres_columnar"
 #define KC_CATALOG_NAME		"columnar_stripe"
 #define KC_CATALOG_PKEY		"columnar_stripe_pkey"

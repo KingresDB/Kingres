@@ -775,10 +775,9 @@ with the transaction, as for any uncommitted change.
 
 ### 7.3 WAL and crash safety
 
-**Resource manager** `KingresColumnar`, id `RM_EXPERIMENTAL_ID` (128) during
-development and an id reserved on the registry named by the 18 documentation
-before the first release (**[Recommendation]**; the id is part of the WAL format
-forever). Records:
+**Resource manager** `KingresColumnar`, id 255, registered on the
+PostgreSQL wiki list of custom resource managers (the id is part of the WAL format
+and never changes). Records:
 
 | Record | Content | Redo |
 |---|---|---|
@@ -2477,7 +2476,7 @@ make the combination of columnar storage, moves and time partitioning complete.
 | 2 | Default codec | `zstd` level 3 where built in, then `lz4`, then `pglz`; a table's codec is fixed at creation in its metapage and changed only for new stripes |
 | 3 | Stripe and chunk sizes | 150 000 and 10 000 rows (the documented defaults of an existing columnar product, taken as a starting point); tune in C3 with a benchmark on a time series of 20 columns |
 | 4 | `UPDATE` and `DELETE` | Not in phase 12 (7.7); a deletion-vector design is a separate later phase if demand appears |
-| 5 | Resource manager id | `RM_EXPERIMENTAL_ID` in development; reserve a real id on the registry before the first release; record it in the extension README, because it is part of the WAL format |
+| 5 | Resource manager id | Decided: id 255, registered as `KingresColumnar` on the PostgreSQL wiki list of custom resource managers; recorded in the extension README, because it is part of the WAL format |
 | 6 | Is `shared_preload_libraries` acceptable for `kingres_columnar` | Yes. It is required by the resource manager, the other two extensions already require it, and the package default lists all three |
 | 7 | Retention default | `drop`, with no default retention value (a policy without `retention` keeps everything), the table name typed in the console to confirm, and a preview of the data it would delete |
 | 8 | Converting a plain (non-partitioned) table without blocking | Not in this part: `ALTER TABLE ... SET ACCESS METHOD` with a clear warning. Build-and-swap needs dependent views, foreign keys, publications and privileges handled; revisit if users ask. The recommended path for large tables is to partition them by time first |
