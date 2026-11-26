@@ -44,7 +44,7 @@ either from **the source it is given**; the major is never typed a second time:
 
 `kingres:<version>` without a suffix is not produced.
 
-**The version `0.1.0` in this README is an example.** `<version>` is `kingres_version` in the top-level `meson.build` (`0.1.0` while this was written), and every file name, tag, label and command below that names `0.1.0` stands for the current value; the numbers of the runs further down are the versions that were built then.
+`<version>` is `kingres_version` in the top-level `meson.build`, `0.1.0` for the first release. If it changes, every file name, tag, label and command below that names `0.1.0` stands for the new value; the numbers of the runs further down are the versions that were built then.
 
 Target: Ubuntu 24.04, amd64. Everything below was run on Windows 11 with WSL2
 (Ubuntu 24.04, Docker Engine installed inside the distribution); see
@@ -59,8 +59,8 @@ Target: Ubuntu 24.04, amd64. Everything below was run on Windows 11 with WSL2
   their versions; the build stops when an extension of the source tree is not
   in the staged tree, or when a `--x.y.sql` or `--x--y.sql` script of it is
   missing from the staged tree or from the `DATA` list of its Makefile). This
-  release carries `kingres_shard` 0.8, `kingres_ledger` 0.3, `kingres_sketch`
-  1.0, `kingres_timepart` 0.2 and `kingres_columnar` 0.2, with every install
+  release carries `kingres_shard` 0.9, `kingres_ledger` 0.3, `kingres_sketch`
+  1.0, `kingres_timepart` 0.3 and `kingres_columnar` 0.2, with every install
   and update script of each (an instance made by an earlier package updates
   with `ALTER EXTENSION ... UPDATE`: tested from `kingres_shard` 0.6 and 0.7,
   `kingres_ledger` 0.1, `kingres_timepart` 0.1 and `kingres_columnar` 0.1).
@@ -73,13 +73,13 @@ Target: Ubuntu 24.04, amd64. Everything below was run on Windows 11 with WSL2
   `kingresd` starts and the instance is restarted); without the preload `CREATE EXTENSION` works,
   a columnar table can be read, and creating one, a write, and the conversion of a
   partition to columnar storage by `kingres_timepart` are refused with a message
-  that names `shared_preload_libraries`. The other four extensions need no
-  preload except `kingres_shard` and `kingres_ledger`.
+  that names `shared_preload_libraries`. `kingres_shard` and `kingres_ledger`
+  are preloaded too; `kingres_sketch` and `kingres_timepart` need no preload.
 - Two modules of PostgreSQL that the product relies on, `pg_stat_statements` and
   `plpgsql`, are part of "all contrib modules" and of the server and are shipped
   for both majors without any extra step: `build.sh` builds with meson, which builds
   every contrib module and PL/pgSQL (nothing in `meson_opts` leaves one out), and the
-  deb and the image take the whole staged tree. `build.sh` now also **stops** when the
+  deb and the image take the whole staged tree. `build.sh` also **stops** when the
   control file, an install script or the library (`pg_stat_statements.so`,
   `plpgsql.so`) of either is missing from the staged tree. `test/lib.sh`
   (`check_postgres_modules`, run by `check_extension_files` for the package, the image
@@ -101,7 +101,7 @@ Target: Ubuntu 24.04, amd64. Everything below was run on Windows 11 with WSL2
   `LimitCORE=0`: `kingresd` can hold the ledger signing key in memory, and a core file would
   write it to disk. `build-deb.sh` refuses a unit without that line, and the tests check it.
 
-Not included yet: see [What is not included](#what-is-not-included-yet).
+Not included: see [What is not included](#what-is-not-included).
 
 ## Build
 
@@ -614,7 +614,7 @@ the instance).
   catalog has the default version of each control file, the install and update scripts
   of this release are in the tree, and `ALTER EXTENSION ... UPDATE` takes a database
   from the versions of the earlier packages (`kingres_shard` 0.6, then, in a database of its own, 0.7 to 0.8, `kingres_ledger` 0.1,
-  `kingres_timepart` 0.1, `kingres_columnar` 0.1) to the current ones; on the node,
+  `kingres_timepart` 0.1, `kingres_columnar` 0.1) to the current ones (shard 0.9, timepart 0.3); on the node,
   `kingres.create_distributed_table` of a table that holds 1000 rows keeps them all. **The other major** (needs
   `--other-deb`): with the cluster running and data present, the package of the
   other major is refused by `apt-get install` and by `dpkg -i` with the message of
@@ -636,7 +636,7 @@ the instance).
   the manager's `/proc/PID/limits` shows a zero core limit, `BUILD-INFO` carries the SHA-256 of
   the installed binary) are in `test-deb.sh`, which needs Docker and a full build and was not run for
   this step.
-  **Owed for kingres_shard 0.8:** the Docker flows (`test-compose.sh`, `test-deb.sh`, `test-image.sh`: the version and script checks of `lib.sh`, the `ALTER EXTENSION ... UPDATE` steps of `flow.sh` from 0.6 and from 0.7) were changed to expect 0.8 and have not been run, because the build machine has no Docker; `test-verifier-package.sh` was run (23 checks), and `lib.sh` and `flow.sh` were checked for syntax and for the presence of every script they name in the tree and in `DATA`.
+  **Known gap in the tests:** the version checks of `test/lib.sh` and the `ALTER EXTENSION ... UPDATE` steps of `test/flow.sh` still expect `kingres_shard` 0.8 and `kingres_timepart` 0.2, while the control files say 0.9 and 0.3. The Docker flows (`test-compose.sh`, `test-deb.sh`, `test-image.sh`) fail those checks until the two files are brought up to date.
 - **`test-image.sh`**: the image builds under the name of its major; its labels
   (major, PostgreSQL version, KingresDB version, `AGPL-3.0-only AND PostgreSQL`)
   and `postgres --version` agree with the source tree; the five extensions are
@@ -705,7 +705,7 @@ Verified by the tests against the commit built:
 ## The preload of `kingres_columnar`
 
 **What the product does now (phase 12, control plane).** `kingresd` writes
-`shared_preload_libraries = 'kingres_shard,kingres_ledger,kingres_columnar'` for every instance
+`shared_preload_libraries = 'kingres_shard,kingres_ledger,kingres_columnar,pg_stat_statements'` for every instance
 (`instance.PreloadLibraries`; `EnsureConfig` brings an older `kingres-managed.conf` up to date at the start of
 `kingresd` and reloads a running instance, and the list takes effect at a restart). The library is left out only when
 the installation has no file for it. The parameter is managed: the settings API refuses a change of it
@@ -726,7 +726,7 @@ earlier package, or any instance of a cluster that was not restarted):
 section 4: "the package default lists all three").** The library registers a WAL resource
 manager, which PostgreSQL accepts only while `shared_preload_libraries` is processed, so the
 product cannot offer "columnar storage" or the conversion of old partitions (the point of
-`kingres_timepart` 0.2) without it, and `kingres_columnar` 0.2 (indexes, a parallel scan) is
+`kingres_timepart` since 0.2) without it, and `kingres_columnar` 0.2 (indexes, a parallel scan) is
 dead weight in the package without it. What it costs every backend, from reading
 `_PG_init` and the hooks in `contrib/kingres_columnar/src` (not measured):
 
@@ -754,7 +754,7 @@ dead weight in the package without it. What it costs every backend, from reading
   never be taken away from an instance that holds columnar data.
 
 **Done (phase 12 control plane):** `RenderManaged` has the new list (`instance.PreloadLibraries`), `EnsureConfig` re-renders
-`kingres-managed.conf` when its list differs, the tests and `managed.go` follow, and the flow test of this directory expects the new list. The text below is the analysis that led to it.
+`kingres-managed.conf` when its list differs, the tests and `managed.go` follow, and the flow test of this directory expects the new list. The paragraph below is the analysis that led to it, in the wording of its time (the list then had three libraries; `pg_stat_statements` was added later).
 
 **Upgrade of an existing cluster.** `kingres-managed.conf` is written when an instance is
 created and rewritten only by `WriteManaged` (a settings change); `EnsureConfig` at the start
@@ -771,16 +771,16 @@ preloaded it tests the conversion in both directions and a B-tree index on a col
 without it the refusals above). The new list takes effect at the restart that an upgrade does
 anyway. On a rolling upgrade of a cluster with standbys, upgrade the standbys first: a primary
 that has begun to write columnar WAL under the new list would otherwise be ahead of a standby
-that cannot replay it. Until this change is made, the working path (preload on, conversion
+that cannot replay it. The working path (preload on, conversion
 both ways, indexed columnar table) is tested in the throw-away server of `pg-smoke.sh`, on
 both majors, with the files of the package.
 
-## What is not included yet
+## What is not included
 
 - **No Patroni, no etcd, no metrics store** (decided: `kingresd` does the failover itself
   ([ADR 0021](../docs/adr/0021-failover-in-kingresd.md)) and exposes Prometheus-format metrics itself).
 - `kingres-cli` (planned, not built); removing or leaving servers, standbys and rebalancing in the compose test
-  (the test does not exercise them, nor does it exercise failover or switchover, which `kingresd` has since the failover increments of 2026-11-18 to 2026-11-20; those are tested by the cluster tests of the control plane).
+  (the test does not exercise them, nor failover or switchover, which `kingresd` has; the cluster tests of the control plane cover those).
 - RPM, arm64, Windows; package signing and an apt repository; image signing and
   publishing; SBOM; debug symbols package (`-dbgsym`); a `kingres-dev` package;
   man pages beyond one-page stubs; the licences of every compiled-in Go and npm
@@ -794,6 +794,11 @@ both majors, with the files of the package.
 - No automated backup, no PITR archive configuration (pointers above only).
 
 ## What was run
+
+This section is the record of the runs, in the wording of their time, with the
+extension versions and counts of those days. The current state is described above and in the
+[guide](../docs/guide/README.md). The version checks of the test scripts need the update named
+under "Known gap in the tests".
 
 ### The run of 2026-11-19 (kingres_shard 0.7, kingres_timepart 0.2, kingres_columnar 0.2)
 
