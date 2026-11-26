@@ -2341,7 +2341,7 @@ setting is `replica.default` in `kingres_cp.cluster_setting`, ADR 0011).
   streamed yet is not put in the setting, so a new standby never makes its group wait during the base backup. This is the
   trade of the design: commits are acknowledged by two servers while a standby streams and by one after the grace period,
   which the alert says in those words. The setting lives in `kingres-managed.conf` (`Extra`), not in `ALTER SYSTEM`.
-- **Alerts**: `groupWithoutSynchronousStandby` (per server and group, on the primary's server), `groupUnderReplicated` (cluster
+- **Alerts**: `groupWithoutSynchronousStandby` (`critical`, as the contract says: commits are acknowledged by one server only; per server and group, on the primary's server), `groupUnderReplicated` (cluster
   scope, `cluster|group:<g>`, raised by the leader when fewer standbys stream than the replica count at three checks in a
   row; never in a one-server cluster, where nothing can be placed), and `replicationLagHigh` for slot retention. The first
   two kinds are not in the `AlertKind` enum of contract 0.6.0 (0.7.0 adds them).
