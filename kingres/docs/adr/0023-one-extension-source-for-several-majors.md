@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # ADR 0023: One source of every extension builds against each supported PostgreSQL major (18 and 19)
 
 - Status: Accepted

@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Final security review of the marker hardening (DX16-02 to DX16-07), commits 648725ca1b and 91376dc4a6 on dx-cp
 
 Method: read of transfer_marker.go, the import step in transfer_import.go (lines 615-700), the e2e test names and the diff of 91376dc4a6.

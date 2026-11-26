@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # ADR 0004: PostgreSQL License; no Citus code
 
 - Status: Superseded by [ADR 0024](0024-agpl-for-kingresdb-code.md) in its choice of licence (2026-11-15); its rule that no Citus code is copied stays

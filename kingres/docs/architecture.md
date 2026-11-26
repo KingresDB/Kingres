@@ -233,7 +233,7 @@ Engine data: `pg_stat_replication`, `pg_stat_wal_receiver`, `pg_replication_slot
 
 **[Recommendation]** This subsection is a design decision. The goal is the Couchbase experience: install one package on a server and that node has everything it needs; open that server's own panel to create a cluster or join one. In Couchbase, every node runs the same cluster-manager processes and the Web Console and CLI are both clients of the node's REST API (see "The Couchbase reference pattern" above); CockroachDB likewise serves its DB Console from every node.
 
-**What the package contains.** One package (named `kingres` as built), built as `.deb`, `.rpm` and a Docker image (Linux first; a Windows server package is out of scope for the first releases, and development on Windows uses WSL2 or Docker):
+**What the package contains.** One package (named `kingres` as built), built as a `.deb` and a Docker image; an `.rpm` is not built, see [the limitations](guide/limitations.md) (Linux first; a Windows server package is out of scope for the first releases, and development on Windows uses WSL2 or Docker):
 
 - The PostgreSQL fork binaries and the `kingres_shard` and `kingres_ledger` extensions.
 - `kingresd`, one Go binary that contains the agent (instance lifecycle), the manager, the client router, the REST API, and the web panel as embedded static files. `kingres-agent` and `kingres-manager` in the architecture above are roles inside this one binary, not separate installs.

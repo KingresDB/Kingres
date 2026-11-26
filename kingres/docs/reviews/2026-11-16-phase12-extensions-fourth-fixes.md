@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Review of the fourth fix round: contrib/kingres_timepart and
 # contrib/kingres_sketch (phase 12)
 

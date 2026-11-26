@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # ADR 0002: Base on PostgreSQL 18 (`REL_18_7`), rebase to 19 later
 
 - Status: Accepted

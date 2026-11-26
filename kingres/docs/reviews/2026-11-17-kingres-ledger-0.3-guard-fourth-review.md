@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # kingres_ledger 0.3, part A: independent review of the fixes for the third review of the guard (fourth round)
 
 ## 1. Scope and method

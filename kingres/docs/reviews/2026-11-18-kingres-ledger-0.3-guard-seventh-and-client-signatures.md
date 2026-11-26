@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Seventh independent review of the guard of kingres_ledger 0.3 (the fixes for L19) and first review of client signatures (part B)
 
 Reviewer: an independent reviewer. Date: 2026-11-18. Export reviewed: the committed tree `678dd32957`.

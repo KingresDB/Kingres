@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Independent review: console of phase 12 (branch p12-web, tip 9a78cf18d5)
 
 Scope: commits c7474b8950, 09220882e9, 2750ea1a66, 1897f91e64, 9a78cf18d5 (kingres/web). Compared with the contract

@@ -636,7 +636,6 @@ the instance).
   the manager's `/proc/PID/limits` shows a zero core limit, `BUILD-INFO` carries the SHA-256 of
   the installed binary) are in `test-deb.sh`, which needs Docker and a full build and was not run for
   this step.
-  **Known gap in the tests:** the version checks of `test/lib.sh` and the `ALTER EXTENSION ... UPDATE` steps of `test/flow.sh` still expect `kingres_shard` 0.8 and `kingres_timepart` 0.2, while the control files say 0.9 and 0.3. The Docker flows (`test-compose.sh`, `test-deb.sh`, `test-image.sh`) fail those checks until the two files are brought up to date.
 - **`test-image.sh`**: the image builds under the name of its major; its labels
   (major, PostgreSQL version, KingresDB version, `AGPL-3.0-only AND PostgreSQL`)
   and `postgres --version` agree with the source tree; the five extensions are
@@ -707,7 +706,7 @@ Verified by the tests against the commit built:
 **What the product does now (phase 12, control plane).** `kingresd` writes
 `shared_preload_libraries = 'kingres_shard,kingres_ledger,kingres_columnar,pg_stat_statements'` for every instance
 (`instance.PreloadLibraries`; `EnsureConfig` brings an older `kingres-managed.conf` up to date at the start of
-`kingresd` and reloads a running instance, and the list takes effect at a restart). The library is left out only when
+`kingresd` and reloads a running instance, and the list takes effect at a restart). An optional library (`kingres_columnar`, `pg_stat_statements`) is left out when
 the installation has no file for it. The parameter is managed: the settings API refuses a change of it
 (`config_parameter_managed`). **Until an instance has been restarted with the new list** (an instance made by an
 earlier package, or any instance of a cluster that was not restarted):
@@ -797,8 +796,7 @@ both majors, with the files of the package.
 
 This section is the record of the runs, in the wording of their time, with the
 extension versions and counts of those days. The current state is described above and in the
-[guide](../docs/guide/README.md). The version checks of the test scripts need the update named
-under "Known gap in the tests".
+[guide](../docs/guide/README.md).
 
 ### The run of 2026-11-19 (kingres_shard 0.7, kingres_timepart 0.2, kingres_columnar 0.2)
 

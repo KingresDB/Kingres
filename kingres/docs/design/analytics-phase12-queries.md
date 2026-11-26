@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # KingresDB: design of phase 12, part 1 (repartitioned joins, MERGE on distributed tables, approximate aggregates)
 
 Status: Proposed design, 2026-11-15; not implemented.

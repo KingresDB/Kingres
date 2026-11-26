@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Second independent review of client signatures in kingres_ledger 0.3 (the fixes for L21)
 
 Reviewer: an independent reviewer. Date: 2026-11-18. Export reviewed: the committed tree named in `COMMIT` of the export.

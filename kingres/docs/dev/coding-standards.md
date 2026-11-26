@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Coding standards
 
 These standards apply to all KingresDB code. Each rule names the tool or review step that enforces it. A rule without an enforcing tool is checked in code review.

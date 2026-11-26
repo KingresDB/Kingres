@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <!-- Portions Copyright (c) 2026, RooyeKhat Media Co -->
 # kingres_columnar
 
@@ -1286,7 +1287,12 @@ Memory and costs worth knowing:
   | `relation_nontransactional_truncate` (C8-01, C10-05) | guarded; **only for a relation made, or given a new file, in the current subtransaction (C11-04)** | warning, nothing changed: not the half of a truncate (a file shortened with the stripe rows left, or the other way round).  Where an error is allowed, for a relation that was not created, or given a new file, in the current subtransaction (neither `rd_createSubid` nor `rd_newRelfilelocatorSubid` is the current subtransaction id, as `ExecuteTruncateGuts` compares them; a table of an outer subtransaction is refused: an abort of the child would not remove its file) it is an error, `cannot truncate columnar table "t" in place: it was not created or given a new file in the current (sub)transaction`: PostgreSQL itself calls it only for such a relation (`TRUNCATE` of a table of the transaction, and a temporary table, which a columnar table cannot be), and it is the only case where an abort removes the file anyway; for any other table the cut file and the reset metapage are not undone by an abort while the deleted catalog rows come back, and the table cannot be read.  For a relation of the transaction it deletes the catalog rows, shortens the file and resets the metapage, in that order: an error in the first step is undone with the transaction and leaves a readable table (`t/031`, `t/033`, `t/034`). |
   | `relation_set_new_filelocator`, `relation_copy_data`, `relation_copy_for_cluster` | guarded | warning; no file is made, nothing copied, the returned ids name nothing |
   | `relation_vacuum` | guarded | warning, skipped (the next vacuum does the same work; no failure of the transaction) |
-  | `index_fetch_begin`, `index_fetch_tuple`, `tuple_fetch_row_version`, `tuple_tid_valid`, `index_delete_tuples`, `index_build_range_scan`, `index_validate_scan`, `scan_sample_next_block`, `scan_sample_next_tuple` | guarded | warning and the answer "nothing" (an index scan and an index build call these; where an error is allowed they do their work, and a TID check raises its error) |
+  | `index_fetch_begin`, `index_fetch_tuple` | guarded | the fetch of a B-tree index scan (B-tree indexes exist since 0.2); where an error is allowed they work; here a warning, and `index_fetch_tuple` answers "nothing" |
+  | `index_delete_tuples` | guarded | bottom-up deletion answers none and `VACUUM` removes the entries; a warning |
+  | `index_build_range_scan` | guarded | reads the rows for the entries of a new index (`CREATE INDEX`, `REINDEX`, and the read of `amcheck` `heapallindexed`); a warning here. `CREATE INDEX CONCURRENTLY` and `REINDEX CONCURRENTLY` are refused here with an error where one is allowed (`kc_am.c`: "CREATE INDEX CONCURRENTLY and REINDEX CONCURRENTLY are not supported on columnar tables") |
+  | `index_validate_scan` | guarded | the second pass of `CREATE INDEX CONCURRENTLY`, which the build above already refuses, so it is a second guard: an error ("indexes on columnar tables are not supported in this version"), or a warning here |
+  | `tuple_fetch_row_version`, `tuple_tid_valid` | guarded | fetching a row by its TID and a TID scan are refused: an error, or a warning here |
+  | `scan_sample_next_block`, `scan_sample_next_tuple` | guarded | `TABLESAMPLE` is refused: an error, or a warning here |
   | `scan_begin`, `scan_getnextslot`, `scan_rescan`, `scan_end`, `scan_analyze_next_block`, `scan_analyze_next_tuple`, `relation_size`, `relation_estimate_size` | reads | work wherever PostgreSQL lets a heap table be read (the relation cache asserts a transaction in progress, and the buffer pin of any table access method fails in a release phase of a resource owner: PostgreSQL's rule, the same for heap) |
   | `slot_callbacks`, `parallelscan_*`, `index_fetch_reset`, `index_fetch_end`, `tuple_get_latest_tid`, `tuple_satisfies_snapshot`, `relation_needs_toast_table`, `relation_toast_am` | nostorage | nothing to do |
   | the object access hook (a drop of a relation) | guarded | warning, the file is not noted (its leftover rows are removed by `VACUUM` and `columnar_check(true)`) |
@@ -1464,9 +1470,9 @@ or `kingres/dev/ext.sh kingres_columnar` for one installation and
 kingres_columnar` for both majors (see
 [`kingres/docs/dev/testing.md`](../../kingres/docs/dev/testing.md)). The tests are
 seventeen `pg_regress` files (`sql/`, `expected/`; the list is `REGRESS` in the
-`Makefile`) and seventy-three TAP files in `t/` (`t/067` to `t/073` cover the merge
+`Makefile`) and seventy-four TAP files in `t/` (`t/067` to `t/073` cover the merge
 of small stripes by `VACUUM`, the give-back of space, and the two security tests
-above): crash recovery,
+above; `t/074` checks the resource manager id): crash recovery,
 standby and `pg_rewind`, backup/restore/dump, concurrent writers, corruption,
 a randomised comparison against heap (`KC_COMPARE_SEED`, `KC_COMPARE_STEPS`),
 older snapshots, array validation, serializable isolation against heap twins,

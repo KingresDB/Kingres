@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Documentation rules
 
 All documentation is in English, in Markdown, in plain prose without marketing language. File and directory names are English, lower case, with hyphens.

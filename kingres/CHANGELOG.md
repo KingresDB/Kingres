@@ -4,7 +4,7 @@
 
 All notable changes of KingresDB are listed here, by release. A release is made for PostgreSQL 18 and PostgreSQL 19 at the same time from one source, and has one version (`kingres_version` in the top-level `meson.build`); see [docs/dev/releases.md](docs/dev/releases.md). The dated, detailed record of the work is [docs/worklog.md](docs/worklog.md), and the independent reviews are in [docs/reviews/](docs/reviews/).
 
-The release script ([packaging/release/release.sh](packaging/release/release.sh)) takes the notes of a release from the section of this file whose heading is `## [<version>]`. It refuses a section that does not exist or is empty, and a section that has a `### Pending` part. The release step sets the date of the first release.
+The release script ([packaging/release/release.sh](packaging/release/release.sh)) takes the notes of a release from the section of this file whose heading is `## [<version>]`. It refuses a section that does not exist or is empty, and a section that has a `### Pending` part. The date in the heading of a release is set by hand, in the commit that is tagged; the script does not edit this file.
 
 ## [Unreleased]
 
@@ -28,12 +28,14 @@ The first release. KingresDB is a thin fork of PostgreSQL 18.7 and PostgreSQL 19
   - Pushdown: closed queries, partial aggregation, sorted streams with limit and joins of colocated tables run in the shard groups, and a row router handles multi-row `INSERT`, `INSERT ... SELECT` and `COPY FROM`. The complete scan stays as the fallback for every query ([ADR 0022](docs/adr/0022-the-complete-scan-stays.md)).
   - Table lifecycle: distribute a table that already holds rows, in blocking and online form; turn a table back into an ordinary table; change the distribution column, the bucket count or the colocation group; distribute user-partitioned tables; carry dependent views and storage parameters.
   - Elasticity: split a bucket, weights per server, plans by disk size.
+  - A bucket move or split does not drop an old copy that objects of its owner depend on (a view, a materialized view, a foreign key, a function on its row type). The copy is left in place, the record of the move says what depends on it, `check_cluster()` reports `orphan_blocked`, and the next cleanup pass after the owner dropped the dependents finishes the move. The locks of a move or split are bounded and are never left behind, and the recovery worker does not undo a move or split that its session still runs.
   - Distributed schemas: a schema is placed and moved as a unit, schemas are part of the rebalance plan and the drain, and `check_cluster` checks them.
   - Analytics: repartitioned joins on columns other than the distribution column, `MERGE` on distributed tables, columnar tables that can be distributed and moved (blocking variants), approximate `count(DISTINCT)` through `kingres_sketch`.
   - Ledger tables are refused by `create_distributed_table` and `create_reference_table` (SQLSTATE `KS016`).
   - Own SQLSTATEs `KS017` to `KS022` for the refusals that the control plane tells apart: no receiving shard group, unreadable bucket sizes, a busy bucket, a pinned schema, a failed verification, and a call on a node that is not the map group primary. A split of a table without a primary key is refused with `0A000`. `kingresd` matches the code, not the wording (see "SQLSTATEs of the answers" in the [README of `kingres_shard`](../contrib/kingres_shard/README.md)).
-- **Control plane** (`kingresd`, REST contract 0.34.0). Cluster creation and joining, servers, roles and grants, network access, databases, tasks, alerts, logs and metrics. The manager leader runs on the primary of the map group, the cluster state is in a system database, and certificates are renewed and revoked.
-  - Rebalance as a task with stop, resume and reports. Strategies by bucket count or disk size, a threshold, weights, an automatic mode (a run makes one move at a time) (off by default), draining a server and splitting a bucket.
+- **Control plane** (`kingresd`, REST contract 0.34.0). Cluster creation and joining, servers, roles and grants, network access, databases, tasks, alerts, logs and metrics (also a Prometheus endpoint, `GET /metrics`, outside the REST contract; it needs a bearer token of a session with the `kingres_stats` role or the scrape token). Server groups (racks or zones), the audit log of sign-ins and administrative actions (merged across the servers) and a SQL workbench (a row limit, a time limit and cancel of a running statement) are part of the contract. The manager leader runs on the primary of the map group, the cluster state is in a system database, and certificates are renewed and revoked.
+  - Starting an instance whose postmaster is still shutting down waits for the shutdown (up to the stop timeout) and then starts it, or reports an error.
+  - Rebalance as a task with stop, resume and reports. Strategies by bucket count or disk size, a threshold, weights, an automatic mode (off by default; a run makes one move at a time), draining a server and splitting a bucket.
   - A drain hands the map group over by a planned switchover (contract 0.27.0).
   - A rebalance is held back, or refused with `group_degraded` unless `force` is sent, while a standby lags by more than `maxStandbyLagBytes`.
   - Distributed schemas: distribute, move and make local as tasks, and the sharding mode of a database. A rebalance and a drain plan and move schemas as items of the plan (contract 0.31.0): `kind` and `schemaName` appear in the plan, the progress and the report. A drain that would need to move a schema that cannot move (pinned by a ledger table, or a table without a key) is refused before a task exists.
@@ -49,7 +51,7 @@ The first release. KingresDB is a thin fork of PostgreSQL 18.7 and PostgreSQL 19
   - Export and import of a table as CSV (contract 0.19.0): resumable uploads and downloads of sealed staged files, and an all-or-nothing import with a commit marker. It is off until the cluster setting `dataTransfer.enabled` is on.
   - Escrow of the key of the certificate authority (contract 0.26.0: `getCaEscrow`, `setCaEscrow`, `rotateCaEscrow`). It is off until switched on. When it is on, a new manager leader opens its own sealed copy and goes on issuing, renewing and revoking certificates. The Certificate authority tab of the Security page shows and changes it.
 - **High availability.** Failover is part of `kingresd` and is fenced by leases.
-  - Manual failover, automatic failover with a counter, planned switchover of an ordinary group and of the map group, restore of preferred primaries, and a call that gives up a stuck bootstrap of the map group.
+  - Manual failover, automatic failover with a counter, planned switchover of an ordinary group and of the map group, restore of preferred primaries (it works also when the leader was the old primary of the restore), and a call that gives up a stuck bootstrap of the map group. The undo of the access rules of the old primary after a promotion carries the term that the promotion made.
   - A group lease is enforced only once a standby that a failover may use is ready, so a primary is not fenced while its first standby is being copied.
   - A planned switchover of the map group survives a clean stop that outlasts the lease of the task. A stop that outlasts that too is rolled back. A repeated clean stop of the old primary asks only for the proof that it stopped and does not release the lease again. A planned switchover must not run while servers of two versions run, because an older server does not honour the proof-only request (see the [upgrade guide](docs/guide/upgrade.md)).
   - Hard failover of the map group while its server is alive (contract 0.28.0): the leader judges the loss, fences its own primary of the map group and hands the lease to a standby's server. `abandonMapGroupBootstrap` takes `lostServerId` to declare a lost candidate. A hard failover that accepts a loss of data needs `kingres_admin` (contract 0.33.0).
@@ -86,8 +88,9 @@ The first release. KingresDB is a thin fork of PostgreSQL 18.7 and PostgreSQL 19
   - The failover dialog of the map group can declare the candidate server lost (`lostServerId`).
 - **Ledger** (`kingres_ledger` 0.3).
   - Append-only and updatable ledger tables with blocks, digests, inclusion proofs and verification; client signatures with a signature policy per table; a write guard.
+  - The REST contract has 37 ledger operations (status, blocks, digests, verifications, settings, signing keys, the trust file, the publication, anchor targets and anchors, aggregates, bundles, client keys, upgrade of the extension and acknowledgement of a divergence).
   - Signing keys, a transparency log per chain and an aggregate log per database, published on a listener of its own.
-  - Anchoring to a WORM object store, an RFC 3161 authority and OpenTimestamps; bundles and the audit of the publication; a rotation generation of the credentials of anchor targets.
+  - Anchoring to a WORM object store, an RFC 3161 authority and OpenTimestamps (the RFC 3161 and OpenTimestamps paths were tested against local fakes only); bundles; an on-demand audit of the publication (the check `publication` of a verification); a rotation generation of the credentials of anchor targets.
   - The acknowledgement of a diverged chain, and the acceptance of a restored system database as a signed event ([ADR 0025](docs/adr/0025-restore-of-the-system-database-is-accepted-by-an-operator.md)).
 - **Verifier** (`kingres-verify`). A standalone command, built from the Go standard library only, that checks digests, proofs, signed checkpoints, tile logs, consistency proofs, aggregates, bundles, client signatures and anchors without trusting the database. It has a reproducible build and a release script that produces signed checksums.
 - **Analytics extensions.**
@@ -96,20 +99,10 @@ The first release. KingresDB is a thin fork of PostgreSQL 18.7 and PostgreSQL 19
   - `kingres_timepart` 0.3: time partitions created ahead and dropped by policy, conversion of old partitions to columnar storage and back, and policies on user-partitioned distributed tables.
 - **Documentation.** A user guide ([docs/guide](docs/guide/README.md)): quickstart, installation, operator guide, upgrade and limitations.
 
-### Changed
-
-- Starting an instance whose postmaster is still shutting down waits for the shutdown (up to the stop timeout) and then starts it, or reports an error. Before, it reported success while the instance went down.
-- The restore of preferred primaries no longer fails with `lease_held_elsewhere` when the leader was the old primary of the restore, and the undo of the access rules of the old primary after a promotion carries the term that the promotion made.
-
-### Fixed
-
-- A bucket move or split no longer drops an old copy that objects of its owner depend on (a view, a materialized view, a foreign key, a function on its row type). The copy is left in place, the record of the move says what depends on it, `check_cluster()` reports `orphan_blocked`, and the next cleanup pass after the owner dropped the dependents finishes the move.
-- The locks of a bucket move or split are bounded and are never left behind, and the recovery worker does not undo a move or split that its session still runs.
-
 ### Security
 
 - The hardening of the extensions is listed under Added.
-- The container image listens on `0.0.0.0:8091` over plain HTTP and accepts setup from other machines, guarded only by the setup token. Publishing the port with `docker run -p 8091:8091` on a network that is not trusted sends the setup token and the first password in clear text. Publish it on `127.0.0.1` as the compose file does, or put TLS in front ([install guide](docs/guide/install.md#from-a-container-image)).
+- The container image listens on `0.0.0.0:8091` over plain HTTP and accepts setup from other machines, guarded only by the setup token. Publishing the port with `docker run -p 8091:8091` on a network that is not trusted sends the setup token and the first password in clear text. Publish it on `127.0.0.1` as the compose file does, or put TLS in front ([install guide](docs/guide/install.md#from-a-container-image)). The database port 5432 also listens on `0.0.0.0` inside the container: publish it on `127.0.0.1` or on a private network only.
 - The archive of a database import is treated as hostile input, and the transfers run as the role that asked ([ADR 0027](docs/adr/0027-transfers-are-staged-encrypted-files-run-as-the-requesting-role.md)).
 
 ### Known limitations
@@ -118,4 +111,11 @@ The first release. KingresDB is a thin fork of PostgreSQL 18.7 and PostgreSQL 19
 - No move of a cluster between PostgreSQL majors; no signed packages, no apt repository.
 - Not in the first release: an external signer command for the ledger, publication mirrors, and the anchor probe from another server.
 - The Extensions tab shows whether each extension is preloaded; the install state of an extension in a database is not shown in the console.
+- Export and import of a database carry no roles, grants, functions, triggers, policies or large objects; a ledger table restarts its chain.
+- A failover of the manager leader at every step of a table transfer or of a database import is not tested on a cluster.
+- Automatic failover is off by default; two failures at once, and a failure during a rebalance, are not tested on a cluster. A cluster of one server has no failover.
+- `kingres_columnar` tables are append-only (no `UPDATE` or `DELETE`), and `CREATE INDEX CONCURRENTLY` and `REINDEX CONCURRENTLY` on them are refused.
+- The check `anchors` of a ledger verification and a scheduled audit of the publication are not built (the check answers 422 `unsupported_operation`).
+- No automated backup and no point-in-time recovery configuration.
+- Packages are Debian (`.deb`) and a container image for amd64 only: no `.rpm`, no arm64.
 - The full list is in [docs/guide/limitations.md](docs/guide/limitations.md).

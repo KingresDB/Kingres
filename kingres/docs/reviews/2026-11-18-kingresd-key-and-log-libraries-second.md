@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Second independent review of the key and log libraries of kingresd
 
 Reviewer: an independent reviewer. Date: 2026-11-18.

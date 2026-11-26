@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # kingres_shard
 
 `kingres_shard` is the sharding extension of KingresDB. It turns ordinary
@@ -3041,7 +3042,7 @@ tables on the same node apart (design 6.3), because a retry is a cost, not becau
 What a move costs the nodes, per move: on the map group primary the session that runs `move_bucket()` and its control sessions; on the source a WAL sender,
 a replication slot and a publication; on the target a subscription with its apply worker and, during the copy, a table synchronization worker. So
 `max_connections`, `max_wal_senders`, `max_replication_slots`, `max_logical_replication_workers` and `max_worker_processes` have to leave room for the
-number of moves that are allowed at once (the `maxConcurrentMoves` option of a rebalance in the control plane, default 1) on top of what the databases use; a node that runs out of
+number of moves that are allowed at once (the `maxConcurrentMoves` option of a rebalance in the control plane: recorded as 1 when a start leaves it out, 1 to 64 otherwise; the control plane runs one move at a time whatever the value, so one move is what to plan for today) on top of what the databases use; a node that runs out of
 connections makes the move fail with "too many clients" and the move is undone.
 
 - **`kingres.move_progress()`** (superusers; it asks the nodes) returns one row per unfinished move: `move_id`, `colocation_id`, `bucket`, `source_group`,

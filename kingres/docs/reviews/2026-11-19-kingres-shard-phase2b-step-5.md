@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 
 # Review of kingres_shard phase 2b, step 5: the analysis module and the colocated INSERT ... SELECT
 

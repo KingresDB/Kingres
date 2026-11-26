@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 
 # Independent review of the fixes for the review of kingres_columnar C5 to C8 (branch `col-c13`)
 

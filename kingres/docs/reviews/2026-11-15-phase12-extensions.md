@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Adversarial review: contrib/kingres_sketch 1.0 and contrib/kingres_timepart 0.1 (phase 12)
 
 Reviewer: independent (not the author). Reviewed state: commit 5fc2a70fad,

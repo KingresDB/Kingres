@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 
 # Review of ledger phase 7, steps 1 and 2 (verifier core, kingres_ledger 0.3 part A)
 

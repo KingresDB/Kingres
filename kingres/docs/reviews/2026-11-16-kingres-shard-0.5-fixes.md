@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Adversarial review: contrib/kingres_shard 0.5, the two fix rounds (S6 and S7)
 
 Reviewer: an independent reviewer (not the author of the code, not the reviewer of the

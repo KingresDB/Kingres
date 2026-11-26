@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Independent review of the manual failover of kingresd (increment 3) and of the fixes for F2
 
 Reviewer: an independent reviewer. Date: 2026-11-18. Tree: the committed export `88f66c7d1d` (control plane, contract 0.10.0, design `ha-phase5-part2.md`).

@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Getting started: build and test KingresDB
 
 This page takes a new machine to a built, tested KingresDB server. Every

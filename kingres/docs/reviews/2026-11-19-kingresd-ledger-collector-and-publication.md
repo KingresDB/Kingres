@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 
 # Independent review of the collector and the publication of the ledger in kingresd (phase 7, steps 5 and 6) and of the fixes for the review of the signing keys
 

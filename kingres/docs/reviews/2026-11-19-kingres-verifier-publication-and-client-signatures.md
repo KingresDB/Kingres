@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Review of kingres-verify, phase 7 steps 7 and 18 (eighth review of the verifier)
 
 ## 1. Scope and method
