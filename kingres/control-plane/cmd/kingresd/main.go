@@ -49,6 +49,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/rebalance"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sdnotify"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/setup"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/standby"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store/pgstore"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/webui"
@@ -226,7 +227,12 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			}
 			return up
 		}
-		if wait, perr := lease.PrepareStart(filepath.Join(cfg.DataDir, leaseDirName), running); perr != nil {
+		// The group of a ready standby is enforced even when the record of the lease manager lacks it (see lease.PrepareStart).
+		standbyEnforced, serr := standby.EnforcedOnDisk(cfg.DataDir)
+		if serr != nil {
+			log.Warn("the standby list of this server cannot be read: every primary waits for its group lease before it starts", "error", serr)
+		}
+		if wait, perr := lease.PrepareStart(filepath.Join(cfg.DataDir, leaseDirName), running, standbyEnforced); perr != nil {
 			return fmt.Errorf("preparing the lease directory: %w", perr)
 		} else if wait {
 			log.Info("the local instance is not running and the lease of its group is enforced: it starts once the lease is held")

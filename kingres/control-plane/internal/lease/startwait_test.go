@@ -24,7 +24,7 @@ func (r *rig) restart(t *testing.T, running bool) (m *Manager, waiting bool) {
 	r.inst.mu.Unlock()
 	r.audit = nil
 	dir := filepath.Join(r.dir, "lease")
-	waiting, err := PrepareStart(dir, func(int32) bool { return running })
+	waiting, err := PrepareStart(dir, func(int32) bool { return running }, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +135,7 @@ func TestRunningInstanceIsKeptAcrossARestartOfTheManager(t *testing.T) {
 // server's own lease.
 func TestGateNeverHoldsBackAStandby(t *testing.T) {
 	dir := tempDir(t)
-	if _, err := PrepareStart(dir, func(int32) bool { return true }); err != nil {
+	if _, err := PrepareStart(dir, func(int32) bool { return true }, nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{FencedMarker + ".1", WaitMarker + ".1"} {
@@ -222,7 +222,7 @@ func TestEnforcedRecordFollowsTheManager(t *testing.T) {
 	if got := readEnforced(dir).Groups; len(got) != 0 {
 		t.Fatalf("a group that is no longer enforced must leave the record: %v", got)
 	}
-	if w, err := PrepareStart(dir, func(int32) bool { return false }); err != nil || w {
+	if w, err := PrepareStart(dir, func(int32) bool { return false }, nil); err != nil || w {
 		t.Fatalf("no enforced group: no waiting (%v, %v)", w, err)
 	}
 }
