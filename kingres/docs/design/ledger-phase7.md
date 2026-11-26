@@ -3263,7 +3263,8 @@ Decisions where the design was silent or open:
   (never from the command line or environment); nothing is ever overwritten.
 - No private key exists in the repository; tests make theirs from a fixed seed or with keygen in a
   temporary directory. The release key itself, its custody and its public value are the owner's
-  decision (design decision 33); the README says "not created yet" where the key will be printed.
+  decision (design decision 33). The owner had the key made on 2026-11-26; its public key, key
+  string and fingerprint are printed in the verifier README ("The release key").
 - go.mod is not edited by the release (the design said a toolchain line is added). Editing a
   tracked file would make the built tree differ from the tag. The go line already names the exact
   release; release.sh insists the installed Go equals it (or the toolchain line if one is added

@@ -118,14 +118,19 @@ Statuses: 0 verified; 1 a check failed, the step is named (`note-parse`, `note-s
 the key cannot be read. Status 3 is not used: every check that is asked for is made or fails.
 With no `--binary` the note alone is checked, and the output says that no binary was.
 
-**The release key.** The project's public key is printed here when the first release is made:
+**The release key.** The project's public release key (Ed25519, key name `kingres-verify-release`),
+held by the project owner:
 
 ```
-release key: (not created yet: the key's custody is a decision of the project owner)
+public key:  bbwi8vQotQ8amSyMOM70mk1Q+JSSD2gmbBDxnYiTma0=
+key string:  kingres-verify-release+dc5771ec+AW28IvL0KLUPGpksjDjO9JpNUPiUkg9oJmwQ8Z2Ik5mt
+fingerprint: 81ac03cf18cf327bcdb757473e71851ec1d8c19eb6d6a8f33a08cb2574bcffd5
 ```
 
-Until then there is no release and nothing to check against; do not trust a key that is not in
-this file and in the documentation of the same tag. The key is made with
+Give `--key` the public key or the key string. The same three values are in the project wiki
+(page "The Verifier"). Do not trust a key that is not in this file and in the documentation of
+the same tag. The key has no expiry date; if it is ever replaced, the new key is announced in
+this file and the wiki before a release is signed with it. The key is made with
 `go run ./cmd/kingres-release-tool keygen --out release.key` (a file of mode 0600 that the tool
 will not overwrite and that other users cannot read; no private key is in the repository, and
 the tests make theirs). `go run ./cmd/kingres-release-tool pub --key-file release.key` prints the
