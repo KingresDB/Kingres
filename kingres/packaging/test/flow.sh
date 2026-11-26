@@ -115,7 +115,7 @@ flow_check_data() {
     local p="$1"
     check_eq "${p}: row of orders" acme "$(psql_run -d shop -Atc 'select customer from public.orders where id = 7' 2>/dev/null)"
     check_eq "${p}: row of audit_rows" first "$(psql_run -d shop -Atc 'select note from public.audit_rows where id = 1' 2>/dev/null)"
-    check_eq "${p}: both extensions present" "kingres_ledger kingres_shard" \
+    check_eq "${p}: the extensions are present (shard and ledger by the options of the database, columnar and timepart with every database)" "kingres_columnar kingres_ledger kingres_shard kingres_timepart" \
         "$(psql_run -d shop -Atc "select string_agg(extname, ' ' order by extname) from pg_extension where extname like 'kingres%'" 2>/dev/null)"
 }
 
