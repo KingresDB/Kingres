@@ -353,7 +353,7 @@ mesh_bucket_counts() {
     local n c=""
     for n in 1 2 3; do
         use_node "${n}"
-        c="${c}$(api GET /databases/mesh | sed -n 's/.*"sharding":{"enabled":true,"bucketCount":\([0-9a-z]*\)}.*/\1/p') "
+        c="${c}$(api GET /databases/mesh | sed -n 's/.*"sharding":{"enabled":true,"bucketCount":\([0-9a-z]*\)[,}].*/\1/p') "
     done
     [ "${c}" = "32 32 32 " ]
 }
