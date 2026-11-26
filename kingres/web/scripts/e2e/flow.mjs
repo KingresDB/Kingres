@@ -12,7 +12,10 @@ export const ADMIN = { user: 'admin', password: 'E2e-Passw0rd-12' }
 // The data directory that the wizard is given: the one backend.sh uses inside WSL. run.mjs reads it from backend.sh when the variable is not set.
 function dataDir() {
   const dir = process.env.E2E_DATA_DIR
-  if (!dir) throw new Error('E2E_DATA_DIR is not set: it is the data directory of the test server inside WSL (backend.sh datadir prints it)')
+  if (!dir)
+    throw new Error(
+      'E2E_DATA_DIR is not set: it is the data directory of the test server inside WSL (backend.sh datadir prints it)',
+    )
   return dir
 }
 
