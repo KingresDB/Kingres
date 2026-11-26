@@ -33,7 +33,7 @@ The first release. KingresDB is a thin fork of PostgreSQL 18.7 and PostgreSQL 19
   - Ledger tables are refused by `create_distributed_table` and `create_reference_table` (SQLSTATE `KS016`).
   - Own SQLSTATEs `KS017` to `KS022` for the refusals that the control plane tells apart: no receiving shard group, unreadable bucket sizes, a busy bucket, a pinned schema, a failed verification, and a call on a node that is not the map group primary. A split of a table without a primary key is refused with `0A000`. `kingresd` matches the code, not the wording (see "SQLSTATEs of the answers" in the [README of `kingres_shard`](../contrib/kingres_shard/README.md)).
 - **Control plane** (`kingresd`, REST contract 0.34.0). Cluster creation and joining, servers, roles and grants, network access, databases, tasks, alerts, logs and metrics. The manager leader runs on the primary of the map group, the cluster state is in a system database, and certificates are renewed and revoked.
-  - Rebalance as a task with stop, resume and reports. Strategies by bucket count or disk size, a threshold, weights, several moves at a time, an automatic mode (off by default), draining a server and splitting a bucket.
+  - Rebalance as a task with stop, resume and reports. Strategies by bucket count or disk size, a threshold, weights, an automatic mode (a run makes one move at a time) (off by default), draining a server and splitting a bucket.
   - A drain hands the map group over by a planned switchover (contract 0.27.0).
   - A rebalance is held back, or refused with `group_degraded` unless `force` is sent, while a standby lags by more than `maxStandbyLagBytes`.
   - Distributed schemas: distribute, move and make local as tasks, and the sharding mode of a database. A rebalance and a drain plan and move schemas as items of the plan (contract 0.31.0): `kind` and `schemaName` appear in the plan, the progress and the report. A drain that would need to move a schema that cannot move (pinned by a ledger table, or a table without a key) is refused before a task exists.
@@ -51,7 +51,7 @@ The first release. KingresDB is a thin fork of PostgreSQL 18.7 and PostgreSQL 19
 - **High availability.** Failover is part of `kingresd` and is fenced by leases.
   - Manual failover, automatic failover with a counter, planned switchover of an ordinary group and of the map group, restore of preferred primaries, and a call that gives up a stuck bootstrap of the map group.
   - A group lease is enforced only once a standby that a failover may use is ready, so a primary is not fenced while its first standby is being copied.
-  - A planned switchover of the map group survives a clean stop that outlasts the lease of the task. A stop that outlasts that too is rolled back. A planned switchover must not run while servers of two versions run (see the [upgrade guide](docs/guide/upgrade.md)).
+  - A planned switchover of the map group survives a clean stop that outlasts the lease of the task. A stop that outlasts that too is rolled back. A repeated clean stop of the old primary asks only for the proof that it stopped and does not release the lease again. A planned switchover must not run while servers of two versions run, because an older server does not honour the proof-only request (see the [upgrade guide](docs/guide/upgrade.md)).
   - Hard failover of the map group while its server is alive (contract 0.28.0): the leader judges the loss, fences its own primary of the map group and hands the lease to a standby's server. `abandonMapGroupBootstrap` takes `lostServerId` to declare a lost candidate. A hard failover that accepts a loss of data needs `kingres_admin` (contract 0.33.0).
   - A switchover ends when the held-back old server has forgotten the leader: state, unquiesce and unfreeze are accepted from the leader that a majority of ready members names.
   - Local recovery of a map group that is held back for good (contract 0.34.0, audit action `releaseMapGroupHold`): `kingresd -release-map-hold -lost <serverId> -accept-data-loss`, run on the server of the old leader while `kingresd` is stopped. It ends the hold when the candidate died and the cluster has only one standby of the map group, which leaves every REST call answering 503.
@@ -109,6 +109,7 @@ The first release. KingresDB is a thin fork of PostgreSQL 18.7 and PostgreSQL 19
 ### Security
 
 - The hardening of the extensions is listed under Added.
+- The container image listens on `0.0.0.0:8091` over plain HTTP and accepts setup from other machines, guarded only by the setup token. Publishing the port with `docker run -p 8091:8091` on a network that is not trusted sends the setup token and the first password in clear text. Publish it on `127.0.0.1` as the compose file does, or put TLS in front ([install guide](docs/guide/install.md#from-a-container-image)).
 - The archive of a database import is treated as hostile input, and the transfers run as the role that asked ([ADR 0027](docs/adr/0027-transfers-are-staged-encrypted-files-run-as-the-requesting-role.md)).
 
 ### Known limitations
@@ -118,4 +119,3 @@ The first release. KingresDB is a thin fork of PostgreSQL 18.7 and PostgreSQL 19
 - Not in the first release: an external signer command for the ledger, publication mirrors, and the anchor probe from another server.
 - The Extensions tab shows whether each extension is preloaded; the install state of an extension in a database is not shown in the console.
 - The full list is in [docs/guide/limitations.md](docs/guide/limitations.md).
-- **Release items, open:** a reserved WAL resource manager id for `kingres_columnar` (it still uses the experimental id 128, `RM_EXPERIMENTAL_ID` in `kingres_columnar.h`); the packages and images of the final contents run through the package tests on a machine with Docker (the shell tests of the package, the image and the compose cluster were changed for `pg_stat_statements` and not run); the tests of the C and SQL of the merged tree on both majors (`g2` was checked on Windows only for the Go code, the console and the contract); the final checks recorded for both majors on the release commits; the version bump and the tag.
