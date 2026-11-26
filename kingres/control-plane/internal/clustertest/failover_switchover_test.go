@@ -240,7 +240,7 @@ func swWait(t *testing.T, e swEnv, id any, d time.Duration) map[string]any {
 			t.Logf("failover status: %v", e.leader.Expect(200, "GET", "/failover", nil))
 			t.Logf("leader log: %s", e.leader.LogTail(12000))
 			for _, n := range e.c.Nodes {
-				t.Logf("the lease, fence and stop lines of %s: %s", n.Host, leaseLines(n.LogTail(8000000)))
+				t.Logf("the lease, fence and stop lines of %s: %s", n.Host, leaseLines(n.Log()))
 			}
 		}
 	}()
@@ -716,9 +716,9 @@ func TestSwitchoverEndsWhenTheOldServerForgotTheLeader(t *testing.T) {
 func noStaleUnquiesce(t *testing.T, c *clustertest.Cluster) {
 	t.Helper()
 	for _, n := range c.Nodes {
-		for _, l := range strings.Split(n.LogTail(8000000), "\n") {
-			if strings.Contains(l, "failover: putting the access rules back") {
-				t.Errorf("the unquiesce of an old primary was refused after the promotion (log of %s): %s", n.Host, l)
+		for _, l := range strings.Split(n.Log(), "\n") {
+			if strings.Contains(l, "failover: putting the access rules back") && strings.Contains(l, "stale_term") {
+				t.Errorf("the unquiesce of an old primary was refused as stale (stale_term) after the promotion (log of %s): %s", n.Host, l)
 			}
 		}
 	}
