@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
 --
 -- ledger_paths: the invariant of the guard, and the paths to it (L10-01,
 -- L10-02, L10-03, L10-13, L10-14).  No statement that a role can issue writes

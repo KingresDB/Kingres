@@ -1,3 +1,6 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+--
 -- sketch_io: text and bytea input and output of the three types, and what
 -- happens to values that are cut off, too long or corrupted.
 SET search_path = public, kingres_sketch;

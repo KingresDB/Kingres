@@ -1,3 +1,6 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+--
 -- init_cluster and create_distributed_table on a single node.
 -- (A role named like a schema would capture unqualified names through
 -- "$user", so the tests pin the search path.)

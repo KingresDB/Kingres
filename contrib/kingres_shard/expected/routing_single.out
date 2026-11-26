@@ -1,3 +1,6 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+--
 -- Full SQL on distributed tables of a one-node cluster.  With a single shard
 -- group every bucket is local: statements must run unchanged on the
 -- partitions PostgreSQL itself keeps, with no routing involved.

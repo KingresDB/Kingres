@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026, RooyeKhat Media Co
 #
 # Runs every fuzz target of the verifier for a short, bounded time. The seed
 # corpora (the published vectors) also run in plain "go test ./...".

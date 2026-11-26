@@ -1,3 +1,6 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+--
 -- ledger_verify: clean verification, digests, inclusion proofs and every
 -- tamper case, performed the way an attacker with catalog access would:
 -- the protection triggers are switched off by editing pg_trigger directly

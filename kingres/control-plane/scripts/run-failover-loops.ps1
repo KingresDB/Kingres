@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026, RooyeKhat Media Co
 #
 # The loops of the definition of done of the failover part (docs/design/ha-phase5-part2.md, section 9: the tests marked (loop) are run 30 times, and the
 # measured times of section 2.5 are reported). Each group of tests runs through run-integration.ps1 (which holds the mutex of the cluster tests) on the

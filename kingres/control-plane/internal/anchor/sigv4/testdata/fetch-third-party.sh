@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026, RooyeKhat Media Co
 #
 # Fetches the third-party test data of package sigv4 into testdata/third_party
 # (or into the directory given as the first argument) and verifies it against

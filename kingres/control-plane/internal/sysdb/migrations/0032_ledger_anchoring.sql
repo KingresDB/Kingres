@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- Copyright (c) 2026, RooyeKhat Media Co
 -- kingres_cp 32: anchoring of the aggregate checkpoints of the ledger (design ledger-phase7.md, 6.2, 6.6, 6.8 and 8.2; step 10 of the plan).
 -- Applied inside one transaction by internal/sysdb; do not add BEGIN/COMMIT.
 -- The numbers 16 to 29 belong to the failover work, 30 and 31 to steps 3 to 6 of phase 7.

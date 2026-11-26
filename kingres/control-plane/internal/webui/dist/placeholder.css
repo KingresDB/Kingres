@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (c) 2026, RooyeKhat Media Co */
 /* Styles of the placeholder page; an external file because the Content-Security-Policy of kingresd allows no inline style. */
 :root { color-scheme: light dark; --ink: #14171f; --surface: #ffffff; }
 @media (prefers-color-scheme: dark) { :root { --ink: #f1eadb; --surface: #0b0d12; } }

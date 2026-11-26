@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- Copyright (c) 2026, RooyeKhat Media Co
 -- kingres_cp 35: the staged files of the data transfer (phase 14a: table CSV export and import).
 -- Applied inside one transaction by internal/sysdb; do not add BEGIN/COMMIT.
 
