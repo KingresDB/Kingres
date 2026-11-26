@@ -168,9 +168,16 @@ func (m *Manager) recordEnforced(group int32, enforced bool) {
 // says so, per group) and whose lease was enforced when the lease manager last
 // knew, it writes the wait marker of the group: that instance is then not started
 // until the lease is held. A running instance (kingresd was restarted, the
-// database kept running) is left alone and a stale marker is removed; no record
-// means not enforced. It returns whether any instance must wait.
-func PrepareStart(dir string, running func(group int32) bool) (bool, error) {
+// database kept running) is left alone and a stale marker is removed. A group is
+// enforced when the record of the lease manager says so or when standbyEnforced
+// (the standby list kept on disk, judged by the predicate the lease uses at run
+// time, see standby.EnforcedOnDisk) says so: the record is written only after a
+// round that left a lease, so it can lack a group whose standby became ready
+// since, and a primary started without a lease would serve until the first round
+// ended, while its standby may have been promoted. Only the record or the list
+// adds a wait, nothing removes one; a nil standbyEnforced judges by the record
+// alone. It returns whether any instance must wait.
+func PrepareStart(dir string, running func(group int32) bool, standbyEnforced func(group int32) bool) (bool, error) {
 	var topo Topology
 	if b, err := os.ReadFile(filepath.Join(dir, topologyFile)); err == nil {
 		_ = json.Unmarshal(b, &topo)
@@ -179,7 +186,7 @@ func PrepareStart(dir string, running func(group int32) bool) (bool, error) {
 	rec := readEnforced(dir)
 	waiting := false
 	for _, g := range topo.Groups {
-		if running(g) || !slices.Contains(rec.Groups, g) {
+		if running(g) || !(slices.Contains(rec.Groups, g) || (standbyEnforced != nil && standbyEnforced(g))) {
 			if err := os.Remove(MarkerPath(dir, WaitMarker, g)); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return false, err
 			}

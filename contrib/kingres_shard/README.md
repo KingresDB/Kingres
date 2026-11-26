@@ -73,7 +73,7 @@ each of them says so at its start and the wording of its time is kept.
 - A **reference table** is an ordinary table that every node holds in full.
   Reads are local; writes run on every node in one distributed transaction.
 - The **catalog** (`kingres.node`, `colocation`, `dist_table`, `bucket_map`,
-  `map_version`, `local_node`, `dist_partition`, `dist_schema`, `sharding_settings`) is authoritative on the primary of the *map
+  `map_version`, `dist_partition`, `dist_schema`, `sharding_settings`) is authoritative on the primary of the *map
   group* (group 0, node 1) and is copied to every other node. Changes to it are
   made on all nodes in one two-phase transaction. The node-local tables are not
   copied (`kingres.dtx_log` with the commit decisions, `kingres.pending_node`, the records of moves, splits and table operations; the list is under "SQL interface").
@@ -597,8 +597,8 @@ owning node, state, modulus, and the partition size where the partition exists o
 `kingres.bucket_move_status`, `kingres.table_operations`, `kingres.partitions` and `kingres.schemas`.
 
 Tables of the schema `kingres`. The catalog, authoritative on the map group primary and copied to every node: `node`,
-`colocation`, `dist_table`, `bucket_map`, `map_version`, `local_node`, `dist_partition`, `dist_schema`, `sharding_settings`
-and the sequence `colocation_id_seq`. Node-local, readable by superusers only: `dtx_log`, `dtx_applied`, `dtx_epoch`,
+`colocation`, `dist_table`, `bucket_map`, `map_version`, `dist_partition`, `dist_schema`, `sharding_settings`
+and the sequence `colocation_id_seq`. Node-local and never synchronised: `local_node` (the id of this node). Node-local as well, readable by superusers only: `dtx_log`, `dtx_applied`, `dtx_epoch`,
 `dtx_incident`, `dtx_unconfirmed`, `pending_node`, `cluster_secret`, `bucket_move`, `bucket_split`, `move_marker`,
 `table_operation`, `table_operation_item`, `table_operation_lock`, `table_old_copy` and `add_node_progress`.
 
@@ -1942,7 +1942,7 @@ a conversion through the text form of a value, a sub-select, a CTE, a view, a lo
 colocation group, a key from the nullable side of an outer join, row-level security, a
 statement that locks rows, and a statement that reads one table and neither groups nor removes duplicates (nothing
 to gain).  `EXPLAIN (VERBOSE)` of the scan such a statement gets says why (`Pushdown: not used: ...`).  A statement that reads a view of another
-owner is not answered by the scan either: it is refused with an error, on every path ("Views" in the limitations of phase 2a).
+owner is not answered by the scan either: it is refused with an error, on every path ("Views" in the limitations of 0.9).
 
 `EXPLAIN` of a shipped statement shows `Pushed:`, `Groups: 3 of 3 (local + 2 remote)` (with `; pruned by <column>`
 when a restriction on the key left groups out), and `Remote SQL:`; `EXPLAIN ANALYZE` adds `Rows from groups:`.
@@ -2341,7 +2341,7 @@ Limits of this version:
 
 The tests of this phase are `t/230` to `t/251`; the numbers of the measured cost are in the design notes and in the paragraph of step 12.
 
-## Limitations in phase 2a
+## Limitations (0.9)
 
 Read these first; each is a reviewed boundary, not an accident. The list was begun in phase 2a, in the wording of that time, and each item was checked again for 0.9: where a later phase lifted a boundary (pushdown, the row router, `MERGE`, the repartitioned join) the item says so, and what remains is a limit of 0.9.
 

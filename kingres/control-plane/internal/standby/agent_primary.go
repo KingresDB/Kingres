@@ -245,7 +245,7 @@ func (a *Agent) Probe(_ context.Context, _ time.Time) ([]monitor.Condition, map[
 	for _, g := range a.primaryGroups() {
 		ps := a.primaries[g]
 		if ps.Without {
-			conds = append(conds, monitor.Condition{Kind: "groupWithoutSynchronousStandby", Severity: "warning",
+			conds = append(conds, monitor.Condition{Kind: "groupWithoutSynchronousStandby", Severity: "critical",
 				Subject: fmt.Sprintf("server:%s|group:%d", a.Self, g),
 				Message: fmt.Sprintf("Shard group %d is running without a synchronous standby: its standbys have not streamed for longer than the grace period, so commits are acknowledged by the primary on server %s alone and a failure of that server now loses them.", g, a.Self)})
 		}

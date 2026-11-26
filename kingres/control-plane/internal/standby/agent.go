@@ -152,12 +152,7 @@ func (a *Agent) List(context.Context) ([]ha.Standby, error) {
 // record ready only after this server took a list with the entry Ready (Leader.markReady), so the fence is armed
 // before a failover can choose the standby.
 func (a *Agent) HasStandby(group int32) bool {
-	for _, e := range a.local.snapshot().entriesOfGroup(group) {
-		if e.Ready || e.Generation > 0 {
-			return true
-		}
-	}
-	return false
+	return a.local.snapshot().hasStandby(group)
 }
 
 func (a *Agent) mgr() *instance.Manager { return a.Svc.Manager() }

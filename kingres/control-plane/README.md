@@ -2266,7 +2266,7 @@ is paused the watchdog does its job. A step of the system clock does not matter 
    checkpoint, a backend that does not end, a walsender that must send its WAL), and the watchdog, which outlives
    kingresd, then stopped the instance with an immediate shutdown in the middle of the clean stop (measured by
    `TestOrderlyStopOutlastingTheLeaseIsNotFencedByTheWatchdog`: a stopped backend keeps the shutdown waiting for 12 s with
-   a lease of 6 s; the watchdog fenced after about 4 s). `-stop-instances` therefore asks the primary instance for the fast
+   a lease of 6 s; the watchdog fenced after about 4 s). `-stop-instances` therefore asks every instance of the node, the primaries first, for the fast
    shutdown without waiting (`pg_ctl stop -m fast -W`), and **after** PostgreSQL has accepted the request writes
    `<data-dir>/lease/standdown` with the process id and start time of that postmaster (lines 1 and 3 of `postmaster.pid`),
    and only then waits. From the request on PostgreSQL admits no new session and ends the existing ones, so no write can
@@ -2341,7 +2341,7 @@ setting is `replica.default` in `kingres_cp.cluster_setting`, ADR 0011).
   streamed yet is not put in the setting, so a new standby never makes its group wait during the base backup. This is the
   trade of the design: commits are acknowledged by two servers while a standby streams and by one after the grace period,
   which the alert says in those words. The setting lives in `kingres-managed.conf` (`Extra`), not in `ALTER SYSTEM`.
-- **Alerts**: `groupWithoutSynchronousStandby` (per server and group, on the primary's server), `groupUnderReplicated` (cluster
+- **Alerts**: `groupWithoutSynchronousStandby` (`critical`, as the contract says: commits are acknowledged by one server only; per server and group, on the primary's server), `groupUnderReplicated` (cluster
   scope, `cluster|group:<g>`, raised by the leader when fewer standbys stream than the replica count at three checks in a
   row; never in a one-server cluster, where nothing can be placed), and `replicationLagHigh` for slot retention. The first
   two kinds are not in the `AlertKind` enum of contract 0.6.0 (0.7.0 adds them).
@@ -2392,7 +2392,7 @@ Multi-server, in WSL (`internal/clustertest/standby_test.go`): `TestStandbysAreC
    only the streaming ones, so that a standby that falls behind stays a candidate of the quorum.
 6. A one-server cluster raises no `groupUnderReplicated` (it is the development arrangement). With two servers or more it does,
    also when fewer standbys can be placed than the count asks for; the message says so.
-7. Standby instances are not stopped by a stop of kingresd (like the primary instance); `-stop-instances` stops them first.
+7. Standby instances are not stopped by a stop of kingresd (like the primary instance); `-stop-instances` asks every instance for its fast shutdown at once, the primaries first, and then waits for each.
 8. kingresd reaches a standby by peer authentication on its private unix socket, never by a password.
 
 **Limits**: a cluster created before this version has no replication lines in `pg_hba.conf` until its trust rules are written
@@ -2818,7 +2818,7 @@ never had a failover every answer is what it was (instance 1), which is what the
   by the copy of the rules (`SyncAccess` from `AccessSourceID`); reads (`CollectRoles`, `CollectGlobals`, the sign-in verifier, the
   proxy's role connections) go to `ConnectID` (the map primary if local, else the first primary). The start, stop and restart operations
   of "this server's instance" act on every primary the server runs (standbys stay the agent's business, as before); the orderly stop
-  of the service stops every standby first, then every primary, and the watchdog of each is told to stand down.
+  of the service asks every instance for its fast shutdown at once, the primaries first (an earlier version stopped every standby first and waited for each; a slow standby then delayed the request for the primary until the lease ran out), writes the stand-down of the watchdog of each primary after PostgreSQL accepted the request, and only then waits for each; the stop of the service is `Service.StopInstanceForShutdown`.
 - Decisions: the managed settings of an instance other than the home one keep their own port and recovery settings (only the
   certificate paths are rewritten); `cluster.NodeID` stays the name of the home instance; a server whose home instance is a standby and that
   runs no primary uses the home instance for what it must read.
@@ -3633,7 +3633,7 @@ submission is partial and passes it to `Resume` at the next attempt, and notes c
 
 ### The review of the wiring of anchoring and its fixes (corrections 230 to 245)
 
-The review ([report](../docs/reviews/2026-11-20-kingresd-anchoring-wiring-and-publication-fixes.md)) found one high, five medium, eight low defects and three notes (P7A-01 to P7A-17). Each is fixed with a test that fails for a one-line mutant that brings the defect back; the fixes are not reviewed yet.
+The review ([report](../docs/reviews/2026-11-20-kingresd-anchoring-wiring-and-publication-fixes.md)) found one high, five medium, eight low defects and three notes (P7A-01 to P7A-17). Each is fixed with a test that fails for a one-line mutant that brings the defect back; a later review ([report](../docs/reviews/2026-11-21-ledger-phase7-anchoring-and-verifier-fixes.md)) found all seventeen fixed, each with a test that kills a one-line mutant (a few redundant guards excepted); the fixes of its own findings (P7R-01 to P7R-11) were reviewed in [this report](../docs/reviews/2026-11-22-ledger-phase7-p7r-fixes.md).
 
 * **Restoring the system database (P7A-02, [ADR 0025](../docs/adr/0025-restore-of-the-system-database-is-accepted-by-an-operator.md), design 9.4).** The chain logs are derived again from the chains; the aggregate log and the events are not, and no computation brings them back. A restored database that is behind `published.json` is refused with the critical alert `ledgerSignerUnavailable` (subject `published-state`), which now says what was published, what the database holds and a confirmation of sixteen hexadecimal digits. The procedure: (1) read the alert and check that the database really was restored and that no newer backup of it exists; (2) restart every `kingresd` after the restore of the system database (as before); (3) on the host of the manager leader write the confirmation of the alert, and on a second line a reason of up to 200 printable ASCII characters, into `<ledger-keys-dir>/accept-restore`; (4) the leader makes the record what the database holds, one generation higher, keeps the old record as `published.json.before-restore-<generation>` (written whole into a temporary file, synced and renamed, with the directory synced, and before anything changes; a copy that is already there is never written over, the new one then gets a suffix `.1`, `.2`, ...: P7R-11), removes the file, and publishes the signed event `restore-acknowledged` before it signs anything else. The other holders take the new generation when the leader sends its record. The logs fork against a mirror that holds the old checkpoints; the event is the public statement of that. A confirmation of another situation is ignored. Two properties of this that are accepted and stated (P7R-11): the event is announced at the start of the next round, but a key task may append another event between the acceptance and that round, so the event `restore-acknowledged` is not always the first event after the acceptance (the record is consistent either way, and the verifier reads the event wherever it is); and a cleared note of an accepted restore can come back from a holder that still has it, which is harmless because the event is keyed by `generation:<n>` and publishing it again finds the existing one.
 * **The due list (P7A-01).** `Store.Due(set, perTarget)` selects by state and by due time in the query (pending for the submit job, submitted and claimed for the upgrade job) and limits to 100 records for each target; tests on the memory store and on PostgreSQL.

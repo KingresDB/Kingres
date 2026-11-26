@@ -3,8 +3,10 @@
 # Getting started: build and test KingresDB
 
 This page takes a new machine to a built, tested KingresDB server. Every
-command here was run on 2026-11-14 on Windows 11 with WSL2 and Ubuntu 24.04;
-the results are in the [work log](../worklog.md).
+command here is written for Windows 11 with WSL2 and Ubuntu 24.04, the setup
+on which the project is developed; the [work log](../worklog.md) records the
+runs of each step with their results. The PostgreSQL versions are 18.7
+(`kingres-18`, `REL_18_7`) and 19.0 (`kingres-19`, `REL_19_0`).
 
 ## What you need
 
