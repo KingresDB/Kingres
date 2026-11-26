@@ -94,6 +94,7 @@ type Runner struct {
 	VerifyWait         time.Duration // the proof is repeated this long (default 30 s)
 	OldServerWait      time.Duration // the calls to the old primary's server after the promotion wait this long (default 15 s)
 	MapVerdictWait     time.Duration // the old leader of a planned switchover of the map group waits this long for the candidate to promote or to refuse (default 6 min)
+	CatalogReadWait    time.Duration // a step after the promotion waits this long for a catalog that cannot be read right now, then pauses (default 3 min)
 	// PromoteNode are the bounds of the repeat loop of kingres.promote_node.
 	PromoteNode PromoteOptions
 	// PositionTimeout is the time of one read of a position (default 5 s).
@@ -1456,9 +1457,9 @@ func (r *Runner) catalogFollows(ctx context.Context, env *task.Env, sc *stepCtx)
 	if gr.NewNode == 0 {
 		return fail(CodeBadPromoteTarget, false, "the standby %d has no node in the catalog", nw.ID)
 	}
-	targets, err := r.targets(ctx, gr, sc.group)
-	if err != nil {
-		return sc.targetsPause(ctx, err)
+	var targets []dbTarget
+	if err := sc.readCatalog(ctx, func() (e error) { targets, e = r.targets(ctx, gr, sc.group); return }); err != nil {
+		return err
 	}
 	var sysOut PromoteOutcome
 	for _, t := range targets {
@@ -1514,18 +1515,21 @@ func (r *Runner) checkCatalog(ctx context.Context, env *task.Env, sc *stepCtx) e
 	if err != nil {
 		return err
 	}
-	targets, err := r.targets(ctx, gr, sc.group)
-	if err != nil {
-		return sc.targetsPause(ctx, err)
+	var targets []dbTarget
+	if err := sc.readCatalog(ctx, func() (e error) { targets, e = r.targets(ctx, gr, sc.group); return }); err != nil {
+		return err
 	}
 	for _, t := range targets {
 		for attempt := 0; ; attempt++ {
-			nodes, err := r.Cat.Nodes(ctx, t.db)
-			if err != nil {
-				return err
-			}
-			term, _, err := r.Cat.Status(ctx, t.db)
-			if err != nil {
+			var nodes []Node
+			var term int64
+			if err := sc.readCatalog(ctx, func() (e error) {
+				if nodes, e = r.Cat.Nodes(ctx, t.db); e != nil {
+					return e
+				}
+				term, _, e = r.Cat.Status(ctx, t.db)
+				return e
+			}); err != nil {
 				return err
 			}
 			before := int64(0) // the term before is known for the system catalog only
@@ -1603,8 +1607,8 @@ func (r *Runner) repoint(ctx context.Context, env *task.Env, sc *stepCtx) error 
 	if err != nil {
 		return err
 	}
-	nodes, err := r.Cat.Nodes(ctx, SystemDB)
-	if err != nil {
+	var nodes []Node
+	if err := sc.readCatalog(ctx, func() (e error) { nodes, e = r.Cat.Nodes(ctx, SystemDB); return }); err != nil {
 		return err
 	}
 	port := 0
@@ -1652,8 +1656,8 @@ func (r *Runner) records(ctx context.Context, env *task.Env, sc *stepCtx) error 
 	if err != nil {
 		return err
 	}
-	nodes, err := r.Cat.Nodes(ctx, SystemDB)
-	if err != nil {
+	var nodes []Node
+	if err := sc.readCatalog(ctx, func() (e error) { nodes, e = r.Cat.Nodes(ctx, SystemDB); return }); err != nil {
 		return err
 	}
 	port := 0

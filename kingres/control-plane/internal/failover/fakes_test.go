@@ -51,6 +51,10 @@ type world struct {
 	promoteErr     map[string]error // scripted errors for the first calls, by server
 	promoteN       map[string]int
 	catScript      []any
+	// readErrs are the errors that the next reads of the catalog (Nodes) answer, one each, once the promotion happened; readErr is what a read answers after them while readForever is set.
+	readErrs       []error
+	readForever    error
+	readCalls      int
 	catCalls       int
 	catalogFollows bool
 	primaryNames   []int64
@@ -463,6 +467,17 @@ func (c fcat) list(db string) *[]Node {
 func (c fcat) Nodes(_ context.Context, db string) ([]Node, error) {
 	c.w.mu.Lock()
 	defer c.w.mu.Unlock()
+	if c.w.promoted2() {
+		c.w.readCalls++
+		if len(c.w.readErrs) > 0 {
+			e := c.w.readErrs[0]
+			c.w.readErrs = c.w.readErrs[1:]
+			return nil, e
+		}
+		if c.w.readForever != nil {
+			return nil, c.w.readForever
+		}
+	}
 	return append([]Node(nil), (*c.list(db))...), nil
 }
 func (c fcat) Status(_ context.Context, db string) (int64, bool, error) {
@@ -941,4 +956,14 @@ func (p fpeers) MapRefusal(_ context.Context, _ int64) (string, bool) {
 	p.w.mu.Lock()
 	defer p.w.mu.Unlock()
 	return p.w.mapRefusal, p.w.mapRefusal != ""
+}
+
+// promoted2 says that some standby was promoted: the reads of the catalog that the faults of readErrs and readForever hit are the ones after it.
+func (w *world) promoted2() bool {
+	for _, p := range w.promoted {
+		if p {
+			return true
+		}
+	}
+	return false
 }
