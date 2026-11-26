@@ -3,10 +3,23 @@
 # KingresDB web panel
 
 The management console of KingresDB: a single-page application (Vue 3, TypeScript, Vite) that is a client
-of the REST API in `kingres/api/openapi.yaml` (revision 0.13.0, 132 operations; the generated files still follow 0.12.0, see "Contract revisions" below) and nothing else. The Go server (`kingresd`) will embed the
-production build from `dist/` and serve it on every node. The information architecture follows the
+of the REST API in `kingres/api/openapi.yaml` (contract 0.34.0, 178 operations; the generated files follow the same
+revision) and nothing else. The information architecture follows the
 "Management panel" chapter of `docs/architecture.md`: a first-run wizard, a **Cluster** scope and a
-**This server** scope.
+**This server** scope. The guide for operators is in [../docs/guide/README.md](../docs/guide/README.md).
+
+**How the console reaches a node.** `kingresd` embeds the production build and serves it on every node. The build
+(`npm run build`, output `dist/`) is copied to `kingres/control-plane/internal/webui/dist`, which `internal/webui/webui.go`
+embeds with `go:embed`; the release recipe (`kingres/packaging/build/build.sh`, the "Panel" step) does the copy, so the
+`kingresd` of a package or image carries the console. The directory in the repository holds a placeholder page only. The server
+sends the headers listed under "What the server must send" and serves `index.html` for every path that is not a file and not
+under `/api/`.
+
+**Pages** (routes of `src/router/index.ts`): the sign-in page (`/login`) and the first-run wizard (`/setup`); then, inside the
+shell, Dashboard, Servers (and one page per server), Databases (and one page per database and per table), Shards, Replication,
+Rebalance, Security, Ledger, Workbench, Tasks, Alerts, Logs, Settings, Configuration, and This server (with its logs). A role
+that is too low gets the "not allowed" page (`/forbidden`), an unknown path the not-found page. What the pages do is described
+under "What the panel does for contract ..." below, which is the record of how each part was built.
 
 ## Quick start
 
@@ -49,8 +62,8 @@ Development switches in the URL (mock API only):
 | `?failover=slow`                                                                      | 0.10.0: the steps of a failover take about three times as long as a task does, so that the phases, the lease wait and Cancel can be tried.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `?failover=warnings`                                                                  | 0.12.0: a finished failover ends `completedWithWarnings` ("Completed, with remarks").                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `?failover=noplan`                                                                    | 0.12.0: a refusal `failover_needs_decision` carries no plan (a server of 0.11.0): the dialog asks with a dry run.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `?failover=map`                                                                       | 0.10.0: the map group can be failed over (the real server answers 422 `unsupported_operation` for it until increment 5; so does the mock without the switch). The manager moves first: the status has no `taskId` and the phase `bootstrap` until the catalog follows.                                                                                                                                                                                                                                                                                                                                                                         |
-| `?failover=graceful`                                                                  | 0.10.0: the planned switchover is accepted (the real server answers 422 `unsupported_operation` until increment 7; so does the mock without the switch): the steps are the switchover's, the groups report `writesPausedSince`. `?failover=switchover:behind` also makes its verification fail: rolled back, task error `standby_behind`.                                                                                                                                                                                                                                                                                                      |
+| `?failover=map`                                                                       | 0.10.0: the map group can be failed over (the mock answers 422 `unsupported_operation` for it without the switch, as a server of 0.10.0 did; `kingresd` fails the map group over now). The manager moves first: the status has no `taskId` and the phase `bootstrap` until the catalog follows.                                                                                                                                                                                                                                                                                                                                                                         |
+| `?failover=graceful`                                                                  | 0.10.0: the planned switchover is accepted (the mock answers 422 `unsupported_operation` without the switch, as a server of 0.10.0 did; `kingresd` does the switchover now): the steps are the switchover's, the groups report `writesPausedSince`. `?failover=switchover:behind` also makes its verification fail: rolled back, task error `standby_behind`.                                                                                                                                                                                                                                                                                                      |
 | `?tables=partitions`                                                                  | 0.14.0: adds to the database `shop` a distributed table `measurements` that the user partitioned by RANGE on `taken_at` (three partitions, the last one the DEFAULT) and a table `measurements_old` of the same colocation group that can be attached to it.                                                                                                                                                                                                                                                                                                                                                                                   |
 | `?tables=fail:space`, `fail:copy`                                                     | 0.14.0: the next change of a table fails at its first step (not enough free space on a server) or in the copy (a connection closed); the table stays as it was.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `?tables=slow`                                                                        | 0.14.0: the tasks of a table take a minute, so that their steps and Cancel can be tried (a task can be cancelled until its switch, at 70 percent).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
@@ -68,7 +81,7 @@ Development switches in the URL (mock API only):
 | `?config=failed:10.0.0.12`                                                            | 0.8.0: the next configuration change fails on that server (PostgreSQL rejects the file): the task ends failed with `config_incomplete`, the other servers are applied, the server shows the text, and **Retry** (the same change again) works. Several servers: comma.                                                                                                                                                                                                                                                                                                                                                                         |
 | `?config=waiting:10.0.0.13`                                                           | 0.8.0: that server cannot be reached for a configuration change: the task holds at its step ("Waiting for server 10.0.0.13, which cannot be reached") and never gives up; it can be cancelled. `__kingresMock.configServerBack(id)` brings the server back.                                                                                                                                                                                                                                                                                                                                                                                    |
 | `?config=restart-conflict`                                                            | 0.8.0: a restart is pending in which `max_connections` goes up and `max_wal_senders` goes down: `restartPendingInstances` answers 409 `config_restart_order_conflict`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `?phase7=today`                                                                       | 0.11.0: the 21 ledger operations that `kingresd` does not build yet answer 422 `unsupported_operation`, as the real server does today (only the settings, the signing keys and the trust file work). Without it the mock answers all 28 new operations as the design of phase 7 says they will.                                                                                                                                                                                                                                                                                                                                                |
+| `?phase7=today`                                                                       | 0.11.0: the 21 ledger operations that the `kingresd` of 0.11.0 did not build answer 422 `unsupported_operation`, to see the state of an older server (only the settings, the signing keys and the trust file work). `kingresd` builds all 28 operations now, and without the switch the mock answers them all.                                                                                                                                                                                                                                                                                                                                                |
 | `?signing=<a>,<b>`                                                                    | 0.11.0: the signing keys: `none` (no key, no locked origin prefix, publication off), `rotating` (two keys active), `revoked` (a revoked key and a third that signs), `plain` (key files not sealed by a passphrase), `backup` (a backup is advised), `alarm` (this server cannot sign: alert `ledgerSignerUnavailable`), `discontinuity`, `command` (external signer), `restored` (0.12.0: the system database is older than what was published: alert `ledgerSignerUnavailable` with the subject `published-state`), `fail:<code>` (the next key task ends failed with that task error code: `key_files_remain`, `passphrase_mismatch`, ...). |
 | `?publication=<a>,<b>`                                                                | 0.11.0: `off`, `plain` (the listener has no TLS), `nolistener`, `behind` (the newest checkpoint is old: alert `ledgerPublicationBehind`), `unread` (a group could not be read: a stale member, alert `ledgerGroupUnread`), `diverged` (the chain of group 2 of `shop` no longer extends its published log: alert `ledgerChainDiverged`).                                                                                                                                                                                                                                                                                                       |
 | `?anchors=<a>,<b>`                                                                    | 0.11.0: `none` (the alert `ledgerNotAnchored`, info), `required` (the same as a warning), `ok`, `behind`, `failed` (a WORM target `archive-worm` exists and the newest aggregate is anchored in time, late, or its record failed). Without the switch no target exists and no alert is raised.                                                                                                                                                                                                                                                                                                                                                 |
@@ -98,7 +111,7 @@ shows as "n/a" with an accessible label, never as 0.
 npm run dev:backend  # mocks off; Vite proxies /api to http://127.0.0.1:8091
 ```
 
-The proxy target is in `vite.config.ts`. `VITE_MOCKS=off` (see `.env.backend`) turns the mocks off. The mock layer
+The proxy target is in `vite.config.ts` (`KINGRES_API_TARGET` overrides it). `VITE_MOCKS=off` turns the mocks off. `npm run dev:backend` reads it from `.env.backend`, which the repository ignores (`.env.*` in `kingres/.gitignore`), so create that file with the line `VITE_MOCKS=off`, or run `VITE_MOCKS=off npm run dev`. The mock layer
 is imported only when `import.meta.env.DEV` is true, so it is not in the production build (checked: no `msw`
 string in `dist/`).
 
@@ -107,11 +120,13 @@ string in `dist/`).
 | Script                        | What it does                                                                                                                                                                                                    |
 | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `npm run dev` / `dev:backend` | Dev server with the mock API / with the proxy to `127.0.0.1:8091`                                                                                                                                               |
-| `npm run build`               | Type-check, then build to `dist/` (the directory the Go server embeds)                                                                                                                                          |
+| `npm run build`               | Type-check, then build to `dist/` (the release recipe copies it to the directory the Go server embeds)                                                                                                          |
 | `npm run typecheck`           | `vue-tsc --noEmit` (scripts and templates, `strict`, `noUncheckedIndexedAccess`)                                                                                                                                |
+| `npm run preview`             | Serves the production build with Vite's preview server                                                                                                                                                          |
 | `npm run lint`                | ESLint (flat config, Vue and Vue accessibility plugins) and `prettier --check`                                                                                                                                  |
 | `npm run lint:fix` / `format` | Fix lint problems / format with Prettier                                                                                                                                                                        |
-| `npm test`                    | Vitest and Testing Library, against the mock API (jsdom, no browser needed)                                                                                                                                     |
+| `npm test` / `test:watch`     | Vitest and Testing Library, against the mock API (jsdom, no browser needed): once / watching                                                                                                                    |
+| `npm run e2e`                 | The end-to-end run against a real `kingresd` (see below)                                                                                                                                                        |
 | `npm run test:browser`        | The tests that need a real Chrome or Edge: layout at 1366, 683 and 320 px, keyboard, axe, and the production build under the content security policy (needs `CHROME_PATH` if Chrome is not in a standard place) |
 | `npm run api:generate`        | Regenerate the API types from the contract                                                                                                                                                                      |
 | `npm run api:check`           | Fail if the generated files are out of date (also run by `npm test`)                                                                                                                                            |
@@ -121,8 +136,8 @@ string in `dist/`).
 ## End-to-end test against the real server
 
 `npm run e2e` is one command. It needs Windows with WSL2 (distribution `Ubuntu-24.04`, user `kingres`), Go, Chrome or Edge, and
-an installed KingresDB with the current extensions inside WSL (`~/kw-cp/install` when it has `kingres_ledger` 0.2, else
-`~/kingres-work/install`; `E2E_PG_INSTALL` names another, for example a PostgreSQL 19 installation, and the same run then proves the console on that major). It:
+an installed KingresDB inside WSL (`scripts/e2e/backend.sh` takes `~/kw-cp/install` when it has the install script of `kingres_ledger` 0.2, else
+`~/kingres-work/install`; the check looks for version 0.2 of the ledger script, which is no longer the current one, so name the installation yourself: `E2E_PG_INSTALL` names it, for example a PostgreSQL 19 installation, and the same run then proves the console on that major). It:
 
 1. builds the production panel (`vite build`), then `kingresd` for Linux from `kingres/control-plane` (or uses `KINGRESD_BIN`) with
    the panel embedded: a Go build overlay puts `dist/` in place of the placeholder in `internal/webui/dist` for this build only,
@@ -133,8 +148,7 @@ an installed KingresDB with the current extensions inside WSL (`~/kw-cp/install`
 4. drives a headless browser through the real flow (`scripts/e2e/flow.mjs`): wizard with the real setup token and the server's own fingerprint (wrong
    token and wrong data directory first), sign-in, reload, roles (duplicate, disable, a stats-only account), a sharded
    database with the ledger, tables made with psql, distribute and enable-ledger from the panel, workbench query and
-   SQL error, grant, network rule, every page, calm notices for the operations the server does not implement yet (failover,
-   rebalance), the cluster settings, the audit log, drop database, server groups (create, assign, refused delete, unassign,
+   SQL error, grant, network rule, every page, the failover and rebalance dialogs (the steps of this part were written when the server did not do them yet, see below), the cluster settings, the audit log, drop database, server groups (create, assign, refused delete, unassign,
    delete), the certificate and fingerprint of a server, the add-server dialog (pin or explicit unpinned choice; the server refuses a request without either), a ledger proof (pending
    until a digest, then shown), the proof and digest files compared byte for byte with the server's answer and accepted by
    `kingres-verify`, a ledger verification and its record, local settings (log level, memory quota and the persistent
@@ -148,16 +162,14 @@ The exit code is 0 only if every step passed. Screenshots are in `.e2e/shots/` (
 keeps `~/kw-web/install` for faster re-runs; `E2E_KEEP_RUNNING=1` leaves the processes running. `scripts/e2e/backend.sh` is
 the WSL side (`prepare`, `start`, `restart`, `token`, `psql`, `stop`). `puppeteer-core` is a development dependency.
 
-The runner has steps for contract 0.7.0 (a running statement is cancelled; "Stop waiting" then "Cancel it on the server"; the
+The runner was written for contracts 0.2 to 0.9: its steps do not cover the later parts of the console (data transfer, analytics, the full ledger console), and the failover step (`scripts/e2e/flow.mjs`, "failover (not implemented yet) answers with a calm notice") still expects the "not available on this server version yet" notice that a server of that time gave, which `kingresd` no longer gives. It has steps for contract 0.7.0 (a running statement is cancelled; "Stop waiting" then "Cancel it on the server"; the
 Replication page shows the lease and the commit rule of every group; the server page lists its leases; changing the replica count
-of a one-server cluster), and the audit step expects `cancelStatement`. **These steps were written but not run**: when the
-increment was made, a cluster test of the control plane (three `kingresd` processes) was running on the same machine, and the
-runner must not start next to it. Run `npm run e2e` (with `E2E_API_PORT` and `E2E_PG_PORT` of your own) when the machine is free.
+of a one-server cluster), and the audit step expects `cancelStatement`. They were written next to a cluster test of the control plane (three `kingresd` processes), which the runner must not start next to; give the runner its own `E2E_API_PORT` and `E2E_PG_PORT` and run it when the machine is free.
 The selectors the new steps use (`group-lease`, `commit-rule`, `replica-count`, `server-leases`) are the ones the unit tests use.
 
 ### What the run against kingresd 0.2.0-dev found (2026-11-15, contract 0.6.0)
 
-All 45 steps pass against the real server (built from the working tree, contract 0.6.0), with the panel served by the server
+This is a record of one run, in the wording of its time; the "kingresd 0.2.0-dev" of its title is a development build before the first release. All 45 steps pass against the real server (built from the working tree, contract 0.6.0), with the panel served by the server
 itself. What the run now proves for 0.6.0:
 
 - The setup wizard shows the server's own fingerprint (`NodeStateInfo.internalFingerprint`, 64 digits) and it equals what
@@ -307,7 +319,7 @@ src/
   bootstrap.ts  builds pinia + query client + router, and the one end-of-session path (used by main.ts and the tests)
 tests/          Vitest; helpers.ts renders the real app against the mock API
 browser-tests/  Real-browser tests (puppeteer-core, own vitest config): layout, keyboard, axe, content security policy
-scripts/        gen-api.mjs
+scripts/        gen-api.mjs (API types), brand-sync.mjs (brand files), e2e/ (the end-to-end runner: run.mjs, flow.mjs, browser.mjs, backend.sh)
 ```
 
 ## Conventions
@@ -382,7 +394,7 @@ scripts/        gen-api.mjs
 
 ## Testing
 
-`npm test` runs everything in about 15 seconds. The tests render the real app (router, pinia, query client)
+`npm test` runs all the unit and component tests under `tests/` and `src/` (the files of `browser-tests/` run with `npm run test:browser`). The tests render the real app (router, pinia, query client)
 and talk to the mock API through MSW in Node, so the same handlers serve `npm run dev` and the tests.
 
 | File                                                                                                                           | Covers                                                                                                                                                                                                                                                                                                                                                                                       |
@@ -446,7 +458,7 @@ tokens instead.
 
 ## Contract revisions and the checks against them
 
-The generated files (`src/api/schema.d.ts`, `src/api/operations.generated.ts`) follow contract **0.19.0** (data transfer, phase 14a). The revision of `kingres/api/openapi.yaml` is the one they are generated from. `npm run api:check` and the contract tests compare
+The generated files (`src/api/schema.d.ts`, `src/api/operations.generated.ts`) follow contract **0.34.0**, the revision of `kingres/api/openapi.yaml` they are generated from. `npm run api:check` and the contract tests compare
 with that file. While the working tree holds a draft of a later revision they fail, and that failure says nothing about the
 panel; to check against another copy of the contract (for example the committed one), point `KINGRES_API_SPEC` at it:
 
@@ -458,6 +470,10 @@ KINGRES_API_SPEC=openapi-copy.yaml npm test
 
 `scripts/gen-api.mjs` and the contract tests read the same variable, so `npm run api:generate` with it set regenerates from that
 copy. Adapting to the next revision is a separate step.
+
+## The record of how the console was built
+
+The sections from here to the end are the record of how the console was built, part by part and contract revision by contract revision, in the wording of their time. Phrases such as "the server of today", "not built yet" and "increment N" name the state of the server when the part was made. The current state is described above and in the [guide](../docs/guide/README.md); where a part says that `kingresd` does not do something, the current contract and server do it unless a limit below says otherwise.
 
 ### The failover console, part 3 (increment 8, after increment 7: the switchover and the restore)
 
@@ -1128,7 +1144,9 @@ The mock (`src/mocks`) is never more permissive than 0.6.0: pin required, admini
 - **System database stopped:** the state is shared across tabs and has a Start button that names the instance (see 0.6.0 for how
   it is learned after a reload).
 
-## Known limits of this increment
+## Known limits
+
+This list was written when the panel followed contract 0.6.0 and 0.7.0. The items on the workbench mode and on paging were rechecked against contract 0.34.0 and hold; read the others as limits of those revisions.
 
 The SQL editor is a plain textarea, the replication page is a table rather than a graph, and the charts are simple
 SVG lines without zoom or tooltips.
