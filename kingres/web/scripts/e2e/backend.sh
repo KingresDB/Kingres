@@ -26,10 +26,13 @@ case "$cmd" in
   prepare)
     mkdir -p "$ROOT"
     # The PostgreSQL installation to copy: the control plane's own (it carries the current extensions,
-    # kingres_ledger 0.2 among them) when it exists, else the first one (E2E_PG_INSTALL overrides both).
+    # the current kingres_ledger among them) when it exists, else the first one (E2E_PG_INSTALL overrides both).
     SRC="${E2E_PG_INSTALL:-}"
     if [ -z "$SRC" ]; then
-      if [ -f "$HOME/kw-cp/install/share/postgresql/extension/kingres_ledger--0.2.sql" ]; then SRC="$HOME/kw-cp/install"; else SRC="$HOME/kingres-work/install"; fi
+      EXTDIR="$HOME/kw-cp/install/share/postgresql/extension"
+      # The current version is the default_version of the control file, so no version number is written here.
+      LEDGER_VER=$(sed -n "s/^default_version[[:space:]]*=[[:space:]]*'\(.*\)'.*/\1/p" "$EXTDIR/kingres_ledger.control" 2>/dev/null)
+      if [ -n "$LEDGER_VER" ] && [ -f "$EXTDIR/kingres_ledger--$LEDGER_VER.sql" ]; then SRC="$HOME/kw-cp/install"; else SRC="$HOME/kingres-work/install"; fi
     fi
     # A kept copy is replaced when its source changed (the extension version decides what the server can do).
     # The stamp names the source, its extension commit and its PostgreSQL version, so that a kept copy of one major is never reused for another.

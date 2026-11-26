@@ -613,8 +613,10 @@ export async function runFlow(ctx) {
     },
   )
 
-  // ---- 9. what the server does not do yet must be calm, not alarming; the cluster settings are real ----
-  await step('failover (not implemented yet) answers with a calm notice', async () => {
+  // ---- 9. a refused failover must be calm, not alarming; the cluster settings are real ----
+  // Failover and the planned switchover are implemented. A cluster of one server has no standby to promote, so the server refuses
+  // with 409 no_replica_available and the dialog explains it with a warning (not a danger) notice.
+  await step('failover on a cluster without a standby is refused with a calm notice', async () => {
     await ui.navigate('/servers')
     await ui.waitForText('Create server group')
     await ui.click('Failover')
@@ -624,18 +626,18 @@ export async function runFlow(ctx) {
       .waitForFunction(
         () =>
           [...document.querySelectorAll('[role=dialog] .notice')].some((n) =>
-            /not available on this server version yet/i.test(n.textContent),
+            /no replica available|no standby|no ready standby/i.test(n.textContent),
           ),
         { timeout: 15000 },
       )
       .catch(() => {
-        throw new Error('failover: no "not available yet" notice')
+        throw new Error('failover: no notice that the group has no standby')
       })
     const danger = await page.$$eval('.notice.tone-danger', (e) =>
       e.map((x) => x.textContent.replace(/s+/g, ' ').slice(0, 100)),
     )
     expect(danger.length === 0, `failover: alarming notice: ${danger.join(' | ')}`)
-    await shot('18-unsupported-failover')
+    await shot('18-failover-refused')
     await ui.click('Cancel', { within: '[role=dialog]' })
   })
 
