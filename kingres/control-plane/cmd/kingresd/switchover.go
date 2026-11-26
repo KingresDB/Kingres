@@ -342,6 +342,14 @@ func cleanStop(ctx context.Context, mgr stopManager, lm stopLeases, fh *fault.Ho
 	if err := mgr.Stop(stopCtx, id); err != nil {
 		log.Warn("failover: stopping the old primary cleanly", "group", group, "instance", id, "error", err)
 	}
+	// A test: the stop ends late, with the instance already down for longer than the lease of a task that is stored in it (the system database of the map
+	// group), as when the shutdown checkpoint of a large instance takes tens of seconds and no renewal can reach the store meanwhile.
+	if fh.FailoverInjection("demote:longstop") == "slow" {
+		select {
+		case <-time.After(25 * time.Second):
+		case <-ctx.Done():
+		}
+	}
 	running, err := mgr.Running(ctx, id)
 	out.Stopped = err == nil && !running
 	if !out.Stopped {

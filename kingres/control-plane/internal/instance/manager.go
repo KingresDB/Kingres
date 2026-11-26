@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -86,6 +87,7 @@ type Manager struct {
 	log                 *slog.Logger
 	startTO             time.Duration
 	stopTO              time.Duration
+	serviceStopping     atomic.Bool // StopForShutdown was called: no start follows a wait for a shutdown
 	gate                func(id int) error
 	// runner replaces the execution of the PostgreSQL programs in a test (nil: run them).
 	runner func(ctx context.Context, prog string, args ...string) (string, error)
@@ -356,13 +358,26 @@ func (m *Manager) start(ctx context.Context, id int) error {
 	if _, err := m.Managed(id); err != nil {
 		return err
 	}
-	if up, err := m.Running(ctx, id); err != nil || up {
-		if err == nil {
+	up, err := m.Running(ctx, id)
+	if err != nil {
+		return err
+	}
+	if up {
+		// A postmaster that is shutting down is not a running instance: pg_ctl status still says so until the pid file is gone, and a start
+		// that took it for running would report success while the instance goes down (a rollback after a stop that outlasted its call).
+		// The shutdown is waited for, bounded, and the instance is started after it; a shutdown that does not end is an error.
+		if !postmasterStopping(m.dataDirOf(id)) {
 			// Found running (a start whose pg_ctl -w ran out of time, but whose postmaster went on): it bound its port, so the
 			// port is not provisional any more.
 			m.clearNeverStarted(id)
+			return nil
 		}
-		return err
+		if err := m.waitShutdown(ctx, id); err != nil {
+			return err
+		}
+		if m.serviceStopping.Load() {
+			return errors.New("instance: the service is stopping; the instance was not started")
+		}
 	}
 	if m.gate != nil {
 		if err := m.gate(id); err != nil {
@@ -736,6 +751,7 @@ func (m *Manager) StopImmediate(ctx context.Context, id int) error {
 // that moment can no longer cost a write that was acknowledged. Stopping a
 // stopped instance is not an error and calls nothing.
 func (m *Manager) StopForShutdown(ctx context.Context, id int, requested func(postmaster string)) error {
+	m.serviceStopping.Store(true) // a start that is waiting for a shutdown must not bring an instance back during the stop of the service
 	if up, err := m.Running(ctx, id); err != nil || !up {
 		return err
 	}
@@ -784,4 +800,67 @@ func postmasterIdentity(data string) string {
 		return ""
 	}
 	return strings.TrimSpace(lines[0]) + " " + strings.TrimSpace(lines[2])
+}
+
+func (m *Manager) dataDirOf(id int) string {
+	d, _ := m.DataDir(id)
+	return d
+}
+
+// postmasterStopping reports that postmaster.pid says the postmaster is shutting down. The file has the pid, the data directory, the start time, the
+// port, the socket directory, the listen addresses, the shared memory key and, as line 8, the status ("starting", "ready", "standby", "stopping", padded
+// to 8 characters). Both majors write it; the status changes to "stopping" when the shutdown begins, before the shutdown checkpoint, while
+// pg_controldata only says "shutting down" once the checkpoint runs. A file with fewer than 8 lines (a postmaster that is still starting) is not
+// stopping, and neither is a file whose pid is a zombie or another program (pg_ctl status counts those as running, and a wait for them never ends).
+func postmasterStopping(data string) bool {
+	b, err := os.ReadFile(filepath.Join(data, "postmaster.pid")) //nolint:gosec // path below the manager root
+	if err != nil {
+		return false
+	}
+	lines := strings.Split(strings.ReplaceAll(string(b), string(rune(13)), ""), string(rune(10)))
+	if len(lines) < 8 || strings.TrimSpace(lines[7]) != "stopping" {
+		return false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(lines[0]))
+	return err == nil && pid > 0 && !notAPostmaster(pid)
+}
+
+// notAPostmaster reports, from /proc where there is one, that the process pid is a zombie or runs another program than PostgreSQL. Where /proc cannot be
+// read nothing is known and the answer is no.
+func notAPostmaster(pid int) bool {
+	stat, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat") //nolint:gosec // a fixed prefix and a number
+	if err != nil {
+		return false
+	}
+	s := string(stat)
+	if i := strings.LastIndex(s, ")"); i >= 0 && i+2 < len(s) && s[i+2] == 'Z' {
+		return true
+	}
+	cmd, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cmdline") //nolint:gosec // a fixed prefix and a number
+	if err != nil {
+		return false
+	}
+	return !strings.Contains(string(cmd), "postgres") && !strings.Contains(string(cmd), "postmaster")
+}
+
+// waitShutdown waits until the instance that is shutting down is gone (the pid file removed), for as long as a stop is allowed to take.
+func (m *Manager) waitShutdown(ctx context.Context, id int) error {
+	deadline := time.Now().Add(m.stopTO)
+	for {
+		up, err := m.Running(ctx, id)
+		if err != nil {
+			return err
+		}
+		if !up {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("instance: the postmaster of instance %d is still shutting down after %s; it was not started", id, m.stopTO)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
 }

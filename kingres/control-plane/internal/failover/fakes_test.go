@@ -89,6 +89,9 @@ type world struct {
 	undoTerms          []int64 // the terms of the quiesce, unquiesce and resume calls
 	stopErr            error   // the answer of the clean stop call
 	dbDownAfterStop    bool    // the rows cannot be read after the clean stop (the map group: its system database is the stopped instance)
+	onResume           func()  // called when the old primary is resumed by a rollback (a test reads the lease of the task at that moment)
+	onDemote           func()  // called when the clean stop is asked for, before anything else (a test cancels the context of the step)
+	beforeStop         func()  // called when the clean stop is asked for, before it is done (a test reads what the task lease is at that moment)
 	afterStop          func()  // called when the clean stop is done (a test cancels the context of the step, as the engine does when the task lease cannot be renewed)
 	notReleased        bool    // the clean stop does not release the lease
 	markTerms          []int64
@@ -287,12 +290,18 @@ func (p fpeers) Demote(_ context.Context, server string, r DemoteRequest) (Demot
 		return DemoteAnswer{}, p.w.oldRefusesDem
 	}
 	if r.Mode == "fast" {
+		if p.w.onDemote != nil {
+			p.w.onDemote()
+		}
 		p.w.mu.Lock()
 		p.w.stopTerms = append(p.w.stopTerms, r.ExpectedTerm)
 		p.w.stopCandidates = append(p.w.stopCandidates, r.Candidate)
 		p.w.mu.Unlock()
 		if p.w.stopErr != nil {
 			return DemoteAnswer{}, p.w.stopErr
+		}
+		if p.w.beforeStop != nil {
+			p.w.beforeStop()
 		}
 		p.w.rec("demote-fast %s", server)
 		p.w.oldWritable = false
@@ -849,12 +858,18 @@ func (p fpeers) Verify(_ context.Context, server string, r VerifyRequest) (Verif
 	return VerifyAnswer{Ok: answers[n]}, nil
 }
 
-func (p fpeers) Resume(_ context.Context, server string, r ResumeRequest) error {
+func (p fpeers) Resume(ctx context.Context, server string, r ResumeRequest) error {
+	if err := ctx.Err(); err != nil {
+		return err // a call made on a cancelled context does not reach the server
+	}
 	p.w.mu.Lock()
 	p.w.undoTerms = append(p.w.undoTerms, r.ExpectedTerm)
 	p.w.mu.Unlock()
 	if err := p.unreach(server); err != nil {
 		return err
+	}
+	if p.w.onResume != nil {
+		p.w.onResume()
 	}
 	p.w.rec("resume %s", server)
 	p.w.mu.Lock()
@@ -890,7 +905,10 @@ func (p fpeers) MapProof(_ context.Context, server string, r MapProofRequest) er
 	return p.w.mapProofErr
 }
 
-func (p fpeers) MapAbandon(_ context.Context, server, reason string) error {
+func (p fpeers) MapAbandon(ctx context.Context, server, reason string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	p.w.rec("map-abandon %s", server)
 	return p.w.mapAbandonErr
 }

@@ -216,6 +216,30 @@ type Env struct {
 	secrets map[string]string
 	eng     *Engine
 	lease   Lease
+	guard   *leaseGuard
+}
+
+// leaseSlack is added to the length that ExtendLease derives, so that the time the run trusts its lease covers what was asked with some room.
+const leaseSlack = 5 * time.Second
+
+// ExtendLease makes the run trust its lease for at least cover from now, for a step that is about to make the store unreachable on purpose: the task
+// of the map group lives in the system database of the very instance that its clean stop shuts down, so no renewal can reach the store for as long
+// as the stop lasts. The lease is renewed in the store with the length cover + the margin of the guard + a small slack (the engine's own length when
+// that is longer), so the trust window (the length less the margin) always covers cover and the lease is no longer than that needs: another server
+// can take the task over only that long after the last renewal. Only a renewal that the store accepted moves the end of the time the run trusts its
+// lease, so no other server can take the task over before the run stops by itself, and a refused renewal leaves the guard as it was. The returned
+// function ends the extension: it puts the length of the renewals back and renews once with the engine's length, for a bounded moment, to bring the
+// store and the guard back to the normal margin; when the store cannot be reached (the stop it was lengthened for is over) the lease and the guard
+// stay as they are, which is consistent and safe, and no renewal follows until the store is back.
+func (e *Env) ExtendLease(ctx context.Context, cover time.Duration) (func(), error) {
+	if e.eng == nil || e.guard == nil {
+		return func() {}, nil
+	}
+	d := cover + e.eng.leaseMargin() + leaseSlack
+	if d < e.eng.lease {
+		d = e.eng.lease
+	}
+	return e.guard.extend(ctx, e.lease, e.Task.ID, d)
 }
 
 // DetailStore is implemented by stores that can keep a task's Detail.
@@ -785,6 +809,7 @@ func (e *Engine) run(ctx context.Context, t Task, started time.Time, secrets map
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	guard := newLeaseGuard(e, cancel, started.Add(e.lease-e.leaseMargin()))
+	env.guard = guard
 	defer guard.stop()
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -979,6 +1004,74 @@ type leaseGuard struct {
 	mu     sync.Mutex
 	until  time.Time
 	timer  *time.Timer
+	// dur is the length of the lease while it is extended (zero: the lease of the engine). renewMu orders a renewal of the store with an extension, so
+	// that a renewal sent before an extension cannot land after it and shorten the lease that the run trusts.
+	dur     time.Duration
+	renewMu sync.Mutex
+}
+
+// extend renews the lease in the store with the length d and, only when the store accepted it, makes the run trust it that long.
+func (g *leaseGuard) extend(ctx context.Context, l Lease, id int64, d time.Duration) (func(), error) {
+	g.renewMu.Lock()
+	defer g.renewMu.Unlock()
+	started := g.e.now()
+	if err := g.e.store.Renew(ctx, id, l, d); err != nil {
+		return nil, err
+	}
+	g.mu.Lock()
+	if d > g.e.lease {
+		g.dur = d
+	}
+	g.mu.Unlock()
+	g.renewed(started, d)
+	var once sync.Once
+	return func() { once.Do(func() { g.restore(ctx, id, l) }) }, nil
+}
+
+// restore ends an extension: the renewals ask for the normal length again, the guard is tightened to the normal margin before anything is sent, and one
+// bounded renewal with the normal length follows. The tightening comes first because a renewal that the store commits but whose answer is late or lost
+// leaves the store with the short lease: a guard that still trusted the long one would then act on a lease the store has given up. A renewal that
+// succeeds only raises the guard again (to the same normal margin). The lock of the renewals is waited for no longer than the renewal itself: a renewal
+// that hangs on a store that is down must not hold the step back, and one that was sent with the long length cannot shorten the store lease.
+func (g *leaseGuard) restore(ctx context.Context, id int64, l Lease) {
+	g.mu.Lock()
+	g.dur = 0
+	g.mu.Unlock()
+	started := g.e.now()
+	g.tighten(started.Add(g.e.lease - g.e.leaseMargin()))
+	deadline := time.Now().Add(3 * time.Second)
+	for !g.renewMu.TryLock() {
+		if !time.Now().Before(deadline) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	defer g.renewMu.Unlock()
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	if g.e.store.Renew(rctx, id, l, g.e.lease) == nil {
+		g.renewed(started, g.e.lease)
+	}
+}
+
+// tighten brings the end of the time the run trusts its lease forward to until, when that is earlier; it never moves it back.
+func (g *leaseGuard) tighten(until time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if until.Before(g.until) {
+		g.until = until
+		g.timer.Reset(until.Sub(g.e.now()))
+	}
+}
+
+// length is the length of the lease that a renewal asks for.
+func (g *leaseGuard) length() time.Duration {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.dur > 0 {
+		return g.dur
+	}
+	return g.e.lease
 }
 
 func newLeaseGuard(e *Engine, cancel context.CancelFunc, until time.Time) *leaseGuard {
@@ -994,10 +1087,10 @@ func (g *leaseGuard) fire() {
 
 // renewed records a renewal that the store accepted; started is the time on
 // the engine's clock before the renewal was sent.
-func (g *leaseGuard) renewed(started time.Time) {
+func (g *leaseGuard) renewed(started time.Time, d time.Duration) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.until = started.Add(g.e.lease - g.e.leaseMargin())
+	g.until = started.Add(d - g.e.leaseMargin())
 	g.timer.Reset(g.until.Sub(g.e.now()))
 }
 
@@ -1022,8 +1115,15 @@ func (e *Engine) renewLoop(ctx context.Context, g *leaseGuard, l Lease, id int64
 			return
 		case <-tick:
 			e.fault(FaultLeaseRenew, id, -1)
+			g.renewMu.Lock()
 			started := e.now()
-			if err := e.store.Renew(ctx, id, l, e.lease); err != nil {
+			d := g.length()
+			err := e.store.Renew(ctx, id, l, d)
+			if err == nil {
+				g.renewed(started, d)
+			}
+			g.renewMu.Unlock()
+			if err != nil {
 				if errors.Is(err, ErrLeaseLost) || errors.Is(err, ErrNotFound) {
 					e.log.Warn("task lease lost", "task", id)
 					g.cancel()
@@ -1036,7 +1136,6 @@ func (e *Engine) renewLoop(ctx context.Context, g *leaseGuard, l Lease, id int64
 				}
 				continue
 			}
-			g.renewed(started)
 		}
 	}
 }

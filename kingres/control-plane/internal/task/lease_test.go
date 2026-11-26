@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 package task_test
 
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -181,4 +183,362 @@ func TestNoStepStartsOnAnExpiredLease(t *testing.T) {
 	if _, err := st.SetStep(ctx, tk.ID, lease, 0, task.StepRunning, 0); !errors.Is(err, task.ErrLeaseLost) {
 		t.Errorf("running mark on an expired lease: %v", err)
 	}
+}
+
+// extendFixture is the renew fixture with a step that lengthens its lease to two minutes and then waits, as the stop of the map group does; the store
+// becomes unreachable right after (it is the instance that is stopped).
+func newExtendFixture(t *testing.T, d time.Duration, storeStops bool) *renewFixture {
+	t.Helper()
+	f := &renewFixture{clk: newClock(), counter: &counter{n: map[string]int{}}, tick: make(chan time.Time),
+		started: make(chan struct{}), release: make(chan struct{}), sawCancel: make(chan struct{}, 1), done: make(chan error, 1)}
+	f.st = task.NewMemStoreClock(f.clk.Now)
+	def := task.Definition{Kind: "test.kind", Steps: []task.Step{{Name: "work", Run: func(ctx context.Context, env *task.Env) error {
+		restore, err := env.ExtendLease(ctx, d)
+		if err != nil {
+			return err
+		}
+		defer restore()
+		if storeStops {
+			f.st.FailOn(func(op string) error {
+				if op == "renew" {
+					return errors.New("the store is stopped")
+				}
+				return nil
+			})
+		}
+		f.started <- struct{}{}
+		select {
+		case <-f.release:
+			return nil
+		case <-ctx.Done():
+			f.sawCancel <- struct{}{}
+			return ctx.Err()
+		}
+	}}}}
+	a, err := task.NewEngine(f.st, []task.Definition{def}, task.Options{Holder: "A", Lease: 30 * time.Second, Now: f.clk.Now, StoreTries: 1, RenewEvery: f.tick})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	tk, _ := a.Submit(ctx, "test.kind", task.Subject{Type: "x", ID: "1"}, nil, "u")
+	f.id = tk.ID
+	go func() { _, err := a.RunOnce(ctx); f.done <- err }()
+	<-f.started
+	return f
+}
+
+// A step that lengthened its lease is not stopped when the store cannot be reached for longer than the lease of the engine (the clean stop of the map group
+// outlasts it), and the store holds the task for that long, so no other server can take it over meanwhile.
+func TestAStepWithALengthenedLeaseSurvivesAStoreThatCannotBeReached(t *testing.T) {
+	f := newExtendFixture(t, 90*time.Second, true)
+	f.clk.Add(40 * time.Second) // beyond lease 30 s: it would have been stopped at 20 s
+	f.tick <- f.clk.Now()
+	f.tick <- f.clk.Now()
+	b := engine(t, f.st, "B", f.clk, task.Definition{Kind: "test.kind", Steps: []task.Step{{Name: "work", Run: func(context.Context, *task.Env) error { f.counter.inc("work"); return nil }}}})
+	if ran, err := b.RunOnce(context.Background()); ran || err != nil {
+		t.Fatalf("B took over a task whose lease was lengthened: %v %v", ran, err)
+	}
+	select {
+	case <-f.sawCancel:
+		t.Fatal("the step was stopped inside its lengthened lease")
+	default:
+	}
+	close(f.release)
+	if err := <-f.done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+}
+
+// The step is stopped once the lengthened lease, less its margin, has passed without a renewal: the extension moves the end of the trust, it does not remove it.
+func TestAStepWithALengthenedLeaseStopsWhenTheLengthenedLeaseRunsOut(t *testing.T) {
+	f := newExtendFixture(t, 90*time.Second, true)
+	f.clk.Add(96 * time.Second) // 90 s covered + 5 s of slack: the lease is 105 s, 95 s are trusted
+	f.tick <- f.clk.Now()
+	<-f.sawCancel
+	if err := <-f.done; !errors.Is(err, task.ErrLeaseLost) {
+		t.Fatalf("ended with %v, want ErrLeaseLost", err)
+	}
+}
+
+// A lease that cannot be lengthened is an error of the step (the store did not take it), and a length that is not longer than the engine's changes nothing.
+func TestAStepThatCannotLengthenItsLeaseIsToldSo(t *testing.T) {
+	clk := newClock()
+	st := task.NewMemStoreClock(clk.Now)
+	var got error
+	var short error
+	var left time.Duration
+	def := task.Definition{Kind: "test.kind", Steps: []task.Step{{Name: "work", Run: func(ctx context.Context, env *task.Env) error {
+		_, short = env.ExtendLease(ctx, 10*time.Second)
+		cur, _ := st.Get(ctx, env.Task.ID)
+		left = cur.LeaseExpires.Sub(clk.Now())
+		st.FailOn(func(op string) error { return errors.New("the store is stopped") })
+		_, got = env.ExtendLease(ctx, time.Minute)
+		return nil
+	}}}}
+	e := engine(t, st, "A", clk, def)
+	e.Submit(context.Background(), "test.kind", task.Subject{Type: "x", ID: "1"}, nil, "u")
+	_, _ = e.RunOnce(context.Background())
+	if left < 29*time.Second {
+		t.Errorf("a short cover cut the lease to %v", left)
+	}
+	if short != nil {
+		t.Errorf("a shorter length: %v", short)
+	}
+	if got == nil {
+		t.Error("a lengthening that the store refused was reported as done")
+	}
+}
+
+// A renewal that comes while the lease is lengthened keeps it as long as it was made (a renewal with the length of the engine would cut it back before the
+// stop).
+func TestARenewalDuringALengthenedLeaseKeepsItLengthened(t *testing.T) {
+	f := newExtendFixture(t, 90*time.Second, false)
+	f.clk.Add(5 * time.Second)
+	f.tick <- f.clk.Now()
+	f.tick <- f.clk.Now() // returns once the first renewal is done
+	got, _ := f.st.Get(context.Background(), f.id)
+	if left := got.LeaseExpires.Sub(f.clk.Now()); left < 100*time.Second {
+		t.Errorf("the lease has %v left after a renewal during the extension, want about two minutes", left)
+	}
+	close(f.release)
+	if err := <-f.done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+}
+
+// The end of the extension puts the length back: the lease the store holds is the normal one right after it (the store answers), and the renewals that
+// follow keep it normal. Without the reset a renewal after the step's restore would ask for the long length again.
+func TestTheEndOfTheExtensionBringsTheLeaseBackToItsNormalLength(t *testing.T) {
+	clk := newClock()
+	st := task.NewMemStoreClock(clk.Now)
+	tick := make(chan time.Time)
+	var afterRestore, afterTick time.Duration
+	var id int64
+	step := make(chan struct{})
+	def := task.Definition{Kind: "test.kind", Steps: []task.Step{{Name: "work", Run: func(ctx context.Context, env *task.Env) error {
+		restore, err := env.ExtendLease(ctx, 90*time.Second)
+		if err != nil {
+			return err
+		}
+		long, _ := st.Get(ctx, env.Task.ID)
+		if long.LeaseExpires.Sub(clk.Now()) < 100*time.Second {
+			return errors.New("the lease was not lengthened")
+		}
+		restore()
+		got, _ := st.Get(ctx, env.Task.ID)
+		afterRestore = got.LeaseExpires.Sub(clk.Now())
+		step <- struct{}{}
+		<-step
+		got, _ = st.Get(ctx, env.Task.ID)
+		afterTick = got.LeaseExpires.Sub(clk.Now())
+		return nil
+	}}}}
+	a, err := task.NewEngine(st, []task.Definition{def}, task.Options{Holder: "A", Lease: 30 * time.Second, Now: clk.Now, StoreTries: 1, RenewEvery: tick})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	tk, _ := a.Submit(ctx, "test.kind", task.Subject{Type: "x", ID: "1"}, nil, "u")
+	id = tk.ID
+	done := make(chan error, 1)
+	go func() { _, err := a.RunOnce(ctx); done <- err }()
+	<-step
+	clk.Add(time.Second)
+	tick <- clk.Now()
+	tick <- clk.Now() // returns once the renewal is done
+	step <- struct{}{}
+	if err := <-done; err != nil {
+		t.Fatalf("run %d: %v", id, err)
+	}
+	if afterRestore > 31*time.Second {
+		t.Errorf("the lease holds %v right after the end of the extension, want the normal length", afterRestore)
+	}
+	if afterTick > 31*time.Second {
+		t.Errorf("a renewal after the end of the extension holds %v, want the normal length", afterTick)
+	}
+}
+
+// A refused extension leaves the guard where it was: the run stops at the deadline of the lease it really holds (20 s), not at the one the refused
+// renewal would have given.
+func TestARefusedExtensionLeavesTheGuardDeadlineUntouched(t *testing.T) {
+	clk := newClock()
+	st := task.NewMemStoreClock(clk.Now)
+	tick := make(chan time.Time)
+	started, saw := make(chan struct{}), make(chan struct{}, 1)
+	var refused error
+	def := task.Definition{Kind: "test.kind", Steps: []task.Step{{Name: "work", Run: func(ctx context.Context, env *task.Env) error {
+		st.FailOn(func(op string) error {
+			if op == "renew" {
+				return errors.New("the store is unreachable")
+			}
+			return nil
+		})
+		_, refused = env.ExtendLease(ctx, 90*time.Second)
+		started <- struct{}{}
+		<-ctx.Done()
+		saw <- struct{}{}
+		return ctx.Err()
+	}}}}
+	a, err := task.NewEngine(st, []task.Definition{def}, task.Options{Holder: "A", Lease: 30 * time.Second, Now: clk.Now, StoreTries: 1, RenewEvery: tick})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	a.Submit(ctx, "test.kind", task.Subject{Type: "x", ID: "1"}, nil, "u")
+	done := make(chan error, 1)
+	go func() { _, err := a.RunOnce(ctx); done <- err }()
+	<-started
+	if refused == nil {
+		t.Fatal("the extension was not refused")
+	}
+	clk.Add(25 * time.Second) // beyond the 20 s of the real lease, far inside the 95 s a refused extension would have set
+	tick <- clk.Now()
+	select {
+	case <-saw:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the run was not stopped at the deadline of the lease it holds: the refused extension moved the guard")
+	}
+	if err := <-done; !errors.Is(err, task.ErrLeaseLost) {
+		t.Fatalf("ended with %v, want ErrLeaseLost", err)
+	}
+}
+
+// An engine whose lease is already longer than what the cover needs is renewed in full (the trust is counted from now), and the cover is never cut.
+func TestAnEngineLeaseLongerThanTheCoverStillCoversIt(t *testing.T) {
+	clk := newClock()
+	st := task.NewMemStoreClock(clk.Now)
+	var left time.Duration
+	def := task.Definition{Kind: "test.kind", Steps: []task.Step{{Name: "work", Run: func(ctx context.Context, env *task.Env) error {
+		clk.Add(100 * time.Second) // most of the lease is gone since the claim
+		if _, err := env.ExtendLease(ctx, 60*time.Second); err != nil {
+			return err
+		}
+		got, _ := st.Get(ctx, env.Task.ID)
+		left = got.LeaseExpires.Sub(clk.Now())
+		return nil
+	}}}}
+	a, err := task.NewEngine(st, []task.Definition{def}, task.Options{Holder: "A", Lease: 200 * time.Second, Now: clk.Now, StoreTries: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Submit(context.Background(), "test.kind", task.Subject{Type: "x", ID: "1"}, nil, "u")
+	if _, err := a.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if left < 190*time.Second {
+		t.Errorf("the lease holds %v after the extension, want the full lease of the engine", left)
+	}
+}
+
+// commitThenFail is a store whose renewal is committed and then answers with an error while fail is set: the answer is lost or late.
+type commitThenFail struct {
+	task.Store
+	fail *atomic.Bool
+}
+
+func (s commitThenFail) Renew(ctx context.Context, id int64, l task.Lease, d time.Duration) error {
+	err := s.Store.Renew(ctx, id, l, d)
+	if err == nil && s.fail.Load() {
+		return errors.New("the answer was lost")
+	}
+	return err
+}
+
+// The renewal that ends an extension shortens the lease in the store. When the store commits it and the answer is lost, the guard must already trust the
+// short lease only: it stops the run at the normal deadline, not at the long one that the store no longer holds.
+func TestAnEndOfExtensionWhoseAnswerIsLostStopsTheRunAtTheNormalDeadline(t *testing.T) {
+	clk := newClock()
+	mem := task.NewMemStoreClock(clk.Now)
+	var fail atomic.Bool
+	tick := make(chan time.Time)
+	started, saw := make(chan struct{}), make(chan struct{}, 1)
+	def := task.Definition{Kind: "test.kind", Steps: []task.Step{{Name: "work", Run: func(ctx context.Context, env *task.Env) error {
+		restore, err := env.ExtendLease(ctx, 90*time.Second)
+		if err != nil {
+			return err
+		}
+		fail.Store(true)
+		restore()
+		started <- struct{}{}
+		<-ctx.Done()
+		saw <- struct{}{}
+		return ctx.Err()
+	}}}}
+	a, err := task.NewEngine(commitThenFail{mem, &fail}, []task.Definition{def}, task.Options{Holder: "A", Lease: 30 * time.Second, Now: clk.Now, StoreTries: 1, RenewEvery: tick})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	a.Submit(ctx, "test.kind", task.Subject{Type: "x", ID: "1"}, nil, "u")
+	done := make(chan error, 1)
+	go func() { _, err := a.RunOnce(ctx); done <- err }()
+	<-started
+	clk.Add(21 * time.Second) // beyond the 20 s of the normal lease, far inside the 95 s of the long one
+	tick <- clk.Now()
+	select {
+	case <-saw:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the guard still trusts the long lease after the end of the extension whose answer was lost")
+	}
+	<-done
+}
+
+// A renewal that hangs on the store holds the lock of the renewals; the end of the extension does not wait for it longer than its own bound.
+func TestTheEndOfTheExtensionDoesNotWaitForAHangingRenewal(t *testing.T) {
+	clk := newClock()
+	mem := task.NewMemStoreClock(clk.Now)
+	release := make(chan struct{})
+	var hang atomic.Bool
+	tick := make(chan time.Time)
+	took := make(chan time.Duration, 1)
+	inRenew := make(chan struct{}, 1)
+	def := task.Definition{Kind: "test.kind", Steps: []task.Step{{Name: "work", Run: func(ctx context.Context, env *task.Env) error {
+		restore, err := env.ExtendLease(ctx, 90*time.Second)
+		if err != nil {
+			return err
+		}
+		hang.Store(true)
+		tick <- clk.Now() // the renewal of the loop starts and hangs
+		<-inRenew
+		begin := time.Now()
+		restore()
+		took <- time.Since(begin)
+		close(release)
+		return nil
+	}}}}
+	st := hangingStore{Store: mem, hang: &hang, release: release, in: inRenew}
+	a, err := task.NewEngine(st, []task.Definition{def}, task.Options{Holder: "A", Lease: 30 * time.Second, Now: clk.Now, StoreTries: 1, RenewEvery: tick})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Submit(context.Background(), "test.kind", task.Subject{Type: "x", ID: "1"}, nil, "u")
+	if _, err := a.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if d := <-took; d > 6*time.Second {
+		t.Errorf("the end of the extension waited %v for a hanging renewal, want its own bound of 3 s", d)
+	}
+}
+
+type hangingStore struct {
+	task.Store
+	hang    *atomic.Bool
+	release chan struct{}
+	in      chan struct{}
+}
+
+func (s hangingStore) Renew(ctx context.Context, id int64, l task.Lease, d time.Duration) error {
+	if s.hang.Load() {
+		select {
+		case s.in <- struct{}{}:
+		default:
+		}
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+		case <-time.After(10 * time.Second):
+		}
+		return errors.New("the store did not answer")
+	}
+	return s.Store.Renew(ctx, id, l, d)
 }
