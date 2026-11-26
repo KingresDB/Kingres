@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package auth implements authentication and authorization: the cluster role
 // hierarchy, the server-side session store, CSRF tokens, the login rate

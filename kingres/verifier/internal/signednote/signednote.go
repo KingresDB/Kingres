@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package signednote parses and verifies signed notes as C2SP "signed-note"
 // defines them (https://c2sp.org/signed-note), for Ed25519 signatures (type

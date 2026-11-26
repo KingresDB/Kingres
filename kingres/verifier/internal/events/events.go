@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package events reads the signed events of a publication (ledger-phase7.md 3.2.4, 3.3, 5.5 and
 // corrections 121 to 149): `events/<6 digits>`, numbered from 0 without a gap, each a signed

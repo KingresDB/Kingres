@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package clientproxy is the client entry point of a server (design ha-phase5.md,
 // part D): it accepts PostgreSQL connections on one port and forwards each of

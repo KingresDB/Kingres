@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Command kingres-verify checks the digests and inclusion proofs of the
 // KingresDB tamper-evident ledger without trusting the database. See

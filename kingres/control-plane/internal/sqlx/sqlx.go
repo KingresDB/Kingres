@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package sqlx is the only way kingresd builds SQL that contains names or
 // text taken from a request. It offers two things:

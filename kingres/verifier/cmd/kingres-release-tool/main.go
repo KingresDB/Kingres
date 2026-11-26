@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Command kingres-release-tool is the signing side of a release of
 // kingres-verify. It is not part of a release and is not installed: the

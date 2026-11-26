@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package clustertest starts a cluster of several kingresd processes on one
 // machine for integration tests: every server has its own data directory, REST

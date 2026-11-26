@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Command gen writes internal/contract/operations_gen.go from the OpenAPI
 // contract. Run it with "go generate ./internal/contract".

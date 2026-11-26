@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package standby creates, maintains and removes the standbys of the shard
 // groups (design ha-phase5.md, part A): placement by the chained ring rule,

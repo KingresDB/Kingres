@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package relay is the streaming relay of the data transfer (design data-export-import.md, "The streaming relay"): the two operations
 // that move a body of any size (uploadDataChunk and downloadDataExport) are not forwarded like the other operations, whose body is read

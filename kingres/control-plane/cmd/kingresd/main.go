@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Command kingresd is the control-plane server of KingresDB. It serves the
 // management REST API (kingres/api/openapi.yaml) and the web panel.

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package cluster implements the cluster-level operations that need the
 // instance manager and the task engine: creating a one-server cluster

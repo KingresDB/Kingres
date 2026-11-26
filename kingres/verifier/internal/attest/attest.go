@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package attest is the client attestation of ledger-phase7.md 3.6 to 3.8, as the verifier reads it:
 // the message a client signs, the three tables of the extension that hold what the verifier needs

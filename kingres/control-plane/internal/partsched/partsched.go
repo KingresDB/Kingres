@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package partsched starts the runs of the time-partitioning policies (phase 12, analytics-phase12-storage.md section 10.6). It runs as two jobs of the
 // scheduler of the manager leader (internal/scheduler): every Interval it asks which policies are due and starts a task partition.maintain for each

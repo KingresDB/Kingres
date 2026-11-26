@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package internalapi is the server-to-server API of kingresd (design
 // control-plane-3.md, D2), specified in kingres/control-plane/internal-api.md.

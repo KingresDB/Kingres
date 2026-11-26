@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package serverinfo reports what the operating system and the instance's log
 // files know about this server: resources (Linux /proc and statfs; every

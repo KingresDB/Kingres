@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package wormv checks the evidence of a WORM anchor (ledger-phase7.md 6.3): an object that holds a signed
 // checkpoint, written to a store under Object Lock. The evidence file is the cluster's claim ("recorded_by":

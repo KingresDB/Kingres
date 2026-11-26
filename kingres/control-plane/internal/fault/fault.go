@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package fault is the fault-injection hook of the tests. It exists so that a
 // partition, a one-way cut or a clock step can be produced inside the process

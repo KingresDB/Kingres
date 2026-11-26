@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package clock separates the two kinds of time the high-availability code uses.
 // Everything that decides something (a heartbeat is late, a lease has expired)

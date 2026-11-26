@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package scheduler runs the recurring jobs of the manager leader (design
 // ledger-phase7.md, 6.7). It is the first recurring scheduler of kingresd;

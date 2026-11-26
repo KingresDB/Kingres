@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package instance manages the local PostgreSQL instances of kingresd (design
 // control-plane-2.md, D3): it creates a data directory with initdb, renders

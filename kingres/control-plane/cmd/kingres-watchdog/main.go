@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Command kingres-watchdog stops a PostgreSQL primary whose lease has run out
 // while kingresd, which would have stopped it, is dead or hung (design

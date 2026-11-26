@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
 
 // Package task is the task engine of kingresd (design control-plane-2.md,
 // D4). A task is a row in kingres_cp.task executed by the manager leader as
