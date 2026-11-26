@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Architecture decision records
 
 An ADR records one decision: the context, the decision, its consequences and the alternatives that were rejected. The design itself is in [../architecture.md](../architecture.md); ADRs record that a recommendation in it has become a decision, and why. The rules for what goes where are in [../dev/documentation.md](../dev/documentation.md).

@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Adversarial review of the fix round: contrib/kingres_columnar 0.1 (commit 5555b252a0)
 
 Reviewer: independent (not the author). Reviewed state: commit 5555b252a0,

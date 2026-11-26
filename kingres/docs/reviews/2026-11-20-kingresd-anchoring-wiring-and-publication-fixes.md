@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 
 # Independent review of the fixes for the collector and publication review (P8-01 to P8-10) and of the wiring of anchoring into kingresd (phase 7, steps 10, 12 and 14)
 

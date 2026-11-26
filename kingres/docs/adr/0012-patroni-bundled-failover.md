@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # ADR 0012: Patroni bundled as the failover engine
 
 - Status: Superseded by [ADR 0021](0021-failover-in-kingresd.md)

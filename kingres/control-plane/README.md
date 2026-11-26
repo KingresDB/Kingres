@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # kingresd: the KingresDB control plane
 
 `kingresd` is the control-plane server of KingresDB. It serves the management

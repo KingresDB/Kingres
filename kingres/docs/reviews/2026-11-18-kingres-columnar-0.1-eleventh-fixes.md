@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Twelfth independent review of kingres_columnar 0.1 (the fixes for C11)
 
 Reviewer: an independent reviewer. Date: 2026-11-18.

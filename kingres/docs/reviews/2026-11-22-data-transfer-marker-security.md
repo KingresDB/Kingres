@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Security review of the marker fixes (DX15-01 to DX15-07), commit a35856d2f6 on dx-cp
 
 ## Summary

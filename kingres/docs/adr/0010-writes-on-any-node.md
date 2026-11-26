@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # ADR 0010: Writes on any node: a primary per server and a router in the agent; no conflict-resolving multi-master
 
 - Status: Accepted

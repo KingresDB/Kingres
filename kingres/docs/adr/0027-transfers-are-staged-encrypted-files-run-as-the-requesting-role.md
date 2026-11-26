@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # ADR 0027: Exports are staged encrypted files, and transfers run as the role that asked
 
 - Status: Accepted

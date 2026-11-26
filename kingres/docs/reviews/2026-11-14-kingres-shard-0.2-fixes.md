@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Adversarial review of the fix round: contrib/kingres_shard 0.2 (S2-01 to S2-20)
 
 Reviewer: independent (not the author, not the reviewer of the first round).

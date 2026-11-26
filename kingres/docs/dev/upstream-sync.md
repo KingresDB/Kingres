@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Upstream sync: branches and rebase policy
 
 This document turns the architecture document's "Branch choice and mirror mechanics" into working rules. The distinction used there applies here: items marked **[Recommendation]** are design decisions (accepted by the project owner where the Open decisions table says so, but not backed by an upstream source), and items marked **[Needs verification]** must be confirmed in practice.

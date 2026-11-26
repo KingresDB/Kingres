@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Adversarial review: contrib/kingres_shard 0.5, the fix round for the third review of the call sequences (S11-01 to S11-12)
 
 Reviewer: an independent reviewer (not the author of the code, not the reviewer of the earlier

@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # ADR 0013: Ledger tables and external anchoring first; consensus only with a consortium use case
 
 - Status: Accepted

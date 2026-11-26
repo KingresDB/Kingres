@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Review of kingres_shard 0.7, phase 9 increments 9.1 and 9.2
 
 ## 1. Scope and method
