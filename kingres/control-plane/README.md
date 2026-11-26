@@ -2,12 +2,12 @@
 # kingresd: the KingresDB control plane
 
 `kingresd` is the control-plane server of KingresDB. It serves the management
-REST API that the web panel uses (and that the planned `kingres-cli`, not built yet, will use)
+REST API that the web panel uses (`kingres-cli` is planned, not built, and will use it too)
 (`kingres/api/openapi.yaml`, conventions in `kingres/api/README.md`) and the
 embedded web panel, on one port (default `127.0.0.1:8091`). It runs on every
 server of a cluster.
 
-This is the **third increment** (several servers). The second added the instance manager, the task engine, the
+This README is the developer reference of the control plane at the first release (REST contract 0.34.0). The sections after "What is implemented" are the record of the increments in which it was built, and keep their wording of that time; where one says "not yet", the table under "What is implemented" and the later sections are current. The second increment added the instance manager, the task engine, the
 system database, cluster creation (`init-cluster`) and the operations behind the Databases, Security, Query and
 Settings pages; the third lets a second and a third server join (`joinCluster`, `addServer`), removes an empty
 server (`removeServer`) and makes the cluster-wide operations run on every server (see
@@ -175,7 +175,7 @@ server at start. The DSN is never logged.
 | `version-check-interval` | `KINGRES_VERSION_CHECK_INTERVAL` | `1m` | how often the manager leader compares the versions of the servers (`versionMismatch`) |
 | `gather-timeout` | `KINGRES_GATHER_TIMEOUT` | `3s` | the time one server gets to answer its part of a cluster-wide read of logs, alerts or metrics |
 | `allow-remote-setup` | `KINGRES_ALLOW_REMOTE_SETUP` | `false` | `true` lets the setup operations come from non-loopback addresses while uninitialized (containers listening on `0.0.0.0`); the setup token is still required |
-| `-version` | | | prints version, contract revision and build commit; the revision it prints is the constant `contractRevision` in `cmd/kingresd/main.go`, which still reads 0.8.0 although the server implements 0.13.0 (the constant is stale; it is not the revision the server implements) (`-ldflags "-X main.commit=..."`, else `unknown`) |
+| `-version` | | | prints version, contract revision and build commit (`-ldflags "-X main.commit=..."`, else `unknown`) |
 | `-stop-instances` | | | stops the managed instances (fast shutdown) and exits |
 | `tls-cert-file`, `tls-key-file` | `KINGRES_TLS_CERT_FILE`, `KINGRES_TLS_KEY_FILE` | none | enable HTTPS (both or neither) |
 
@@ -465,12 +465,10 @@ and "Results of the spikes and changes made by the code (phase 14c)").
 
 ## What is implemented
 
-The server implements revision **0.28.0** of the contract (174 operations, 138
-paths; what is not done is in "Not done in this increment"). "Real" means the operation works against PostgreSQL or the local node
-state. "Not yet" means: after authentication, CSRF and role checks have passed
-the server answers **HTTP 422 with `code: unsupported_operation`**
-(`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **178 of 178 operations are real; 0 answer "not yet".**
+The server implements revision **0.34.0** of the contract (178 operations, 142
+paths). "Real" means the operation works against PostgreSQL or the local node
+state. An operation that a server does not implement answers, after authentication, CSRF and role checks,
+**HTTP 422 with `code: unsupported_operation`**, which every authenticated operation lists. **All 178 operations are real; none answers so.** The one exception inside an operation is the check `anchors` of `startLedgerVerification`, which answers 422 `unsupported_operation`.
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -515,8 +513,8 @@ manager and are never reported.
 ### Values the server does not have are `null`
 
 0.2.0 makes "not available" a first-class answer, and the server uses it
-instead of inventing zeros. These are always `null` in this version, because no
-catalog or agent provides them. The list is enforced by
+instead of inventing zeros. In the integration test of the REST layer (one instance, no manager and no agent) these are `null`, because no
+catalog or agent provides them there. The list is enforced by
 `TestIntegrationValuesWithoutSourceAreNull`, which fails when one of them
 becomes non-null:
 
@@ -536,9 +534,8 @@ becomes non-null:
   `ledgerSummary.*`; `sharding.bucketCount` of a database without colocation
   groups.
 - Ledger verification state and time (`LedgerStatus`, `LedgerChainStatus`).
-- `NodeStateInfo.setupTask` until a setup request was accepted. Initialization
-  is not implemented, so it stays null; its persistence and response are in
-  place and tested.
+- `NodeStateInfo.setupTask` until a setup request was accepted (the integration
+  test sends none).
 
 Everything else is read from PostgreSQL:
 
@@ -1220,13 +1217,8 @@ Only the two steps of the distributed schemas that call the extension once (`Mak
 
 ## Not done in this increment, and the manager's state on a leader change
 
-**Not done** (each still answers 422 `unsupported_operation`, or is unchanged; this paragraph is from the third
-increment, and rebalance and failover are built since, see the table above and the later sections):
-restoring preferred primaries (9 operations answer "not yet" now: this one and the eight ledger operations of
-client keys, bundles and divergence), a way back for a server with buckets whose certificates were
-revoked (it needs rebalance; rebalance exists now), the rotation of the CA itself, and a change of the manager leader without the CA key (the three bullets
-below; a leader change by the failover of the map group is built since, increment 5, and the key of the CA can be escrowed
-since 2026-11-22). Certificate renewal and revocation, the dedicated problem for a leader without the CA key, cluster-wide
+**Not done at the first release:** the rotation of the CA itself, and a change of the manager leader without the CA key unless the escrow is on (the three bullets
+below; a leader change by the failover of the map group is built, and the key of the CA can be escrowed). Certificate renewal and revocation, the dedicated problem for a leader without the CA key, cluster-wide
 logs, alerts and metrics and the four alert kinds that nothing raised are done (see "Fifth increment"). Server groups, `updateServer`, inclusion proofs, ledger verification records, instance start and
 stop, leave-cluster and local settings are done (see their sections).
 
@@ -3216,7 +3208,7 @@ and `rotateCaEscrow` (`internal/httpapi/handlers_members.go`, type `CAEscrow`), 
 - **Threat model.** A recipient's disk holds the copy and the key that opens it: its compromise is a compromise of the CA, as the leader's disk always was; the escrow widens the set of such disks from one to the
   leader's plus the standbys of the map group. A server removed while it cannot be reached keeps its copy and must be treated as knowing the key; the rotation of the CA itself is not built. The key is never in
   a REST answer, task, audit event, log or table. See the design for the alternatives that were rejected.
-- **Not built:** a console panel; an alert for a recipient that stays out of date (the status shows it); the removal of `ca.key` from an old leader that comes back.
+- **Not built:** an alert for a recipient that stays out of date (the status shows it); the removal of `ca.key` from an old leader that comes back. The console shows and changes the escrow on the Certificate authority tab of the Security page.
 - **Tests:** `internal/pki` (`TestEscrowRoundTripGivesTheNewLeaderTheCA`, `TestHostileBlobs`, `TestAWrongKeyOpensNothing`, `TestABlobForAnotherCAIsNotAdopted`, `TestAnOlderBlobDoesNotReplaceANewerOne`,
   `TestRotationReplacesTheEscrowKeyAndTheOldOneStopsWorking`), `internal/membership` (`escrow_test.go`: the leader's side with the receivers of other servers), `internal/httpapi`
   (`handlers_caescrow_test.go`), and the cluster tests `TestCAEscrowMapGroupFailover` and `TestCAEscrowTamperedCopyIsNotAdopted` (`internal/clustertest/caescrow_test.go`).

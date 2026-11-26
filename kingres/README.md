@@ -8,7 +8,7 @@
 
 # KingresDB
 
-KingresDB is a thin fork of PostgreSQL that adds three things:
+KingresDB is a thin fork of PostgreSQL that adds three main things. It also ships analytics extensions, export and import of tables and databases, and a standalone verifier (see the repository map below):
 
 - **Sharding.** Tables are split into a fixed number of hash buckets spread over several servers. The logic lives in an extension (`kingres_shard`), not in the executor.
 - **A tamper-evident ledger.** Ledger tables keep a hash chain and Merkle blocks, so changes to history can be detected, with digests that can be anchored outside the database (`kingres_ledger`).
@@ -22,7 +22,7 @@ The design is in [docs/architecture.md](docs/architecture.md). It separates sour
 
 ## Status
 
-There is one product branch per PostgreSQL major, with the same KingresDB code on each: `kingres-18` on upstream tag `REL_18_7`, and `kingres-19` on `REL_19_0` (PostgreSQL 19.0); see [docs/dev/releases.md](docs/dev/releases.md). No release has been made. The first release is 0.1.0; its notes are in [CHANGELOG.md](CHANGELOG.md). The table is the state of the code by phase of the roadmap in [docs/architecture.md](docs/architecture.md). The REST contract is 0.34.0. "Done" means written, tested and reviewed where the work log says so.
+There is one product branch per PostgreSQL major, with the same KingresDB code on each: `kingres-18` on upstream tag `REL_18_7`, and `kingres-19` on `REL_19_0` (PostgreSQL 19.0); see [docs/dev/releases.md](docs/dev/releases.md). No release has been made. The state is that of 2026-11-26. The first release is 0.1.0; its notes are in [CHANGELOG.md](CHANGELOG.md). The table is the state of the code by phase of the roadmap in [docs/architecture.md](docs/architecture.md). The REST contract is 0.34.0. "Done" means written, tested and reviewed where the work log says so.
 
 | Phase | State | Detail |
 |---|---|---|

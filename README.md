@@ -25,7 +25,10 @@ query pushdown, table lifecycle, elasticity, distributed schemas, high
 availability, the ledger with its verifier, signing and anchoring, the control
 plane and the console, analytics, configuration from the console and the export
 and import of tables and databases are built.  The README of the project states
-the exact state of every phase.
+the exact state of every phase, and
+[kingres/docs/guide/limitations.md](kingres/docs/guide/limitations.md) lists what
+KingresDB does not do.  Failover is new in this release: test your recovery
+procedure before you rely on it.
 
 - [kingres/README.md](kingres/README.md): the status of every phase, the
   repository map and the documentation.
