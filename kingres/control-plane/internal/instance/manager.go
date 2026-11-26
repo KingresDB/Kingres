@@ -743,41 +743,49 @@ func (m *Manager) StopImmediate(ctx context.Context, id int) error {
 	return nil
 }
 
-// StopForShutdown is the orderly stop of the service: it asks the instance for a
-// fast shutdown without waiting (pg_ctl stop -W), then calls requested with the
-// identity of the postmaster that was asked (process id and start time, "" when
-// unknown), and only then waits until the instance is gone or the stop timeout
-// has passed. requested runs after PostgreSQL has accepted the request, which
-// ends all sessions and admits no new one, so a watchdog told to stand down at
-// that moment can no longer cost a write that was acknowledged. Stopping a
-// stopped instance is not an error and calls nothing.
-func (m *Manager) StopForShutdown(ctx context.Context, id int, requested func(postmaster string)) error {
+// ShutdownRequest is a fast shutdown that was asked for and not yet awaited (RequestShutdown, AwaitShutdown).
+type ShutdownRequest struct {
+	ID int
+	// Postmaster is the identity of the postmaster that was asked (process id and start time, "" when unknown).
+	Postmaster string
+	deadline   time.Time
+}
+
+// RequestShutdown asks the instance for a fast shutdown without waiting (pg_ctl stop -W) and returns what AwaitShutdown
+// needs; a stopped instance is not an error and gives a nil request. The wait for the end is bounded by the stop timeout
+// counted from this request.
+func (m *Manager) RequestShutdown(ctx context.Context, id int) (*ShutdownRequest, error) {
 	m.serviceStopping.Store(true) // a start that is waiting for a shutdown must not bring an instance back during the stop of the service
 	if up, err := m.Running(ctx, id); err != nil || !up {
-		return err
+		return nil, err
 	}
 	data, _ := m.DataDir(id)
 	ident := postmasterIdentity(data)
 	out, err := m.run(ctx, "pg_ctl", "stop", "-D", data, "-m", "fast", "-W")
 	if err != nil {
 		if up, rerr := m.Running(ctx, id); rerr == nil && !up {
-			return nil // it ended between the check and the request
+			return nil, nil // it ended between the check and the request
 		}
-		return fmt.Errorf("instance: pg_ctl stop: %w: %s", err, out)
+		return nil, fmt.Errorf("instance: pg_ctl stop: %w: %s", err, out)
 	}
-	if requested != nil {
-		requested(ident)
+	return &ShutdownRequest{ID: id, Postmaster: ident, deadline: time.Now().Add(m.stopTO)}, nil
+}
+
+// AwaitShutdown waits until the instance of a request is gone or its stop timeout has passed. A nil request is a stopped
+// instance and returns at once.
+func (m *Manager) AwaitShutdown(ctx context.Context, r *ShutdownRequest) error {
+	if r == nil {
+		return nil
 	}
-	deadline := time.Now().Add(m.stopTO)
 	for {
-		up, err := m.Running(ctx, id)
+		up, err := m.Running(ctx, r.ID)
 		if err != nil {
 			return err
 		}
 		if !up {
 			return nil
 		}
-		if time.Now().After(deadline) {
+		if time.Now().After(r.deadline) {
 			return fmt.Errorf("instance: the instance did not shut down within %s", m.stopTO)
 		}
 		select {
@@ -786,6 +794,64 @@ func (m *Manager) StopForShutdown(ctx context.Context, id int, requested func(po
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
+}
+
+// StopForShutdown is the orderly stop of one instance of the service: it asks the instance for a
+// fast shutdown without waiting (pg_ctl stop -W), then calls requested with the
+// identity of the postmaster that was asked (process id and start time, "" when
+// unknown), and only then waits until the instance is gone or the stop timeout
+// has passed. requested runs after PostgreSQL has accepted the request, which
+// ends all sessions and admits no new one, so a watchdog told to stand down at
+// that moment can no longer cost a write that was acknowledged. Stopping a
+// stopped instance is not an error and calls nothing.
+func (m *Manager) StopForShutdown(ctx context.Context, id int, requested func(postmaster string)) error {
+	return m.StopAllForShutdown(ctx, nil, []int{id}, func(_ int, pm string) {
+		if requested != nil {
+			requested(pm)
+		}
+	})
+}
+
+// StopAllForShutdown is the orderly stop of the service for all instances of the server. The fast shutdown is asked
+// of every instance first, the primaries before the standbys, and only then are the instances awaited. The lease
+// watchdog of a primary fences it with an immediate shutdown a few seconds after kingresd stopped renewing the lease,
+// unless the stop was requested and the watchdog told to stand down (requested, called with the instance id and the
+// postmaster asked), so the request for a primary must never wait for anything else: not for the end of another
+// instance's shutdown (a standby in crash recovery on a slow disk, an earlier primary with a long shutdown
+// checkpoint) and not for the requests for the standbys, which come after it. An instance that is in both lists is
+// asked once, as a primary. Every failure is returned, joined, each with the id of its instance; a failure of one
+// instance never keeps the others from being asked and awaited.
+func (m *Manager) StopAllForShutdown(ctx context.Context, standbys, primaries []int, requested func(id int, postmaster string)) error {
+	var errs []error
+	seen := map[int]bool{}
+	var asked []*ShutdownRequest
+	ask := func(id int, primary bool) {
+		if seen[id] {
+			return
+		}
+		seen[id] = true
+		r, err := m.RequestShutdown(ctx, id)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("instance %d: %w", id, err))
+			return
+		}
+		if r != nil && primary && requested != nil {
+			requested(id, r.Postmaster)
+		}
+		asked = append(asked, r)
+	}
+	for _, id := range primaries {
+		ask(id, true)
+	}
+	for _, id := range standbys {
+		ask(id, false)
+	}
+	for _, r := range asked {
+		if err := m.AwaitShutdown(ctx, r); err != nil {
+			errs = append(errs, fmt.Errorf("instance %d: %w", r.ID, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // postmasterIdentity is the process id and the start time of the postmaster, the

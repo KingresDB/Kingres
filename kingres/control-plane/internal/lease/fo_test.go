@@ -28,7 +28,7 @@ func TestTheGateOfAnInstanceWithoutAGroupHoldsForMigratedMarkers(t *testing.T) {
 	if err := Gate(dir, unknown)(1); err == nil {
 		t.Fatal("before the migration the legacy marker must hold the instance (setup)")
 	}
-	if _, err := PrepareStart(dir, func(int32) bool { return false }); err != nil {
+	if _, err := PrepareStart(dir, func(int32) bool { return false }, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(FencedPath(dir, 3)); err != nil {
