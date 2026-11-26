@@ -94,3 +94,5 @@ kingres/packaging/release/release.sh --version <version> --commit18 <sha> --comm
 **Test.** `kingres/packaging/test/test-release.sh` runs the real script against a small test repository with stand-ins for the three build scripts and for docker, and checks every gate, the dry run, the checksums, the notes, the tags and that nothing is pushed.
 
 After the script: push, then publish. Signing the checksums, signing packages and images and publishing them are the project owner's decisions and are not part of the script. No release is tagged before every phase of the first release is finished ([../architecture.md](../architecture.md), "Scope of the first release").
+
+**The tag of the verifier.** A KingresDB release makes only the product tags `kingres-<version>-pg18` and `kingres-<version>-pg19`; no separate `v<version>` tag is made. The signed release of the verifier (`kingres/verifier`, see its README) is therefore cut with `--tag kingres-<version>-pg18`.

@@ -7,7 +7,7 @@ The architecture document's "Proposed repository layout" sketch shows a `postgre
 
 ## Directory tree
 
-Directories marked "planned" do not exist yet or are empty.
+Only `kingres-cli` is planned: it does not exist yet.
 
 ```
 <repository root>/                 Upstream PostgreSQL tree (branch kingres-18, base REL_18_7)
@@ -27,7 +27,7 @@ Directories marked "planned" do not exist yet or are empty.
       internal/                      All other Go packages (agent, manager, router, task engine, REST handlers)
     web/                           Vue 3 and TypeScript panel
     verifier/                      Standalone ledger verifier (does not trust the database)
-    packaging/                     deb, rpm, Docker image, systemd unit for the kingres package
+    packaging/                     deb, Docker image, systemd unit, release script for the kingres package
     dev/                           Developer scripts
     docs/
       architecture.md              Design and decisions (source of truth)
@@ -41,6 +41,7 @@ Directories marked "planned" do not exist yet or are empty.
         upstream-sync.md             Branching and rebase policy
         testing.md                   Test strategy and definition of done
         documentation.md             Documentation rules
+        releases.md                  Product branches and how a release is made
       worklog.md                   Dated record of work done
 ```
 
