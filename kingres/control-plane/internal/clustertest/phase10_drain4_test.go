@@ -477,8 +477,8 @@ func TestDrainWhoseServerDiesWhileTheMapGroupIsHandedOver(t *testing.T) {
 }
 
 // The order that made the test above fail one run in a few: the bootstrap of the candidate is given up while it still waits for the fence lease, in the moment between
-// its look at the journal and the call that adopts the lease. The abandon lets go of the lease, the call then adopts it again, and the candidate renewed it for ever, so
-// that the old leader, started again by the abandon, never won it. The crash point holds the bootstrap in that moment; the abandon is made there, and the bootstrap goes on
+// the call that adopts the lease (it has returned) and the bootstrap's next look at the journal. The abandon lets go of the lease, the next call then adopts it again, and
+// the candidate renewed it for ever, so that the old leader, started again by the abandon, never won it. The crash point holds the bootstrap in that moment; the abandon is made there, and the bootstrap goes on
 // afterwards.
 func TestDrainWhoseSwitchoverIsGivenUpWhileTheCandidateAsksForTheFenceLeaseLeavesTheLeaseToTheOldLeader(t *testing.T) {
 	c := p10d4Cluster(t, 300)
@@ -497,9 +497,23 @@ func TestDrainWhoseSwitchoverIsGivenUpWhileTheCandidateAsksForTheFenceLeaseLeave
 	defer nw.Heal()
 	id := clustertest.TaskID(old.Expect(202, "POST", "/servers/"+old.Host+"/drain", map[string]any{}))
 	mapStopped(t, old)
+	// What the abandon answered, how many times and how long the last call took: a failure says why (a refusal, a promoted bootstrap, a call that did not return), and the
+	// logs of the candidate and of the old leader are shown with it.
+	var lastStatus, calls int
+	var lastBody map[string]any
+	var lastTook time.Duration
+	defer func() {
+		if t.Failed() {
+			t.Logf("the abandon was called %d times; the last answer after %v: %d %v", calls, lastTook, lastStatus, lastBody)
+			t.Logf("the candidate %s:\n%s\nthe old leader %s:\n%s", nw.Host, nw.LogTail(4000), old.Host, old.LogTail(3000))
+		}
+	}()
 	until(t, 3*time.Minute, "the bootstrap to be given up", func() bool {
-		st, b := nw.Do("POST", "/failover/map/abandon", map[string]any{"reason": "the candidate cannot promote"}, nil)
-		return st == 200 && b["abandoned"] == true
+		start := time.Now()
+		calls++
+		defer func() { lastTook = time.Since(start) }()
+		lastStatus, lastBody = nw.Do("POST", "/failover/map/abandon", map[string]any{"reason": "the candidate cannot promote"}, nil)
+		return lastStatus == 200 && lastBody["abandoned"] == true
 	})
 	// The abandon let go of the lease, and the grants of the servers still name the candidate for up to the lease duration (12s). The rollback of the old leader's task
 	// has let go of it as well by now; the bootstrap goes on after that, and asks for the lease of a bootstrap that was given up.
