@@ -40,6 +40,7 @@ The first release. KingresDB is a thin fork of PostgreSQL 18.7 and PostgreSQL 19
   - Rebalance as a task with stop, resume and reports. Strategies by bucket count or disk size, a threshold, weights, an automatic mode (off by default; a run makes one move at a time), draining a server and splitting a bucket.
   - A drain hands the map group over by a planned switchover (contract 0.27.0).
   - A rebalance is held back, or refused with `group_degraded` unless `force` is sent, while a standby lags by more than `maxStandbyLagBytes`.
+  - The removal of a server that a rebalance emptied a moment ago forces the cleanup of the moves that are still in the cleaning phase (their old copies are dropped before the retention delay; this is logged and audited as `cleanupMovedBucketsForced`) and tries again, for about two minutes, while a move of its groups is still cleaning; the task says what it waits for. It does not fail when another cleanup holds one of those moves at that moment.
   - Distributed schemas: distribute, move and make local as tasks, and the sharding mode of a database. A rebalance and a drain plan and move schemas as items of the plan (contract 0.31.0): `kind` and `schemaName` appear in the plan, the progress and the report. A drain that would need to move a schema that cannot move (pinned by a ledger table, or a table without a key) is refused before a task exists.
   - Table lifecycle as tasks: distribute, make a table ordinary again, change its distribution, create a partition.
   - Distribute with related tables (contract 0.32.0):
