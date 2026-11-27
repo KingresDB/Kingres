@@ -48,6 +48,11 @@ const (
 	callMapProof    = "POST /failover/map/proof"
 )
 
+// abandonLockWait is how long the abandon waits for the lifecycle lock of the standby agent before it answers that it must be repeated (503). A promotion holds the
+// lock for seconds; a create or a rebuild of a standby can hold it for minutes, and the call of an operator must not hang that long. It stays under the default
+// write timeout of the HTTP server (60 s) and under the 30 s of a server that forwards the call, so that the answer reaches the caller.
+const abandonLockWait = 25 * time.Second
+
 // mapFailover is the server's part of the failover of the map group: the candidate that runs the bootstrap, the receiver that
 // finds a candidate for a request, and the answers about the bootstrap while no task can be read.
 type mapFailover struct {
@@ -75,6 +80,9 @@ type mapFailover struct {
 	// asks the old leader's server to end the hold of its primary (F6-01, F6-02).
 	lifecycleLock   func(ctx context.Context) (func(), error)
 	resumeOldLeader func(ctx context.Context, oldServer string) (bool, error)
+	// lockWait bounds the abandon's wait for the lifecycle lock (0: abandonLockWait). A create, a remove or a rebuild of a standby holds the lock too and can take minutes;
+	// the abandon then answers that it must be repeated instead of waiting for it.
+	lockWait time.Duration
 	// The parts of the resolution of a held-back primary that a test stands in for (nil: the real ones): the calls to other servers, the list of servers, the marker, the end of
 	// the hold, and the two ways of asking an instance whether it is in recovery.
 	liveOf          func(ctx context.Context, server string) string // the view of a server (nil: the planner's)
@@ -804,7 +812,13 @@ func (m *mapFailover) abandonLocalFull(ctx context.Context, reason string) (mapA
 	// finds let go of.
 	unlock := func() {}
 	if m.lifecycleLock != nil {
-		u, lerr := m.lifecycleLock(ctx)
+		wait := m.lockWait
+		if wait <= 0 {
+			wait = abandonLockWait
+		}
+		lctx, cancel := context.WithTimeout(ctx, wait)
+		u, lerr := m.lifecycleLock(lctx)
+		cancel()
 		if lerr != nil {
 			return mapAbandonAnswer{}, problem.New(problem.ServiceUnavailable, "A promotion, a create, a remove or a rebuild of a standby is running on this server; repeat the call.").WithRetryAfter(5)
 		}
@@ -909,6 +923,7 @@ func (m *mapFailover) Abandon(ctx context.Context, actor string, id internalapi.
 		return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "The servers of the cluster cannot be read now.").WithRetryAfter(5)
 	}
 	var asked, failed int
+	busy := ""
 	for _, s := range members {
 		if s == m.self {
 			continue
@@ -920,12 +935,20 @@ func (m *mapFailover) Abandon(ctx context.Context, actor string, id internalapi.
 			if errors.As(err, &ce) && ce.Status == http.StatusConflict {
 				return failover.MapAbandonResult{}, problem.New(problem.Conflict, ce.Message)
 			}
+			// A server whose bootstrap could not be given up now (its lifecycle lock is held by a promotion, a create, a remove or a rebuild of a standby, or the
+			// lease of a bootstrap it gave up could not be let go of yet) says that the call must be repeated: the answer must not become "nothing in progress".
+			if errors.As(err, &ce) && ce.Status == http.StatusServiceUnavailable && ce.Code == string(problem.ServiceUnavailable) && busy == "" {
+				busy = s + ": " + ce.Message
+			}
 			failed++
 			continue
 		}
 		if out.Abandoned {
 			return failover.MapAbandonResult{Abandoned: true, ResumedServer: out.ResumedServer}, nil
 		}
+	}
+	if busy != "" {
+		return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "A server could not give up its bootstrap of the map group now ("+busy+"); repeat the call.").WithRetryAfter(5)
 	}
 	if asked > 0 && failed == asked {
 		return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "No other server of the cluster answered, so it is not known whether a bootstrap of the map group is in progress there.").WithRetryAfter(5)

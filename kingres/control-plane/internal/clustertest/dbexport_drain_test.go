@@ -131,7 +131,13 @@ func TestDatabaseExportAndDrainAtTheSameTime(t *testing.T) {
 	}
 
 	var drainID any
+	// A standby of the group that still replays the rows written above makes the drain refuse with group_degraded (a drain must not move the buckets of a group
+	// whose standby lags); under the load of a shared machine that lasts some seconds. The drain is asked again until the group is not degraded.
 	st, dr := l.Do("POST", "/servers/"+victim.Host+"/drain", map[string]any{}, nil)
+	for deadline := time.Now().Add(3 * time.Minute); st == 409 && dr["code"] == "group_degraded" && time.Now().Before(deadline); {
+		time.Sleep(time.Second)
+		st, dr = l.Do("POST", "/servers/"+victim.Host+"/drain", map[string]any{}, nil)
+	}
 	refused := false
 	switch st {
 	case 202:
