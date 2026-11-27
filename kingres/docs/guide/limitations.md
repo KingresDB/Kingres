@@ -31,6 +31,7 @@ Read this before you decide what to run on KingresDB. Each item is a boundary th
 - A drain hands the map group over (step 4) and a rebalance is held back while a standby lags by more than `maxStandbyLagBytes`; a drain moves the distributed schemas of the server together with its buckets.
 - An old leader of a map group switchover that cannot resolve its hold because every other server is gone does not resume by itself; an operator ends the hold with the abandon call once a standby answers.
 - Automatic failover is off by default. Two failures at once, and a failure during a rebalance, are not tested on a cluster.
+- Under heavy machine load a planned switchover of the map group can be given up and rolled back: a lease that lapses, or a clean stop that outlasts its bound of 90 seconds. The old leader is started again and the task ends `switchover_unproven`; repeat the request. In repeated runs of the cluster tests of switchover, PostgreSQL 19 passed 95 of 95 and PostgreSQL 18 passed 93 of 95 on an overloaded test machine. One of the two failures was a task that failed after the promotion while the promoted instance restarted; the steps after the promotion now wait for the catalog and then pause instead of failing. The other was such a give-up, which is not changed.
 - A cluster of one server has no failover; the phase 5 design says what two servers can and cannot do.
 - A failover cannot restore data that no standby had. The dry run says whether writes may be lost, and a real request must accept that explicitly.
 
