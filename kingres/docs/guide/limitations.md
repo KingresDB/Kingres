@@ -80,7 +80,7 @@ Read this before you decide what to run on KingresDB. Each item is a boundary th
 - No automated backup, no point-in-time recovery archive configuration, and no backup of the certificate authority key ([operator-guide.md](operator-guide.md), section 7).
 - The compose cluster is for development; its test does not exercise removing a server, failover, switchover or rebalance.
 - No NLS, GSSAPI, LDAP, PAM, JIT or procedural languages other than PL/pgSQL are built in.
-- The bases are PostgreSQL 18.7 and PostgreSQL 19.0 ([install.md](install.md)). No release has been made and nothing is tagged.
+- The bases are PostgreSQL 18.7 and PostgreSQL 19.0 ([install.md](install.md)). The first release, 0.1.0, is tagged `kingres-0.1.0-pg18` and `kingres-0.1.0-pg19`.
 
 ## Outside the code
 
