@@ -10,7 +10,7 @@ The release script ([packaging/release/release.sh](packaging/release/release.sh)
 
 Nothing yet.
 
-## [0.1.0] - not released
+## [0.1.0] - 2026-11-28
 
 The first release. KingresDB is a thin fork of PostgreSQL 18.7 and PostgreSQL 19.0 with sharding, a tamper-evident ledger, a control plane and a web console, and extensions for analytics. The REST contract is 0.34.0 (178 operations on 142 paths).
 

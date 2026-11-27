@@ -16,7 +16,7 @@ Also useful: [../../CHANGELOG.md](../../CHANGELOG.md) (what changed), [../../REA
 
 ## How to read the markers
 
-The guide describes the first release (0.1.0; REST contract 0.34.0, `kingres_shard` 0.9, `kingres_timepart` 0.3), checked against its code. No release has been made yet. A boundary that the design leaves open carries the word **Open**. Do not rely on it in production.
+The guide describes the first release (0.1.0; REST contract 0.34.0, `kingres_shard` 0.9, `kingres_timepart` 0.3), checked against its code; it was released on 2026-11-28 as `kingres-0.1.0-pg18` and `kingres-0.1.0-pg19`. A boundary that the design leaves open carries the word **Open**. Do not rely on it in production.
 
 ## KingresDB in one page
 

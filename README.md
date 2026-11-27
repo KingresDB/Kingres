@@ -17,8 +17,8 @@ directory; the rest of this tree is the PostgreSQL source it is based on.  It
 is built for PostgreSQL 18 (this branch) and for PostgreSQL 19 (branch
 `kingres-19`), from one source of each extension.
 
-**Status.**  There is no release yet.  The first release will be 0.1.0.  It
-contains every phase of the roadmap except phase 8 (a global snapshot and a
+**Status.**  The first release is 0.1.0 (2026-11-28), tagged
+`kingres-0.1.0-pg18` and `kingres-0.1.0-pg19`.  It contains every phase of the roadmap except phase 8 (a global snapshot and a
 multi-node ledger), which is future roadmap, and phase 15 (management of
 third-party extensions), which comes after the first release.  Sharding,
 query pushdown, table lifecycle, elasticity, distributed schemas, high
