@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -107,9 +108,11 @@ func (m *Manager) stepRemoveUnregister(ctx context.Context, env *task.Env) error
 	if err != nil {
 		return err
 	}
+	// The detail is also cleared when the task is being stopped, so it does not use the context of the step.
+	say := func(s string) { _ = env.SetDetail(context.WithoutCancel(ctx), s) }
 	for _, db := range dbs {
 		err := m.waitUnreachable(ctx, env, in.ServerID, "unregistering it in "+db, func() error {
-			return m.unregisterNode(ctx, db, in.ServerID)
+			return m.unregisterNode(ctx, db, in.ServerID, say)
 		})
 		if err != nil {
 			return err
@@ -118,17 +121,86 @@ func (m *Manager) stepRemoveUnregister(ctx context.Context, env *task.Env) error
 	return nil
 }
 
-func (m *Manager) unregisterNode(ctx context.Context, db, host string) error {
+func (m *Manager) unregisterNode(ctx context.Context, db, host string, say func(string)) error {
 	c, err := m.Svc.ServiceConn(ctx, db)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-	return m.unregisterNodeOn(ctx, c, db, host)
+	return m.unregisterNodeOn(ctx, c, db, host, say)
+}
+
+// cleaningWait bounds how long the removal of a node waits for the moves of its group that are still in the cleaning phase
+// after their cleanup was forced; cleaningPoll is the pause between two tries. The forced cleanup does not finish every move
+// at once: it skips a move that another cleanup holds at that moment (the one at the end of a rebalance, or the background
+// worker of the extension), and a move waits while a transaction of its switch is still prepared or a reader still uses its
+// old partitions. Each try forces the cleanup again. The bound is checked before each new try, and a try in progress is not cut
+// short (a forced cleanup can take up to a minute per move whose old partitions are still read), so the wait can end later.
+var (
+	cleaningWait = 2 * time.Minute
+	cleaningPoll = 2 * time.Second
+)
+
+// removeCalls are the calls of the removal of one node, apart from the database, so that the wait for the moves in the cleaning
+// phase can be tested without one.
+type removeCalls struct {
+	remove   func() error        // kingres.remove_node
+	cleaning func() (int, error) // the moves of the node's group in the cleaning phase; 0 when the group still has a standby or buckets
+	force    func() (int, error) // kingres.cleanup_moved_buckets(true): the number of moves it finished
+	say      func(string)        // the detail of the task; "" clears it
+}
+
+// removeWaitingForCleaning removes a node. The extension refuses it with SQLSTATE 55006 while the group of the node has a standby,
+// owns buckets, or takes part in a move that is not finished. When moves of the group are in the cleaning phase (and the group has
+// no standby and no bucket, which the extension checks first), their cleanup is forced and the removal is tried again, until it is
+// done or wait is over; while one of them is cleaning, a move of the group in an earlier phase is waited for too, as it may reach
+// the cleaning phase. Any other refusal (a standby, buckets, or only moves in earlier phases) and any other error are returned at
+// once. forced is the number of moves the forced cleanups finished, and ran says whether one ran at all.
+func removeWaitingForCleaning(ctx context.Context, rc removeCalls, wait, poll time.Duration) (forced int, ran bool, err error) {
+	deadline := time.Now().Add(wait)
+	told := false
+	defer func() {
+		if told {
+			rc.say("")
+		}
+	}()
+	for try := 0; ; try++ {
+		err = rc.remove()
+		var pe *pgconn.PgError
+		if err == nil || !errors.As(err, &pe) || pe.Code != "55006" {
+			return forced, ran, err
+		}
+		n, cerr := rc.cleaning()
+		if cerr != nil || n == 0 {
+			return forced, ran, err
+		}
+		if try > 0 {
+			if time.Now().After(deadline) {
+				return forced, ran, err
+			}
+			rc.say(fmt.Sprintf("Waiting for %d bucket moves of its group in the cleaning phase to finish before the server is unregistered.", n))
+			told = true
+			select {
+			case <-ctx.Done():
+				return forced, ran, ctx.Err()
+			case <-time.After(poll):
+			}
+		}
+		f, ferr := rc.force()
+		if ferr != nil {
+			return forced, ran, err
+		}
+		forced += f
+		ran = true
+	}
 }
 
 // unregisterNodeOn is unregisterNode on the session c of the service role, which is open to database db (see registerNodeOn).
-func (m *Manager) unregisterNodeOn(ctx context.Context, c *pgx.Conn, db, host string) error {
+// say, when not nil, is told what the removal waits for.
+func (m *Manager) unregisterNodeOn(ctx context.Context, c *pgx.Conn, db, host string, say func(string)) error {
+	if say == nil {
+		say = func(string) {}
+	}
 	if err := extgate.Require(ctx, c, extguard.Shard, db); err != nil {
 		return err
 	}
@@ -141,26 +213,46 @@ func (m *Manager) unregisterNodeOn(ctx context.Context, c *pgx.Conn, db, host st
 		return err
 	}
 	for _, id := range ids {
-		_, err := c.Exec(ctx, `SELECT kingres.remove_node($1)`, id)
-		var pe *pgconn.PgError
-		if errors.As(err, &pe) && pe.Code == "55006" {
-			// The server was emptied by a rebalance a moment ago: its moves are still in the cleaning phase,
-			// waiting for the delay after which the old copies of the buckets are dropped, and the extension
-			// refuses to remove a group that takes part in a move. The server is going away with its data, so
-			// the old copies are dropped now (cleanup_moved_buckets(true)), and the removal tries again.
-			// The extension cannot limit this to the groups of the server that goes (there is no argument for it): it
-			// finishes every move that is cleaning, also those of buckets that moved between other servers, whose old
-			// copies are then dropped before their retention delay is over. That is said in the log and the audit log
-			// with the number, so that it is not silent (RB-14 c).
-			var finished int
-			if cerr := c.QueryRow(ctx, `SELECT kingres.cleanup_moved_buckets(true)`).Scan(&finished); cerr == nil {
-				m.log().Warn("removing a server finished the moves in the cleaning phase of the whole cluster before their retention delay", "server", host, "database", db, "moves", finished)
-				m.audit(ctx, "system", "cleanupMovedBucketsForced", host, audit.OutcomeSuccess, map[string]any{"database": db, "moves": finished})
-				_, err = c.Exec(ctx, `SELECT kingres.remove_node($1)`, id)
-			}
+		// The server was emptied by a rebalance a moment ago: its moves are still in the cleaning phase,
+		// waiting for the delay after which the old copies of the buckets are dropped, and the extension
+		// refuses to remove a group that takes part in a move. The server is going away with its data, so
+		// the old copies are dropped now (cleanup_moved_buckets(true)), and the removal tries again, for as
+		// long as cleaningWait, while a move of the group is still cleaning (see removeWaitingForCleaning).
+		// The extension cannot limit this to the groups of the server that goes (there is no argument for it): it
+		// finishes every move that is cleaning, also those of buckets that moved between other servers, whose old
+		// copies are then dropped before their retention delay is over. That is said in the log and the audit log
+		// with the number, so that it is not silent (RB-14 c).
+		forced, ran, rerr := removeWaitingForCleaning(ctx, removeCalls{
+			remove: func() error {
+				_, err := c.Exec(ctx, `SELECT kingres.remove_node($1)`, id)
+				return err
+			},
+			cleaning: func() (int, error) {
+				var n int
+				// The refusals of kingres.remove_node in its order: a standby of the group, buckets of the group, then a move.
+				err := c.QueryRow(ctx, `SELECT count(*) FROM kingres.bucket_move m JOIN kingres.node n ON n.node_id = $1
+					WHERE n.role = 'primary' AND m.phase = 'cleaning' AND (m.source_group = n.group_id OR m.target_group = n.group_id)
+					AND NOT EXISTS (SELECT 1 FROM kingres.node s WHERE s.group_id = n.group_id AND s.role = 'standby')
+					AND NOT EXISTS (SELECT 1 FROM kingres.bucket_map b WHERE b.group_id = n.group_id)`, id).Scan(&n)
+				return n, err
+			},
+			force: func() (int, error) {
+				var n int
+				err := c.QueryRow(ctx, `SELECT kingres.cleanup_moved_buckets(true)`).Scan(&n)
+				return n, err
+			},
+			say: say,
+		}, cleaningWait, cleaningPoll)
+		if ran && forced > 0 {
+			m.log().Warn("removing a server finished the moves in the cleaning phase of the whole cluster before their retention delay", "server", host, "database", db, "moves", forced)
+			m.audit(ctx, "system", "cleanupMovedBucketsForced", host, audit.OutcomeSuccess, map[string]any{"database": db, "moves": forced})
 		}
-		if err != nil {
-			return fmt.Errorf("unregistering node %d in database %s: %w", id, db, cleanPG(err))
+		if rerr != nil {
+			var pe *pgconn.PgError
+			if errors.As(rerr, &pe) {
+				m.log().Warn("the extension refused to unregister a node", "server", host, "database", db, "node", id, "sqlstate", pe.Code, "message", pe.Message)
+			}
+			return fmt.Errorf("unregistering node %d in database %s: %w", id, db, cleanPG(rerr))
 		}
 	}
 	return nil

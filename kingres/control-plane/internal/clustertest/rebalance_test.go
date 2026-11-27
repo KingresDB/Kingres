@@ -514,9 +514,48 @@ func TestRebalance(t *testing.T) {
 		if s := leader.Servers()[victim.Host]["status"]; s != "live" {
 			t.Errorf("an emptied server is %v, want live", s)
 		}
+		ctx := context.Background()
+		// The moves that emptied it are still in the cleaning phase. A cleanup that runs at the same moment (the one at the end
+		// of a rebalance, or the background worker of the extension) holds one of them: here a session locks its row as such a
+		// cleanup does. The cleanup that the removal forces skips that move, and the removal waits for it instead of failing
+		// (the final checks of 0.1.0 found the failure, about one run in five).
+		lock := leader.ServicePG("rb")
+		var mapPrimary bool
+		if err := lock.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM kingres.local_node l JOIN kingres.node n ON n.node_id = l.node_id
+			WHERE n.group_id = 0 AND n.role = 'primary')`).Scan(&mapPrimary); err != nil || !mapPrimary {
+			t.Fatalf("the leader's instance is not the primary of the map group (%v): the move cannot be held", err)
+		}
+		tx, err := lock.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		var held int64
+		if err := tx.QueryRow(ctx, `SELECT m.move_id FROM kingres.bucket_move m JOIN kingres.node n ON n.host = $1 AND n.role = 'primary'
+			WHERE m.phase = 'cleaning' AND (m.source_group = n.group_id OR m.target_group = n.group_id)
+			ORDER BY m.move_id LIMIT 1 FOR UPDATE OF m`, victim.Host).Scan(&held); err != nil {
+			t.Fatalf("no move of the emptied server in the cleaning phase to hold: %v", err)
+		}
 		// It still owns nothing, so it can be removed; the standbys it hosts do not stop that.
 		body := leader.Expect(202, "DELETE", "/servers/"+victim.Host, nil)
-		leader.WaitTaskDone(clustertest.TaskID(body), 5*time.Minute)
+		id := clustertest.TaskID(body)
+		waiting := false
+		for end := time.Now().Add(3 * time.Minute); time.Now().Before(end) && !waiting; time.Sleep(200 * time.Millisecond) {
+			_, task := leader.Do("GET", fmt.Sprintf("/tasks/%v", id), nil, nil)
+			if task["state"] == "failed" {
+				t.Fatalf("the removal failed while move %d was held: %v", held, task["error"])
+			}
+			if d, _ := task["detail"].(string); strings.Contains(d, "in the cleaning phase") {
+				waiting = true
+			}
+		}
+		if !waiting {
+			t.Fatalf("the removal does not say that it waits for move %d\n%s", held, leader.LogTail(3000))
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		leader.WaitTaskDone(id, 5*time.Minute)
 		if _, ok := leader.Servers()[victim.Host]; ok {
 			t.Errorf("the removed server is still listed")
 		}

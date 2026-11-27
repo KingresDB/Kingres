@@ -36,7 +36,7 @@ func TestSchemaSpoofIsNeverExecutedByMembership(t *testing.T) {
 	want("bucketsOwned", err)
 	want("registerNodeOn", registerNodeOn(ctx, c, db, "10.0.0.9", 5432))
 	m := &Manager{}
-	want("unregisterNodeOn", m.unregisterNodeOn(ctx, c, db, "10.0.0.9"))
+	want("unregisterNodeOn", m.unregisterNodeOn(ctx, c, db, "10.0.0.9", nil))
 }
 
 // TestUntrustedSchemaIsRefusedByMembership: kingres_shard is installed in a schema kingres that the tenant owns; the removal facts are refused.
