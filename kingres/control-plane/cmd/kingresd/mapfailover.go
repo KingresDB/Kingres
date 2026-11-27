@@ -50,8 +50,8 @@ const (
 
 // abandonLockWait is how long the abandon waits for the lifecycle lock of the standby agent before it answers that it must be repeated (503). A promotion holds the
 // lock for seconds; a create or a rebuild of a standby can hold it for minutes, and the call of an operator must not hang that long. It stays under the default
-// write timeout of the HTTP server (60 s), so that the answer reaches the caller.
-const abandonLockWait = 45 * time.Second
+// write timeout of the HTTP server (60 s) and under the 30 s of a server that forwards the call, so that the answer reaches the caller.
+const abandonLockWait = 25 * time.Second
 
 // mapFailover is the server's part of the failover of the map group: the candidate that runs the bootstrap, the receiver that
 // finds a candidate for a request, and the answers about the bootstrap while no task can be read.
@@ -923,6 +923,7 @@ func (m *mapFailover) Abandon(ctx context.Context, actor string, id internalapi.
 		return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "The servers of the cluster cannot be read now.").WithRetryAfter(5)
 	}
 	var asked, failed int
+	busy := ""
 	for _, s := range members {
 		if s == m.self {
 			continue
@@ -934,12 +935,20 @@ func (m *mapFailover) Abandon(ctx context.Context, actor string, id internalapi.
 			if errors.As(err, &ce) && ce.Status == http.StatusConflict {
 				return failover.MapAbandonResult{}, problem.New(problem.Conflict, ce.Message)
 			}
+			// A server whose bootstrap could not be given up now (its lifecycle lock is held by a promotion, a create, a remove or a rebuild of a standby, or the
+			// lease of a bootstrap it gave up could not be let go of yet) says that the call must be repeated: the answer must not become "nothing in progress".
+			if errors.As(err, &ce) && ce.Status == http.StatusServiceUnavailable && ce.Code == string(problem.ServiceUnavailable) && busy == "" {
+				busy = s + ": " + ce.Message
+			}
 			failed++
 			continue
 		}
 		if out.Abandoned {
 			return failover.MapAbandonResult{Abandoned: true, ResumedServer: out.ResumedServer}, nil
 		}
+	}
+	if busy != "" {
+		return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "A server could not give up its bootstrap of the map group now ("+busy+"); repeat the call.").WithRetryAfter(5)
 	}
 	if asked > 0 && failed == asked {
 		return failover.MapAbandonResult{}, problem.New(problem.ServiceUnavailable, "No other server of the cluster answered, so it is not known whether a bootstrap of the map group is in progress there.").WithRetryAfter(5)
