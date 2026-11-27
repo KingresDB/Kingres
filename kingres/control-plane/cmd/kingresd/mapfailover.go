@@ -48,6 +48,11 @@ const (
 	callMapProof    = "POST /failover/map/proof"
 )
 
+// abandonLockWait is how long the abandon waits for the lifecycle lock of the standby agent before it answers that it must be repeated (503). A promotion holds the
+// lock for seconds; a create or a rebuild of a standby can hold it for minutes, and the call of an operator must not hang that long. It stays under the default
+// write timeout of the HTTP server (60 s), so that the answer reaches the caller.
+const abandonLockWait = 45 * time.Second
+
 // mapFailover is the server's part of the failover of the map group: the candidate that runs the bootstrap, the receiver that
 // finds a candidate for a request, and the answers about the bootstrap while no task can be read.
 type mapFailover struct {
@@ -75,6 +80,9 @@ type mapFailover struct {
 	// asks the old leader's server to end the hold of its primary (F6-01, F6-02).
 	lifecycleLock   func(ctx context.Context) (func(), error)
 	resumeOldLeader func(ctx context.Context, oldServer string) (bool, error)
+	// lockWait bounds the abandon's wait for the lifecycle lock (0: abandonLockWait). A create, a remove or a rebuild of a standby holds the lock too and can take minutes;
+	// the abandon then answers that it must be repeated instead of waiting for it.
+	lockWait time.Duration
 	// The parts of the resolution of a held-back primary that a test stands in for (nil: the real ones): the calls to other servers, the list of servers, the marker, the end of
 	// the hold, and the two ways of asking an instance whether it is in recovery.
 	liveOf          func(ctx context.Context, server string) string // the view of a server (nil: the planner's)
@@ -804,7 +812,13 @@ func (m *mapFailover) abandonLocalFull(ctx context.Context, reason string) (mapA
 	// finds let go of.
 	unlock := func() {}
 	if m.lifecycleLock != nil {
-		u, lerr := m.lifecycleLock(ctx)
+		wait := m.lockWait
+		if wait <= 0 {
+			wait = abandonLockWait
+		}
+		lctx, cancel := context.WithTimeout(ctx, wait)
+		u, lerr := m.lifecycleLock(lctx)
+		cancel()
 		if lerr != nil {
 			return mapAbandonAnswer{}, problem.New(problem.ServiceUnavailable, "A promotion, a create, a remove or a rebuild of a standby is running on this server; repeat the call.").WithRetryAfter(5)
 		}

@@ -148,6 +148,39 @@ func TestTheAbandonWaitsForAPromotionThatIsRunningAndThenRefuses(t *testing.T) {
 	}
 }
 
+// The abandon does not wait without end for the lifecycle lock: a create or a rebuild of a standby that holds it for minutes makes the abandon answer that it must be
+// repeated (503), and nothing is given up or let go of. Found as an abandon of a cluster test that answered nothing for three minutes under load.
+func TestTheAbandonAnswersThatItMustBeRepeatedWhileTheLifecycleLockIsHeldLong(t *testing.T) {
+	m, js := abandonRig(t)
+	seen := abandonWatch(m)
+	_, _ = js.Begin("b1", "s1", 3, "manual", "alice", false)
+	m.lockWait = 50 * time.Millisecond
+	m.lifecycleLock = func(ctx context.Context) (func(), error) {
+		<-ctx.Done() // a rebuild of a standby holds the lock
+		return nil, ctx.Err()
+	}
+	start := time.Now()
+	ok, err := m.abandonLocal(context.Background(), "operator")
+	var p *problem.Problem
+	if ok || !errors.As(err, &p) || p.Code != problem.ServiceUnavailable {
+		t.Fatalf("the abandon while the lock is held: %v %v", ok, err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("the abandon waited %v", d)
+	}
+	if !js.Active() || seen.released != 0 {
+		t.Fatalf("the bootstrap was given up (active %v, released %d)", js.Active(), seen.released)
+	}
+	// once the lock is free the repeated call gives the bootstrap up
+	m.lifecycleLock = func(context.Context) (func(), error) { return func() {}, nil }
+	if ok, err := m.abandonLocal(context.Background(), "operator"); err != nil || !ok {
+		t.Fatalf("the repeated abandon: %v %v", ok, err)
+	}
+	if js.Active() || seen.released != 1 {
+		t.Fatalf("after the repeat: active %v, released %d", js.Active(), seen.released)
+	}
+}
+
 // resolveRig is the old leader's side: held back, with a list of servers and an answer for each.
 type resolveRig struct {
 	m       *mapFailover
