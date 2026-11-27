@@ -393,6 +393,9 @@ func (r *Runner) takeFence(ctx context.Context, j journal.Journal) (bool, error)
 	}
 	var quorumSince time.Time
 	for {
+		if !r.Journal.Active() {
+			return false, failover.Fail(failover.CodeSwitchoverUnproven, false, "the bootstrap of the map group was given up while it waited for the lease; nothing more is done")
+		}
 		if err := ctx.Err(); err != nil {
 			return false, err
 		}
@@ -407,6 +410,14 @@ func (r *Runner) takeFence(ctx context.Context, j journal.Journal) (bool, error)
 		} else {
 			quorumSince = time.Time{}
 			ans, err := r.P.Lease(ctx, r.P.Self(), failover.LeaseRequest{Group: Group, Role: failover.LeaseFence, ExpectedTerm: j.Term})
+			// A crash point of the tests: the lease is adopted and renewed, and the bootstrap has not looked at the journal again. A test that gives the bootstrap up here, and
+			// lets it go on, makes the order of the race that the look at the journal and letGoIfGivenUp close.
+			if ferr := r.fault(journal.StepLease + ":asked"); ferr != nil {
+				return false, ferr
+			}
+			if gerr := r.letGoIfGivenUp(ctx, j.ID); gerr != nil {
+				return false, gerr
+			}
 			switch {
 			case err != nil && failover.IsCode(err, "stale_term"):
 				return false, errors.New("another failover changed the catalog term of the cluster; nothing else is done")
@@ -427,6 +438,28 @@ func (r *Runner) takeFence(ctx context.Context, j journal.Journal) (bool, error)
 			return false, err
 		}
 	}
+}
+
+// letGoIfGivenUp closes the race between the abandon and a call that asks this server's lease manager to take the lease of the map group. The abandon marks the
+// journal and then lets go of the lease; a call of the runner that was already on its way adopts the lease after that release, and the adoption is renewed for as
+// long as nothing releases it, which keeps the old leader (whose held-back primary the abandon started again) from ever winning the lease. The journal is marked
+// before the release, so a call that returns while the journal is still active is covered by the release that follows it, and one that returns after the mark is
+// let go of here. It is done only for the bootstrap that was given up (the id of the journal), never for a later one.
+func (r *Runner) letGoIfGivenUp(ctx context.Context, id string) error {
+	cur, ok := r.Journal.Current()
+	if !ok || cur.ID != id || cur.Abandoned.IsZero() {
+		return nil
+	}
+	var rerr error
+	for try := 0; try < 5; try++ {
+		if _, rerr = r.P.Lease(context.WithoutCancel(ctx), r.P.Self(), failover.LeaseRequest{Group: Group, Role: failover.LeaseRelease}); rerr == nil {
+			return failover.Fail(failover.CodeSwitchoverUnproven, false, "the bootstrap of the map group was given up while it asked for the lease; the lease was let go of and nothing more is done")
+		}
+		if err := r.sleep(ctx, dur(r.LeasePoll, time.Second)); err != nil {
+			break
+		}
+	}
+	return failover.Fail(failover.CodeSwitchoverUnproven, false, "the bootstrap of the map group was given up while it asked for the lease, and the lease could not be let go of (%v)", rerr)
 }
 
 func errText(err error) string {
@@ -597,7 +630,11 @@ func (r *Runner) promote(ctx context.Context, j journal.Journal) (bool, error) {
 		if !r.Journal.Active() {
 			return false, failover.Fail(failover.CodeSwitchoverUnproven, false, "the bootstrap of the map group was given up before the promotion; nothing more is done")
 		}
-		if ans, err := r.P.Lease(ctx, r.P.Self(), failover.LeaseRequest{Group: Group, Role: failover.LeaseHolder, ExpectedTerm: j.Term}); err == nil && ans.Held {
+		ans, err := r.P.Lease(ctx, r.P.Self(), failover.LeaseRequest{Group: Group, Role: failover.LeaseHolder, ExpectedTerm: j.Term})
+		if gerr := r.letGoIfGivenUp(ctx, j.ID); gerr != nil {
+			return false, gerr
+		}
+		if err == nil && ans.Held {
 			break
 		}
 		if !r.now().Before(deadline) {

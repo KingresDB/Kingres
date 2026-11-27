@@ -30,6 +30,7 @@ type world struct {
 	resumeOldErr              error                                // the answer of the call that asks the old leader to end its hold
 	onResumeOld               func()                               // runs inside the call that asks the old leader to end its hold
 	onHolderLease             func() (failover.LeaseAnswer, error) // the answer of the holder lease call (a test gives the bootstrap up there)
+	onFenceLease              func()                               // runs inside the fence lease call, after the adoption is made (a test gives the bootstrap up there, as an abandon does)
 	promoteErr                error                                // the callee refuses a promotion that carries a proof
 	promoteReqs               []failover.PromoteRequest
 	freezeErr                 error // FreezeLocal fails from the second call on (the agent was lost with a restart)
@@ -154,6 +155,9 @@ func (p ports) Lease(_ context.Context, s string, r failover.LeaseRequest) (fail
 		if r.Role == failover.LeaseFence && p.w.fenceRefusals > 0 {
 			p.w.fenceRefusals--
 			return failover.LeaseAnswer{Held: false, WaitMs: 9000, RefusedBy: map[string]string{"s2": "s1", "s3": "s1"}}, nil
+		}
+		if r.Role == failover.LeaseFence && p.w.onFenceLease != nil {
+			p.w.onFenceLease()
 		}
 		if r.Role == failover.LeaseHolder && p.w.onHolderLease != nil {
 			return p.w.onHolderLease()
@@ -954,5 +958,42 @@ func TestABootstrapGivenUpWhileItWaitsForTheLeaseDoesNotPromote(t *testing.T) {
 		if w.count("promote s2") != 0 || js.PromotionStarted() {
 			t.Fatalf("held %v: a promotion was begun after the abandon:\n%s", held, strings.Join(w.log, "\n"))
 		}
+	}
+}
+
+// The fault of the cluster test of a drain whose switchover of the map group is given up: the abandon marked the journal and let go of the lease while a call of the
+// bootstrap that asks for the fence lease was on its way; the call then adopted the lease after the release, nothing released it again, and the old leader's primary,
+// started again by the abandon, never won the lease. The runner lets go of what it adopted for a bootstrap that was given up.
+func TestAFenceLeaseAdoptedAfterTheAbandonIsLetGoOf(t *testing.T) {
+	w := newWorld()
+	r, js := w.runner(t)
+	w.onFenceLease = func() { _ = js.Abandon("an operator") }
+	_, err := r.Run(context.Background(), req())
+	var fe *failover.Error
+	if !errors.As(err, &fe) || fe.Code != failover.CodeSwitchoverUnproven {
+		t.Fatalf("the bootstrap that was given up ended with %v, want switchover_unproven:\n%s", err, strings.Join(w.log, "\n"))
+	}
+	if w.count("lease-release s2") != 1 || w.index("lease-release s2") < w.index("lease-fence s2") {
+		t.Fatalf("the lease that the call adopted after the abandon was not let go of:\n%s", strings.Join(w.log, "\n"))
+	}
+	if w.count("lease-fence s2") != 1 || js.IsDone(journal.StepLease) || w.count("promote s2") != 0 {
+		t.Fatalf("the bootstrap went on after the abandon:\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+func TestAHolderLeaseAdoptedAfterTheAbandonIsLetGoOf(t *testing.T) {
+	w := newWorld()
+	r, js := w.runner(t)
+	w.onHolderLease = func() (failover.LeaseAnswer, error) {
+		_ = js.Abandon("an operator")
+		return failover.LeaseAnswer{Held: true}, nil
+	}
+	_, err := r.Run(context.Background(), req())
+	var fe *failover.Error
+	if !errors.As(err, &fe) || fe.Code != failover.CodeSwitchoverUnproven {
+		t.Fatalf("the bootstrap that was given up ended with %v, want switchover_unproven:\n%s", err, strings.Join(w.log, "\n"))
+	}
+	if w.count("lease-release s2") != 1 || w.count("promote s2") != 0 || js.PromotionStarted() {
+		t.Fatalf("the holder lease was not let go of, or a promotion was begun:\n%s", strings.Join(w.log, "\n"))
 	}
 }
