@@ -475,3 +475,43 @@ func TestDrainWhoseServerDiesWhileTheMapGroupIsHandedOver(t *testing.T) {
 		t.Errorf("the drain of a server that died ended %v: %v", task["state"], task["error"])
 	}
 }
+
+// The order that made the test above fail one run in a few: the bootstrap of the candidate is given up while it still waits for the fence lease, in the moment between
+// its look at the journal and the call that adopts the lease. The abandon lets go of the lease, the call then adopts it again, and the candidate renewed it for ever, so
+// that the old leader, started again by the abandon, never won it. The crash point holds the bootstrap in that moment; the abandon is made there, and the bootstrap goes on
+// afterwards.
+func TestDrainWhoseSwitchoverIsGivenUpWhileTheCandidateAsksForTheFenceLeaseLeavesTheLeaseToTheOldLeader(t *testing.T) {
+	c := p10d4Cluster(t, 300)
+	old := c.Leader()
+	views := topology(t, old)[0]
+	if len(views) == 0 {
+		t.Fatalf("the map group has no standby: %v", topology(t, old))
+	}
+	nw := nodeOf(c, views[0].server)
+	if nw == nil || nw == old {
+		t.Fatalf("the standby of the map group is on %q", views[0].server)
+	}
+	waitReport(t, old, clustertest.TaskID(old.Expect(202, "POST", "/rebalance", nil)), 10*time.Minute)
+	until(t, 2*time.Minute, "the first rebalance to have ended", func() bool { return rbStatus(old)["state"] == "idle" })
+	nw.SetFaults(fault.Spec{FailoverPoint: "map:B3 take the fence lease:asked", FailoverMode: "hold"})
+	defer nw.Heal()
+	id := clustertest.TaskID(old.Expect(202, "POST", "/servers/"+old.Host+"/drain", map[string]any{}))
+	mapStopped(t, old)
+	until(t, 3*time.Minute, "the bootstrap to be given up", func() bool {
+		st, b := nw.Do("POST", "/failover/map/abandon", map[string]any{"reason": "the candidate cannot promote"}, nil)
+		return st == 200 && b["abandoned"] == true
+	})
+	// The abandon let go of the lease, and the grants of the servers still name the candidate for up to the lease duration (12s). The rollback of the old leader's task
+	// has let go of it as well by now; the bootstrap goes on after that, and asks for the lease of a bootstrap that was given up.
+	time.Sleep(2 * time.Second)
+	nw.Heal()
+	until(t, 5*time.Minute, "the drain to end on the old leader once its instance is back", func() bool {
+		st, b := old.Do("GET", fmt.Sprintf("/tasks/%v", id), nil, nil)
+		s, _ := b["state"].(string)
+		return st == 200 && (s == "done" || s == "failed" || s == "cancelled")
+	})
+	until(t, 2*time.Minute, "the old leader to hold the map group again", func() bool {
+		hosts, _ := primaryOf(t, old)
+		return hosts[0] == old.Host
+	})
+}
