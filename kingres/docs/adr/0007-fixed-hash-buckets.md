@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
-# ADR 0007: Fixed hash buckets (default 1024)
+# ADR 0007: Fixed hash buckets (default 128)
 
 - Status: Accepted
 - Date: 2026-11-14
@@ -34,4 +34,4 @@ Distributed tables use a fixed number of hash buckets per colocation group, 1024
 
 ## Note of 2026-11-20: the default that was implemented
 
-The decision above says 1024 buckets by default. The implemented default is **128**, decided during the sharding MVP (work log of 2026-11-14; [design/shard-mvp.md](../design/shard-mvp.md)): a bucket is stored as one hash partition, and 1024 partitions per table is too many relations on a small cluster. It is set in two places: the setting `kingres_shard.default_bucket_count` of the extension (default 128, range 1 to 4096; `contrib/kingres_shard/src/kingres_shard.c`), and the control plane, which offers and uses 128 as the default of `sharding.bucketCount` (range 1 to 4096; `kingres/control-plane/internal/ops/databases.go` and the contract). The rest of this ADR, a fixed number of buckets chosen at creation, stands. The title and the index keep the figure of the time of the decision.
+The decision above says 1024 buckets by default. The implemented default is **128**, decided during the sharding MVP (work log of 2026-11-14; [design/shard-mvp.md](../design/shard-mvp.md)): a bucket is stored as one hash partition, and 1024 partitions per table is too many relations on a small cluster. It is set in two places: the setting `kingres_shard.default_bucket_count` of the extension (default 128, range 1 to 4096; `contrib/kingres_shard/src/kingres_shard.c`), and the control plane, which offers and uses 128 as the default of `sharding.bucketCount` (range 1 to 4096; `kingres/control-plane/internal/ops/databases.go` and the contract). The rest of this ADR, a fixed number of buckets chosen at creation, stands. The title and the index give the implemented default; the decision text above keeps the figure of the time of the decision.

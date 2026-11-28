@@ -14,7 +14,7 @@ An ADR records one decision: the context, the decision, its consequences and the
 | [0004](0004-postgresql-license-no-citus-code.md) | PostgreSQL License; no Citus code | Superseded by 0024 in its choice of licence | 2026-11-14 | 3 |
 | [0005](0005-wsl2-build-environment.md) | WSL2 as the build environment | Accepted | 2026-11-14 | 4 |
 | [0006](0006-sharding-mvp-first.md) | Sharding MVP first | Accepted | 2026-11-14 | 5 |
-| [0007](0007-fixed-hash-buckets.md) | Fixed hash buckets (default 1024; the implemented default is 128, see the note in the ADR) | Accepted | 2026-11-14 | - |
+| [0007](0007-fixed-hash-buckets.md) | Fixed hash buckets (default 128; the decision text says 1024, see the note in the ADR) | Accepted | 2026-11-14 | - |
 | [0008](0008-map-group-source-of-truth.md) | Map group in PostgreSQL is the source of truth; etcd only for leader election | Accepted; the Patroni and etcd parts are superseded by 0021 and 0018 | 2026-11-14 | - |
 | [0009](0009-two-phase-commit-no-global-snapshot.md) | 2PC without a global snapshot at first | Accepted | 2026-11-14 | - |
 | [0010](0010-writes-on-any-node.md) | Writes on any node: a primary per server and a router in the agent; no conflict-resolving multi-master | Accepted | 2026-11-14 | - |
