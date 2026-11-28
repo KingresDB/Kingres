@@ -828,8 +828,8 @@ commits `3858bd7e0f`, `344375cc7f` and `f01ff9459a` (branch `p8-design`) and in
    "writers fail rather than readers" is conditional on the overrun rate measured in `record`.
 2. **Retention and window defaults** (`dtx_member_retention` 60 s, `slop` 500 ms, `av_wait_timeout` 5 s,
    `av_max_rounds` 20). Default: as stated.
-2b. **Added defaults** from the second re-review: `av_young_wait` 6 s, `dtx_member_max_rows` 5 000 000, `av_statements`
-   avoid-repartition on in `enforce`, clock-anomaly window `Wt`. Default: as stated.
+2b. **Added defaults** from the second re-review: `av_young_wait` 6 s, `dtx_member_max_rows` 5 000 000, the avoid-repartition setting
+   on in `enforce`, clock-anomaly window `Wt`. Default: as stated.
 3. **Posting the upstream proposal** (15): who and when. Default: after P8-S, so that the proposal can
    cite measurements.
 4. **Acceptance numbers of 6.2.** Default: as proposed.
