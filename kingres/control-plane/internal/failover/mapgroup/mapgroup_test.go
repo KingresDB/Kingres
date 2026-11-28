@@ -1057,3 +1057,24 @@ func TestTheWaitForTheFenceLeaseSaysWhyItStopped(t *testing.T) {
 		t.Fatalf("a journal that ended: %v\n%s", err, strings.Join(w.log, "\n"))
 	}
 }
+
+// After the call was cancelled the release is still tried again and again (five times), on the context of its own: a first try that fails does not end the tries.
+func TestTheReleaseOfAGivenUpBootstrapIsRetriedAfterTheCallWasCancelled(t *testing.T) {
+	w := newWorld()
+	r, js := w.runner(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	w.onFenceLease = func() { _ = js.Abandon("an operator"); cancel() }
+	tries := 0
+	w.onRelease = func(context.Context) (failover.LeaseAnswer, error) {
+		tries++
+		if tries < 3 {
+			return failover.LeaseAnswer{}, errors.New("no majority of grantors")
+		}
+		return failover.LeaseAnswer{}, nil
+	}
+	_, err := r.Run(ctx, req())
+	var fe *failover.Error
+	if !errors.As(err, &fe) || !strings.Contains(fe.Error(), "was let go of") || tries != 3 {
+		t.Fatalf("tries %d, error %v\n%s", tries, err, strings.Join(w.log, "\n"))
+	}
+}

@@ -467,7 +467,7 @@ func (r *Runner) letGoIfGivenUp(ctx context.Context, id string) error {
 		if rerr == nil {
 			return failover.Fail(failover.CodeSwitchoverUnproven, false, "the bootstrap of the map group was given up while it asked for the lease; the lease was let go of and nothing more is done")
 		}
-		if err := r.sleep(ctx, dur(r.LeasePoll, time.Second)); err != nil {
+		if err := r.sleep(rctx, dur(r.LeasePoll, time.Second)); err != nil {
 			break
 		}
 	}

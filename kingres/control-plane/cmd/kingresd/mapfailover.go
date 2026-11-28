@@ -116,10 +116,7 @@ func newMapFailover(dataDir string, svc *cluster.Service, self string, log *slog
 		return nil, err
 	}
 	m := &mapFailover{svc: svc, self: self, log: log, fd: fd, peers: peers, cat: cat, pl: pl, rr: rr, journal: js}
-	m.releaseFence = func(ctx context.Context) error {
-		_, err := m.peers.Lease(ctx, m.self, failover.LeaseRequest{Group: 0, Role: failover.LeaseRelease})
-		return err
-	}
+	m.releaseFence = m.releaseOwnLease
 	m.tellOldLeader = func(ctx context.Context, oldServer string, taskID int64, reason string) error {
 		return m.peers.do(ctx, oldServer, http.MethodPost, "/failover/map/refused", mapRefusedBody{Reason: reason, TaskID: taskID}, nil)
 	}
@@ -862,6 +859,20 @@ func (m *mapFailover) noteRelease(server string, r failover.LeaseRequest, ans fa
 		return
 	}
 	m.releasePending.Store(err != nil || ans.Held)
+}
+
+// releaseOwnLease lets go of the fence and holder lease that this server holds for the map group. An answer that says the lease is still held (the adoption of a promoted
+// primary is not let go of) is not a release: it is an error, as it is for the runner of the bootstrap, so that the abandon does not go on to ask the old leader to
+// resume while the lease still guards a promoted primary.
+func (m *mapFailover) releaseOwnLease(ctx context.Context) error {
+	ans, err := m.peers.Lease(ctx, m.self, failover.LeaseRequest{Group: 0, Role: failover.LeaseRelease})
+	if err != nil {
+		return err
+	}
+	if ans.Held {
+		return errors.New("the lease of the map group is still held")
+	}
+	return nil
 }
 
 // releaseTheLease lets go of the lease of the bootstrap; a failure is remembered, so that a repeated abandon does it again.
