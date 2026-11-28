@@ -2,7 +2,7 @@
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Phase 8, part 1: a global snapshot across shard groups (design)
 
-Status: Proposed design, 2026-11-28, revised the same day after an independent review (section 16);
+Status: Proposed design, 2026-11-28, revised the same day after two independent reviews (sections 16 and 16.1);
 not implemented. Nothing here is built. Where this document says "exists" it describes the
 repository at `kingres-18` (d1344c1aa9) and names the file.
 
@@ -237,8 +237,11 @@ with kinds `commit`, `commit_prepared`, `prepare`. Call sites, per branch:
 - `PrepareTransaction` (`xact.c`): in place of `prepared_at = GetCurrentTimestamp()`. This is not in a
   critical section.
 
-The hook is called in a critical section for `commit` (and in PG19 `commit_prepared`): it may use
-atomics and `pg_memory_barrier()` and must not allocate, lock or fail. Size: about 40 changed lines
+The hook is called in a critical section for `commit`, and for `commit_prepared` **inside it in PG19
+and outside it in PG18** (the line of `committs` differs, 1.2 item 3); the extension's code must be
+valid in both contexts, so for both kinds: it may use atomics and `pg_memory_barrier()` and must not
+allocate, lock, **wait** or fail, and the tests run on both majors. Any waiting the clock needs
+(promotion, 5.6) happens **before** a transaction can reach the hook. Size: about 40 changed lines
 per branch, excluding tests. **Not** a `pg_compat.h` matter: these are server files, so the two
 patches differ (the origin timestamp name, `DELAY_CHKPT_*`, `MarkAsPreparing`'s argument) and are
 carried on `kingres-18` and `kingres-19` as separate commits of the same register row; each
@@ -247,17 +250,26 @@ there). `pg_compat.h` belongs to the extension, which must build against both pa
 
 ### 4.2 KP-0006: snapshot hook in `snapmgr.c`
 
-`Snapshot (*statement_snapshot_hook)(Snapshot plain, SnapshotUse use)`, called in
+`Snapshot (*statement_snapshot_hook)(SnapshotUse use)`, called in
 `GetTransactionSnapshot` (the three places that return `CurrentSnapshot`, except the serializable
-branch) and `GetLatestSnapshot` (only for `use = statement`). The hook receives the ordinary
-snapshot and returns **either the same pointer or a different snapshot that the extension owns**
-(its own `SnapshotData` with its own growable arrays). It never edits `CurrentSnapshotData` or
+branch) and `GetLatestSnapshot` (only for `use = statement`) **before** the caller's own
+`GetSnapshotData` call. **The hook takes no snapshot from the caller (N1):** it must itself call
+`observe(S)` and **then** `GetSnapshotData` into its own struct, because the correctness argument of
+5.2 (I1, the Dekker order: observe, then snapshot, then slot scan) needs the snapshot to be taken
+after `observe(S)`; a snapshot that the caller took earlier would miss a writer that started after it,
+drew a timestamp `<= S` before `observe(S)` ran, and committed. The hook returns **`NULL`** when
+the backend has no timestamp set (the caller then proceeds exactly as before), or **a snapshot that
+the extension owns** (its own `SnapshotData` with its own growable arrays). Lifetime: the returned
+snapshot is valid until the next call of the hook in the same backend, as `CurrentSnapshotData` is
+valid until the next `GetSnapshotData`; callers already register or copy before doing anything else
+(`GetTransactionSnapshot` comment), and `CopySnapshot` for the first `REPEATABLE READ` snapshot
+copies it. The hook never edits `CurrentSnapshotData` or
 `SecondarySnapshotData`: the reuse path of `GetSnapshotDataReuse` (1.2 item 6) keeps working on
 unmodified structs, and a later plain statement is unaffected. For the first snapshot of a
 `REPEATABLE READ` transaction the hook runs before `CopySnapshot`, which copies `xcnt` and
 `subxcnt` entries from any array. `SnapshotUse` tells the hook which caller it is in, so that catalog
 (`GetCatalogSnapshot`, a separate struct), historic, and non-MVCC snapshots never reach it. The hook
-returns `plain` when the backend has no timestamp set. Parallel workers: the leader serialises the
+Parallel workers: the leader serialises the
 active snapshot (`SerializeSnapshot` copies `xmin`, `xmax`, the arrays), so a parallel query under
 a rewritten snapshot works; **[Needs verification]** by test. Size: about 30 lines in
 `snapmgr.c` and `snapmgr.h` per branch.
@@ -333,7 +345,8 @@ read by anyone.
    participants do it inside `PrepareTransaction` through the `prepare` hook (`slot.bound = L`, barrier,
    `p = clock.next()`; `p` becomes `prepared_at`); the origin does it by calling `prepare_ts()`
    through its own extension function before it sends the first `PREPARE`, and keeps the slot
-   published;
+   published. The origin may have no xid yet at that point (the `dtx_log` insert assigns it), so
+   `prepare_ts()` first calls `GetTopTransactionId()` and only then publishes `(xid, bound)`;
 2. the slot stays published for a remote participant until its prepared transaction is `valid` in the
    two-phase state (`MarkAsPrepared`); from then on `gxact->prepared_at` (durable in the state
    file) is the published bound, found by scanning the prepared transactions
@@ -350,8 +363,17 @@ read by anyone.
    `commit_prepared` hook returns `C`, and **before the commit becomes visible** it runs
    `observe(C)` unconditionally (it must also come before `ProcArrayEndTransaction`, the invariant I3).
 
-**The reader** (the snapshot at `S`, 5.3): `observe(S)`; barrier; `GetSnapshotData`; barrier; scan the
-slots and the prepared transactions; wait for each running xid that might commit at or below `S`.
+**The reader** (the snapshot at `S`, 5.3), **in this order and inside the hook (N1)**: `observe(S)`;
+barrier; **then** `GetSnapshotData` (taken by the hook itself, never by the caller before the
+hook); barrier; scan the slots and the prepared transactions; wait for each running xid that might
+commit at or below `S`.
+
+**The token prefix (N2).** A session that holds a token (6.4) sends it in front of **every** group
+transaction it opens, including plain single-group ones: the batch that begins the transaction on a
+group calls `kingres_snapshot.hlc_observe(token)` first (one function call in the same batch, no
+round trip; one CAS on the group's clock). A transaction that runs on the session's own node does
+the same locally. Without it a single-group write at a group whose clock is behind would get a
+timestamp below an earlier commit of the same session.
 
 **Invariants** (each is tested by the differential test and the model of 11):
 
@@ -367,7 +389,12 @@ slots and the prepared transactions; wait for each running xid that might commit
   transaction that the read sees as finished. For a participant this is the `observe(C)` at `COMMIT PREPARED`
   (C3). For the origin, `observe(C)` before the local commit.
 - **I4 (the origin is a participant).** The origin's local part follows the participant protocol (C1).
-- **I5 (the clock never goes back, also across restarts and promotion)** (5.6).
+- **I5 (the clock never goes back, also across restarts and promotion)** (5.6), and **no transaction
+  reaches the commit or prepare hook before the clock is ready** (the stall is outside the hook).
+- **I6 (snapshot after observe).** The snapshot of a reader is taken by the hook after `observe(S)`,
+  never before (N1).
+- **I7 (token before write).** Every group transaction of a session that holds a token calls
+  `observe(token)` before it can draw a timestamp (N2).
 
 **Drift guard (H2).** A timestamp received at the **start of a statement** (`S`) or in a **prepare
 answer** (`p_i`) that is more than `kingres_snapshot.max_forward_drift` (default 250 ms) above the
@@ -393,7 +420,9 @@ every xid `< xmax_i` that is not in `xip_i` finished before the call, hence with
 
 1. `observe(S)`; barrier; if `S` is older than the oldest sample, or no sample exists yet (after a
    restart or promotion until the first sample): error `KS001` ("older than the horizon").
-2. `plain = GetSnapshotData(...)` (the plain snapshot the caller obtained; `xmax_now`, `xip_now`).
+2. `plain = GetSnapshotData(&own_struct)`, **taken by the hook itself, after step 1** (N1; `xmax_now`,
+   `xip_now`). The reuse path of `GetSnapshotData` may return the cached content of `own_struct`
+   only if no transaction with an xid completed since, which is safe.
 3. **Wait rule (Clock-SI), against `plain`.** For every slot with `bound <= S` whose `xid` is in
    `xip_now`, and every valid prepared transaction with `prepared_at <= S` that is in `xip_now`:
    wait until it finishes (`XactLockTableWait`), then repeat from
@@ -415,7 +444,12 @@ every xid `< xmax_i` that is not in `xip_i` finished before the call, hence with
    plain snapshot; `snapXactCompletionCount = 0` (never reused); `copied = false`.
 6. **Advertise `xmin`.** `ProcArrayInstallRestoredXmin(xmin, keeper_proc)` for the keeper of this
    database (1.2 item 7): it fails if the keeper's `xmin` is newer than the snapshot's (the horizon
-   was passed): error `KS001`.
+   was passed): error `KS001`. **It takes `ProcArrayLock` exclusive (N5)**, the lock that
+   `ProcArrayEndTransaction` and every commit take, so it is not called for every statement: the
+   backend installs it **once per transaction** (per statement in `READ COMMITTED` only when the
+   rebuilt `xmin` is older than the `xmin` the backend already advertises, which is the case only when
+   the window has a late commit or a running transaction below the plain `xmin`), and the benchmark of
+   10 includes a cross-group `SELECT` at high concurrency with concurrent commits.
 
 Why the cut is a prefix of the timestamp order: visibility of `x` at `S` is "committed and timestamp
 `<= S`". Transactions below `xmax_i` and outside `xip_i` have timestamps `<= h_i <= S` (I3). The
@@ -445,7 +479,7 @@ Every sender of a fragment must do it: all go through `node_conn.c`; **[Needs ve
 **Transaction snapshot, `REPEATABLE READ`.** `S` is taken at the first statement and kept. A group's
 snapshot at `S` is built when the group is first used; if `S` is older than the horizon at that
 moment, the statement fails with `KS001`. **Limit (M3):** a cross-group transaction cannot first
-touch a new group more than `horizon` (default 30 s) after its start, and after a restart or a
+touch a new group more than the current hold (`horizon`, default 5 s; up to `horizon_max`, 30 s, while a cross-group RR transaction is registered, 5.5) after its start, and after a restart or a
 promotion the ring is empty for one sample interval to one horizon, during which an `S` older than
 the first sample is refused. Both are stated in limitations.md.
 
@@ -492,8 +526,21 @@ A background worker **per database that has the extension** (the same launcher p
 
 - Every `kingres_snapshot.sample_interval` (default 20 ms) it takes `GetSnapshotData`, stores the
   snapshot's `xmax` and running list, then reads the clock (**after**, C3) and stores `h`. The ring
-  keeps `kingres_snapshot.horizon` seconds (default **30 s**, M3; 1 500 samples; the running lists are
-  short on a healthy system and the ring has a size cap).
+  keeps the **current hold** of seconds (below; the running lists are short on a healthy system
+  and the ring has a size cap).
+- **Adaptive and on demand (N7).** A worker per database that does nothing but hold an old `xmin`
+  is a cost for every database even when no global statement exists, and the hold has a price: at
+  30 s a hot row updated 5 000 times per second keeps about 150 000 dead versions in its HOT chain,
+  which slows every access to that row. So: the keeper starts for a database only when a
+  cross-group statement first asks for a snapshot there (a signal to the launcher, the same pattern
+  as `recovery.c`; it needs a free `max_worker_processes` slot, which `kingresd` accounts for) and
+  stops after `keeper_idle_stop` (default 5 minutes) without a request. Its **default hold is 5 s**
+  (`kingres_snapshot.horizon`), enough for a statement or a short transaction; it is raised
+  to `kingres_snapshot.horizon_max` (default 30 s) only while a cross-group `REPEATABLE READ`
+  transaction is registered on the cluster (the originator tells each group at the transaction's first
+  use there, and the hold shrinks back when it ends). A snapshot older than the current hold gets `KS001`.
+  The first request after a start waits for one sample interval for a sample to exist. The hot-row test
+  is part of 10.
 - It keeps the oldest sample's snapshot registered, so its own `MyProc->xmin` is that snapshot's `xmin`;
   it registers a new oldest snapshot before it releases the old one, so the floor never has a gap.
   Vacuum, pruning and freezing cannot pass it (`ComputeXidHorizons` includes its `xmin`, 1.2 item 8);
@@ -510,20 +557,33 @@ A background worker **per database that has the extension** (the same launcher p
 **[Recommendation]** The new primary must give timestamps above everything the old primary gave,
 including snapshot timestamps handed out and never logged.
 
-1. The clock has a persisted **limit** in a one-row table of the extension, updated by a worker every
-   `limit_interval` (default 500 ms) to `max(clock, physical_now + max_forward_drift) + 2 * limit_interval`,
-   in a WAL-logged transaction (one xid per interval; a hot update; **L1:** with a synchronous standby
-   down, the update stalls like every commit, and the clock stalls when it would pass the limit).
-   Values handed out are `<=` the limit, because a received `S` is bounded by `now + max_forward_drift`.
-2. **Promotion (and start in the primary role):** the clock starts at
-   `max(physical_now, latest replayed limit, GetLatestCommitTsData() + 1)`; **if that is above
-   `physical_now`, the node does not take timestamps** (commits wait in the hook, statements wait at `S`)
-   **until physical time reaches it**, a stall of at most `2 * limit_interval + max_forward_drift`
-   (1.25 s by default) plus replication lag of the limit row; the other nodes would refuse a timestamp
-   further ahead (the guard), so a jump is not allowed. The failover task shows the stall
-   (`clockStallMs`). With asynchronous replication the replayed limit may be older; the stall then also
-   uses `physical_now + max_forward_drift`, which is an upper bound on anything the old primary can
-   have handed out when its own clock was no more than the guard ahead of physical time.
+1. The clock has a persisted **limit**, carried **in WAL by a custom resource manager** (N3), not in
+   a table: a table is not readable before the new primary is open, and the limit is per instance
+   while the extension is per database. `kingres_snapshot` registers a resource manager in
+   `_PG_init` (`RegisterCustomRmgr`, available to a preloaded library in both PG18 and PG19). A limit
+   worker writes one small record every `limit_interval` (default 500 ms) with the value
+   `max(clock, physical_now + max_forward_drift) + 2 * limit_interval` (no xid, no heap, no dead
+   tuples: **L1** is thereby smaller, but with a synchronous standby down the record flush stalls like
+   every commit, and the clock stalls when it would pass the limit). The redo function of the
+   resource manager, on a standby, stores the replayed value in shared memory. Values handed out are
+   `<=` the limit, because a received `S` is bounded by `now + max_forward_drift`. **Owner action:**
+   a custom resource manager needs an ID; the project registered ID 255 for columnar on the PostgreSQL
+   wiki ("Custom WAL Resource Managers"); this needs a **second ID requested the same way** before
+   release (a development value from the experimental range may be used until then, as columnar did).
+2. **Promotion and start in the primary role (N3, I5):** at the end of recovery, before the first
+   write transaction can reach a hook, the extension computes the start value
+   `max(physical_now, replayed limit, GetLatestCommitTsData() + 1)`. **If that is above `physical_now`,
+   `clockReady` stays false until physical time reaches it**, a stall of at most
+   `2 * limit_interval + max_forward_drift` (1.25 s by default, plus the replication lag of the
+   limit record); other nodes would refuse a timestamp further ahead (the guard), so a jump is not
+   allowed. **The stall is never inside the commit hook**: while `clockReady` is false a transaction
+   that would take a timestamp fails **at its start** (the first call that assigns an xid or sets a
+   snapshot timestamp, outside every critical section) with a retryable error, and the failover task
+   keeps the promoted primary out of the router until `clockReady` and shows the stall
+   (`clockStallMs`). With asynchronous replication the replayed limit may be older; the start value
+   then also takes `physical_now + max_forward_drift`, an upper bound on anything the old primary can
+   have handed out when its own clock was no more than the guard ahead of physical time. Every
+   statement and commit path that bypasses the check is a mutant of the model of 11.
 3. Prepared transactions after a crash keep `prepared_at` (durable in the state file, 1.2 item 4), so
    a reader after a restart knows `p`. A prepared transaction prepared before the extension was on has a
    wall-clock `prepared_at`, which is below any HLC value of the moment and makes readers wait for it, which
@@ -568,6 +628,20 @@ that are stated in limitations.md and measured:
   synchronous replication wait (1.2 item 2), so a **down synchronous standby** makes every global
   statement at that group with `S` after the commit began wait for the commit wait length; writers
   already hang in that case.
+- **Ordinary commits in flight (N6).** In normal operation, every global statement waits at each group
+  for every transaction that has already drawn a timestamp `<= S` and has not left the procarray: its
+  WAL flush plus, with synchronous replication (the KingresDB default), the standby round trip, at
+  **every group and every statement**, and again when step 2 of 5.3 is repeated. With `S` about now
+  this is a few milliseconds on a healthy cluster and the replication latency on a loaded one; the
+  benchmark of 10 measures it with synchronous replication on. For a statement that does not need
+  recency, `kingres_snapshot.recency = stale` takes `S = clock - stale_ms` (default off, `stale_ms`
+  default 20), which skips the wait for commits that began in the last milliseconds; it is a session
+  choice and is documented as the trade of recency for latency.
+- **At the origin (review note on C1).** A reader at the origin with `S >= p_local` waits for the
+  origin's own xid through the origin's **whole prepare phase** (every `PREPARE` round trip), not only
+  through the commit. Deadlock: the wait is on an xid whose owner is waiting for network answers, not
+  for a lock the reader holds; a reader that is itself a distributed writer holding locks at other
+  groups is the one case to test (12 item 11) against the existing distributed deadlock detection.
 - One **in-doubt** prepared transaction (lost coordinator) makes every global statement at that group with
   `S >= p` wait until it is decided. The wait is bounded by `prepared_wait_timeout` (default 5 s), after
   which the statement fails with `KS001`; this bounds time, **not success**.
@@ -615,21 +689,36 @@ that are stated in limitations.md and measured:
 Correct (never a state that is not a consistent cut) for any skew, with I1 to I5. Skew changes only
 recency: if node X's clock is `e` ahead of Y's, a commit at X at wall time `t` gets about `t + e`, and
 a statement started at Y at wall time `t + d` with `d < e`, in no carried relation, takes `S` near `t + d`
-and misses it. **Bounded-recency mode (`kingres_snapshot.recency = bounded`, built in the same
-increment as the integration, P8-5, not later):** the statement takes `S = physical_now + max_forward_drift`
-and waits at the originator until physical time passes `S` (the mirror of Spanner's commit wait on the
+and misses it. **Two different bounds (N4).** The **guard** `max_forward_drift` (default 250 ms) is what a node
+accepts from another node: a statement timestamp or a prepare answer further ahead of its own physical
+clock is refused. The **assumed skew bound** `skew_epsilon` (default 100 ms, always smaller than the
+guard minus the network time) is what the bounded mode assumes about the real offsets between nodes;
+`kingresd` measures the offsets, alerts at half of `skew_epsilon` and marks a node whose offset is
+above it `clockSkew` critical, and the mode is **correct only while the real skew is below
+`skew_epsilon`**.
+
+**Bounded-recency mode (`kingres_snapshot.recency = bounded`, built in the same increment as the
+integration, P8-5, not later):** the statement takes `S = physical_now + skew_epsilon` at the
+originator and waits there until physical time passes `S` (the mirror of Spanner's commit wait on the
 read side and of YugabyteDB's `DEFERRABLE`), so `S` is above every timestamp of a commit that
-completed before the statement began, provided the skew is within the guard; every group
-`observe`s `S`. It costs `max_forward_drift` of latency per statement (250 ms by default), so it is
-a per-session or per-statement choice. The default guard is **250 ms** (lowered from 500 ms for
-this reason); the alert is at half.
+completed before the statement began, provided the real skew is below `skew_epsilon`; every group
+`observe`s `S`. Because `skew_epsilon` is below the guard, a receiver whose clock is not ahead of
+the originator's by more than `guard - skew_epsilon` accepts `S`; with the first version of this
+design (`S = physical_now + guard`) nearly every receiver would have refused it. The mode costs
+`skew_epsilon` of latency per statement, so it is a per-session or per-statement choice, and it holds
+every node's clock up to `skew_epsilon` ahead of physical time while it is in use, which the guard
+margin already allows for. The default guard is **250 ms** (lowered from 500 ms); the alert is at
+half.
 
 ### 6.4 Causality tokens
 
 The session token is `max(last commit timestamp, last snapshot S, min_ts)`; it is carried
 automatically within one session and by the router per client connection. The next statement takes
-`S >= token`; a transaction that **read** at `S` and then writes commits above `S`, so W2 after reading W1
-gets a timestamp above W1's. Across sessions the client passes the token
+`S >= token`, and **every group transaction of the session, including a plain single-group write,
+calls `observe(token)` first** (5.2, "The token prefix", I7), so that a transaction that **read** at
+`S`, or a write after a commit at a node whose clock is ahead, commits above the token: W2 after
+reading W1 gets a timestamp above W1's. The cost is one function call in the batch that opens the
+transaction on a group and one CAS; it is part of the "almost nothing" measurement (10). Across sessions the client passes the token
 (`SELECT kingres_snapshot.session_token()`, `SET kingres_snapshot.min_ts = ...`; `kingres-cli`
 prints and accepts it). **Not available:** a token for "the maximum commit timestamp of the rows a
 statement read" (visibility does not return it); the token is the snapshot `S`, an upper bound.
@@ -699,8 +788,8 @@ library in the preload list. The packaging and the install guide state both.
 
 `kingres_snapshot.hlc_now()`, `hlc_observe(timestamptz)`, `last_commit_ts()`, `session_token()`,
 `prepare_ts()`, `current_snapshot_ts()`; settings `ts`, `commit_ts` (internal), `min_ts`,
-`max_forward_drift` (250 ms), `horizon` (30 s), `sample_interval` (20 ms), `limit_interval` (500 ms),
-`prepared_wait_timeout` (5 s), `recency` (`default`, `bounded`); a view `kingres_snapshot.status`.
+`max_forward_drift` (250 ms), `horizon` (5 s), `horizon_max` (30 s), `keeper_idle_stop` (5 min), `skew_epsilon` (100 ms), `stale_ms` (20 ms), `sample_interval` (20 ms), `limit_interval` (500 ms),
+`prepared_wait_timeout` (5 s), `recency` (`default`, `bounded`, `stale`); a view `kingres_snapshot.status`.
 `kingres_shard`: `kingres.check_cluster()` gains the kinds `snapshot_not_ready`, `clock_skew`,
 `dtx_commit_ts_missing`.
 
@@ -732,8 +821,12 @@ measurement.
 | Forced `suboverflowed` | tuples above the rebuilt `xmin` | a read-heavy test over recent data; the SLRU hit rate |
 | Prepared wait | a reader meeting an in-doubt transaction | a test that holds a prepared transaction |
 | 2PC latency | distributed write | no extra round trip; the existing 2PC benchmark |
-| Keeper | up to `horizon` seconds of dead rows; 50 snapshots per second per database | table size after one hour of `pgbench -N` |
-| Clock limit worker | 2 xids per second | negligible |
+| Keeper | up to the current hold (5 s, 30 s with an RR transaction) of dead rows; 50 snapshots per second per database while it runs | table size after one hour of `pgbench -N` |
+| Clock limit worker | 2 small WAL records per second (a custom resource manager, no xid) | negligible; recovery replay measured on a standby |
+| `ProcArrayInstallRestoredXmin` (N5) | exclusive `ProcArrayLock` once per transaction | a cross-group `SELECT` at 64 and 256 clients **with concurrent commits**, against the same statement with the mode off |
+| In-flight commit wait (N6) | every global statement at every group | the same, with synchronous replication on and a standby 1 ms and 10 ms away; and with `recency = stale` |
+| Token prefix (N2) | one function call and one CAS per group transaction of a session with a token | `pgbench -N` through the router with and without a token |
+| Hot row under the keeper (N7) | HOT chain length | one row updated 5 000 times per second for 60 s with the keeper at 5 s and at 30 s; time per read of that row |
 
 **Benchmark protocol (H8):** five runs of three minutes after a one-minute warm-up, same machine,
 same data directory, the median and the spread (min to max) reported; the I/O-bound case on a real disk
@@ -749,7 +842,7 @@ Sizes are relative (S, M, L).
 
 | # | Increment | Size | Depends on | Touches `kingres_shard`? |
 |---|---|---|---|---|
-| P8-M | **Model** (before any code): a model of publish, draw, observe, prepare, wait, snapshot rebuild and failover as a TLA+ spec checked with TLC, or a randomised interleaving model in Go with an invariant checker; scenarios of C1, C2, C3, H2 and H4; each invariant has a mutant (remove a barrier, draw before publish, take the clock before the snapshot, take the max with the clock at the local commit) that the model must catch | S to M | none | no |
+| P8-M | **Model** (before any code): a model of publish, draw, observe, prepare, wait, snapshot rebuild and failover as a TLA+ spec checked with TLC, or a randomised interleaving model in Go with an invariant checker; scenarios of C1, C2, C3, H2, H4 and N1 to N4; the model includes the custom-resource-manager limit record and the promotion; each invariant has a mutant that the model must catch: **remove a barrier; draw before publish; take the clock before the snapshot; take the max with the clock at the local commit; N1 take the snapshot before `observe(S)` (the caller's snapshot); N2 omit `observe(token)` before a plain single-group write; N3 stall inside the commit hook, or start the clock from a limit that is not yet replayed, or let a transaction reach the hook before `clockReady`; N4 bounded mode with `S = physical_now + guard`, refused by a receiver whose clock is not ahead** | S to M | none | no |
 | P8-S | **Spike and gate** (6 criteria below) | M | P8-M | no |
 | P8-1 | Core patches in the register per branch, with tests and the rebase test of upstream-sync.md; the upstream proposal text | S | P8-S | no |
 | P8-2 | `kingres_snapshot` 0.1: clock, slots, limit worker, hooks, keeper, SQL, status view, TAP tests on one node and on a primary with a standby; always-on tested | L | P8-1 | no |
@@ -778,7 +871,7 @@ places). P8-5, P8-6 and P8-7 wait for phase 15 rest and the join work to merge.
    - **D3, inclusion.** Every ordinary snapshot taken before the clock reading `h` is a subset of the
      snapshot rebuilt at `h` (the plain snapshot is recorded with `pg_current_snapshot()`).
    - A build with the wait rule removed, and a build with the clock read before the snapshot, must fail
-     D1 or D2 (negative controls).
+     D1 or D2 (negative controls); so must a build that takes the snapshot before `observe(S)` (N1) and a build that omits the token prefix before a single-group write (N2, tested by the causal-pair test).
 2. The model of P8-M passes, and its mutants fail.
 3. The non-test core diff of KP-0005 and KP-0006 is under about 200 lines per branch, with no
    visibility function changed.
@@ -811,7 +904,7 @@ If the gate fails, the fallback (option 6, which is real work, section 3.3) or a
      absent, G2 allowed.
    - *Negative controls*: with the mode off the bank test must fail; with the wait rule off, with a
      draw-before-publish debug build, with the origin's local part not published, and with the clock
-     read before the snapshot, each must fail.
+     read before the snapshot, with the snapshot taken before `observe(S)` (N1), with no token observed before a single-group write at a group whose clock is behind (N2), and with a promoted primary that takes timestamps before `clockReady` (N3), each must fail.
 5. **Crash points.** Every `kingres_shard_fault_point` of 2PC (`after_first_prepare`, `after_prepare`,
    `after_log`, and recovery's) with a reader at `S` before, between and after: D whole or not at all,
    and the wait ends. Kill the origin, a participant, a primary (failover), with and without
@@ -826,6 +919,11 @@ If the gate fails, the fallback (option 6, which is real work, section 3.3) or a
    pushdown paths compared with the complete scan (ADR 0022).
 10. **Stress of M9.** A build with a delay injected between publish and draw, and between `observe(S)`
     and the slot scan, run under the differential tests.
+11. **Deadlocks and the origin wait (N10).** A reader at the origin with `S >= p_local` while the origin is in its prepare phase, where the reader is itself a distributed writer holding locks at other groups: run against the existing distributed deadlock detection (phase 5); no hang beyond `prepared_wait_timeout`.
+12. **D1 load additions.** `COMMIT PREPARED` with a `C` below the local clock, and a writer delayed between publish and draw, are part of the D1 workload (re-review).
+13. **Promotion (N3).** A promoted primary refuses a transaction before `clockReady` at its start (outside a critical section); the stall is measured and bounded; a commit never waits inside the hook; kill during the stall; the limit record is replayed on a standby (tests of the custom resource manager on PG18 and PG19).
+14. **Token (N2).** A session commits W1 at A (clock ahead), then a plain single-group write W2 at B
+    (clock behind): W2's timestamp is above W1's, and a global reader never sees W2 without W1.
 
 ## 13. Security review points
 
@@ -859,9 +957,10 @@ Each has a recommended default; none blocks P8-M or the spike.
    skew-bounded recency, plus the bounded mode from P8-5. Default: as in 6; ADR 0031 says "causal"
    only with the token.
 3. **`snapshot.mode` default after the feature ships.** Default: `off` first.
-4. **Horizon default.** Default 30 s (changed from 10 s after the review; the RR limit and the
-   empty-ring window are stated).
+4. **Horizon.** Default hold 5 s, 30 s while a cross-group RR transaction is registered, keeper on demand (N7); the RR limit and the empty-ring window are stated.
 5. **Drift guard default.** Default 250 ms (changed from 500 ms).
+5a. **Assumed skew bound `skew_epsilon`** for the bounded mode, default 100 ms (N4).
+5b. **A second custom WAL resource manager ID** for the clock limit record: an owner action on the PostgreSQL wiki, as was done for columnar (255) (N3).
 6. **`SERIALIZABLE` across groups.** Default: no.
 7. **Reads on standbys at a timestamp.** Default: later.
 8. **Release train.** Default: part 1 after ledger witnesses, which need no core patch (the ledger
@@ -897,7 +996,7 @@ and its answer:
 | H8 correctness criterion in the gate | D1 to D3, a model before code (P8-M), negative controls, a benchmark protocol, an independent review | 11, 12 |
 | M1 subtrans retention, forced `suboverflowed` | Verified (`ComputeXidHorizons` includes backends' xmin); cost measured | 1.2 item 8, 5.3, 10 |
 | M2 "pay nothing" | "Almost nothing", RR case measured | 2, 5.4 |
-| M3 horizon vs RR | 30 s default; RR limit and empty ring stated | 5.4, 5.5, 14 |
+| M3 horizon vs RR | 5 s hold, 30 s with a cross-group RR transaction (16.1, N7); RR limit and empty ring stated | 5.4, 5.5, 14 |
 | M4 apply workers and timestamps | Hook observes origin timestamps without refusing; invariant on `switch_ts`; visible side effects stated | 5.7, 5.2 |
 | M5 ADR 0023 misapplied; unpatched server | Core patches per branch; `pg_compat.h` is the extension's; library check; upstream-sync line | 4.1, 4.4, 8.1; ADR 0032 |
 | M6 fallback description | Rewritten as real work | 3.3 option 6; ADR 0032 |
@@ -908,3 +1007,29 @@ and its answer:
 | L2 `TRUNCATE` and rewrites | Stated | 5.7, 6.2 item 4 |
 | L3 termination of the wait loop | Argued; timeout | 5.3 step 3 |
 | L4 block builder under a rewritten snapshot; format 2 | Ledger design | ledger document 5.3 and 17 |
+
+### 16.1 Re-review of 344375cc7f (second round)
+
+The second review found 20 of 25 first-round findings fixed and 5 partly fixed (C4, H3, H4, H5, M7),
+and 14 new problems. Each answer:
+
+| Finding | Status | Answer | Where |
+|---|---|---|---|
+| N1 (critical) the hook got a snapshot taken before `observe(S)` | fixed | The hook takes no snapshot from the caller: it runs `observe(S)`, then `GetSnapshotData` into its own struct, then the slot scan; invariant I6; mutant "snapshot before observe" in the model, D1 and the negative controls | 4.2, 5.2, 5.3 step 2, 11, 12 |
+| N2 (high) the token not observed at plain single-group writes | fixed | Every group transaction of a session that holds a token calls `observe(token)` as a batch prefix (one call, one CAS); invariant I7; causal-pair negative control; measured | 5.2 (token prefix), 6.4, 10, 12 item 14 |
+| N3 (high) promotion stall inside the critical section; limit unreadable before open | fixed | The limit is carried in WAL by a custom resource manager (redo fills shared memory on the standby); the start value is computed at end of recovery; `clockReady` gates a transaction **at its start**, never in the hook; the failover task keeps the primary out of the router until ready. **Owner action:** a second WAL resource manager ID on the PostgreSQL wiki, as was done for columnar (255). Mutants in the model | 5.6, 4.1, 11, 12 item 13, 14 |
+| N4 (high) bounded mode refused by its own guard | fixed | A separate assumed skew bound `skew_epsilon` (default 100 ms) below the guard (250 ms): `S = physical_now + skew_epsilon`; both specified; the mode is correct only while the real skew is below `skew_epsilon`; mutant in the model | 6.3, 11 |
+| N5 exclusive `ProcArrayLock` per global statement | fixed (measure) | Installed once per transaction, and per statement only when the rebuilt `xmin` is older than the advertised one; benchmark at high concurrency with concurrent commits | 5.3 step 6, 10 |
+| N6 waiting for in-flight ordinary commits | stated, optional mitigation | Stated with the synchronous replication cost; `recency = stale` takes `S` slightly in the past (default off); measured with a standby 1 ms and 10 ms away | 5.9, 10 |
+| N7 keeper per database, always on, 30 s hold, HOT chains | fixed | On demand per database, stops when idle; default hold 5 s, 30 s only while a cross-group RR transaction is registered; hot-row test | 5.5, 10 |
+| N8 epoch successor | fixed | Ledger design | [phase8-multinode-ledger.md](phase8-multinode-ledger.md) 5.1, 17 |
+| N9 `max_cosignature_age` vs archived bundles | fixed | Ledger design | same |
+| N10 deadlock with the origin's own xid wait | fixed (test) | Stated; deadlock test with a reader that is itself a distributed writer | 5.9, 12 item 11 |
+| C4 (partly) | fixed | See N1; lifetime of the extension-owned snapshot stated; the size gate stays about 200 lines per branch | 4.2, 4.4 |
+| H3 (partly) | stated | Ordinary in-flight commits added to the limits (N6); the origin's whole prepare phase is stated; mitigation (a) helps only when the origin is alive, which is said | 5.9 |
+| H4 (partly) | fixed | See N3 | 5.6 |
+| H5 (partly) | fixed | See N2 and N4 | 6.3, 6.4 |
+| M7 (partly) | fixed | See N2: the write group observes the token | 6.4 |
+| Low: snapshot lifetime | fixed | Valid until the next hook call | 4.2 |
+| Low: origin xid before `p_local` | fixed | `prepare_ts()` calls `GetTopTransactionId()` first | 5.2 |
+| Low: commit_prepared hook context PG18 and PG19 | fixed | Code valid in both contexts; tests on both majors | 4.1 |

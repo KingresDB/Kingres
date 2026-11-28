@@ -238,11 +238,22 @@ cluster key that names the old origin and the `(size, root)` that the witness it
 largest it cosigned), and the new log's first checkpoint embeds that `(size, root)` and a count of
 epochs. The tail between the restored state and the witnessed size is declared lost in the statement
 (the statement is how the loss becomes visible). A witness refuses a new origin without it, rate-limits
-epoch changes, and publishes each as an event; the console and `kingres-verify` show "epoch changed
+epoch changes, and publishes each as an event. **One successor per closed log (N8):** the witness
+records "closed, successor = X" for the old origin and refuses any other successor, and the first
+checkpoint of the new log must name the closing statement; otherwise an operator could close O1 and
+open O2 at witnesses {1,2} and O2' at {3,4}, a split view across epochs that the `2k - n` rule does
+not cover (each epoch is a different log); the console and `kingres-verify` show "epoch changed
 N times, last on ...". The old epoch stays verifiable against its cosigned head, so proofs under the old
 epoch cannot be replaced by anything the new epoch says. This **makes an epoch change visible and
 countable; it does not prevent one**: an operator can still start a new epoch and lose history, and
 the auditor sees it.
+
+**Age and archived bundles (N9).** `max_cosignature_age` applies to verification of the **current
+state** (the question "is this the latest agreed state"). An archived bundle is verified **"as of
+the time of the bundle"**: `kingres-verify --as-of <time>` (or the bundle's own recorded time, when
+it carries one that a witness cosigned) checks the age against that time, and the output says
+"verified as of ...; not checked for freshness". Offline-first does not turn into a time bomb: a bundle
+kept for a year still verifies as an archive.
 
 **Policy and downgrade (H7).** When the trust file lists a witness policy, a checkpoint with
 fewer than `k` valid cosignatures, with none (stripped), or older than `max_cosignature_age`, is a
@@ -585,3 +596,5 @@ Findings H6 to H7, M8 and L4 of the independent review concern this document; th
 | M8 (e) value over witnesses | Stated; layer 2 deferred until a counterparty | 15, 16 |
 | L4 block builder under a rewritten snapshot; format 2 | Tested and retried; an old verifier refuses a format 2 leaf explicitly | 5.3 |
 | Open question 6, 2, 5 | Revised | 16 |
+| N8 epoch successor uniqueness (second review) | A witness records "closed, successor = X" and refuses any other successor | 5.1 |
+| N9 `max_cosignature_age` vs archived bundles (second review) | Age applies to current-state checks; archives verify "as of" a time | 5.1 |
