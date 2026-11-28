@@ -10,7 +10,7 @@ The release script ([packaging/release/release.sh](packaging/release/release.sh)
 
 ### Added
 
-- **Phase 8 design** (documentation only): a global snapshot across shard groups from hybrid-clock commit timestamps, and a multi-node ledger with witnesses and a BFT notary of checkpoints ([docs/design/phase8-global-snapshot.md](docs/design/phase8-global-snapshot.md), [docs/design/phase8-multinode-ledger.md](docs/design/phase8-multinode-ledger.md), proposed ADRs 0030 to 0034). Nothing is built yet.
+- **Phase 8 design** (documentation only): atomic visibility of distributed transactions across shard groups, with no change to PostgreSQL server code (a read-only statement over several groups never sees a distributed transaction on one group and not on another; off by default, per database, with a kill switch), and a multi-node ledger with witnesses and a BFT notary of checkpoints, in one release ([docs/design/phase8-atomic-visibility.md](docs/design/phase8-atomic-visibility.md), [docs/design/phase8-multinode-ledger.md](docs/design/phase8-multinode-ledger.md), proposed ADRs 0030 to 0034). Nothing is built yet.
 
 ### Changed
 

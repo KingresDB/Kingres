@@ -9,8 +9,9 @@ Builds on [ledger-phase7.md](ledger-phase7.md) (chains per shard group, the aggr
 publication, anchoring, the verifier), [ledger-mvp.md](ledger-mvp.md), [ledger-0.2.md](ledger-0.2.md),
 [ADR 0013](../adr/0013-ledger-tables-and-anchoring-first.md), [ADR 0021](../adr/0021-failover-in-kingresd.md),
 [ADR 0028](../adr/0028-ledger-tables-are-carried-as-data-and-restart-their-chain.md) and
-[phase8-global-snapshot.md](phase8-global-snapshot.md). The decisions are the proposed ADRs 0033
-and 0034. Statement kinds as in architecture.md: **[Fact]**, **[Recommendation]**,
+[phase8-atomic-visibility.md](phase8-atomic-visibility.md). The decisions are the proposed ADRs 0033
+and 0034. **This part ships in the same release as atomic visibility (owner, 2026-11-28), both layers
+including the BFT notary, run by the project's own test witnesses and test validators.** Statement kinds as in architecture.md: **[Fact]**, **[Recommendation]**,
 **[Needs verification]**; a source marked "background" was not re-fetched on 2026-11-28.
 
 ## 1. What exists, and what "multi-node ledger with consensus" can mean
@@ -70,8 +71,7 @@ Goals:
 3. No change to the chain format (phase 7, principle 1), no slowdown of the commit path
    (principle 2): consensus is over **closed checkpoints**, never in a transaction's commit.
 4. Offline-first verification stays: a bundle verifies with the trust file alone.
-5. One extension source for PG18 and PG19 (ADR 0023): this part adds no extension code except an
-   optional consistent-cut helper; it is `kingresd`, the verifier and two new binaries.
+5. One extension source for PG18 and PG19 (ADR 0023): this part adds no extension code; it is `kingresd`, the verifier and two new binaries.
 
 Non-goals:
 
@@ -347,32 +347,15 @@ no fault tolerance and the console says so.
 **What the notary does not do:** order or validate the members' SQL transactions; hide data (it holds
 roots, sizes and public keys); make a member's ledger correct; decide membership by itself.
 
-### 5.3 The consistent cut (uses part 1)
+### 5.3 The consistent cut: dropped
 
-Today an aggregate round reads heads one group after another (ledger-phase7.md 5.6). With the global
-snapshot of part 1 the round can read all heads **at one timestamp `S`**:
-
-1. The leader takes `S = hlc.now()` (from any instance's `kingres_snapshot.hlc_now()`), then asks each
-   group to build its block under the snapshot `S` (a new `op: "head_at"` of `ledger/read`: the
-   extension closes the open block with `ledger_build_block()` run under the rewritten snapshot,
-   so the block holds exactly the pending transactions committed at or below `S`).
-2. The aggregate leaf gains a format 2 field `cut_ts` (the leaf has a `format` field,
-   ledger-phase7.md 5.2; format 1 leaves stay valid; the verifier prints "cut at `S`" for format 2).
-   **An old verifier must refuse a format 2 leaf explicitly** (an unknown format is an error, not a
-   skip), and the release notes say that bundles with a cut need the verifier of that release (L4).
-   The block builder is a writing transaction: under a rewritten snapshot it may meet a serialization
-   failure on the rows it updates; the increment tests that and retries the block build.
-3. The statement of 5.6 can then be made: the heads are the heads **as of one global snapshot**; a
-   distributed transaction is in all its groups' blocks of this cut or in none.
-
-Without `snapshot.mode = on` nothing changes (format 1, as today). The notary and the witnesses
-sign and record format 2 leaves like any other.
-
-**[Needs verification]** that the block builder can run under a rewritten snapshot (it takes an
-exclusive lock on `kingres.ledger_chain` and reads `ledger_pending`; a pending row of a transaction
-committed after `S` must not enter the block: the builder already skips a transaction that commits
-after its snapshot, README "A transaction that commits after the builder's snapshot is picked up by the
-next block", so it only needs the snapshot to be the rewritten one).
+The first draft let the aggregate round read all heads at one timestamp of a global snapshot. That needs
+a global order of commits, which the planned atomic visibility does not give (the owner declined the
+core patches it would need, [ADR 0032](../adr/0032-phase-8-makes-no-core-patch.md)). **The aggregate
+keeps the statement of phase 7 (5.6): the heads are read one group after another.** The leaf format
+stays 1; there is no `head_at`, no `kingres_ledger` 0.4 for this, and no format 2 leaf. If causal
+order is ever built (the upstream proposal, atomic-visibility design section 15), the cut can be
+reopened by a new ADR.
 
 ### 5.4 Interaction with the rest
 
@@ -402,7 +385,7 @@ next block", so it only needs the snapshot to be the rewritten one).
 | Collusion needed to rewrite undetected | The operator, every anchor target, every mirror and the trust file | The operator and at least `2k - n` witnesses (to hide a fork), or `k` (to forge one history) | The operator and a third (to halt) or two thirds (to rewrite) of the voting power |
 | Agreement among organisations on each other's checkpoints | No | No (each witness is independent) | Yes |
 | Total order of checkpoints of different members | No | No | Yes (block order; not real time) |
-| Consistent cut across shard groups | No | No | Yes with the global snapshot (5.3), the same in all layers |
+| Consistent cut across shard groups | No | No | No (dropped, 5.3) |
 | Data correct, authorised writes, prevention | No | No | No |
 | Availability: ledger keeps working if witnesses or the notary are down | n/a | Yes (cosigning is delayed) | Yes (submissions are queued) |
 
@@ -429,10 +412,6 @@ next block", so it only needs the snapshot to be the rewritten one).
   an optional field that an old verifier ignores with a warning that it cannot check witnesses).
 - Layer 2 adds `kingres-notary` as a new package or a part of the main package (open question 3)
   and nothing to the extension. A cluster that does not use it is untouched.
-- The cut (5.3) needs `kingres_ledger` 0.4 (the `head_at` support) and `kingres_snapshot`; both are
-  opt-in and the aggregate stays format 1 without them. Mixed versions in a rolling upgrade: a server
-  whose extension is older answers `ledger_too_old`, the existing refusal, and the round uses
-  format 1.
 - One source for PG18 and PG19: `kingres_ledger` 0.4 change goes through its `pg_compat.h`;
   `kingres-notary`, the witness and the verifier do not depend on the major.
 
@@ -446,8 +425,7 @@ next block", so it only needs the snapshot to be the rewritten one).
 | Trust file download includes the witness and notary policy | `kingres-cli ledger trust-file` |
 | Alerts `ledgerWitnessRefused`, `ledgerWitnessLag`, `ledgerNotaryStalled`, `ledgerNotaryEquivocation` | `kingres-cli alerts` |
 
-Console: tabs "Witnesses" and "Notary" on the Ledger page, the cut shown on the aggregate view,
-the new statements in the "what this proves" text. `kingres-verify`: `verify` accepts a witness and
+Console: tabs "Witnesses" and "Notary" on the Ledger page, the new statements in the "what this proves" text. `kingres-verify`: `verify` accepts a witness and
 notary policy; `monitor` can run as a witness-like observer; a new `notary` subcommand checks a notary
 proof. Rule since 2026-11-28: the CLI command comes with the REST change.
 
@@ -496,8 +474,8 @@ proof. Rule since 2026-11-28: the CLI command comes with the REST change.
    faulty the network halts and the alert fires; the member change rule.
 4. **End to end:** cluster tests: a three-group cluster with aggregation, two witnesses and a
    four-validator notary; restore of the system database (fork) is refused; leader failover at
-   every step of a round; consistent cut with a distributed bank workload (the sum of ledger
-   balances at the cut equals the total).
+   every step of a round; clock-step, node-kill and network-cut nemeses of the shared harness (the
+   harness of the atomic visibility part is reused).
 5. **Verifier tests:** a bundle with k, k-1 and zero cosignatures under a policy; with a wrong key; with
    a notary proof of a validator set that is not the pinned one; with a forged proof (mutants: break
    the quorum count, the signature check, the set pin, and see the tests fail).
@@ -520,22 +498,20 @@ Sizes are relative (S, M, L).
 | L-5 | Notary application (state machine, proof format, tests with a fake consensus engine) | M | L-1 | new directory |
 | L-6 | `kingres-notary` with CometBFT, packaging, key handling, `kingresd` supervision and submitter, REST, console, CLI | L | L-5, L-3 | new directory, `kingresd` |
 | L-7 | Notary proof in the verifier | M | L-5 | `kingres/verifier` |
-| L-8 | Consistent cut: `kingres_ledger` 0.4 `head_at`, leaf format 2, verifier, console text | M | part 1 P8-2 and P8-5 (`kingres_snapshot`, `kingres_shard` 0.11) | `contrib/kingres_ledger` (also changed by the phase 15 line), `ledgerround`, verifier |
 | L-9 | Network tests, faulty-member and partition tests, reviews, documentation (operator guide chapter, limitations) | L | L-6, L-7 | tests, docs |
 
-Order: L-1 to L-4 form the first deliverable (witnesses, M1) and can start now; none touches
-`kingres_shard`, and none needs part 1. L-5 can start in parallel with them. L-6 and L-7 follow.
-L-8 waits for part 1. Which increments can run beside work in `kingres_shard`: all except L-8
-(which touches `kingres_ledger`, owned for now by the phase 15 line, and needs the part 1
-increments that touch `kingres_shard`).
+Order: L-1 to L-4 (witnesses) can start now; none touches `kingres_shard` or needs the atomic
+visibility part. L-5 starts in parallel. L-6 and L-7 follow. **All of L-1 to L-7 and L-9 ship in the
+same release as atomic visibility** (the owner's decision of 2026-11-28); L-8 is dropped (5.3). Every
+increment passes the harness and an independent review before it merges (atomic visibility design 9.1).
+All of it can run beside work in `kingres_shard` (none of it touches that extension).
 
 ## 13. Open questions only the owner can decide
 
 1. **Is M3 (replicated SQL tables among organisations) wanted?** Default: no; reopen with a named use
    case (section 4).
-2. **Is a first member organisation (other than the project) available to run a witness or a
-   validator, for testing and for the first deployment?** Default: the project runs two witnesses on
-   separate hosts for tests; a real deployment needs the owner's counterparties.
+2. **Answered on 2026-11-28:** no outside organisation yet; the project runs its own test witnesses
+   (two or more, on separate hosts) and test validators (four or more) for the tests and the release.
 3. **Packaging of `kingres-notary` and `kingres-witness`:** inside the main package, or separate
    packages. Default: `kingres-witness` separate (it is meant to run elsewhere), `kingres-notary`
    in its own package, both versioned with the release.
@@ -570,20 +546,20 @@ light client specification and `app_version` handling.
    newest block it can reach (online) or fails a proof older than `max_notary_age` from the trust file.
 5. **Value, stated plainly.** Over witnesses the notary adds a **total order** of the members'
    checkpoints and a **single recorded equivocation**; agreement among organisations on each other's
-   histories can already be had by cross-witnessing, each organisation running a witness for the
-   others. **Recommendation:** build layer 1 first and do not build layer 2 before a real counterparty
-   exists (open question 2); the design of layer 2 stays here as the next step.
+   histories can also be had by cross-witnessing. The owner decided on 2026-11-28 to build it in the
+   same release anyway, with the project's own test validators; a deployment can use layer 1 alone.
 
 ## 16. Open questions, revised
 
-The questions of section 13 stand with these changes: 2. has default "no layer 2 until a counterparty
-exists"; 5. the CometBFT decision is taken when a counterparty exists, as a child process over the ABCI
-socket; 6. is decided (above).
+The questions of section 13 stand with these changes: 2. is answered (no outside organisation; own
+test witnesses and validators); 5. the CometBFT decision is taken now: a pinned dependency of
+`kingres-notary` only, run as a child process over the ABCI socket unless the spike of L-6 shows the
+library is simpler to package; 6. is decided (above). The consistent cut is dropped (5.3).
 
 ## 17. Review of 2026-11-28 and where each finding is answered
 
 Findings H6 to H7, M8 and L4 of the independent review concern this document; the others are in
-[phase8-global-snapshot.md](phase8-global-snapshot.md) section 16.
+[phase8-timestamp-snapshot-rejected.md](phase8-timestamp-snapshot-rejected.md) section 16 (the rejected design; its findings do not apply to the planned one).
 
 | Finding | Answer | Where |
 |---|---|---|
@@ -594,7 +570,7 @@ Findings H6 to H7, M8 and L4 of the independent review concern this document; th
 | M8 (c) equivocation record vs rejection | `report_equivocation` is its own successful transaction | 5.2 |
 | M8 (d) notary proof freshness | `max_notary_age`, newest block | 15 |
 | M8 (e) value over witnesses | Stated; layer 2 deferred until a counterparty | 15, 16 |
-| L4 block builder under a rewritten snapshot; format 2 | Tested and retried; an old verifier refuses a format 2 leaf explicitly | 5.3 |
+| L4 block builder under a rewritten snapshot; format 2 | Void: the consistent cut is dropped, no format 2 leaf | 5.3 |
 | Open question 6, 2, 5 | Revised | 16 |
 | N8 epoch successor uniqueness (second review) | A witness records "closed, successor = X" and refuses any other successor | 5.1 |
 | N9 `max_cosignature_age` vs archived bundles (second review) | Age applies to current-state checks; archives verify "as of" a time | 5.1 |

@@ -42,6 +42,37 @@ Rebasing rewrites commits. Rules, **[Recommendation]**:
 
 The hosting platform, and therefore whether branch protection can enforce these rules, is not decided yet (decision #2 is only half settled).
 
+## PostgreSQL internals that KingresDB relies on for atomic visibility (check these first)
+
+Phase 8 makes no core patch ([ADR 0032](../adr/0032-phase-8-makes-no-core-patch.md)); the extension
+relies on the internals below. **On every minor and every major upgrade, check this table first**,
+before anything else in this document: each row says where to look and which test fails if the
+internal changed. Version differences are confined to the extension's `src/pg_compat.h`; the tests run
+on PG18 and PG19. The same table, with the reasons, is in section 9.3 of
+[../design/phase8-atomic-visibility.md](../design/phase8-atomic-visibility.md) (its table is the
+source; update both).
+
+| # | Internal | Where | Relied on for | Test that fails |
+|---|---|---|---|---|
+| 1 | `ExecutorStart_hook`, type `void (*)(QueryDesc *, int)` | `executor/executor.h`, `execMain.c` | validating and taking the local snapshot before the executor starts | the spike's twin-row test; chain order with `fanout.c` |
+| 2 | `QueryDesc.snapshot` replaced in the hook; `CreateQueryDesc` registers it and `FreeQueryDesc` unregisters it | `tcop/pquery.c` | the local scan reads the validated snapshot | cassert run of the harness |
+| 3 | `PushActiveSnapshot`, `PopActiveSnapshot`, `RegisterSnapshot`, `UnregisterSnapshot`, `GetLatestSnapshot`, `GetActiveSnapshot` | `utils/time/snapmgr.c`, `snapmgr.h` | candidate and active snapshot | cassert run; twin-row test |
+| 4 | `SPI_execute` with `read_only = true` uses the active snapshot | `executor/spi.c` | the local report runs under the candidate snapshot | report-equals-snapshot test |
+| 5 | `pg_prepared_xacts` columns (`transaction`, `gid`, `prepared`, `ownerid`, `dbid`) | `access/transam/twophase.c`, `catalog/pg_proc.dat` | mapping pending xids to transactions | SQL regress |
+| 6 | `pg_current_snapshot`, `pg_snapshot_xip`, `pg_visible_in_snapshot` | `utils/adt/xid8funcs.c` | reading `xip` and visibility | SQL regress |
+| 7 | `SnapshotData` fields (`xmin`, `xmax`, `xip`, `xcnt`) if C code reads them | `utils/snapshot.h` | optional fast path | compile |
+| 8 | A prepared transaction stays in the procarray and in `xip` until decided | `twophase.c` `MarkAsPrepared` | the pending rule | in-doubt nemesis of the harness |
+| 9 | `PREPARE TRANSACTION`, `COMMIT PREPARED`; the gid is an opaque string up to 200 characters | SQL | the 2PC protocol and `dtx_id` | existing 2PC tests |
+| 10 | Transaction callbacks and events `PRE_PREPARE`, `PRE_COMMIT`, `COMMIT`, `ABORT` | `access/xact.h` | writer-side hooks (already used) | existing tests |
+| 11 | `GetTopTransactionIdIfAny`, `IsolationUsesXactSnapshot`, `XactReadOnly` | `access/xact.h` | which statements are covered | unit |
+| 12 | Background worker API | `postmaster/bgworker.h` | garbage collection (existing recovery worker) | existing |
+| 13 | `clock_gettime(CLOCK_MONOTONIC)` | POSIX | `mono_us` | unit |
+
+Not used, and listed so that a reviewer knows they were considered: `ProcArrayInstallRestoredXmin`,
+`SET TRANSACTION SNAPSHOT` / `pg_export_snapshot`, commit timestamps, replication origins, custom WAL
+resource managers, and a new preloaded library.
+
+
 ## Routine: rebasing onto a new minor release
 
 Run when upstream publishes a new `REL_18_x` tag (minor releases come at least every three months).
@@ -70,7 +101,6 @@ At minimum, in WSL2 (build instructions are in [getting-started.md](getting-star
 7. A check that the `PG_MODULE_MAGIC` ABI check still accepts the extensions (a minor release should not change the ABI; confirm by loading them).
 8. Confirm that `core.eol` and `core.autocrlf` still keep the tree LF (`git diff --stat` after the rebase must show only intended changes).
 
-9. (From phase 8, once KP-0005 and KP-0006 exist: [ADR 0032](../adr/0032-phase-8-core-patches-are-two-hooks-one-per-branch.md).) Each core patch of the register that touches commit, prepare or snapshot code is carried once per product branch. After a rebase, re-apply or re-check both branches' versions, run the differential snapshot tests and the model of the phase 8 design, and confirm that `kingres_snapshot` still builds and loads against both patched trees.
 **[Needs verification]** The architecture document recommends a nightly CI job that merges the latest upstream stable tag and runs the full suite. The project runs no CI (GitHub Actions is switched off, see [releases.md](releases.md)), so there is no such job; the equivalent is to run this routine by hand when upstream publishes a tag. How a dry run is made (merge in a throwaway branch versus a dry-run rebase) is open.
 
 ## A new major version

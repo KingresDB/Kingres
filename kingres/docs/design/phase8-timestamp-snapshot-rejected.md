@@ -1,9 +1,17 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
-# Phase 8, part 1: a global snapshot across shard groups (design)
+# Phase 8, part 1: a global snapshot across shard groups (design): REJECTED ALTERNATIVE
 
-Status: Proposed design, 2026-11-28, revised the same day after two independent reviews (sections 16 and 16.1);
-not implemented. Nothing here is built. Where this document says "exists" it describes the
+**Status: rejected by the owner on 2026-11-28, kept as the record.** This design needs two patches to
+the PostgreSQL server (KP-0005, KP-0006); the owner decided that no core patch is made. The design that
+is planned is [phase8-atomic-visibility.md](phase8-atomic-visibility.md), which gives less (no causal
+order, no consistent cut) and needs no server change. Read this document for what the stronger
+guarantee would need, and for the review findings (sections 16 and 16.1) that the planned design learned
+from. Links below that point to "ADR 0030 to 0034" mean the ADRs as they are now (rewritten for the
+planned design).
+
+Original status: Proposed design, 2026-11-28, revised the same day after two independent reviews
+(sections 16 and 16.1); not implemented. Nothing here is built. Where this document says "exists" it describes the
 repository at `kingres-18` (d1344c1aa9) and names the file.
 
 Builds on [shard-phase2a.md](shard-phase2a.md) (2PC, the distributed scan),

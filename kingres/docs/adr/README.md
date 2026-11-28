@@ -36,11 +36,11 @@ An ADR records one decision: the context, the decision, its consequences and the
 | [0026](0026-the-candidate-of-the-map-group-receives-the-proof-of-the-operators-session.md) | The candidate of a map group failover receives the proof of the operator's session | Accepted | 2026-11-23 | - |
 | [0027](0027-transfers-are-staged-encrypted-files-run-as-the-requesting-role.md) | Exports are staged encrypted files, and transfers run as the role that asked | Accepted | 2026-11-23 | - |
 | [0028](0028-ledger-tables-are-carried-as-data-and-restart-their-chain.md) | Ledger tables are carried as data, and the imported ledger starts a new chain | Accepted | 2026-11-22 | - |
-| [0030](0030-global-snapshot-by-hybrid-clock-timestamps.md) | The global snapshot is a hybrid-clock timestamp that each group turns into an ordinary snapshot | Proposed | 2026-11-28 | - (would supersede 0009 in part) |
-| [0031](0031-snapshot-isolation-across-groups-and-its-limits.md) | Snapshot isolation across groups, with a skew-bounded recency, is the guarantee | Proposed | 2026-11-28 | - |
-| [0032](0032-phase-8-core-patches-are-two-hooks-one-per-branch.md) | Phase 8 adds two small core patches (hooks), one per product branch, with a decision gate and a fallback | Proposed | 2026-11-28 | - |
-| [0033](0033-multi-node-ledger-witnesses-then-a-bft-notary-of-checkpoints.md) | The multi-node ledger is witnesses first and a BFT notary of checkpoints second; no Raft, no replicated SQL | Proposed | 2026-11-28 | 8 (extends 0013) |
-| [0034](0034-phase-8-is-opt-in-staged-and-separate-from-the-fixed-parts.md) | Phase 8 is opt-in, staged, and kept apart from the code other lines change | Proposed | 2026-11-28 | - |
+| [0030](0030-atomic-visibility-by-validated-snapshots.md) | Atomic visibility of distributed transactions by validating ordinary snapshots against durable per-participant evidence | Proposed | 2026-11-28 | - (would supersede 0009 in part) |
+| [0031](0031-what-atomic-visibility-guarantees-and-what-it-does-not.md) | What atomic visibility guarantees, and what it does not | Proposed | 2026-11-28 | - |
+| [0032](0032-phase-8-makes-no-core-patch.md) | Phase 8 makes no core patch; the hook design is a rejected alternative | Proposed | 2026-11-28 | - |
+| [0033](0033-multi-node-ledger-witnesses-then-a-bft-notary-of-checkpoints.md) | The multi-node ledger is witnesses and a BFT notary of checkpoints, in one release; no Raft, no replicated SQL | Proposed | 2026-11-28 | 8 (extends 0013) |
+| [0034](0034-phase-8-is-off-by-default-staged-and-has-a-kill-switch.md) | Phase 8 is off by default, staged, has a kill switch, and ships as one release with both parts | Proposed | 2026-11-28 | - |
 "Open decision #" refers to the table "Open decisions" in architecture.md.
 
 ## Statuses
