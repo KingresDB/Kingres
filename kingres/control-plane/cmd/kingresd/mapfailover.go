@@ -593,7 +593,9 @@ func (p *mapPorts) Demote(ctx context.Context, s string, r failover.DemoteReques
 	return p.m.peers.Demote(ctx, s, r)
 }
 func (p *mapPorts) Lease(ctx context.Context, s string, r failover.LeaseRequest) (failover.LeaseAnswer, error) {
-	return p.m.peers.Lease(ctx, s, r)
+	ans, err := p.m.peers.Lease(ctx, s, r)
+	p.m.noteRelease(s, r, ans, err)
+	return ans, err
 }
 func (p *mapPorts) Promote(ctx context.Context, s string, r failover.PromoteRequest) (failover.PromoteAnswer, error) {
 	return p.m.peers.Promote(ctx, s, r)
@@ -851,6 +853,15 @@ func (m *mapFailover) abandonLocalFull(ctx context.Context, reason string) (mapA
 	unlock()
 	unlock = func() {}
 	return m.afterRelease(ctx, cur, reason), nil
+}
+
+// noteRelease remembers that a release of the lease of this server for the map group, asked by the runner of a bootstrap that was given up, did not let go of it (it failed, or
+// the answer says the lease is still held), so that a repeated abandon finishes the release; a release that let go clears the memory.
+func (m *mapFailover) noteRelease(server string, r failover.LeaseRequest, ans failover.LeaseAnswer, err error) {
+	if r.Role != failover.LeaseRelease || r.Group != 0 || server != m.self {
+		return
+	}
+	m.releasePending.Store(err != nil || ans.Held)
 }
 
 // releaseTheLease lets go of the lease of the bootstrap; a failure is remembered, so that a repeated abandon does it again.
