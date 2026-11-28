@@ -18,7 +18,13 @@ is built for PostgreSQL 18 (this branch) and for PostgreSQL 19 (branch
 `kingres-19`), from one source of each extension.
 
 **Status.**  The first release is 0.1.0 (2026-11-28), tagged
-`kingres-0.1.0-pg18` and `kingres-0.1.0-pg19`.  It contains every phase of the roadmap except phase 8 (a global snapshot and a
+`kingres-0.1.0-pg18` and `kingres-0.1.0-pg19`; the GitHub releases
+[kingres-0.1.0-pg18](https://github.com/KingresDB/Kingres/releases/tag/kingres-0.1.0-pg18)
+and
+[kingres-0.1.0-pg19](https://github.com/KingresDB/Kingres/releases/tag/kingres-0.1.0-pg19)
+carry the Debian packages, the container images and the checksums (how to
+check and install them: [kingres/docs/guide/install.md](kingres/docs/guide/install.md#download-a-release)).
+It contains every phase of the roadmap except phase 8 (a global snapshot and a
 multi-node ledger), which is future roadmap, and phase 15 (management of
 third-party extensions), which comes after the first release.  Sharding,
 query pushdown, table lifecycle, elasticity, distributed schemas, high

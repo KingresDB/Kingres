@@ -8,6 +8,40 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-28 (branch kingres-18): the first release, 0.1.0, is published
+
+### What was done
+
+- **Release.** KingresDB 0.1.0 was published on two GitHub releases, one per PostgreSQL major: `kingres-0.1.0-pg18` (the tag is on `kingres-18` at `dc2b7f1047`) and `kingres-0.1.0-pg19` (on `kingres-19` at `d34c6c1026`). Each page carries the Debian package `kingres_0.1.0+pg<N>-1_amd64.deb`, the image archive `kingres-0.1.0-pg<N>-image.tar.gz` (load with `docker load`) and `SHA256SUMS`, whose lines name `pg18/...` or `pg19/...` paths (check with `sha256sum -c --ignore-missing`). The page of PostgreSQL 18 also carries the four binaries of the verifier (linux-amd64, linux-arm64, darwin-arm64, windows-amd64), `RELEASE`, and the signed sums of the verifier as `kingres-verify-SHA256SUMS` and `kingres-verify-SHA256SUMS.note`. The product `SHA256SUMS` of 0.1.0 is not signed; the project owner decided on this day that it is signed from the next release on.
+- **The last two fixes before the tag.**
+  - A bootstrap of the map group that is given up while it asks for the fence or holder lease lets go of the lease it adopted after the abandon (`69a1bb9685`). The abandon marked the journal and released the lease, and a call of the runner that was already on its way adopted the lease again, so the old leader whose primary was started again never won it and the drain never ended (found as an intermittent timeout of the cluster test of a given-up switchover of the map group). The wait for the fence lease looks at the journal before every call.
+  - The abandon waits for the lifecycle lock of the standby agent for at most 25 seconds and then answers 503 with Retry-After (`6a82753964`, bound corrected in `dc2b7f1047`), instead of waiting until a create, a remove or a rebuild of a standby on that server ended. The same holds when a server forwards the abandon to the others: one that could not give its bootstrap up now makes the answer 503 with Retry-After, and a server where the feature does not run is still only one that did not answer. The 25 seconds are under the 30 seconds of the forwarding call and the write timeout of the HTTP server.
+- **Documentation.** The README of the project, the README of `kingres`, the user guide (download, check and install a release; the limitations) and the wiki say that 0.1.0 is released and link to the two release pages.
+
+### How it was verified
+
+The documentation was read against the CHANGELOG, the packaging README and the release pages as the project owner described them; the links of the changed files resolve. No code was changed in this entry and no test was run for it. The tests of the two fixes are named in their commits.
+
+### Needs-verification items
+
+None.
+
+### Decisions and deviations
+
+- The product `SHA256SUMS` of 0.1.0 is not signed; from the next release on it is signed (decided 2026-11-28; the release script is changed separately).
+
+### Still open
+
+- Phase 15 (management of third-party extensions) is built in a branch and is being merged; it is not part of 0.1.0. The real extensions (pgvector, pg_cron, pgaudit) are not packaged yet.
+- Phase 8 is future roadmap.
+- Failover is new in 0.1.0: the limits are in [guide/limitations.md](guide/limitations.md).
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-24 (branch rel-prep, from g2): the documentation of the first release brought up to g2
 
 ### What was done

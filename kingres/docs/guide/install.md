@@ -14,6 +14,38 @@ KingresDB is released for two PostgreSQL majors at the same time. Choose one; a 
 
 The bases are PostgreSQL 18.7 (`kingres-18`, upstream tag `REL_18_7`) and PostgreSQL 19.0 (`kingres-19`, upstream tag `REL_19_0`, the branch moved from `REL_19_RC2` on 2026-11-22; [../dev/releases.md](../dev/releases.md)).
 
+## Download a release
+
+KingresDB 0.1.0 was released on 2026-11-28. Each major has its own release page on GitHub:
+
+| | Release page | Tag |
+|---|---|---|
+| PostgreSQL 18 | [kingres-0.1.0-pg18](https://github.com/KingresDB/Kingres/releases/tag/kingres-0.1.0-pg18) | `kingres-0.1.0-pg18` on `kingres-18` |
+| PostgreSQL 19 | [kingres-0.1.0-pg19](https://github.com/KingresDB/Kingres/releases/tag/kingres-0.1.0-pg19) | `kingres-0.1.0-pg19` on `kingres-19` |
+
+Each page carries the Debian package (`kingres_0.1.0+pg<N>-1_amd64.deb`), the image archive (`kingres-0.1.0-pg<N>-image.tar.gz`, for `docker load`) and `SHA256SUMS`. The page of PostgreSQL 18 also carries the files of the standalone verifier: the binaries for linux-amd64, linux-arm64, darwin-arm64 and windows-amd64, `RELEASE`, and the signed sums of the verifier under the names `kingres-verify-SHA256SUMS` and `kingres-verify-SHA256SUMS.note`.
+
+Check the files before you install anything. The lines of `SHA256SUMS` name the files with the folder of their major (`pg18/...` or `pg19/...`), so put the downloaded files into that folder next to `SHA256SUMS`, and let `sha256sum` skip the files of the other major:
+
+```
+mkdir -p kingres-0.1.0/pg18 && cd kingres-0.1.0
+# download SHA256SUMS here, and the .deb and the image archive into pg18/
+sha256sum -c --ignore-missing SHA256SUMS      # every line that is checked must read OK
+sudo apt install ./pg18/kingres_0.1.0+pg18-1_amd64.deb
+# or: gunzip -c pg18/kingres-0.1.0-pg18-image.tar.gz | docker load
+```
+
+`SHA256SUMS` protects against a damaged download. It is not signed in 0.1.0 (later releases sign it), and there is no apt repository, so it does not protect against a release page that someone else controls.
+
+The verifier files are signed. Check them with a verifier you already trust (a build of your own, or one from an earlier release) and with the release key printed in [../../verifier/README.md](../../verifier/README.md) and on the wiki page of the verifier, not with a key from the place you downloaded the files:
+
+```
+kingres-verify release verify --sums kingres-verify-SHA256SUMS --note kingres-verify-SHA256SUMS.note \
+    --key <release key> --binary kingres-verify-linux-amd64
+```
+
+The line you want is `VERIFIED`. The `kingres-verify` that the package installs is the same program; the verifier README describes the command and its exit statuses.
+
 ## From the Debian package
 
 Supported: Ubuntu 24.04 on amd64 (the package is built there; other distributions are not tested). Install it with apt so that the run-time libraries come along:
@@ -57,7 +89,7 @@ All settings of `kingresd` are listed in [../../control-plane/README.md](../../c
 
 ## From a container image
 
-The image is `kingres:<version>-pg18` or `kingres:<version>-pg19`. There is no tag without the major. Load a released image file, or build it from a product branch (`kingres/packaging/docker/build-image.sh --rev kingres-18`; needs Docker):
+The image is `kingres:<version>-pg18` or `kingres:<version>-pg19`. There is no tag without the major. Load the image archive of a release ([above](#download-a-release)), or build it from a product branch (`kingres/packaging/docker/build-image.sh --rev kingres-18`; needs Docker):
 
 ```
 gunzip -c kingres-<version>-pg18-image.tar.gz | docker load

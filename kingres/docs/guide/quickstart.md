@@ -4,6 +4,8 @@
 
 This page takes you from nothing to a running KingresDB, first one node and then three. It uses the Debian package on Ubuntu 24.04 (amd64). For a container, for the other PostgreSQL major, or for a build from source, see [install.md](install.md).
 
+Download the package from the release page of your major ([kingres-0.1.0-pg18](https://github.com/KingresDB/Kingres/releases/tag/kingres-0.1.0-pg18) or [kingres-0.1.0-pg19](https://github.com/KingresDB/Kingres/releases/tag/kingres-0.1.0-pg19)) and check it with `sha256sum -c --ignore-missing SHA256SUMS` first; [install.md](install.md#download-a-release) shows how.
+
 Choose the major first: `kingres_<version>+pg18-<revision>_amd64.deb` (PostgreSQL 18) or `kingres_<version>+pg19-<revision>_amd64.deb` (PostgreSQL 19). Only one can be installed on a machine, and all servers of a cluster must use the same one.
 
 ## One node
