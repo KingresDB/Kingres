@@ -102,7 +102,7 @@ repository at a release tag (and builds it, see scripts/repro-check.sh in the
 verifier directory) or from the release files on another machine, and checks it
 with the release key:
 
-    kingres-verify release verify --sums SHA256SUMS --note SHA256SUMS.note \
+    kingres-verify release verify --sums kingres-verify-SHA256SUMS --note kingres-verify-SHA256SUMS.note \
         --key <release key> --binary kingres-verify-linux-amd64
 
 The service unit sets LimitCORE=0: kingresd can hold the ledger signing key in

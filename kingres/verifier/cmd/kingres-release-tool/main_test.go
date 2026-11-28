@@ -100,3 +100,25 @@ func TestBadInput(t *testing.T) {
 		}
 	}
 }
+
+// A file that release verify would refuse is not listed in the sums: the release fails when the
+// sums are made, not after the signing.
+func TestSumsRefusesAFileAboveTheLimitOfReleaseVerify(t *testing.T) {
+	dir := t.TempDir()
+	big := filepath.Join(dir, "image.tar.gz")
+	f, err := os.Create(big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(release.MaxFile + 1); err != nil {
+		t.Skipf("cannot make a sparse file: %v", err)
+	}
+	f.Close()
+	c, _, e := do(t, "sums", "--out", filepath.Join(dir, "SHA256SUMS"), big)
+	if c == 0 || !strings.Contains(e, "release verify refuses a file above") {
+		t.Fatalf("%d %q", c, e)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "SHA256SUMS")); err == nil {
+		t.Error("a sums file was written")
+	}
+}

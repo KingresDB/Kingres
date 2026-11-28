@@ -21,6 +21,7 @@
 package safefile
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -239,4 +240,49 @@ func OpenArg(path string, limit int64) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("%s %w (%d bytes, at most %d)", path, ErrTooLarge, st.Size(), limit)
 	}
 	return &limitedFile{f: f, name: path, left: limit}, nil
+}
+
+// hashAll hashes a regular file of at most limit bytes from an open handle
+// without holding its bytes: they go through a fixed buffer into the hash. The
+// size is bounded before reading and again while reading.
+func hashAll(f statReader, name string, limit int64) ([sha256.Size]byte, int64, error) {
+	var sum [sha256.Size]byte
+	st, err := f.Stat()
+	if err != nil {
+		return sum, 0, fmt.Errorf("%s: %w", name, err)
+	}
+	if !st.Mode().IsRegular() {
+		return sum, 0, fmt.Errorf("%s %w (it is %s)", name, ErrNotRegular, kind(st.Mode()))
+	}
+	if st.Size() > limit {
+		return sum, 0, fmt.Errorf("%s %w (%d bytes, at most %d)", name, ErrTooLarge, st.Size(), limit)
+	}
+	h := sha256.New()
+	// One byte more than the limit shows that the file grew after the Stat.
+	n, err := io.Copy(h, io.LimitReader(f, limit+1))
+	if err != nil {
+		return sum, 0, fmt.Errorf("reading %s: %w", name, err)
+	}
+	if n > limit {
+		return sum, 0, fmt.Errorf("%s %w (more than %d bytes)", name, ErrTooLarge, limit)
+	}
+	copy(sum[:], h.Sum(nil))
+	return sum, n, nil
+}
+
+// HashArg is ReadArg for a file that is only hashed: the SHA-256 and the size
+// of a file the auditor named on the command line, with the same rules as
+// ReadArg (a regular file after links, opened without blocking, at most limit
+// bytes), and memory that does not depend on the size of the file.
+func HashArg(path string, limit int64) ([sha256.Size]byte, int64, error) {
+	var zero [sha256.Size]byte
+	if err := checkArgPath(path); err != nil {
+		return zero, 0, err
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|openFlags, 0) // #nosec G304 -- the path is a command line argument
+	if err != nil {
+		return zero, 0, err
+	}
+	defer f.Close()
+	return hashAll(f, path, limit)
 }

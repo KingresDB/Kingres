@@ -31,6 +31,10 @@ const (
 	// SumsName and NoteName are the names of the two files of a release.
 	SumsName = "SHA256SUMS"
 	NoteName = "SHA256SUMS.note"
+	// MaxFile is the largest file that is listed in a sums file and checked with release verify (a package
+	// or a saved image). kingres-release-tool sums refuses a larger file, so a release is not signed
+	// with a file that its own verifier would refuse.
+	MaxFile = 1 << 30
 	// MaxSums is the largest sums file accepted (it must fit in a signed note).
 	MaxSums = signednote.MaxNoteSize
 )
@@ -42,7 +46,8 @@ type Entry struct {
 }
 
 // validFileName reports whether name may be a file of a release: letters,
-// digits, dot, dash and underscore only, not starting with a dash or a dot, so
+// digits, dot, dash, underscore and plus (a Debian package of the product is
+// kingres_0.1.0+pg18-1_amd64.deb) only, not starting with a dash or a dot, so
 // that it is never a path, an option or a hidden file.
 func validFileName(name string) bool {
 	if name == "" || len(name) > 255 || name[0] == '-' || name[0] == '.' {
@@ -50,7 +55,7 @@ func validFileName(name string) bool {
 	}
 	for _, c := range []byte(name) {
 		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '-', c == '_':
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '-', c == '_', c == '+':
 		default:
 			return false
 		}

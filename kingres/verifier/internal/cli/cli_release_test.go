@@ -9,11 +9,14 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/release"
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/safefile"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
@@ -295,5 +298,91 @@ func TestReleaseVerifyMarksASignedSetWhoseCommitIsUnknown(t *testing.T) {
 	code, out, _ := run(t, args(strings.Repeat("c0", 20), "2026-11-21T10:00:00Z")...)
 	if code != 0 || !strings.HasPrefix(out, "VERIFIED:") || strings.Contains(out, "NOT A RELEASE") {
 		t.Errorf("a real release: %d\n%s", code, out)
+	}
+}
+
+// The same command checks the files of the product release: a Debian package (its name has a plus) and a compressed image, listed by their plain names in a sums file
+// that is signed with the same key. A file that is a copy of another name does not match.
+func TestReleaseVerifyChecksTheFilesOfTheProductRelease(t *testing.T) {
+	r := newTestRelease(t)
+	deb := []byte("pretend deb of the product")
+	img := []byte("pretend image of the product")
+	sums, err := release.FormatSums([]release.Entry{
+		{Hash: sha256.Sum256(deb), Name: "kingres_0.1.0+pg18-1_amd64.deb"},
+		{Hash: sha256.Sum256(img), Name: "kingres-0.1.0-pg18-image.tar.gz"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	note, err := release.Sign(r.priv, sums)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := writeTemp(t, r.dir, "kingres-SHA256SUMS", string(sums))
+	n := writeTemp(t, r.dir, "kingres-SHA256SUMS.note", string(note))
+	d := writeTemp(t, r.dir, "kingres_0.1.0+pg18-1_amd64.deb", string(deb))
+	i := writeTemp(t, r.dir, "kingres-0.1.0-pg18-image.tar.gz", string(img))
+	code, out, errs := run(t, "release", "verify", "--sums", s, "--note", n, "--key", r.key, "--binary", d, "--binary", i)
+	if code != 0 || !strings.HasPrefix(out, "VERIFIED:") || !strings.Contains(out, "2 binary(ies) match") || errs != "" {
+		t.Fatalf("%d\n%s%s", code, out, errs)
+	}
+	bad := writeTemp(t, r.dir, "kingres_0.1.0+pg19-1_amd64.deb", string(deb))
+	if code, _, _ := run(t, "release", "verify", "--sums", s, "--note", n, "--key", r.key, "--binary", bad); code == 0 {
+		t.Error("a package that the sums do not list was accepted")
+	}
+	// a signed set of the verifier is not accepted for the files of the product, and the other way round, by name
+	if code, _, _ := run(t, "release", "verify", "--sums", s, "--note", n, "--key", r.key, "--binary", r.bin); code == 0 {
+		t.Error("a verifier binary matched the product sums")
+	}
+}
+
+// A file above the limit is an input error and a file below it is hashed as a stream (the
+// bytes of the checked file are not kept: only the RELEASE file is read into memory).
+func TestReleaseVerifyRefusesAFileAboveTheLimit(t *testing.T) {
+	r := newTestRelease(t)
+	big := filepath.Join(r.dir, "kingres-verify-linux-amd64")
+	f, err := os.Create(big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(release.MaxFile + 1); err != nil {
+		t.Skipf("cannot make a sparse file: %v", err)
+	}
+	f.Close()
+	if code, _, errs := run(t, r.args("--binary", big)...); code != ExitUsage || !strings.Contains(errs, "larger than the limit") {
+		t.Fatalf("%d %q", code, errs)
+	}
+}
+
+func TestReleaseVerifyHashesAFileWithoutReadingItIntoMemory(t *testing.T) {
+	r := newTestRelease(t)
+	// 200 MiB of zeros, listed under its name in a new signed set
+	big := filepath.Join(r.dir, "kingres_9.9.9+pg18-1_amd64.deb")
+	f, err := os.Create(big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(200 << 20); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	sum, _, err := safefile.HashArg(big, release.MaxFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sums, _ := release.FormatSums([]release.Entry{{Hash: sum, Name: "kingres_9.9.9+pg18-1_amd64.deb"}})
+	note, _ := release.Sign(r.priv, sums)
+	s := writeTemp(t, r.dir, "kingres-SHA256SUMS", string(sums))
+	n := writeTemp(t, r.dir, "kingres-SHA256SUMS.note", string(note))
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	code, out, errs := run(t, "release", "verify", "--sums", s, "--note", n, "--key", r.key, "--binary", big)
+	runtime.ReadMemStats(&after)
+	if code != 0 || !strings.HasPrefix(out, "VERIFIED:") {
+		t.Fatalf("%d\n%s%s", code, out, errs)
+	}
+	if grew := int64(after.TotalAlloc - before.TotalAlloc); grew > 50<<20 {
+		t.Fatalf("checking a 200 MiB file allocated %d bytes", grew)
 	}
 }

@@ -15,16 +15,21 @@
 #     existing tag, a missing changelog section, a missing or failed or stale check,
 #     a missing Docker without --skip-images, a non-empty output directory
 #   - a run with --skip-images and a run with a stand-in docker build the packages
-#     (and the image files), write SHA256SUMS that sha256sum accepts, write the
-#     release notes from the template, prepare both tags on the right commits and
+#     (and the image files), write kingres-SHA256SUMS (the plain names of the files) that sha256sum accepts and that
+#     the verifier checks against its signed note (a throwaway key made in the test),
+#     write the release notes from the template, prepare both tags on the right commits and
 #     push nothing (a bare repository configured as the remote stays empty)
+#   - a missing git committer identity, a missing or unusable key, and a bad --date are
+#     refused before anything is built; the date of the notes is the local date or --date
 #
 # What this does not cover: the real builds (build/build.sh, build-deb.sh,
 # build-image.sh), which test-deb.sh, test-image.sh and test-compose.sh cover on a
 # machine with Docker.
 #
 # Usage: test-release.sh [--work DIR]      (default $HOME/kingres-release-test)
-# Needs: bash, git, sha256sum, gzip. It makes one directory in DIR and removes it.
+# Needs: bash, git, sha256sum, gzip, and kingres-release-tool and kingres-verify: built with go
+# from kingres/verifier when go is on the PATH, else the programs named by KINGRES_REL_TOOL and
+# KINGRES_REL_VERIFY (built for the machine this runs on). It makes one directory in DIR and removes it.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -73,6 +78,7 @@ while [ "$#" -gt 0 ]; do case "$1" in --work) work="$2"; shift 2 ;; --out) out="
 major="${work##*pg}"
 echo "deb ${major} ${revision}" >>"${KINGRES_TEST_LOG}"
 printf 'fake package for pg%s\n' "${major}" >"${out}/kingres_${KINGRES_TEST_VERSION}+pg${major}-${revision}_amd64.deb"
+if [ -n "${KINGRES_TEST_BIGDEB:-}" ]; then truncate -s 1073741825 "${out}/kingres_${KINGRES_TEST_VERSION}+pg${major}-${revision}_amd64.deb"; fi
 STUB
 cat >"${stubs}/build-image.sh" <<'STUB'
 #!/usr/bin/env bash
@@ -94,6 +100,20 @@ export KINGRES_REL_BUILD_SH="${stubs}/build.sh"
 export KINGRES_REL_DEB_SH="${stubs}/build-deb.sh"
 export KINGRES_REL_IMAGE_SH="${stubs}/build-image.sh"
 export KINGRES_REL_DOCKER="${stubs}/docker"
+
+# ---- the signing tools and a throwaway key ---------------------------------------
+if [ -z "${KINGRES_REL_TOOL:-}" ] || [ -z "${KINGRES_REL_VERIFY:-}" ]; then
+    command -v go >/dev/null || { echo "test-release.sh: go is not on the PATH; give KINGRES_REL_TOOL and KINGRES_REL_VERIFY" >&2; exit 2; }
+    mkdir -p "${run}/tools"
+    ( cd "${pkg}/../verifier" && GOTOOLCHAIN=local go build -trimpath -o "${run}/tools/kingres-release-tool" ./cmd/kingres-release-tool \
+        && GOTOOLCHAIN=local go build -trimpath -o "${run}/tools/kingres-verify" ./cmd/kingres-verify ) || { echo "test-release.sh: cannot build the tools" >&2; exit 2; }
+    export KINGRES_REL_TOOL="${run}/tools/kingres-release-tool"
+    export KINGRES_REL_VERIFY="${run}/tools/kingres-verify"
+fi
+keyfile="${run}/test-release.key"
+pubkey="$("${KINGRES_REL_TOOL}" keygen --out "${keyfile}" | sed -n 's/^public key:  //p')"
+[ -n "${pubkey}" ] || { echo "test-release.sh: keygen made no key" >&2; exit 2; }
+unset GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
 
 # ---- the test repository ------------------------------------------------------
 tg() { git -c safe.directory='*' -C "${repo}" "$@"; }
@@ -174,7 +194,7 @@ release() {
     rc=$?
     set -e
 }
-good_args=(--version "${version}" --commit18 "${c18}" --commit19 "${c19}" --checks-file "${checks}" --work "${run}/work")
+good_args=(--version "${version}" --commit18 "${c18}" --commit19 "${c19}" --checks-file "${checks}" --key-file "${keyfile}" --work "${run}/work")
 has() { printf '%s\n' "${text}" | grep -q -- "$1"; }
 no_tags() { [ -z "$(tg tag -l 'kingres-*')" ]; }
 remote_empty() { [ -z "$(git -c safe.directory='*' -C "${remote}" for-each-ref)" ]; }
@@ -182,6 +202,7 @@ remote_empty() { [ -z "$(git -c safe.directory='*' -C "${remote}" for-each-ref)"
 # ---- dry run -------------------------------------------------------------------
 note "dry run"
 release "${good_args[@]}" --out "${run}/out-dry" --dry-run
+check "the dry run prints the date of the notes" has "Release date: $(date +%Y-%m-%d) (the local date"
 check_eq "a dry run with every gate met exits 0" 0 "${rc}"
 check "the dry run says it is a dry run" has "Dry run: every gate passed"
 check "the dry run prints the manual steps" has "git push <remote> kingres-0.1.0-pg18 kingres-0.1.0-pg19"
@@ -264,6 +285,26 @@ c18_draft="$(tg rev-parse HEAD)"
 release --version "${version}" --commit18 "${c18_draft}" --commit19 "${c19}" --checks-file "${checks}" --work "${run}/work" --out "${run}/o16" --dry-run
 if [ "${rc}" -ne 0 ] && has "still has a '### Pending' part"; then pass "refused: the changelog section still has a Pending part"; else fail "pending part: rc ${rc}"; fi
 tg reset -q --hard "${c18}"
+note "identity, key and date"
+# no committer identity: neither in the environment nor in any configuration
+tg config --unset user.name
+tg config --unset user.email
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 release "${good_args[@]}" --out "${run}/o20" --skip-images
+if [ "${rc}" -ne 0 ] && has "no git committer identity" && no_tags && [ ! -e "${KINGRES_TEST_LOG}" ] && [ ! -e "${run}/o20" ]; then pass "refused before any build: no committer identity"; else fail "no identity: rc ${rc}"; fi
+GIT_COMMITTER_NAME="From Env" GIT_COMMITTER_EMAIL="env@example.invalid" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 release "${good_args[@]}" --out "${run}/o21" --dry-run
+if [ "${rc}" -eq 0 ] && has "committer identity is set (From Env <env@example.invalid>)"; then pass "an identity from GIT_COMMITTER_* is accepted"; else fail "env identity: rc ${rc}"; fi
+tg config user.name "Release Test"
+tg config user.email "release-test@example.invalid"
+refuses "no --key-file" "no --key-file" --version "${version}" --commit18 "${c18}" --commit19 "${c19}" --checks-file "${checks}" --work "${run}/work" --out "${run}/o22" --skip-images
+release --version "${version}" --commit18 "${c18}" --commit19 "${c19}" --checks-file "${checks}" --work "${run}/work" --out "${run}/o23" --dry-run
+if [ "${rc}" -eq 0 ] && has "SKIP  release key"; then pass "a dry run needs no key"; else fail "dry run without key: rc ${rc}"; fi
+refuses "a key file that does not exist" "does not exist or is not readable" "${good_args[@]}" --key-file "${run}/no-such.key" --out "${run}/o24" --skip-images
+echo "not a key" >"${run}/bad.key"
+chmod 600 "${run}/bad.key"
+refuses "a file that is not a release key" "is not a release key" "${good_args[@]}" --key-file "${run}/bad.key" --out "${run}/o25" --skip-images
+refuses "a date in the wrong form" "--date must be YYYY-MM-DD" "${good_args[@]}" --date 28.11.2026 --out "${run}/o26" --skip-images
+refuses "a date that does not exist" "is not a date" "${good_args[@]}" --date 2026-02-30 --out "${run}/o27" --skip-images
+
 check "no output directory was made by a refused run" test ! -e "${run}/o1"
 
 # ---- a release without images ---------------------------------------------------
@@ -275,8 +316,15 @@ check "the skipped images are announced" has "SKIPPED: container images"
 check "the pg18 package exists" test -f "${out1}/pg18/kingres_${version}+pg18-1_amd64.deb"
 check "the pg19 package exists" test -f "${out1}/pg19/kingres_${version}+pg19-1_amd64.deb"
 check "no image file was written" bash -c "! ls '${out1}'/pg*/*image* "
-check "SHA256SUMS is accepted by sha256sum -c" bash -c "cd '${out1}' && sha256sum -c SHA256SUMS"
-check_eq "SHA256SUMS has two lines" 2 "$(wc -l <"${out1}/SHA256SUMS" | tr -d ' ')"
+check_eq "kingres-SHA256SUMS lists the two packages by their plain names" "kingres_${version}+pg18-1_amd64.deb kingres_${version}+pg19-1_amd64.deb " "$(awk '{print $2}' "${out1}/kingres-SHA256SUMS" | sort | tr '\n' ' ')"
+check "the checksums are accepted by sha256sum -c in a folder that holds the files" bash -c "d='${run}/flat1' && mkdir -p \"\$d\" && cp '${out1}'/pg*/*.deb \"\$d\"/ && cd \"\$d\" && sha256sum -c '${out1}/kingres-SHA256SUMS'"
+check "no file named SHA256SUMS is written (it would collide with the sums of the verifier on the release page)" test ! -e "${out1}/SHA256SUMS"
+check "the signed note exists" test -s "${out1}/kingres-SHA256SUMS.note"
+check "the verifier accepts the note and every file with the public key" "${KINGRES_REL_VERIFY}" release verify --sums "${out1}/kingres-SHA256SUMS" --note "${out1}/kingres-SHA256SUMS.note" --key "${pubkey}" --binary "${out1}/pg18/kingres_${version}+pg18-1_amd64.deb" --binary "${out1}/pg19/kingres_${version}+pg19-1_amd64.deb"
+check "the verifier refuses a changed sums file" bash -c "cp '${out1}/kingres-SHA256SUMS' '${run}/tampered' && sed -i '1s/^./0/' '${run}/tampered' && ! '${KINGRES_REL_VERIFY}' release verify --sums '${run}/tampered' --note '${out1}/kingres-SHA256SUMS.note' --key '${pubkey}' >/dev/null"
+check "the notes carry the local date of the machine" grep -q "^Date $(date +%Y-%m-%d)\." "${out1}/RELEASE-NOTES.md"
+check "the notes name the sums, the note and the public key" bash -c "grep -q 'kingres-SHA256SUMS.note' '${out1}/RELEASE-NOTES.md' && grep -qF '${pubkey}' '${out1}/RELEASE-NOTES.md'"
+check "the manual steps send the sums and the note with each tag" has "kingres-SHA256SUMS.note"
 check "the notes carry the version" grep -q "^# KingresDB ${version}\$" "${out1}/RELEASE-NOTES.md"
 check "the notes carry the changelog section" grep -q "first release marker line" "${out1}/RELEASE-NOTES.md"
 check "the notes do not carry an older section" bash -c "! grep -q 'An older line' '${out1}/RELEASE-NOTES.md'"
@@ -303,18 +351,50 @@ note "release with images (stand-in docker)"
 tg tag -d kingres-0.1.0-pg18 kingres-0.1.0-pg19 >/dev/null
 rm -f "${KINGRES_TEST_LOG}"
 out2="${run}/release-img"
-release "${good_args[@]}" --out "${out2}" --revision 2
+release "${good_args[@]}" --out "${out2}" --revision 2 --date 2026-11-30
 check_eq "the run exits 0" 0 "${rc}"
 check "the pg18 image file exists and is not empty" test -s "${out2}/pg18/kingres-${version}-pg18-image.tar.gz"
 check "the pg19 image file exists and is not empty" test -s "${out2}/pg19/kingres-${version}-pg19-image.tar.gz"
 check "the revision 2 package exists" test -f "${out2}/pg18/kingres_${version}+pg18-2_amd64.deb"
-check_eq "SHA256SUMS has four lines" 4 "$(wc -l <"${out2}/SHA256SUMS" | tr -d ' ')"
-check "SHA256SUMS is accepted by sha256sum -c" bash -c "cd '${out2}' && sha256sum -c SHA256SUMS"
+check_eq "kingres-SHA256SUMS has four lines" 4 "$(wc -l <"${out2}/kingres-SHA256SUMS" | tr -d ' ')"
+check "the checksums are accepted by sha256sum -c in a folder that holds the files" bash -c "d='${run}/flat2' && mkdir -p \"\$d\" && cp '${out2}'/pg*/* \"\$d\"/ && cd \"\$d\" && sha256sum -c '${out2}/kingres-SHA256SUMS'"
+check "the verifier accepts an image file with the public key" "${KINGRES_REL_VERIFY}" release verify --sums "${out2}/kingres-SHA256SUMS" --note "${out2}/kingres-SHA256SUMS.note" --key "${pubkey}" --binary "${out2}/pg19/kingres-${version}-pg19-image.tar.gz"
+check "the date given with --date is in the notes" grep -q "^Date 2026-11-30\." "${out2}/RELEASE-NOTES.md"
 check "the image of pg18 carries the major in its tag" grep -q "image ${c18} kingres:${version}-pg18" "${KINGRES_TEST_LOG}"
 check "the image of pg19 carries the major in its tag" grep -q "image ${c19} kingres:${version}-pg19" "${KINGRES_TEST_LOG}"
 check "the saved image is the image of that tag" bash -c "gzip -dc '${out2}/pg19/kingres-${version}-pg19-image.tar.gz' | grep -q 'kingres:${version}-pg19'"
 check "the notes list the image files" grep -q "docker load" "${out2}/RELEASE-NOTES.md"
 check "the notes do not say the images were not built" bash -c "! grep -q 'not built' '${out2}/RELEASE-NOTES.md'"
 check "nothing was pushed" remote_empty
+
+# ---- the identity of blanks, the date warning, a file that is too large, a late failure -------
+note "blank identity, date warning, size limit, no half set"
+tg tag -d kingres-0.1.0-pg18 kingres-0.1.0-pg19 >/dev/null 2>&1 || true
+GIT_COMMITTER_NAME=" " GIT_COMMITTER_EMAIL="x@example.invalid" release "${good_args[@]}" --out "${run}/o30" --dry-run
+if [ "${rc}" -ne 0 ] && has "no git committer identity"; then pass "refused: a GIT_COMMITTER_NAME of blanks (git would refuse it too)"; else fail "blank name env: rc ${rc}"; fi
+tg config user.name " "
+GIT_COMMITTER_NAME=" " GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 release "${good_args[@]}" --out "${run}/o31" --dry-run
+if [ "${rc}" -ne 0 ] && has "no git committer identity"; then pass "refused: a name of blanks only"; else fail "blank name: rc ${rc}"; fi
+tg config user.name "Release Test"
+tg config user.email "no-at-sign"
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 release "${good_args[@]}" --out "${run}/o32" --dry-run
+if [ "${rc}" -ne 0 ] && has "no git committer identity"; then pass "refused: an e-mail without an @"; else fail "e-mail without at: rc ${rc}"; fi
+tg config user.email "release-test@example.invalid"
+release "${good_args[@]}" --out "${run}/o33" --dry-run --date 2020-01-01
+if [ "${rc}" -eq 0 ] && has "WARNING: the release date 2020-01-01 is not today"; then pass "a date that is not today is warned about"; else fail "date warning: rc ${rc}"; fi
+release "${good_args[@]}" --out "${run}/o34" --dry-run
+if ! has "WARNING: the release date"; then pass "no warning for the local date"; else fail "warning for today"; fi
+tg tag -d kingres-0.1.0-pg18 kingres-0.1.0-pg19 >/dev/null 2>&1 || true
+rm -f "${KINGRES_TEST_LOG}"
+KINGRES_TEST_BIGDEB=1 release "${good_args[@]}" --out "${run}/o35" --skip-images
+if [ "${rc}" -ne 0 ] && has "refuses a file above 1073741824 bytes" && no_tags; then pass "refused: a package above the limit of release verify, found right after its build"; else fail "big package: rc ${rc}"; fi
+check "no sums were written for the refused package" test ! -e "${run}/o35/kingres-SHA256SUMS"
+tg tag -d kingres-0.1.0-pg18 kingres-0.1.0-pg19 >/dev/null 2>&1 || true
+printf '#!/bin/sh\nexit 1\n' >"${stubs}/verify-fail"
+chmod +x "${stubs}/verify-fail"
+KINGRES_REL_VERIFY="${stubs}/verify-fail" release "${good_args[@]}" --out "${run}/o36" --skip-images
+if [ "${rc}" -ne 0 ] && has "does not verify" && no_tags; then pass "refused: a note that does not verify, nothing tagged"; else fail "verify failure: rc ${rc}"; fi
+check "no sums and no note are left in the output after the failed verify" bash -c "test ! -e '${run}/o36/kingres-SHA256SUMS' && test ! -e '${run}/o36/kingres-SHA256SUMS.note'"
+
 
 summary

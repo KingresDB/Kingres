@@ -125,6 +125,7 @@ type Runner struct {
 	ProofWait      time.Duration // the wait for the proof of the clean stop in a planned switchover, default 4 min
 	ProofPullAfter time.Duration // the proof is read from the old leader's server when its task did not send it by then, default 20 s
 	LeasePoll      time.Duration // default 1 s
+	ReleaseWait    time.Duration // the time one let-go of a lease of a bootstrap that was given up may take (default 30 s)
 	QuorumWait     time.Duration // default 60 s
 	ReadBound      time.Duration // the positions must stop moving within this, default 15 s
 	PromoteWait    time.Duration // the promoted instance is waited for this long, default 3 min
@@ -161,6 +162,9 @@ func (r *Runner) now() time.Time {
 	}
 	return time.Now()
 }
+
+// releaseWait is the default of Runner.ReleaseWait.
+const releaseWait = 30 * time.Second
 
 func dur(v, d time.Duration) time.Duration {
 	if v > 0 {
@@ -394,7 +398,7 @@ func (r *Runner) takeFence(ctx context.Context, j journal.Journal) (bool, error)
 	var quorumSince time.Time
 	for {
 		if !r.Journal.Active() {
-			return false, failover.Fail(failover.CodeSwitchoverUnproven, false, "the bootstrap of the map group was given up while it waited for the lease; nothing more is done")
+			return false, failover.Fail(failover.CodeSwitchoverUnproven, false, "the bootstrap of the map group is not in progress any more (it was given up or it ended) while it waited for the lease; nothing more is done")
 		}
 		if err := ctx.Err(); err != nil {
 			return false, err
@@ -450,12 +454,20 @@ func (r *Runner) letGoIfGivenUp(ctx context.Context, id string) error {
 	if !ok || cur.ID != id || cur.Abandoned.IsZero() {
 		return nil
 	}
+	// The release must not end with the call that was cancelled (the bootstrap is over), and must not wait for ever either: it has a time of its own.
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dur(r.ReleaseWait, releaseWait))
+	defer cancel()
 	var rerr error
 	for try := 0; try < 5; try++ {
-		if _, rerr = r.P.Lease(context.WithoutCancel(ctx), r.P.Self(), failover.LeaseRequest{Group: Group, Role: failover.LeaseRelease}); rerr == nil {
+		// An answer that says the lease is still held (an adoption of a promoted primary is not let go of) is not a release.
+		var ans failover.LeaseAnswer
+		if ans, rerr = r.P.Lease(rctx, r.P.Self(), failover.LeaseRequest{Group: Group, Role: failover.LeaseRelease}); rerr == nil && ans.Held {
+			rerr = errors.New("the lease is still held")
+		}
+		if rerr == nil {
 			return failover.Fail(failover.CodeSwitchoverUnproven, false, "the bootstrap of the map group was given up while it asked for the lease; the lease was let go of and nothing more is done")
 		}
-		if err := r.sleep(ctx, dur(r.LeasePoll, time.Second)); err != nil {
+		if err := r.sleep(rctx, dur(r.LeasePoll, time.Second)); err != nil {
 			break
 		}
 	}

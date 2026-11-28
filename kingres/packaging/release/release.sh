@@ -17,6 +17,7 @@
 #
 # Usage:
 #   release.sh --version V --commit18 SHA --commit19 SHA --out DIR
+#              --key-file FILE [--date YYYY-MM-DD]
 #              [--checks-file FILE] [--work DIR] [--revision N]
 #              [--skip-images] [--sign-tags] [--dry-run]
 #
@@ -24,9 +25,19 @@
 #                      on both branches; it is never guessed (source-info.sh reads it)
 #   --commit18 SHA     the commit kingres-18 must be at (full id, or 12 or more digits)
 #   --commit19 SHA     the commit kingres-19 must be at (the sync commit made from it)
-#   --out DIR          where the artifacts, SHA256SUMS and RELEASE-NOTES.md are written;
+#   --out DIR          where the artifacts, kingres-SHA256SUMS, its signed
+#                      note and RELEASE-NOTES.md are written;
 #                      must not exist or must be empty (a release is never written over
 #                      another)
+#   --key-file FILE    the release key (the file kingres-release-tool keygen made; the key of
+#                      kingres/verifier). The checksums of the packages and images are
+#                      signed with it, in the signed note format the verifier reads
+#                      (kingres-verify release verify). A real run is refused without it,
+#                      before anything is built; a dry run needs none (it builds and signs
+#                      nothing). The key is read by the signing step only and never copied
+#   --date DATE        the date written in the release notes, YYYY-MM-DD (default: today by
+#                      the clock of this machine, in its time zone, not UTC). It is printed
+#                      at the start and again with the notes
 #   --checks-file FILE the record of the final checks (format below). Without it every
 #                      run is refused; a dry run reports the missing record as a failed gate
 #   --work DIR         work area of the builds (default: $HOME/kingres-release-work);
@@ -53,6 +64,11 @@
 #   - kingres/CHANGELOG.md has a section for the version that no longer has a
 #     "### Pending" part (the draft marker), and the release-notes template exists
 #   - the record of checks says every required check passed on the expected commit
+#   - a git committer identity is set (user.name and user.email in the git configuration of
+#     the repository, or GIT_COMMITTER_NAME and GIT_COMMITTER_EMAIL), because the tags are
+#     made as the very last step and a missing identity would fail them after the builds
+#   - a key file is given and exists (not for a dry run); before the first build the tool
+#     of kingres/verifier is built from the commit of kingres-18 and reads the key
 #
 # The record of checks is a text file with one line per run, written by whoever ran
 # the check (the script never runs the multi-hour suites itself):
@@ -71,6 +87,9 @@
 # holds this script), KINGRES_REL_BUILD_SH, KINGRES_REL_DEB_SH, KINGRES_REL_IMAGE_SH
 # (replacements of build/build.sh, deb/build-deb.sh, docker/build-image.sh),
 # KINGRES_REL_DOCKER (the docker command, default docker),
+# KINGRES_REL_TOOL and KINGRES_REL_VERIFY (ready-made kingres-release-tool and
+# kingres-verify programs; default: built with go from kingres/verifier of the commit of
+# kingres-18, GOTOOLCHAIN=local),
 # KINGRES_REL_ALLOW_PRERELEASE=1 (accept a PostgreSQL pre-release; for trials only).
 set -euo pipefail
 
@@ -88,6 +107,8 @@ commit18=""
 commit19=""
 out=""
 checks_file=""
+key_file=""
+release_date=""
 work="${HOME}/kingres-release-work"
 revision=1
 skip_images=0
@@ -104,6 +125,8 @@ while [ "$#" -gt 0 ]; do
         --commit19)    need_value "$1" "$#"; commit19="$2"; shift 2 ;;
         --out)         need_value "$1" "$#"; out="$2"; shift 2 ;;
         --checks-file) need_value "$1" "$#"; checks_file="$2"; shift 2 ;;
+        --key-file)    need_value "$1" "$#"; key_file="$2"; shift 2 ;;
+        --date)        need_value "$1" "$#"; release_date="$2"; shift 2 ;;
         --work)        need_value "$1" "$#"; work="$2"; shift 2 ;;
         --revision)    need_value "$1" "$#"; revision="$2"; shift 2 ;;
         --skip-images) skip_images=1; shift ;;
@@ -121,6 +144,15 @@ esac
 [ -n "${commit19}" ] || die "--commit19 is required"
 [ -n "${out}" ] || die "--out is required"
 case "${revision}" in ''|*[!0-9]*) die "--revision must be a number" ;; esac
+date_given=1
+if [ -z "${release_date}" ]; then
+    release_date="$(date +%Y-%m-%d)"   # the local date: the release is made in the time zone of the machine, not in UTC
+    date_given=0
+fi
+case "${release_date}" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) [ "$(date -d "${release_date}" +%Y-%m-%d 2>/dev/null)" = "${release_date}" ] || die "--date ${release_date} is not a date" ;;
+    *) die "--date must be YYYY-MM-DD" ;;
+esac
 for c in git sha256sum; do command -v "${c}" >/dev/null || die "${c} is not on the PATH"; done
 
 g() { git -c safe.directory='*' -C "${repo}" "$@"; }
@@ -149,6 +181,14 @@ if [ "${dry_run}" -eq 1 ]; then
 else
     printf 'KingresDB release %s\n\n' "${version}"
 fi
+if [ "${date_given}" -eq 1 ]; then
+    printf 'Release date: %s (given with --date)\n\n' "${release_date}"
+else
+    printf 'Release date: %s (the local date of this machine; --date overrides it)\n\n' "${release_date}"
+fi
+if [ "${release_date}" != "$(date +%Y-%m-%d)" ]; then
+    printf 'WARNING: the release date %s is not today (%s) by the clock of this machine; the notes will carry it as given\n\n' "${release_date}" "$(date +%Y-%m-%d)"
+fi
 
 # ---- gate 1: a clean working tree -------------------------------------------
 status="$(g status --porcelain --untracked-files=all)"
@@ -156,6 +196,33 @@ if [ -z "${status}" ]; then
     gate_pass "the working tree is clean"
 else
     gate_fail "the working tree is not clean (commit, stash or remove: $(printf '%s' "${status}" | head -3 | tr '\n' ';'))"
+fi
+
+# ---- gate 1b: a committer identity (the tags are the last step) ---------------
+# git tag -a needs a committer identity; without one the tag step fails after every build. The identity is looked for where git looks
+# for it explicitly: the environment, then the configuration of the repository (a name and an e-mail made up from the host name do not count).
+ident_name="${GIT_COMMITTER_NAME:-$(g config --get user.name 2>/dev/null || true)}"
+ident_email="${GIT_COMMITTER_EMAIL:-$(g config --get user.email 2>/dev/null || true)}"
+# a name or an e-mail of blanks only is no identity (git refuses an empty ident name), and an e-mail has an @
+ident_name_t="$(printf '%s' "${ident_name}" | tr -d '[:space:]')"
+ident_email_t="$(printf '%s' "${ident_email}" | tr -d '[:space:]')"
+if [ -n "${ident_name_t}" ] && [ -n "${ident_email_t}" ] && [ "${ident_email_t#*@}" != "${ident_email_t}" ]; then
+    gate_pass "a git committer identity is set (${ident_name} <${ident_email}>)"
+else
+    gate_fail "no git committer identity: set user.name and user.email (not blank, the e-mail with an @) (git config) or GIT_COMMITTER_NAME and GIT_COMMITTER_EMAIL; the tags are made after the builds and would fail there"
+fi
+
+# ---- gate 1c: the release key -------------------------------------------------
+if [ -n "${key_file}" ]; then
+    if [ -f "${key_file}" ] && [ -r "${key_file}" ]; then
+        gate_pass "the key file ${key_file} exists and is readable"
+    else
+        gate_fail "the key file ${key_file} does not exist or is not readable"
+    fi
+elif [ "${dry_run}" -eq 1 ]; then
+    printf 'SKIP  release key: no --key-file; a dry run builds and signs nothing (a real run is refused without a key)\n'
+else
+    gate_fail "no --key-file: the checksums of the packages and images are signed with the release key (kingres-release-tool keygen makes one; --dry-run needs none)"
 fi
 
 # ---- gate 2: the branches are at the expected commits -----------------------
@@ -342,20 +409,20 @@ fi
 printf '\nPlan:\n'
 printf '  pg18  commit %s  ->  %s%s\n' "${actual18:0:12}" "${deb18}" "${with_image18}"
 printf '  pg19  commit %s  ->  %s%s\n' "${actual19:0:12}" "${deb19}" "${with_image19}"
-printf '  then SHA256SUMS, RELEASE-NOTES.md in %s, and the local tags %s and %s\n' "${out}" "${tag18}" "${tag19}"
+printf '  then kingres-SHA256SUMS and its signed note, RELEASE-NOTES.md (dated %s) in %s, and the local tags %s and %s\n' "${release_date}" "${out}" "${tag18}" "${tag19}"
 
 manual_steps() {
     cat <<STEPS
 
 Manual steps (this script never pushes and never contacts GitHub):
-  1. Look at ${out}/RELEASE-NOTES.md and ${out}/SHA256SUMS.
+  1. Look at ${out}/RELEASE-NOTES.md and ${out}/kingres-SHA256SUMS. The signed note ${out}/kingres-SHA256SUMS.note is checked with the public key of the release key (kingres-verify release verify).
   2. Push the branches, then the two tags (replace <remote> by the remote of the project):
        git push <remote> kingres-18 kingres-19
        git push <remote> ${tag18} ${tag19}
   3. Create the GitHub release of each tag with its files and the notes, for example:
-       gh release create ${tag18} --title "KingresDB ${version} on PostgreSQL 18" --notes-file ${out}/RELEASE-NOTES.md ${out}/pg18/* ${out}/SHA256SUMS
-       gh release create ${tag19} --title "KingresDB ${version} on PostgreSQL 19" --notes-file ${out}/RELEASE-NOTES.md ${out}/pg19/* ${out}/SHA256SUMS
-  4. Publishing or signing the packages and images is a separate decision of the project owner.
+       gh release create ${tag18} --title "KingresDB ${version} on PostgreSQL 18" --notes-file ${out}/RELEASE-NOTES.md ${out}/pg18/* ${out}/kingres-SHA256SUMS ${out}/kingres-SHA256SUMS.note
+       gh release create ${tag19} --title "KingresDB ${version} on PostgreSQL 19" --notes-file ${out}/RELEASE-NOTES.md ${out}/pg19/* ${out}/kingres-SHA256SUMS ${out}/kingres-SHA256SUMS.note
+  4. The checksums are signed (kingres-SHA256SUMS.note); the packages and images themselves are not signed, and publishing them is a separate decision of the project owner.
 STEPS
 }
 
@@ -364,6 +431,37 @@ if [ "${dry_run}" -eq 1 ]; then
     manual_steps
     exit 0
 fi
+
+# ---- the tool that signs and checks the sums, and the key, before the first build -------------------------
+# The tool and the verifier of kingres/verifier are built from the commit of kingres-18 (not from the working tree); the key is read once, so that a
+# key that cannot be used is found now and not after the builds.
+tool_dir="${tmp}/tools"
+mkdir -p "${tool_dir}"
+rel_tool="${KINGRES_REL_TOOL:-}"
+rel_verify="${KINGRES_REL_VERIFY:-}"
+if [ -z "${rel_tool}" ] || [ -z "${rel_verify}" ]; then
+    command -v go >/dev/null || die "go is not on the PATH: it builds kingres-release-tool and kingres-verify, which sign and check the checksums (nothing was built or tagged)"
+    g archive --format=tar "${actual18}" kingres/verifier | tar -x -C "${tool_dir}" || die "cannot take kingres/verifier from ${actual18:0:12}"
+    ( cd "${tool_dir}/kingres/verifier" && GOTOOLCHAIN=local CGO_ENABLED=0 go build -trimpath -o "${tool_dir}/kingres-release-tool" ./cmd/kingres-release-tool \
+        && GOTOOLCHAIN=local CGO_ENABLED=0 go build -trimpath -o "${tool_dir}/kingres-verify" ./cmd/kingres-verify ) \
+        || die "cannot build the release tool and the verifier from kingres/verifier (nothing was built or tagged)"
+    rel_tool="${rel_tool:-${tool_dir}/kingres-release-tool}"
+    rel_verify="${rel_verify:-${tool_dir}/kingres-verify}"
+fi
+pubkey="$("${rel_tool}" pub --key-file "${key_file}" 2>/dev/null | sed -n 's/^public key:  //p' || true)"
+[ -n "${pubkey}" ] || die "the key file ${key_file} is not a release key (the file that kingres-release-tool keygen made, mode 0600; nothing was built or tagged)"
+printf 'Release key: %s\n' "${pubkey}"
+
+# release verify and the sums tool refuse a file above this size (release.MaxFile of kingres/verifier): a file that large is found right after it is
+# built, not after the signing, and the message says why.
+max_file_bytes=1073741824
+check_size() { # FILE
+    local n
+    n="$(wc -c <"$1" | tr -d ' ')"
+    if [ "${n}" -gt "${max_file_bytes}" ]; then
+        die "$1 has ${n} bytes: kingres-verify release verify refuses a file above ${max_file_bytes} bytes, so it could not be listed in the signed sums (nothing was tagged)"
+    fi
+}
 
 # ---- the builds ---------------------------------------------------------------
 mkdir -p "${out}" "${work}"
@@ -382,6 +480,7 @@ for m in 18 19; do
     printf '\n==> PostgreSQL %s: Debian package\n' "${m}"
     "${deb_sh}" --work "${work}/pg${m}" --out "${out}/pg${m}" --revision "${revision}"
     [ -f "${out}/pg${m}/${!deb}" ] || die "build-deb.sh did not produce ${out}/pg${m}/${!deb}"
+    check_size "${out}/pg${m}/${!deb}"
     sums_files+=("pg${m}/${!deb}")
     artifact_lines="${artifact_lines}- \`pg${m}/${!deb}\`"$'\n'
     if [ "${skip_images}" -eq 0 ]; then
@@ -390,6 +489,7 @@ for m in 18 19; do
         tarball="kingres-${version}-pg${m}-image.tar.gz"
         "${docker_cmd}" save "${!img}" | gzip -n >"${out}/pg${m}/${tarball}"
         [ -s "${out}/pg${m}/${tarball}" ] || die "docker save wrote nothing for ${!img}"
+        check_size "${out}/pg${m}/${tarball}"
         sums_files+=("pg${m}/${tarball}")
         artifact_lines="${artifact_lines}- \`pg${m}/${tarball}\` (\`docker load\`, image \`${!img}\`)"$'\n'
     fi
@@ -399,11 +499,28 @@ if [ "${skip_images}" -eq 1 ]; then
     artifact_lines="${artifact_lines}- Container images: **not built** for this release (the build machine has no Docker)."$'\n'
 fi
 
-# ---- checksums ----------------------------------------------------------------
-( cd "${out}" && sha256sum "${sums_files[@]}" >SHA256SUMS && sha256sum -c SHA256SUMS >/dev/null ) \
-    || die "sha256sum does not accept the sums that were just written"
-printf '\nSHA256SUMS:\n'
-cat "${out}/SHA256SUMS"
+# ---- checksums, signed ------------------------------------------------------------
+# One list for both majors, the plain names of the files (the release page of each tag holds them without their directory), so that it is checked in a
+# directory that holds the downloaded files. Its name differs from the verifier's (kingres-verify-SHA256SUMS), which is on the same page.
+sums_name="kingres-SHA256SUMS"
+sums_paths=()
+for f in "${sums_files[@]}"; do sums_paths+=("${out}/${f}"); done
+sums_tmp="${tmp}/sums"
+mkdir -p "${sums_tmp}"
+"${rel_tool}" sums --out "${sums_tmp}/${sums_name}" "${sums_paths[@]}" || die "cannot write the checksums"
+check_dir="${tmp}/check"
+mkdir -p "${check_dir}"
+for f in "${sums_files[@]}"; do ln -s "${out}/${f}" "${check_dir}/$(basename "${f}")"; done
+( cd "${check_dir}" && sha256sum -c "${sums_tmp}/${sums_name}" >/dev/null ) || die "sha256sum does not accept the sums that were just written"
+"${rel_tool}" sign --key-file "${key_file}" --sums "${sums_tmp}/${sums_name}" --out "${sums_tmp}/${sums_name}.note" || die "cannot sign the checksums"
+verify_args=()
+for f in "${sums_files[@]}"; do verify_args+=(--binary "${out}/${f}"); done
+"${rel_verify}" release verify --sums "${sums_tmp}/${sums_name}" --note "${sums_tmp}/${sums_name}.note" --key "${pubkey}" "${verify_args[@]}" >/dev/null \
+    || die "the signed note that was just made does not verify"
+# the sums and the note reach the output directory only now: a failure above leaves no set that looks complete
+mv "${sums_tmp}/${sums_name}" "${sums_tmp}/${sums_name}.note" "${out}/"
+printf '\n%s (signed in %s.note by the release key %s):\n' "${sums_name}" "${sums_name}" "${pubkey}"
+cat "${out}/${sums_name}"
 
 # ---- release notes --------------------------------------------------------------
 changelog_file="${tmp}/changelog-section"
@@ -419,10 +536,10 @@ checks_out="${tmp}/checks"
 artifacts_file="${tmp}/artifacts"
 {
     printf '%s\n' "${artifact_lines}"
-    printf '%s\n' "- \`SHA256SUMS\` (\`sha256sum -c SHA256SUMS\`). The checksums are not signed yet; signing is the project owner's decision."
+    printf '%s\n' "- \`kingres-SHA256SUMS\` (the checksums of all the files above by their plain names; \`sha256sum -c kingres-SHA256SUMS\` in the folder that holds them) and \`kingres-SHA256SUMS.note\`, a signed note over it made with the release key \`${pubkey}\`; \`kingres-verify release verify --sums kingres-SHA256SUMS --note kingres-SHA256SUMS.note --key <the public key> --binary <file>\` checks a file against it. The packages and images themselves are not signed."
 } >"${artifacts_file}"
 notes="${out}/RELEASE-NOTES.md"
-today="$(date -u +%Y-%m-%d)"
+today="${release_date}"
 {
     while IFS= read -r line || [ -n "${line}" ]; do
         case "${line}" in

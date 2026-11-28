@@ -606,3 +606,106 @@ func TestThePromotingCallConsultsTheJournalOfTheBootstrap(t *testing.T) {
 		t.Fatal("handleFailoverPromote does not ask the journal of the bootstrap")
 	}
 }
+
+// A bootstrap that was given up and whose runner could not let go of the lease (every one of its calls failed, or answered that the lease is held) leaves the release
+// pending, so that a repeated abandon finishes it; a release that let go ends the wait.
+func TestAFailedReleaseOfTheRunnerLeavesTheReleasePendingForTheNextAbandon(t *testing.T) {
+	ctx := context.Background()
+	m, js := abandonRig(t)
+	seen := abandonWatch(m)
+	_, _ = js.Begin("b1", "s1", 3, "manual", "alice", false)
+	if err := js.Abandon("operator"); err != nil {
+		t.Fatal(err)
+	}
+	rel := failover.LeaseRequest{Group: 0, Role: failover.LeaseRelease}
+	m.noteRelease("s2", rel, failover.LeaseAnswer{}, errors.New("no majority of grantors"))
+	if !m.releasePending.Load() {
+		t.Fatal("a failed release was not remembered")
+	}
+	m.noteRelease("s2", rel, failover.LeaseAnswer{Held: true}, nil)
+	if !m.releasePending.Load() {
+		t.Fatal("an answer that the lease is held was taken for a release")
+	}
+	m.noteRelease("s2", failover.LeaseRequest{Group: 0, Role: failover.LeaseFence}, failover.LeaseAnswer{}, errors.New("x"))
+	m.noteRelease("s3", rel, failover.LeaseAnswer{}, nil)
+	m.noteRelease("s2", failover.LeaseRequest{Group: 1, Role: failover.LeaseRelease}, failover.LeaseAnswer{}, nil)
+	if !m.releasePending.Load() {
+		t.Fatal("a call that is not this server's release of the map group changed the memory")
+	}
+	ans, err := m.abandonLocalFull(ctx, "again")
+	if err != nil || !ans.Abandoned || seen.released != 1 {
+		t.Fatalf("the repeat did not finish the release: %+v %v released %d", ans, err, seen.released)
+	}
+	m.noteRelease("s2", rel, failover.LeaseAnswer{}, nil)
+	if m.releasePending.Load() {
+		t.Fatal("a release that let go did not end the wait")
+	}
+}
+
+// The calls of the runner of the bootstrap go through mapPorts.Lease: a release that fails, or that answers
+// that the lease is still held, leaves the release pending for a repeated abandon. (A test of noteRelease alone
+// would stay green if mapPorts.Lease did not call it.)
+func ownLeaseRig(t *testing.T, answer func() (failover.LeaseAnswer, error)) (*mapFailover, *journal.Store, *int) {
+	t.Helper()
+	m, js := abandonRig(t)
+	calls := newCallTable()
+	n := new(int)
+	calls.Register("POST /failover/lease", func(context.Context, string, []byte) (any, error) {
+		*n++
+		return answer()
+	})
+	m.peers = &foPeers{self: m.self, calls: calls}
+	m.releaseFence = m.releaseOwnLease
+	return m, js, n
+}
+
+func TestTheRunnersFailedReleaseThroughMapPortsLeavesTheReleasePending(t *testing.T) {
+	for name, answer := range map[string]func() (failover.LeaseAnswer, error){
+		"failed": func() (failover.LeaseAnswer, error) {
+			return failover.LeaseAnswer{}, errors.New("no majority of grantors")
+		},
+		"held": func() (failover.LeaseAnswer, error) { return failover.LeaseAnswer{Held: true}, nil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			m, _, _ := ownLeaseRig(t, answer)
+			p := &mapPorts{m: m}
+			_, _ = p.Lease(context.Background(), m.self, failover.LeaseRequest{Group: 0, Role: failover.LeaseRelease})
+			if !m.releasePending.Load() {
+				t.Fatal("the release that did not let go was not remembered")
+			}
+		})
+	}
+	m, _, _ := ownLeaseRig(t, func() (failover.LeaseAnswer, error) { return failover.LeaseAnswer{}, nil })
+	m.releasePending.Store(true)
+	if _, err := (&mapPorts{m: m}).Lease(context.Background(), m.self, failover.LeaseRequest{Group: 0, Role: failover.LeaseRelease}); err != nil || m.releasePending.Load() {
+		t.Fatalf("a release that let go did not end the wait: %v", err)
+	}
+}
+
+// The repeated abandon does not take an answer "still held" for a release: it answers that it must be repeated,
+// keeps the release pending, and does not ask the old leader to resume.
+func TestARepeatedAbandonDoesNotTakeAHeldLeaseForReleased(t *testing.T) {
+	held := true
+	m, js, calls := ownLeaseRig(t, func() (failover.LeaseAnswer, error) { return failover.LeaseAnswer{Held: held}, nil })
+	resumed := 0
+	m.resumeOldLeader = func(context.Context, string) (bool, error) { resumed++; return true, nil }
+	m.tellOldLeader = func(context.Context, string, int64, string) error { return nil }
+	_, _ = js.Begin("b1", "s1", 3, "manual", "alice", false)
+	_, _ = js.SetPlanned(journal.Planned{TaskID: 42, StandbyID: 3})
+	ctx := context.Background()
+	var p *problem.Problem
+	for i := 0; i < 2; i++ { // the abandon itself, then the repeat
+		ans, err := m.abandonLocalFull(ctx, "operator")
+		if ans.Abandoned || !errors.As(err, &p) || p.Code != problem.ServiceUnavailable || resumed != 0 || !m.releasePending.Load() {
+			t.Fatalf("round %d: %+v %v (resumed %d, pending %v)", i, ans, err, resumed, m.releasePending.Load())
+		}
+	}
+	if *calls != 2 {
+		t.Fatalf("the lease was asked to be let go of %d times, want 2", *calls)
+	}
+	held = false
+	ans, err := m.abandonLocalFull(ctx, "operator again")
+	if err != nil || !ans.Abandoned || ans.ResumedServer != "s1" || resumed != 1 || m.releasePending.Load() {
+		t.Fatalf("the repeat after the lease was let go of: %+v %v (resumed %d)", ans, err, resumed)
+	}
+}

@@ -4,10 +4,13 @@
 package safefile
 
 import (
+	"crypto/sha256"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -262,4 +265,76 @@ func TestSubDirs(t *testing.T) {
 		t.Fatalf("absent directory: %v", err)
 	}
 	within(t, func() {})
+}
+
+// A file is hashed without being held, refused above the limit (by its size, and by
+// what is read when it grew), and refused when it is not a regular file.
+func TestHashArg(t *testing.T) {
+	dir := testdir.New(t)
+	if err := os.WriteFile(filepath.Join(dir, "ok"), []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum, n, err := HashArg(filepath.Join(dir, "ok"), 5)
+	want := sha256.Sum256([]byte("hello"))
+	if err != nil || n != 5 || sum != want {
+		t.Fatalf("%x %d %v", sum, n, err)
+	}
+	if _, _, err := HashArg(filepath.Join(dir, "ok"), 4); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("over the limit: %v", err)
+	}
+	if _, _, err := HashArg(dir, 100); !errors.Is(err, ErrNotRegular) {
+		t.Fatalf("a directory: %v", err)
+	}
+	if _, _, err := HashArg(filepath.Join(dir, "absent"), 100); !errors.Is(err, fs.ErrNotExist) || Unusable(err) {
+		t.Fatalf("absent: %v", err)
+	}
+}
+
+// A file larger than the memory the test may use is hashed through the stream: the
+// reader never holds more than its buffer, and the limit is enforced while reading even
+// when the size said at the start was small.
+type growing struct {
+	left int64
+	size int64
+}
+
+func (g *growing) Stat() (fs.FileInfo, error) { return fakeInfo{g.size}, nil }
+func (g *growing) Read(p []byte) (int, error) {
+	if g.left <= 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > g.left {
+		p = p[:g.left]
+	}
+	clear(p)
+	g.left -= int64(len(p))
+	return len(p), nil
+}
+
+type fakeInfo struct{ size int64 }
+
+func (fakeInfo) Name() string       { return "f" }
+func (i fakeInfo) Size() int64      { return i.size }
+func (fakeInfo) Mode() fs.FileMode  { return 0o600 }
+func (fakeInfo) ModTime() time.Time { return time.Time{} }
+func (fakeInfo) IsDir() bool        { return false }
+func (fakeInfo) Sys() any           { return nil }
+
+func TestHashAllStreamsALargeFileAndEnforcesTheLimitWhileReading(t *testing.T) {
+	const size = int64(2) << 30 // 2 GiB of stream: held in memory it would fail the test machine
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	_, n, err := hashAll(&growing{left: size, size: size}, "big", size)
+	runtime.ReadMemStats(&after)
+	if err != nil || n != size {
+		t.Fatalf("%d %v", n, err)
+	}
+	if grew := int64(after.TotalAlloc - before.TotalAlloc); grew > 64<<20 {
+		t.Fatalf("hashing a %d byte stream allocated %d bytes", size, grew)
+	}
+	// the size said at the start is small and the file grows: the limit holds while reading
+	if _, _, err := hashAll(&growing{left: 1 << 20, size: 10}, "grew", 1000); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("a file that grew past the limit: %v", err)
+	}
 }

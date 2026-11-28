@@ -236,9 +236,13 @@ kc_parallelscan_reinitialize(Relation rel, ParallelTableScanDesc pscan)
  * What the entry points that always raise an error do where an error is
  * forbidden: the one helper decides (kc_entry_refused); where it says no the
  * entry point answers "nothing" and the transaction cannot commit if it is
- * still open.  No index can exist on a columnar table (an index build is an
- * error), so PostgreSQL itself never calls these at all; a module that does
- * gets the answer a table without rows would give, and a WARNING.
+ * still open.  A B-tree index can be built on a columnar table and its scans
+ * use the index fetches below; what stays refused here is what needs a TID of
+ * a row that is not flushed yet (fetching a row version by TID, a TID check,
+ * the second pass of CREATE INDEX CONCURRENTLY).  PostgreSQL asks for these
+ * only from AFTER ROW triggers, TID scans, foreign keys and the like; a module
+ * that calls them where an error is forbidden gets the answer a table without
+ * rows would give, and a WARNING.
  */
 /*
  * Index fetches (C6b).  An index scan hands the access method a TID, and the
@@ -334,8 +338,10 @@ kc_index_fetch_tuple(IndexFetchTableData *scan, ItemPointer tid,
 /*
  * Reached by AFTER ROW triggers (the event holds the row's TID and the
  * executor re-reads the row at the end of the statement), by TID scans and by
- * foreign key checks.  A row of a columnar table has no TID before it is
- * flushed, so none of these can work in this version.
+ * foreign key checks.  The TID of a row is its row number and an index fetch can
+ * read it back (kc_index_fetch_tuple), but this entry point is not given a
+ * way to read a row that a writer has not flushed yet, so these callers are
+ * refused with an error that says what they need.
  */
 static bool
 kc_fetch_row_version(Relation rel, ItemPointer tid, Snapshot snapshot,
@@ -1084,7 +1090,7 @@ kc_index_validate_scan(Relation table_rel, Relation index_rel,
 		return;
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("indexes on columnar tables are not supported in this version")));
+			 errmsg("CREATE INDEX CONCURRENTLY is not supported on columnar tables")));
 }
 
 /*

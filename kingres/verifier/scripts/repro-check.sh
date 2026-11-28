@@ -19,7 +19,7 @@
 #
 # The checks of this project run on a developer's machine; no workflow runs this
 # anywhere else. A third party runs the same script on their own checkout, or builds
-# once and compares with SHA256SUMS of a release (README of the verifier).
+# once and compares with kingres-verify-SHA256SUMS of a release (README of the verifier).
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -92,14 +92,14 @@ if ! cmp -s "${run}/out-1/${iso_name}" "${run}/hostile-${iso_name}"; then
     printf 'differs under a hostile Go environment (a go env -w file, GOEXPERIMENT, GOFIPS140): %s\n' "${iso_name}"
 fi
 if [ "${status}" -eq 0 ]; then
-    n="$(wc -l <"${run}/out-1/SHA256SUMS" | tr -d ' ')"
+    n="$(wc -l <"${run}/out-1/kingres-verify-SHA256SUMS" | tr -d ' ')"
     printf 'REPRODUCIBLE: %s files, identical from %s and from %s, and %s is the same under a hostile Go environment\n' "${n}" "${src1#"${run}"/}" "${src2#"${run}"/}" "${iso_name}"
-    cat "${run}/out-1/SHA256SUMS"
+    cat "${run}/out-1/kingres-verify-SHA256SUMS"
 else
     printf 'NOT REPRODUCIBLE: the two builds differ\n--- build 1\n'
-    cat "${run}/out-1/SHA256SUMS"
+    cat "${run}/out-1/kingres-verify-SHA256SUMS"
     printf -- '--- build 2\n'
-    cat "${run}/out-2/SHA256SUMS"
+    cat "${run}/out-2/kingres-verify-SHA256SUMS"
     for f in "${run}"/out-1/*; do
         b="$(basename "${f}")"
         cmp -s "${f}" "${run}/out-2/${b}" || printf 'differs: %s\n' "${b}"

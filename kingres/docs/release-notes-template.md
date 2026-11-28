@@ -20,7 +20,7 @@ The links in this list are relative to the directory `kingres/` of the tagged tr
 
 ## Files
 
-All files are listed in `SHA256SUMS`; check them with `sha256sum -c SHA256SUMS`.
+All package and image files are listed in `kingres-SHA256SUMS`, which is signed (`kingres-SHA256SUMS.note`); see below.
 
 @ARTIFACTS@
 

@@ -7,7 +7,7 @@ This guide is for the people who install and run KingresDB. It says what to do a
 | Page | What it covers |
 |---|---|
 | [quickstart.md](quickstart.md) | One node, then three nodes, up in a few commands |
-| [install.md](install.md) | Install from the Debian package or from source, for PostgreSQL 18 and 19 |
+| [install.md](install.md) | Download a release and check it, install from the Debian package, a container image or source, for PostgreSQL 18 and 19 |
 | [operator-guide.md](operator-guide.md) | The control plane and the console, servers, rebalance, failover and switchover, backups and the system database, ledger anchoring and the verifier, analytics, export and import of a table and of a database, query statistics |
 | [upgrade.md](upgrade.md) | Updating the extensions (`ALTER EXTENSION ... UPDATE`), `kingresd` and the package |
 | [limitations.md](limitations.md) | What KingresDB does not do, in the first release |

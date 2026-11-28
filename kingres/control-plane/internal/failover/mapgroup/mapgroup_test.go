@@ -24,14 +24,15 @@ type world struct {
 	pulls                     int
 	pullCheckpoint, pullState string
 	pullErr                   error
-	refusedErr                error                                // telling the old leader fails
-	behind                    int                                  // the callee answers standby_behind this many times before it promotes
-	onPromote                 func()                               // runs inside the call that promotes (a test gives the bootstrap up there)
-	resumeOldErr              error                                // the answer of the call that asks the old leader to end its hold
-	onResumeOld               func()                               // runs inside the call that asks the old leader to end its hold
-	onHolderLease             func() (failover.LeaseAnswer, error) // the answer of the holder lease call (a test gives the bootstrap up there)
-	onFenceLease              func()                               // runs inside the fence lease call, after the adoption is made (a test gives the bootstrap up there, as an abandon does)
-	promoteErr                error                                // the callee refuses a promotion that carries a proof
+	refusedErr                error                                                   // telling the old leader fails
+	behind                    int                                                     // the callee answers standby_behind this many times before it promotes
+	onPromote                 func()                                                  // runs inside the call that promotes (a test gives the bootstrap up there)
+	resumeOldErr              error                                                   // the answer of the call that asks the old leader to end its hold
+	onResumeOld               func()                                                  // runs inside the call that asks the old leader to end its hold
+	onHolderLease             func() (failover.LeaseAnswer, error)                    // the answer of the holder lease call (a test gives the bootstrap up there)
+	onFenceLease              func()                                                  // runs inside the fence lease call, after the adoption is made (a test gives the bootstrap up there, as an abandon does)
+	onRelease                 func(ctx context.Context) (failover.LeaseAnswer, error) // the answer of the call that lets go of the lease (a test makes it fail, or answer that the lease is held)
+	promoteErr                error                                                   // the callee refuses a promotion that carries a proof
 	promoteReqs               []failover.PromoteRequest
 	freezeErr                 error // FreezeLocal fails from the second call on (the agent was lost with a restart)
 	freezes                   int
@@ -145,13 +146,19 @@ func (p ports) Demote(_ context.Context, s string, r failover.DemoteRequest) (fa
 	p.w.rec("demote %s to=%s", s, r.TransferTo)
 	return failover.DemoteAnswer{Stopped: true, Transferred: true}, nil
 }
-func (p ports) Lease(_ context.Context, s string, r failover.LeaseRequest) (failover.LeaseAnswer, error) {
+func (p ports) Lease(ctx context.Context, s string, r failover.LeaseRequest) (failover.LeaseAnswer, error) {
 	switch {
 	case r.TransferTo != "":
 		p.w.rec("lease-transfer %s to %s", s, r.TransferTo)
 		return failover.LeaseAnswer{Transferred: true, Holder: r.TransferTo}, nil
 	default:
 		p.w.rec("lease-%s %s", r.Role, s)
+		if r.Role == failover.LeaseRelease && p.w.onRelease != nil {
+			return p.w.onRelease(ctx)
+		}
+		if r.Role == failover.LeaseRelease {
+			return failover.LeaseAnswer{}, nil
+		}
 		if r.Role == failover.LeaseFence && p.w.fenceRefusals > 0 {
 			p.w.fenceRefusals--
 			return failover.LeaseAnswer{Held: false, WaitMs: 9000, RefusedBy: map[string]string{"s2": "s1", "s3": "s1"}}, nil
@@ -995,5 +1002,79 @@ func TestAHolderLeaseAdoptedAfterTheAbandonIsLetGoOf(t *testing.T) {
 	}
 	if w.count("lease-release s2") != 1 || w.count("promote s2") != 0 || js.PromotionStarted() {
 		t.Fatalf("the holder lease was not let go of, or a promotion was begun:\n%s", strings.Join(w.log, "\n"))
+	}
+}
+
+// A release that answers "held" (the adoption of a promoted primary is not let go of) is not a release: the lease is asked to be let go of again, and the bootstrap ends
+// with the text that says it could not be.
+func TestAReleaseThatAnswersHeldIsNotARelease(t *testing.T) {
+	w := newWorld()
+	r, js := w.runner(t)
+	w.onFenceLease = func() { _ = js.Abandon("an operator") }
+	w.onRelease = func(context.Context) (failover.LeaseAnswer, error) { return failover.LeaseAnswer{Held: true}, nil }
+	_, err := r.Run(context.Background(), req())
+	var fe *failover.Error
+	if !errors.As(err, &fe) || fe.Code != failover.CodeSwitchoverUnproven || !strings.Contains(fe.Error(), "could not be let go of") {
+		t.Fatalf("a lease that is still held was taken for let go of: %v\n%s", err, strings.Join(w.log, "\n"))
+	}
+	if n := w.count("lease-release s2"); n != 5 {
+		t.Fatalf("the release was asked %d times, want 5:\n%s", n, strings.Join(w.log, "\n"))
+	}
+}
+
+// The release of a lease for a bootstrap that was given up has a time of its own and does not end with the call that was cancelled.
+func TestTheReleaseOfAGivenUpBootstrapHasATimeOfItsOwn(t *testing.T) {
+	w := newWorld()
+	r, js := w.runner(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	w.onFenceLease = func() { _ = js.Abandon("an operator"); cancel() }
+	var hasDeadline bool
+	var ctxErr error
+	w.onRelease = func(c context.Context) (failover.LeaseAnswer, error) {
+		_, hasDeadline = c.Deadline()
+		ctxErr = c.Err()
+		return failover.LeaseAnswer{}, nil
+	}
+	_, _ = r.Run(ctx, req())
+	if w.count("lease-release s2") != 1 || !hasDeadline || ctxErr != nil {
+		t.Fatalf("release called %d times, deadline %v, context error %v:\n%s", w.count("lease-release s2"), hasDeadline, ctxErr, strings.Join(w.log, "\n"))
+	}
+}
+
+// The wait for the fence lease says what is true when the journal is not in progress because it ended, not only when it was given up.
+func TestTheWaitForTheFenceLeaseSaysWhyItStopped(t *testing.T) {
+	w := newWorld()
+	r, js := w.runner(t)
+	j, err := js.Begin("b1", "s1", 3, "manual", "admin", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Done(journal.StepGateOpen); err != nil {
+		t.Fatal(err)
+	}
+	_, err = r.takeFence(context.Background(), j)
+	if err == nil || !strings.Contains(err.Error(), "not in progress") || w.count("lease-fence s2") != 0 {
+		t.Fatalf("a journal that ended: %v\n%s", err, strings.Join(w.log, "\n"))
+	}
+}
+
+// After the call was cancelled the release is still tried again and again (five times), on the context of its own: a first try that fails does not end the tries.
+func TestTheReleaseOfAGivenUpBootstrapIsRetriedAfterTheCallWasCancelled(t *testing.T) {
+	w := newWorld()
+	r, js := w.runner(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	w.onFenceLease = func() { _ = js.Abandon("an operator"); cancel() }
+	tries := 0
+	w.onRelease = func(context.Context) (failover.LeaseAnswer, error) {
+		tries++
+		if tries < 3 {
+			return failover.LeaseAnswer{}, errors.New("no majority of grantors")
+		}
+		return failover.LeaseAnswer{}, nil
+	}
+	_, err := r.Run(ctx, req())
+	var fe *failover.Error
+	if !errors.As(err, &fe) || !strings.Contains(fe.Error(), "was let go of") || tries != 3 {
+		t.Fatalf("tries %d, error %v\n%s", tries, err, strings.Join(w.log, "\n"))
 	}
 }
