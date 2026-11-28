@@ -23,6 +23,7 @@ Sourced: C2SP tlog-cosignature (a witness cosigns a checkpoint after verifying c
 
 ## Consequences
 
+- **Trust domain (review).** Witnesses and validators run by the project are one trust domain with the operator they constrain: they prove that the mechanism works under faults, not independence. The default trust file lists no project witness as production trust; the console and the verifier show how many witnesses of a policy are independent; "agreement among organisations" is claimed only with real independent members (design, section 18).
 - Phase 7's limits stay and are stated: nothing prevents a change; the correctness of data is not proven; an offline check proves "agreed by `k` witnesses as of the cosignature time", not that the checkpoint is the latest.
 - A notary needs at least four validators for any fault tolerance; the console says so for fewer. Over witnesses it adds a total order and a single recorded equivocation; cross-witnessing between organisations gives agreement on histories too, and a real deployment may use only layer 1.
 - Both layers are tested by the harness with faulty and partitioned members (design, section 11).

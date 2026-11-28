@@ -383,7 +383,7 @@ reopened by a new ADR.
 | A rewritten history is detectable by a third party | Yes, if an anchor or a monitor copy exists elsewhere | Yes, and offline, if k witnesses saw the older checkpoint | Yes, by every member, and recorded as equivocation |
 | A split view (two histories to two verifiers) is detectable | Only by a monitor that saw both | Yes, if `k > n/2 + f` and the verifier checks freshness: two forks each need `k` cosignatures, and the quorums share `2k - n` witnesses, an honest one of which refuses the second | Yes: one history by consensus |
 | Collusion needed to rewrite undetected | The operator, every anchor target, every mirror and the trust file | The operator and at least `2k - n` witnesses (to hide a fork), or `k` (to forge one history) | The operator and a third (to halt) or two thirds (to rewrite) of the voting power |
-| Agreement among organisations on each other's checkpoints | No | No (each witness is independent) | Yes |
+| Agreement among organisations on each other's checkpoints | No | No (each witness is independent) | Yes, **only with real independent members** (18) |
 | Total order of checkpoints of different members | No | No | Yes (block order; not real time) |
 | Consistent cut across shard groups | No | No | No (dropped, 5.3) |
 | Data correct, authorised writes, prevention | No | No | No |
@@ -574,3 +574,42 @@ Findings H6 to H7, M8 and L4 of the independent review concern this document; th
 | Open question 6, 2, 5 | Revised | 16 |
 | N8 epoch successor uniqueness (second review) | A witness records "closed, successor = X" and refuses any other successor | 5.1 |
 | N9 `max_cosignature_age` vs archived bundles (second review) | Age applies to current-state checks; archives verify "as of" a time | 5.1 |
+
+## 18. What project-run witnesses and validators prove (M9) and further review points
+
+**Trust domain.** In this release every witness and every validator is run by the project (or by the
+cluster's own operator): the owner decided on 2026-11-28 that no outside organisation exists yet. Such
+witnesses are **one trust domain** with the party they are meant to constrain, and a four-validator BFT
+network under one administrator tolerates crashes and bugs, not that administrator. The condition
+`2k - n > f` is satisfied formally with f = 0 assumed colluders and means nothing against the project.
+So:
+
+1. **What project-run layers prove:** that the formats, the quorum and freshness rules, the epoch rules,
+   the notary's state machine and the failure handling work, under the harness's faulty and partitioned
+   members. They are a **test deployment** of the mechanism.
+2. **What they do not prove:** independence. They do **not** protect against the operator of the cluster
+   that publishes the checkpoints when that operator also runs the witnesses and the validators.
+3. **The guarantee table (section 6)** states the "agreement among organisations" row as **valid only with
+   real independent members**; a deployment with none must not claim it.
+4. **The trust file.** The release's default policy **does not list the project's test witnesses as
+   production trust**: the shipped default trust file has an empty witness policy; the test witnesses are
+   in a separate, clearly named `test-policy.json`. Each witness entry in a trust file has a field
+   `operator` (a free text naming who runs it) and `independent_of_log_operator` (a boolean the
+   auditor sets); the verifier prints how many witnesses of the policy are independent and the
+   **console shows "witnesses: N, independent: M"**; with M = 0 the verifier's output says "no
+   independent witness".
+5. A real consortium use (outside members) needs the owner's counterparties; until then the layers are
+   shipped as a tested mechanism.
+
+**Further points of the second review.**
+
+- **Witness clock.** The cosignature timestamp is the witness's wall clock and is the only freshness
+  signal; the verifier cannot detect a witness with a wrong clock except by comparing several; the
+  verifier compares the cosignature times of the witnesses and warns when they differ by more than
+  `max_cosignature_skew` (trust file, default 5 minutes).
+- **`--as-of`.** The time is chosen by the user, so an archive proves "agreed by k witnesses at or before
+  that time" only if the cosignature timestamps are **checked against it**, not only the flag; the output
+  prints the newest cosignature time found and fails if it is later than the `--as-of` time.
+- **Validator-set change between a notary proof and the trust file:** the verifier **rejects** the proof
+  (a different set is not the pinned one) and prints how to refresh the pinned set from another channel
+  (the light-client rule with the trust period of section 15).

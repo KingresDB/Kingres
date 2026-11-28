@@ -55,7 +55,7 @@ source; update both).
 | # | Internal | Where | Relied on for | Test that fails |
 |---|---|---|---|---|
 | 1 | `ExecutorStart_hook`, type `void (*)(QueryDesc *, int)` | `executor/executor.h`, `execMain.c` | validating and taking the local snapshot before the executor starts | the spike's twin-row test; chain order with `fanout.c` |
-| 2 | `QueryDesc.snapshot` replaced in the hook; `CreateQueryDesc` registers it and `FreeQueryDesc` unregisters it | `tcop/pquery.c` | the local scan reads the validated snapshot | cassert run of the harness |
+| 2 | `QueryDesc.snapshot` replaced in the hook and registered before it returns; `ExecutorStart` sets `es_snapshot = RegisterSnapshot(queryDesc->snapshot)`; `CreateQueryDesc` registers and `FreeQueryDesc` unregisters; `ExecInitParallelPlan` asserts the active snapshot equals `es_snapshot` | `execMain.c`, `tcop/pquery.c`, `execParallel.c` | the local scan and its parallel workers read the validated snapshot | cassert run of the harness; parallel-query test |
 | 3 | `PushActiveSnapshot`, `PopActiveSnapshot`, `RegisterSnapshot`, `UnregisterSnapshot`, `GetLatestSnapshot`, `GetActiveSnapshot` | `utils/time/snapmgr.c`, `snapmgr.h` | candidate and active snapshot | cassert run; twin-row test |
 | 4 | `SPI_execute` with `read_only = true` uses the active snapshot | `executor/spi.c` | the local report runs under the candidate snapshot | report-equals-snapshot test |
 | 5 | `pg_prepared_xacts` columns (`transaction`, `gid`, `prepared`, `ownerid`, `dbid`) | `access/transam/twophase.c`, `catalog/pg_proc.dat` | mapping pending xids to transactions | SQL regress |
@@ -66,7 +66,7 @@ source; update both).
 | 10 | Transaction callbacks and events `PRE_PREPARE`, `PRE_COMMIT`, `COMMIT`, `ABORT` | `access/xact.h` | writer-side hooks (already used) | existing tests |
 | 11 | `GetTopTransactionIdIfAny`, `IsolationUsesXactSnapshot`, `XactReadOnly` | `access/xact.h` | which statements are covered | unit |
 | 12 | Background worker API | `postmaster/bgworker.h` | garbage collection (existing recovery worker) | existing |
-| 13 | `clock_gettime(CLOCK_MONOTONIC)` | POSIX | `mono_us` | unit |
+| 13 | `clock_gettime(CLOCK_BOOTTIME)` and `CLOCK_MONOTONIC` | POSIX / Linux | `mono_us`, spans, the anomaly check | unit, suspend nemesis |
 
 Not used, and listed so that a reviewer knows they were considered: `ProcArrayInstallRestoredXmin`,
 `SET TRANSACTION SNAPSHOT` / `pg_export_snapshot`, commit timestamps, replication origins, custom WAL

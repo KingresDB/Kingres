@@ -31,6 +31,8 @@ in [dev/documentation.md](dev/documentation.md).
   `pquery.c`), the snapshot manager, SPI's read-only snapshot, prepared transactions in the procarray,
   the xid8 snapshot functions.
 
+- Revised after an independent review of the new plan (1 critical, 4 high, 9 medium, 5 low; the table is section 19 of the design): every new round retakes all groups, a node is `young` after a boot or promotion, `parts` holds group ids, a durable per-group recording watermark, `REPEATABLE READ` coverage dropped from the release, retention conditional on participants, `observe` is a shadow protocol, `record` only counts, sender guard and registry, `CLOCK_BOOTTIME`, project-run witnesses stated as one trust domain, mutants m14 to m21, the sentence "designed to" until the conditions are established.
+
 ### How it was verified
 
 - Documentation only; relative links checked by script.

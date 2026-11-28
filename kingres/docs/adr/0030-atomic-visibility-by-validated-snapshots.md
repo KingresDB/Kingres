@@ -14,11 +14,11 @@ A consistent cut across groups would need a total order of commits that every sn
 
 ## Decision
 
-1. Every participant of a distributed transaction writes, inside that transaction and before `PREPARE`, one row (`dtx_member`) with the transaction's common id and the list of participants. The row is visible exactly when the transaction is visible at that group.
-2. A **read-only statement that reads two or more groups** acquires one snapshot per group (a helper `REPEATABLE READ READ ONLY` session for each remote group; a candidate snapshot for the local group), reads a report computed under each snapshot, and **validates** that every distributed transaction visible at one group is visible at every participant in the statement. A violation is resolved by retaking the snapshot of the lagging group after a wait; the wait is bounded; a bound exceeded **fails the statement** with a retryable error.
+1. Every participant of a distributed transaction writes, inside that transaction and before `PREPARE`, one row (`dtx_member`) with the transaction's common id and the list of participating **groups** (group ids, not node ids). A durable per-group recording watermark (`ready`) says that no row can be missing; a group that is not ready, or was started or promoted recently, makes covered statements fail or wait. The row is visible exactly when the transaction is visible at that group.
+2. A **read-only statement that reads two or more groups** acquires one snapshot per group in one parallel **round** (a helper `REPEATABLE READ READ ONLY` session for each remote group; a candidate snapshot for the local group), reads a report computed under each snapshot, and **validates** that every distributed transaction visible at one group is visible at every participant in the statement. A violation is resolved by **a new round at all groups** after a wait (a snapshot of an earlier round is never kept across a wait); the wait is bounded; a bound exceeded **fails the statement** with a retryable error.
 3. The origin bounds the prepare phase (`dtx_window`) so that the reader's window is complete.
 4. Nothing is drawn from a clock; only monotonic values of one boot of one node are compared. No server change, no restart, no preload, no commit timestamps.
-5. Every uncertainty is an error, never a read (design section 7).
+5. Every uncertainty is an error rather than a read (design section 7), under the conditions of 7.1; until they are established by the model, the harness and a review this is a design goal.
 6. The model and the differential tests come first; a Jepsen-style harness gates every increment (ADR 0034).
 
 ## Consequences
