@@ -297,3 +297,38 @@ func TestReleaseVerifyMarksASignedSetWhoseCommitIsUnknown(t *testing.T) {
 		t.Errorf("a real release: %d\n%s", code, out)
 	}
 }
+
+// The same command checks the files of the product release: a Debian package (its name has a plus) and a compressed image, listed by their plain names in a sums file
+// that is signed with the same key. A file that is a copy of another name does not match.
+func TestReleaseVerifyChecksTheFilesOfTheProductRelease(t *testing.T) {
+	r := newTestRelease(t)
+	deb := []byte("pretend deb of the product")
+	img := []byte("pretend image of the product")
+	sums, err := release.FormatSums([]release.Entry{
+		{Hash: sha256.Sum256(deb), Name: "kingres_0.1.0+pg18-1_amd64.deb"},
+		{Hash: sha256.Sum256(img), Name: "kingres-0.1.0-pg18-image.tar.gz"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	note, err := release.Sign(r.priv, sums)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := writeTemp(t, r.dir, "kingres-SHA256SUMS", string(sums))
+	n := writeTemp(t, r.dir, "kingres-SHA256SUMS.note", string(note))
+	d := writeTemp(t, r.dir, "kingres_0.1.0+pg18-1_amd64.deb", string(deb))
+	i := writeTemp(t, r.dir, "kingres-0.1.0-pg18-image.tar.gz", string(img))
+	code, out, errs := run(t, "release", "verify", "--sums", s, "--note", n, "--key", r.key, "--binary", d, "--binary", i)
+	if code != 0 || !strings.HasPrefix(out, "VERIFIED:") || !strings.Contains(out, "2 binary(ies) match") || errs != "" {
+		t.Fatalf("%d\n%s%s", code, out, errs)
+	}
+	bad := writeTemp(t, r.dir, "kingres_0.1.0+pg19-1_amd64.deb", string(deb))
+	if code, _, _ := run(t, "release", "verify", "--sums", s, "--note", n, "--key", r.key, "--binary", bad); code == 0 {
+		t.Error("a package that the sums do not list was accepted")
+	}
+	// a signed set of the verifier is not accepted for the files of the product, and the other way round, by name
+	if code, _, _ := run(t, "release", "verify", "--sums", s, "--note", n, "--key", r.key, "--binary", r.bin); code == 0 {
+		t.Error("a verifier binary matched the product sums")
+	}
+}

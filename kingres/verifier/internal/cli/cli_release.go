@@ -15,9 +15,10 @@ import (
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/release"
 )
 
-// maxReleaseBinary is the largest binary read for release verify (a build of this
-// program is about 8 MiB).
-const maxReleaseBinary = 256 << 20
+// maxReleaseBinary is the largest file read for release verify. A build of this program is
+// about 8 MiB; the files of a product release (a Debian package, a container image saved
+// and compressed) are checked with the same command and may be several hundred MiB.
+const maxReleaseBinary = 1 << 30
 
 func (e *env) runRelease(args []string) int {
 	if len(args) == 0 {

@@ -42,7 +42,8 @@ type Entry struct {
 }
 
 // validFileName reports whether name may be a file of a release: letters,
-// digits, dot, dash and underscore only, not starting with a dash or a dot, so
+// digits, dot, dash, underscore and plus (a Debian package of the product is
+// kingres_0.1.0+pg18-1_amd64.deb) only, not starting with a dash or a dot, so
 // that it is never a path, an option or a hidden file.
 func validFileName(name string) bool {
 	if name == "" || len(name) > 255 || name[0] == '-' || name[0] == '.' {
@@ -50,7 +51,7 @@ func validFileName(name string) bool {
 	}
 	for _, c := range []byte(name) {
 		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '-', c == '_':
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '-', c == '_', c == '+':
 		default:
 			return false
 		}

@@ -7,9 +7,9 @@
 #   kingres-verify-linux-amd64, kingres-verify-linux-arm64,
 #   kingres-verify-darwin-arm64, kingres-verify-windows-amd64.exe,
 #   RELEASE               which release this is: version, commit, commit date, Go release
-#   SHA256SUMS            the SHA-256 of each file (RELEASE too, so the signature covers
+#   kingres-verify-SHA256SUMS            the SHA-256 of each file (RELEASE too, so the signature covers
 #                         the version), in the form sha256sum -c reads
-#   SHA256SUMS.note       a signed note over the text of SHA256SUMS, signed by the
+#   kingres-verify-SHA256SUMS.note       a signed note over the text of kingres-verify-SHA256SUMS, signed by the
 #                         release key (Ed25519, key name kingres-verify-release)
 #
 # Usage:
@@ -165,14 +165,14 @@ files+=(RELEASE)
 
 # ---- sums and note -----------------------------------------------------------
 tool() { go run -trimpath ./cmd/kingres-release-tool "$@"; }
-tool sums --out "${out}/SHA256SUMS" "${files[@]/#/${out}/}"
-( cd "${out}" && sha256sum -c SHA256SUMS >/dev/null ) || die "sha256sum does not accept the sums that were just written"
+tool sums --out "${out}/kingres-verify-SHA256SUMS" "${files[@]/#/${out}/}"
+( cd "${out}" && sha256sum -c kingres-verify-SHA256SUMS >/dev/null ) || die "sha256sum does not accept the sums that were just written"
 
 if [ "${unsigned}" -eq 1 ]; then
-    printf '\nUNSIGNED: %s holds binaries and SHA256SUMS but no SHA256SUMS.note.\n' "${out}"
+    printf '\nUNSIGNED: %s holds binaries and kingres-verify-SHA256SUMS but no kingres-verify-SHA256SUMS.note.\n' "${out}"
     printf 'This is not a release: nobody can check who made these files.\n'
 else
-    tool sign --key-file "${key_file}" --sums "${out}/SHA256SUMS" --out "${out}/SHA256SUMS.note"
+    tool sign --key-file "${key_file}" --sums "${out}/kingres-verify-SHA256SUMS" --out "${out}/kingres-verify-SHA256SUMS.note"
     # The note is checked with the verifier itself, with the public key of the key
     # file, before anything is announced.
     pubkey="$(tool pub --key-file "${key_file}" | sed -n 's/^public key:  //p')"
@@ -181,7 +181,7 @@ else
     accept=()
     [ "${dry}" -eq 0 ] || accept=(--accept-dry-run)
     go run -trimpath ./cmd/kingres-verify release verify ${accept[@]+"${accept[@]}"} \
-        --sums "${out}/SHA256SUMS" --note "${out}/SHA256SUMS.note" --key "${pubkey}" \
+        --sums "${out}/kingres-verify-SHA256SUMS" --note "${out}/kingres-verify-SHA256SUMS.note" --key "${pubkey}" \
         --binary "${out}/${files[0]}" --binary "${out}/RELEASE" >/dev/null || die "the note that was just made does not verify"
     if [ "${dry}" -eq 1 ]; then
         printf '\nDRY RUN: %s holds signed files, but this is NOT a release (%s).\n' "${out}" "${problems[*]:-no reason}"
@@ -190,4 +190,4 @@ else
     fi
     printf 'public key (print it in the README and the documentation): %s\n' "${pubkey}"
 fi
-cat "${out}/SHA256SUMS"
+cat "${out}/kingres-verify-SHA256SUMS"
