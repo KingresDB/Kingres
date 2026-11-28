@@ -186,6 +186,9 @@ if [ "${date_given}" -eq 1 ]; then
 else
     printf 'Release date: %s (the local date of this machine; --date overrides it)\n\n' "${release_date}"
 fi
+if [ "${release_date}" != "$(date +%Y-%m-%d)" ]; then
+    printf 'WARNING: the release date %s is not today (%s) by the clock of this machine; the notes will carry it as given\n\n' "${release_date}" "$(date +%Y-%m-%d)"
+fi
 
 # ---- gate 1: a clean working tree -------------------------------------------
 status="$(g status --porcelain --untracked-files=all)"
@@ -200,10 +203,13 @@ fi
 # for it explicitly: the environment, then the configuration of the repository (a name and an e-mail made up from the host name do not count).
 ident_name="${GIT_COMMITTER_NAME:-$(g config --get user.name 2>/dev/null || true)}"
 ident_email="${GIT_COMMITTER_EMAIL:-$(g config --get user.email 2>/dev/null || true)}"
-if [ -n "${ident_name}" ] && [ -n "${ident_email}" ]; then
+# a name or an e-mail of blanks only is no identity (git refuses an empty ident name), and an e-mail has an @
+ident_name_t="$(printf '%s' "${ident_name}" | tr -d '[:space:]')"
+ident_email_t="$(printf '%s' "${ident_email}" | tr -d '[:space:]')"
+if [ -n "${ident_name_t}" ] && [ -n "${ident_email_t}" ] && [ "${ident_email_t#*@}" != "${ident_email_t}" ]; then
     gate_pass "a git committer identity is set (${ident_name} <${ident_email}>)"
 else
-    gate_fail "no git committer identity: set user.name and user.email (git config) or GIT_COMMITTER_NAME and GIT_COMMITTER_EMAIL; the tags are made after the builds and would fail there"
+    gate_fail "no git committer identity: set user.name and user.email (not blank, the e-mail with an @) (git config) or GIT_COMMITTER_NAME and GIT_COMMITTER_EMAIL; the tags are made after the builds and would fail there"
 fi
 
 # ---- gate 1c: the release key -------------------------------------------------
@@ -446,6 +452,17 @@ pubkey="$("${rel_tool}" pub --key-file "${key_file}" 2>/dev/null | sed -n 's/^pu
 [ -n "${pubkey}" ] || die "the key file ${key_file} is not a release key (the file that kingres-release-tool keygen made, mode 0600; nothing was built or tagged)"
 printf 'Release key: %s\n' "${pubkey}"
 
+# release verify and the sums tool refuse a file above this size (release.MaxFile of kingres/verifier): a file that large is found right after it is
+# built, not after the signing, and the message says why.
+max_file_bytes=1073741824
+check_size() { # FILE
+    local n
+    n="$(wc -c <"$1" | tr -d ' ')"
+    if [ "${n}" -gt "${max_file_bytes}" ]; then
+        die "$1 has ${n} bytes: kingres-verify release verify refuses a file above ${max_file_bytes} bytes, so it could not be listed in the signed sums (nothing was tagged)"
+    fi
+}
+
 # ---- the builds ---------------------------------------------------------------
 mkdir -p "${out}" "${work}"
 out="$(cd "${out}" && pwd)"
@@ -463,6 +480,7 @@ for m in 18 19; do
     printf '\n==> PostgreSQL %s: Debian package\n' "${m}"
     "${deb_sh}" --work "${work}/pg${m}" --out "${out}/pg${m}" --revision "${revision}"
     [ -f "${out}/pg${m}/${!deb}" ] || die "build-deb.sh did not produce ${out}/pg${m}/${!deb}"
+    check_size "${out}/pg${m}/${!deb}"
     sums_files+=("pg${m}/${!deb}")
     artifact_lines="${artifact_lines}- \`pg${m}/${!deb}\`"$'\n'
     if [ "${skip_images}" -eq 0 ]; then
@@ -471,6 +489,7 @@ for m in 18 19; do
         tarball="kingres-${version}-pg${m}-image.tar.gz"
         "${docker_cmd}" save "${!img}" | gzip -n >"${out}/pg${m}/${tarball}"
         [ -s "${out}/pg${m}/${tarball}" ] || die "docker save wrote nothing for ${!img}"
+        check_size "${out}/pg${m}/${tarball}"
         sums_files+=("pg${m}/${tarball}")
         artifact_lines="${artifact_lines}- \`pg${m}/${tarball}\` (\`docker load\`, image \`${!img}\`)"$'\n'
     fi
@@ -486,16 +505,20 @@ fi
 sums_name="kingres-SHA256SUMS"
 sums_paths=()
 for f in "${sums_files[@]}"; do sums_paths+=("${out}/${f}"); done
-"${rel_tool}" sums --out "${out}/${sums_name}" "${sums_paths[@]}" || die "cannot write the checksums"
+sums_tmp="${tmp}/sums"
+mkdir -p "${sums_tmp}"
+"${rel_tool}" sums --out "${sums_tmp}/${sums_name}" "${sums_paths[@]}" || die "cannot write the checksums"
 check_dir="${tmp}/check"
 mkdir -p "${check_dir}"
 for f in "${sums_files[@]}"; do ln -s "${out}/${f}" "${check_dir}/$(basename "${f}")"; done
-( cd "${check_dir}" && sha256sum -c "${out}/${sums_name}" >/dev/null ) || die "sha256sum does not accept the sums that were just written"
-"${rel_tool}" sign --key-file "${key_file}" --sums "${out}/${sums_name}" --out "${out}/${sums_name}.note" || die "cannot sign the checksums"
+( cd "${check_dir}" && sha256sum -c "${sums_tmp}/${sums_name}" >/dev/null ) || die "sha256sum does not accept the sums that were just written"
+"${rel_tool}" sign --key-file "${key_file}" --sums "${sums_tmp}/${sums_name}" --out "${sums_tmp}/${sums_name}.note" || die "cannot sign the checksums"
 verify_args=()
 for f in "${sums_files[@]}"; do verify_args+=(--binary "${out}/${f}"); done
-"${rel_verify}" release verify --sums "${out}/${sums_name}" --note "${out}/${sums_name}.note" --key "${pubkey}" "${verify_args[@]}" >/dev/null \
+"${rel_verify}" release verify --sums "${sums_tmp}/${sums_name}" --note "${sums_tmp}/${sums_name}.note" --key "${pubkey}" "${verify_args[@]}" >/dev/null \
     || die "the signed note that was just made does not verify"
+# the sums and the note reach the output directory only now: a failure above leaves no set that looks complete
+mv "${sums_tmp}/${sums_name}" "${sums_tmp}/${sums_name}.note" "${out}/"
 printf '\n%s (signed in %s.note by the release key %s):\n' "${sums_name}" "${sums_name}" "${pubkey}"
 cat "${out}/${sums_name}"
 

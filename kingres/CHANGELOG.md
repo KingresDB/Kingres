@@ -11,11 +11,12 @@ The release script ([packaging/release/release.sh](packaging/release/release.sh)
 ### Changed
 
 - **Signed checksums of the product.** `release.sh` now signs the checksums of the packages and images with the release key of the verifier (`--key-file`; a real run is refused without one, a dry run needs none). The sums are `kingres-SHA256SUMS` (the plain names of the files of both majors) and the signed note `kingres-SHA256SUMS.note`; `kingres-verify release verify` checks a package or an image against them. The sums of the verifier are named `kingres-verify-SHA256SUMS` and `kingres-verify-SHA256SUMS.note` by its script, so the two sets no longer share a name on a release page. `release verify` accepts a `+` in a file name (a Debian package has one) and files up to 1 GiB.
+- `release.sh` writes the sums and the note to a temporary directory and moves them into `--out` only after the note verifies, warns when `--date` is not today, refuses a git identity of blanks (or an e-mail without an `@`), and refuses a package or image above 1 GiB right after it is built. `release verify` and `kingres-release-tool sums` hash files as a stream with the same 1 GiB limit.
 - `release.sh` writes the date of the release notes by the local clock, not UTC, and takes `--date YYYY-MM-DD`; it prints the date at the start. It also refuses at the start, before any build, when no git committer identity is set (the tags are the last step).
 
 ### Fixed
 
-- A bootstrap of the map group that was given up no longer counts an answer "still held" to the release of its lease as a release, the release has a time of its own, and a release that could not be done by the bootstrap is finished by a repeated abandon.
+- A bootstrap of the map group that was given up no longer counts an answer "still held" to the release of its lease as a release, the release has a time of its own, and a release that could not be done by the bootstrap is finished by a repeated abandon. The release of the abandon itself does not take an answer "still held" for a release either, and the retries go on after the call was cancelled.
 - The error of `CREATE INDEX CONCURRENTLY` on a columnar table says so (it said that indexes are not supported); old comments in `kc_am.c` that said no index can exist were corrected.
 - ADR 0007 gives the implemented default of 128 buckets in its title and in the index.
 

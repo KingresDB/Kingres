@@ -78,6 +78,7 @@ while [ "$#" -gt 0 ]; do case "$1" in --work) work="$2"; shift 2 ;; --out) out="
 major="${work##*pg}"
 echo "deb ${major} ${revision}" >>"${KINGRES_TEST_LOG}"
 printf 'fake package for pg%s\n' "${major}" >"${out}/kingres_${KINGRES_TEST_VERSION}+pg${major}-${revision}_amd64.deb"
+if [ -n "${KINGRES_TEST_BIGDEB:-}" ]; then truncate -s 1073741825 "${out}/kingres_${KINGRES_TEST_VERSION}+pg${major}-${revision}_amd64.deb"; fi
 STUB
 cat >"${stubs}/build-image.sh" <<'STUB'
 #!/usr/bin/env bash
@@ -365,5 +366,35 @@ check "the saved image is the image of that tag" bash -c "gzip -dc '${out2}/pg19
 check "the notes list the image files" grep -q "docker load" "${out2}/RELEASE-NOTES.md"
 check "the notes do not say the images were not built" bash -c "! grep -q 'not built' '${out2}/RELEASE-NOTES.md'"
 check "nothing was pushed" remote_empty
+
+# ---- the identity of blanks, the date warning, a file that is too large, a late failure -------
+note "blank identity, date warning, size limit, no half set"
+tg tag -d kingres-0.1.0-pg18 kingres-0.1.0-pg19 >/dev/null 2>&1 || true
+GIT_COMMITTER_NAME=" " GIT_COMMITTER_EMAIL="x@example.invalid" release "${good_args[@]}" --out "${run}/o30" --dry-run
+if [ "${rc}" -ne 0 ] && has "no git committer identity"; then pass "refused: a GIT_COMMITTER_NAME of blanks (git would refuse it too)"; else fail "blank name env: rc ${rc}"; fi
+tg config user.name " "
+GIT_COMMITTER_NAME=" " GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 release "${good_args[@]}" --out "${run}/o31" --dry-run
+if [ "${rc}" -ne 0 ] && has "no git committer identity"; then pass "refused: a name of blanks only"; else fail "blank name: rc ${rc}"; fi
+tg config user.name "Release Test"
+tg config user.email "no-at-sign"
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 release "${good_args[@]}" --out "${run}/o32" --dry-run
+if [ "${rc}" -ne 0 ] && has "no git committer identity"; then pass "refused: an e-mail without an @"; else fail "e-mail without at: rc ${rc}"; fi
+tg config user.email "release-test@example.invalid"
+release "${good_args[@]}" --out "${run}/o33" --dry-run --date 2020-01-01
+if [ "${rc}" -eq 0 ] && has "WARNING: the release date 2020-01-01 is not today"; then pass "a date that is not today is warned about"; else fail "date warning: rc ${rc}"; fi
+release "${good_args[@]}" --out "${run}/o34" --dry-run
+if ! has "WARNING: the release date"; then pass "no warning for the local date"; else fail "warning for today"; fi
+tg tag -d kingres-0.1.0-pg18 kingres-0.1.0-pg19 >/dev/null 2>&1 || true
+rm -f "${KINGRES_TEST_LOG}"
+KINGRES_TEST_BIGDEB=1 release "${good_args[@]}" --out "${run}/o35" --skip-images
+if [ "${rc}" -ne 0 ] && has "refuses a file above 1073741824 bytes" && no_tags; then pass "refused: a package above the limit of release verify, found right after its build"; else fail "big package: rc ${rc}"; fi
+check "no sums were written for the refused package" test ! -e "${run}/o35/kingres-SHA256SUMS"
+tg tag -d kingres-0.1.0-pg18 kingres-0.1.0-pg19 >/dev/null 2>&1 || true
+printf '#!/bin/sh\nexit 1\n' >"${stubs}/verify-fail"
+chmod +x "${stubs}/verify-fail"
+KINGRES_REL_VERIFY="${stubs}/verify-fail" release "${good_args[@]}" --out "${run}/o36" --skip-images
+if [ "${rc}" -ne 0 ] && has "does not verify" && no_tags; then pass "refused: a note that does not verify, nothing tagged"; else fail "verify failure: rc ${rc}"; fi
+check "no sums and no note are left in the output after the failed verify" bash -c "test ! -e '${run}/o36/kingres-SHA256SUMS' && test ! -e '${run}/o36/kingres-SHA256SUMS.note'"
+
 
 summary
