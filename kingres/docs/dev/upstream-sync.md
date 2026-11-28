@@ -42,6 +42,37 @@ Rebasing rewrites commits. Rules, **[Recommendation]**:
 
 The hosting platform, and therefore whether branch protection can enforce these rules, is not decided yet (decision #2 is only half settled).
 
+## PostgreSQL internals that KingresDB relies on for atomic visibility (check these first)
+
+Phase 8 makes no core patch ([ADR 0032](../adr/0032-phase-8-makes-no-core-patch.md)); the extension
+relies on the internals below. **On every minor and every major upgrade, check this table first**,
+before anything else in this document: each row says where to look and which test fails if the
+internal changed. Version differences are confined to the extension's `src/pg_compat.h`; the tests run
+on PG18 and PG19. The same table, with the reasons, is in section 9.3 of
+[../design/phase8-atomic-visibility.md](../design/phase8-atomic-visibility.md) (its table is the
+source; update both).
+
+| # | Internal | Where | Relied on for | Test that fails |
+|---|---|---|---|---|
+| 1 | `ExecutorStart_hook`, type `void (*)(QueryDesc *, int)` | `executor/executor.h`, `execMain.c` | validating and taking the local snapshot before the executor starts | the spike's twin-row test; chain order with `fanout.c` |
+| 2 | `QueryDesc.snapshot` replaced in the hook and registered before it returns; `ExecutorStart` sets `es_snapshot = RegisterSnapshot(queryDesc->snapshot)`; `CreateQueryDesc` registers and `FreeQueryDesc` unregisters; `ExecInitParallelPlan` asserts the active snapshot equals `es_snapshot` | `execMain.c`, `tcop/pquery.c`, `execParallel.c` | the local scan and its parallel workers read the validated snapshot | cassert run of the harness; parallel-query test |
+| 3 | `PushActiveSnapshot`, `PopActiveSnapshot`, `RegisterSnapshot`, `UnregisterSnapshot`, `GetLatestSnapshot`, `GetActiveSnapshot` | `utils/time/snapmgr.c`, `snapmgr.h` | candidate and active snapshot | cassert run; twin-row test |
+| 4 | `SPI_execute` with `read_only = true` uses the active snapshot | `executor/spi.c` | the local report runs under the candidate snapshot | report-equals-snapshot test |
+| 5 | `pg_prepared_xacts` columns (`transaction`, `gid`, `prepared`, `ownerid`, `dbid`) | `access/transam/twophase.c`, `catalog/pg_proc.dat` | mapping pending xids to transactions | SQL regress |
+| 6 | `pg_current_snapshot`, `pg_snapshot_xip`, `pg_visible_in_snapshot` | `utils/adt/xid8funcs.c` | reading `xip` and visibility | SQL regress |
+| 7 | `SnapshotData` fields (`xmin`, `xmax`, `xip`, `xcnt`) if C code reads them | `utils/snapshot.h` | optional fast path | compile |
+| 8 | A prepared transaction stays in the procarray and in `xip` until decided | `twophase.c` `MarkAsPrepared` | the pending rule | in-doubt nemesis of the harness |
+| 9 | `PREPARE TRANSACTION`, `COMMIT PREPARED`; the gid is an opaque string up to 200 characters | SQL | the 2PC protocol and `dtx_id` | existing 2PC tests |
+| 10 | Transaction callbacks and events `PRE_PREPARE`, `PRE_COMMIT`, `COMMIT`, `ABORT` | `access/xact.h` | writer-side hooks (already used) | existing tests |
+| 11 | `GetTopTransactionIdIfAny`, `IsolationUsesXactSnapshot`, `XactReadOnly` | `access/xact.h` | which statements are covered | unit |
+| 12 | Background worker API | `postmaster/bgworker.h` | garbage collection (existing recovery worker) | existing |
+| 13 | `clock_gettime(CLOCK_BOOTTIME)` and `CLOCK_MONOTONIC` | POSIX / Linux | `mono_us`, spans, the anomaly check | unit, suspend nemesis |
+
+Not used, and listed so that a reviewer knows they were considered: `ProcArrayInstallRestoredXmin`,
+`SET TRANSACTION SNAPSHOT` / `pg_export_snapshot`, commit timestamps, replication origins, custom WAL
+resource managers, and a new preloaded library.
+
+
 ## Routine: rebasing onto a new minor release
 
 Run when upstream publishes a new `REL_18_x` tag (minor releases come at least every three months).

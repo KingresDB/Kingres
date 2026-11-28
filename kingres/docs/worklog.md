@@ -8,6 +8,63 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-28 (branch p8-design): phase 8 re-planned without core patches
+
+### What was done
+
+- The owner decided that **no core patch is made** and that both parts ship in **one release**, the BFT
+  notary included, run by the project's own test witnesses and validators. The timestamp design
+  (two core hooks, two independent reviews) moved to
+  [design/phase8-timestamp-snapshot-rejected.md](design/phase8-timestamp-snapshot-rejected.md).
+- New plan: [design/phase8-atomic-visibility.md](design/phase8-atomic-visibility.md). Atomic visibility of
+  distributed transactions for read-only statements over several groups, from ordinary snapshots
+  validated against a row each participant writes inside the transaction; no clock, no restart, no new
+  library; off by default, per database, with a kill switch, a staged rollout (`record`, `observe`,
+  `enforce`), metrics and alerts, and a table of every PostgreSQL internal relied on (also in
+  `dev/upstream-sync.md`). The guarantee is stated in plain words with the anomalies that remain
+  (causal order, write skew) and their workarounds. An upstream proposal of the hooks is described as a
+  long-term, non-dependent step.
+- ADRs 0030 to 0034 rewritten (0032 is now "no core patch"); the ledger design drops the consistent cut and
+  ships both layers in the release; the increments, the gate and the open questions are re-derived. The
+  model and the differential tests come first, a harness gates every increment.
+- Read in the PG18 and PG19 trees and cited: the executor hook and snapshot ownership (`execMain.c`,
+  `pquery.c`), the snapshot manager, SPI's read-only snapshot, prepared transactions in the procarray,
+  the xid8 snapshot functions.
+
+- Revised after an independent review of the new plan (1 critical, 4 high, 9 medium, 5 low; the table is section 19 of the design): every new round retakes all groups, a node is `young` after a boot or promotion, `parts` holds group ids, a durable per-group recording watermark, `REPEATABLE READ` coverage dropped from the release, retention conditional on participants, `observe` is a shadow protocol, `record` only counts, sender guard and registry, `CLOCK_BOOTTIME`, project-run witnesses stated as one trust domain, mutants m14 to m21, the sentence "designed to" until the conditions are established.
+
+- Second re-review (0 critical, 1 high, 5 medium, 3 low): cluster-wide readiness and settings, the switch task for `enforce`, a recovering clock anomaly, a row cap, `av_state` privileges and promotion detection, a separate `young` budget, a repartition-avoidance setting and counter; mutants m22 to m26.
+
+### How it was verified
+
+- Documentation only; relative links checked by script.
+
+### Still open
+
+- The spike (P8-S) must show that the local snapshot swap in `ExecutorStart_hook` is safe on both
+  majors; the model must catch every mutant. Nothing is built.
+- Owner questions in section 16 of the atomic visibility design and 13 of the ledger design.
+
+
+## 2026-11-28 (branch p8-design): phase 8 is designed
+
+### What was done
+
+- Wrote [design/phase8-timestamp-snapshot-rejected.md](design/phase8-timestamp-snapshot-rejected.md) (renamed later) (hybrid-clock commit timestamps, snapshots rewritten from a timestamp, two small core hooks, a model and a spike with a decision gate, the fallback of atomic visibility) and [design/phase8-multinode-ledger.md](design/phase8-multinode-ledger.md) (witness quorum first, a CometBFT notary of checkpoints second, no Raft, no replicated SQL, the consistent cut).
+- Proposed ADRs 0030 to 0034 and added them to the index; updated the phase 8 paragraphs of architecture.md, the phase table of the README, the limitations guide and the changelog.
+- Second review round (re-review of 344375cc7f: 1 critical, 3 high, 6 medium, 3 low new): the snapshot hook takes its own snapshot after the clock is raised, the token is observed before every group transaction, the clock limit is carried in WAL by a custom resource manager and the promotion stall is outside the commit hook, bounded recency has its own skew bound, the keeper is on demand with a 5 s hold. Each is in section 16.1 of the snapshot design.
+- Revised after an independent review (4 critical, 8 high, 9 medium, 4 low; each answered by id in section 16 of the snapshot design and section 17 of the ledger design): the origin joins the prepare protocol, publish-then-draw covers the prepare timestamp, the sample clock is read after the snapshot, the snapshot hook moved to `snapmgr.c` on an extension-owned copy, KP-0007 dropped (`ProcArrayInstallRestoredXmin` exists in both trees), a model and differential tests added to the gate, witness quorums must intersect, epochs are cosigned and counted.
+- Read in the code and recorded in the design: the 2PC and snapshot behaviour of `node_conn.c` and `recovery.c`, the commit timestamp code of PG18 and PG19 (`xact.c`, `twophase.c`; the PG19 rename of the origin timestamp), the absence of a snapshot hook, the monotonic-only clock rule of `kingresd`.
+
+### How it was verified
+
+- Documentation only; relative links checked by script.
+
+### Still open
+
+- The owner's decisions listed in section 14 of the snapshot design and section 13 of the ledger design.
+- The spike (P8-S) is the first test of the technique; nothing is built.
+
 ## 2026-11-28 (branch kingres-18): the first release, 0.1.0, is published
 
 ### What was done

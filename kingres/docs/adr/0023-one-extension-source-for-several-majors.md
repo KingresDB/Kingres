@@ -48,3 +48,5 @@ Supporting a further major, or dropping one, is decided by a new ADR.
 - **A port per major, on its own branch** (the plan of ADR 0002). Simple at first; rejected because every later change has to be made on each branch.
 - **Support only the newest major.** No compatibility layer, but users on a major that upstream still supports for years would have to upgrade PostgreSQL to get a KingresDB fix.
 - **Version tests wherever a difference appears.** Less ceremony than a header; rejected because the differences then spread through the code and nobody can see what a new major costs.
+
+Note of 2026-11-28: phase 8 makes no core patch ([ADR 0032](0032-phase-8-makes-no-core-patch.md)), so this ADR's rule that the three patches of the register apply to both trees unchanged stays true. The decision is unchanged. (An earlier draft of phase 8 proposed per-branch core patches; that note was withdrawn with the draft.)
