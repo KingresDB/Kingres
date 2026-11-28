@@ -31,6 +31,10 @@ const (
 	// SumsName and NoteName are the names of the two files of a release.
 	SumsName = "SHA256SUMS"
 	NoteName = "SHA256SUMS.note"
+	// MaxFile is the largest file that is listed in a sums file and checked with release verify (a package
+	// or a saved image). kingres-release-tool sums refuses a larger file, so a release is not signed
+	// with a file that its own verifier would refuse.
+	MaxFile = 1 << 30
 	// MaxSums is the largest sums file accepted (it must fit in a signed note).
 	MaxSums = signednote.MaxNoteSize
 )

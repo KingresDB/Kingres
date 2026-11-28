@@ -13,12 +13,12 @@ import (
 	"strings"
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/release"
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/safefile"
 )
 
-// maxReleaseBinary is the largest file read for release verify. A build of this program is
-// about 8 MiB; the files of a product release (a Debian package, a container image saved
-// and compressed) are checked with the same command and may be several hundred MiB.
-const maxReleaseBinary = 1 << 30
+// maxReleaseInfo is the largest RELEASE file (five short lines) held in memory; every other file is
+// hashed as a stream, so what release verify holds does not depend on the size of a package or an image.
+const maxReleaseInfo = 64 << 10
 
 func (e *env) runRelease(args []string) int {
 	if len(args) == 0 {
@@ -110,15 +110,28 @@ func releaseVerifyRun(r *result, a releaseVerifyArgs) outcome {
 	// input error whatever the note says.
 	type held struct {
 		path string
-		data []byte
+		sum  [sha256.Size]byte
+		info []byte // the bytes of the RELEASE file only
 	}
 	var bins []held
 	for _, p := range a.binaries {
-		b, err := readArg(p, maxReleaseBinary)
+		name := a.name
+		if name == "" {
+			name = filepath.Base(p)
+		}
+		if name == release.InfoName {
+			b, err := readArg(p, maxReleaseInfo)
+			if err != nil {
+				return inputOut(err)
+			}
+			bins = append(bins, held{p, sha256.Sum256(b), b})
+			continue
+		}
+		sum, _, err := safefile.HashArg(p, release.MaxFile)
 		if err != nil {
 			return inputOut(err)
 		}
-		bins = append(bins, held{p, b})
+		bins = append(bins, held{p, sum, nil})
 	}
 	if err := release.VerifyNote(sums, note, key); err != nil {
 		step := "note-signature"
@@ -147,14 +160,14 @@ func releaseVerifyRun(r *result, a releaseVerifyArgs) outcome {
 		if !ok {
 			return failedOut("binary", fmt.Errorf("%q is not in the signed sums (it lists: %s)", want, listNames(entries)))
 		}
-		got := sha256.Sum256(b.data)
+		got := b.sum
 		if !bytes.Equal(got[:], ent.Hash[:]) {
 			return failedOut("binary", fmt.Errorf("%q has SHA-256 %s, the signed sums say %s for %s", b.path, hex.EncodeToString(got[:]), hex.EncodeToString(ent.Hash[:]), want))
 		}
 		r.ok("binary", fmt.Sprintf("%s is %s: SHA-256 %s", b.path, want, hex.EncodeToString(got[:])))
 		if want == release.InfoName {
 			// the file that says which release this is: its hash is in the signed sums, so what it says is signed
-			info, err := release.ParseInfo(b.data)
+			info, err := release.ParseInfo(b.info)
 			if err != nil {
 				return failedOut("release-info", fmt.Errorf("%q matches the signed sums and is not a RELEASE file of this format: %w", b.path, err))
 			}

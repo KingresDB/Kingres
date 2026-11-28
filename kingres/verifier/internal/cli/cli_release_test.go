@@ -9,11 +9,14 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/release"
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/safefile"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
@@ -330,5 +333,56 @@ func TestReleaseVerifyChecksTheFilesOfTheProductRelease(t *testing.T) {
 	// a signed set of the verifier is not accepted for the files of the product, and the other way round, by name
 	if code, _, _ := run(t, "release", "verify", "--sums", s, "--note", n, "--key", r.key, "--binary", r.bin); code == 0 {
 		t.Error("a verifier binary matched the product sums")
+	}
+}
+
+// A file above the limit is an input error and a file below it is hashed as a stream (the
+// bytes of the checked file are not kept: only the RELEASE file is read into memory).
+func TestReleaseVerifyRefusesAFileAboveTheLimit(t *testing.T) {
+	r := newTestRelease(t)
+	big := filepath.Join(r.dir, "kingres-verify-linux-amd64")
+	f, err := os.Create(big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(release.MaxFile + 1); err != nil {
+		t.Skipf("cannot make a sparse file: %v", err)
+	}
+	f.Close()
+	if code, _, errs := run(t, r.args("--binary", big)...); code != ExitUsage || !strings.Contains(errs, "larger than the limit") {
+		t.Fatalf("%d %q", code, errs)
+	}
+}
+
+func TestReleaseVerifyHashesAFileWithoutReadingItIntoMemory(t *testing.T) {
+	r := newTestRelease(t)
+	// 200 MiB of zeros, listed under its name in a new signed set
+	big := filepath.Join(r.dir, "kingres_9.9.9+pg18-1_amd64.deb")
+	f, err := os.Create(big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(200 << 20); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	sum, _, err := safefile.HashArg(big, release.MaxFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sums, _ := release.FormatSums([]release.Entry{{Hash: sum, Name: "kingres_9.9.9+pg18-1_amd64.deb"}})
+	note, _ := release.Sign(r.priv, sums)
+	s := writeTemp(t, r.dir, "kingres-SHA256SUMS", string(sums))
+	n := writeTemp(t, r.dir, "kingres-SHA256SUMS.note", string(note))
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	code, out, errs := run(t, "release", "verify", "--sums", s, "--note", n, "--key", r.key, "--binary", big)
+	runtime.ReadMemStats(&after)
+	if code != 0 || !strings.HasPrefix(out, "VERIFIED:") {
+		t.Fatalf("%d\n%s%s", code, out, errs)
+	}
+	if grew := int64(after.TotalAlloc - before.TotalAlloc); grew > 50<<20 {
+		t.Fatalf("checking a 200 MiB file allocated %d bytes", grew)
 	}
 }

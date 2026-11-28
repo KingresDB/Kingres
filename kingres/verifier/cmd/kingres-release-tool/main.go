@@ -31,6 +31,7 @@ import (
 	"strings"
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/release"
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/safefile"
 )
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
@@ -151,11 +152,15 @@ func sums(args []string) error {
 	}
 	var es []release.Entry
 	for _, p := range fs.Args() {
-		b, err := os.ReadFile(p)
+		// A stream, not a read of the whole file; and no file above the limit of release verify: it could not be checked with the verifier of the project.
+		sum, _, err := safefile.HashArg(p, release.MaxFile)
 		if err != nil {
+			if errors.Is(err, safefile.ErrTooLarge) {
+				return fmt.Errorf("%w; release verify refuses a file above %d bytes, so the file cannot be listed in the sums", err, release.MaxFile)
+			}
 			return err
 		}
-		es = append(es, release.Entry{Hash: sha256.Sum256(b), Name: filepath.Base(p)})
+		es = append(es, release.Entry{Hash: sum, Name: filepath.Base(p)})
 	}
 	text, err := release.FormatSums(es)
 	if err != nil {
