@@ -8,6 +8,23 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-28 (branch p8-design): phase 8 is designed
+
+### What was done
+
+- Wrote [design/phase8-global-snapshot.md](design/phase8-global-snapshot.md) (hybrid-clock commit timestamps, snapshots rewritten from a timestamp, three small core hooks, a spike with a decision gate, the fallback of atomic visibility) and [design/phase8-multinode-ledger.md](design/phase8-multinode-ledger.md) (witness quorum first, a CometBFT notary of checkpoints second, no Raft, no replicated SQL, the consistent cut).
+- Proposed ADRs 0030 to 0034 and added them to the index; updated the phase 8 paragraphs of architecture.md, the phase table of the README, the limitations guide and the changelog.
+- Read in the code and recorded in the design: the 2PC and snapshot behaviour of `node_conn.c` and `recovery.c`, the commit timestamp code of PG18 and PG19 (`xact.c`, `twophase.c`; the PG19 rename of the origin timestamp), the absence of a snapshot hook, the monotonic-only clock rule of `kingresd`.
+
+### How it was verified
+
+- Documentation only; relative links checked by script.
+
+### Still open
+
+- The owner's decisions listed in section 14 of the snapshot design and section 13 of the ledger design.
+- The spike (P8-S) is the first test of the technique; nothing is built.
+
 ## 2026-11-28 (branch kingres-18): the first release, 0.1.0, is published
 
 ### What was done
