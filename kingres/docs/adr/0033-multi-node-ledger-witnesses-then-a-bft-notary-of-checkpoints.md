@@ -14,18 +14,18 @@ Sourced: C2SP tlog-cosignature (a witness cosigns a checkpoint after verifying c
 
 ## Decision
 
-1. Layer 1: independent witnesses follow the published checkpoints, verify consistency and cosign (C2SP formats); the verifier accepts a checkpoint when k of n listed witnesses cosigned it.
-2. Layer 2: a notary, a CometBFT network run by member organisations, whose application is a deterministic state machine that verifies and records members' signed checkpoints and consistency proofs. It executes no SQL.
+1. Layer 1: independent witnesses follow the published checkpoints, verify consistency and cosign (C2SP formats). A trust file lists a **witness policy**: the witnesses, a threshold `k`, and a maximum age of a cosignature. The verifier rejects a policy with `k <= n/2` (two disjoint quorums could cosign two forks; a split view needs at least `2k - n` colluding witnesses), and a checkpoint below the threshold, stripped of cosignatures or too old is a failure; it only warns when the trust file has no policy. An epoch change is accepted only with a closing statement at the witnesses' stored head, and is visible and counted, not prevented.
+2. Layer 2: a notary, a CometBFT network run by member organisations, whose application is a deterministic state machine that verifies and records members' signed checkpoints and consistency proofs and records equivocation as evidence in a successful transaction. It executes no SQL. It is built only when a real counterparty exists.
 3. Raft is not used for the ledger.
 4. Replicated SQL (order-then-execute) is not built; it is reopened only with a named consortium use case.
 5. Consensus is over closed checkpoints, never on a transaction's commit path; the chain format is unchanged.
-6. With the global snapshot on, the aggregate may be a consistent cut (leaf format 2).
+6. With the global snapshot on, the aggregate may be a consistent cut (leaf format 2, refused explicitly by an old verifier).
 
 ## Consequences
 
-- Phase 7's limits stay and are stated: nothing prevents a change; the correctness of data is not proven.
-- A notary needs at least four validators for any fault tolerance; the console says so for fewer.
-- Layer 1 can ship alone and before the global snapshot.
+- Phase 7's limits stay and are stated: nothing prevents a change; the correctness of data is not proven; an offline check proves "agreed by `k` witnesses as of the cosignature time", not that the checkpoint is the latest.
+- A notary needs at least four validators for any fault tolerance; the console says so for fewer. Over witnesses it adds a total order and a single recorded equivocation, little else, since organisations can witness each other.
+- Layer 1 can ship alone and before the global snapshot; it needs no core patch.
 
 ## Alternatives considered
 

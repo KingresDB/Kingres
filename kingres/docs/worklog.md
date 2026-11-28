@@ -12,8 +12,9 @@ in [dev/documentation.md](dev/documentation.md).
 
 ### What was done
 
-- Wrote [design/phase8-global-snapshot.md](design/phase8-global-snapshot.md) (hybrid-clock commit timestamps, snapshots rewritten from a timestamp, three small core hooks, a spike with a decision gate, the fallback of atomic visibility) and [design/phase8-multinode-ledger.md](design/phase8-multinode-ledger.md) (witness quorum first, a CometBFT notary of checkpoints second, no Raft, no replicated SQL, the consistent cut).
+- Wrote [design/phase8-global-snapshot.md](design/phase8-global-snapshot.md) (hybrid-clock commit timestamps, snapshots rewritten from a timestamp, two small core hooks, a model and a spike with a decision gate, the fallback of atomic visibility) and [design/phase8-multinode-ledger.md](design/phase8-multinode-ledger.md) (witness quorum first, a CometBFT notary of checkpoints second, no Raft, no replicated SQL, the consistent cut).
 - Proposed ADRs 0030 to 0034 and added them to the index; updated the phase 8 paragraphs of architecture.md, the phase table of the README, the limitations guide and the changelog.
+- Revised after an independent review (4 critical, 8 high, 9 medium, 4 low; each answered by id in section 16 of the snapshot design and section 17 of the ledger design): the origin joins the prepare protocol, publish-then-draw covers the prepare timestamp, the sample clock is read after the snapshot, the snapshot hook moved to `snapmgr.c` on an extension-owned copy, KP-0007 dropped (`ProcArrayInstallRestoredXmin` exists in both trees), a model and differential tests added to the gate, witness quorums must intersect, epochs are cosigned and counted.
 - Read in the code and recorded in the design: the 2PC and snapshot behaviour of `node_conn.c` and `recovery.c`, the commit timestamp code of PG18 and PG19 (`xact.c`, `twophase.c`; the PG19 rename of the origin timestamp), the absence of a snapshot hook, the monotonic-only clock rule of `kingresd`.
 
 ### How it was verified

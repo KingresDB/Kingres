@@ -70,6 +70,7 @@ At minimum, in WSL2 (build instructions are in [getting-started.md](getting-star
 7. A check that the `PG_MODULE_MAGIC` ABI check still accepts the extensions (a minor release should not change the ABI; confirm by loading them).
 8. Confirm that `core.eol` and `core.autocrlf` still keep the tree LF (`git diff --stat` after the rebase must show only intended changes).
 
+9. (From phase 8, once KP-0005 and KP-0006 exist: [ADR 0032](../adr/0032-phase-8-core-patches-are-two-hooks-one-per-branch.md).) Each core patch of the register that touches commit, prepare or snapshot code is carried once per product branch. After a rebase, re-apply or re-check both branches' versions, run the differential snapshot tests and the model of the phase 8 design, and confirm that `kingres_snapshot` still builds and loads against both patched trees.
 **[Needs verification]** The architecture document recommends a nightly CI job that merges the latest upstream stable tag and runs the full suite. The project runs no CI (GitHub Actions is switched off, see [releases.md](releases.md)), so there is no such job; the equivalent is to run this routine by hand when upstream publishes a tag. How a dry run is made (merge in a throwaway branch versus a dry-run rebase) is open.
 
 ## A new major version

@@ -2,7 +2,7 @@
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # Phase 8, part 2: a multi-node ledger with consensus (design)
 
-Status: Proposed design, 2026-11-28; not implemented. Where this document says "exists" it
+Status: Proposed design, 2026-11-28, revised the same day after an independent review (section 17); not implemented. Where this document says "exists" it
 describes `kingres-18` at d1344c1aa9 and names the file.
 
 Builds on [ledger-phase7.md](ledger-phase7.md) (chains per shard group, the aggregate digest,
@@ -127,10 +127,21 @@ state is consistent with what it had seen before. Clients can require a quorum o
 [spec](https://www.github.com/C2SP/C2SP/blob/main/tlog-cosignature.md); the witness HTTP API is
 C2SP `tlog-witness`, and `transparency-dev/witness` implements it,
 [pkg.go.dev](https://pkg.go.dev/github.com/transparency-dev/witness)). **Threat model:** the log
-operator (and the cluster) may be wholly malicious; the verifier trusts that **fewer than k** of the
-chosen witnesses collude with it (and, for liveness, that k are reachable). No agreement among
-witnesses is needed (each acts alone), so there is no consensus protocol, no leader and no
-membership agreement. **Chosen** for M1, as the first and cheapest increment, because it adds the
+operator (and the cluster) may be wholly malicious. Each witness acts alone, so there is no
+consensus protocol, no leader and no membership agreement, and **therefore quorums must intersect**:
+with `n` witnesses and a threshold `k`, an operator can show fork A to one set of `k` witnesses and
+fork B to another set of `k`; the two sets share at least `2k - n` witnesses, and an honest one of
+them refuses the second fork. A split view therefore needs at least `2k - n` colluding witnesses.
+The policy rule is **`2k - n > f`**, where `f >= 1` is the number of colluding witnesses the auditor
+assumes; `k <= n/2` is **rejected** by the verifier (two disjoint quorums exist), and `k >= floor(2n/3) + 1`
+is recommended. "Fewer than k collude" is not the condition. For liveness `k` witnesses must be
+reachable. **Freshness is separate:** a validly cosigned old checkpoint stays valid for ever, so a
+verifier that is shown only an old bundle cannot tell. A cosignature carries a timestamp
+(C2SP `tlog-cosignature`); the trust file has `max_cosignature_age` and the verifier fails a
+checkpoint whose newest cosignature is older (`--max-age` overrides), and `kingres-witness` answers
+anyone's request for the latest checkpoint it holds so that an auditor or a monitor can compare
+witnesses (a gossip by pull). An offline verification then proves "agreed by `k` witnesses as of the
+cosignature time", and no more. **Chosen** for M1, as the first and cheapest increment, because it adds the
 property phase 7 lacks (a third party that will notice, and prove, a split view or a rollback)
 with the formats phase 7 already publishes.
 
@@ -154,7 +165,7 @@ the row router would need a deterministic mode. **Not built.** See section 4.
 | Option | Threat model | Trust assumption | Adds beyond phase 7 | Cost | Decision |
 |---|---|---|---|---|---|
 | Phase 7 aggregate + anchors + monitors (exists) | Rewrite is detected if an anchor or monitor copy exists elsewhere | Auditor keeps trust file and a monitor | n/a | exists | keep |
-| Witness quorum (C2SP cosignatures) | Malicious operator; split view; rollback | Fewer than k witnesses collude | k-of-n proof that others saw the same history, checked offline | Small to medium | **build first (M1)** |
+| Witness quorum (C2SP cosignatures) | Malicious operator; split view; rollback | Quorums intersect (`2k - n > f`) and fewer than `2k - n` witnesses collude; freshness is checked separately | k-of-n proof that others saw the same history, checked offline | Small to medium | **build first (M1)** |
 | Raft | Crash faults only | Same trust domain | Availability of a sequencer (already have failover) | Medium | reject |
 | CometBFT notary of checkpoints | Up to f of 3f+1 Byzantine members | Fewer than a third of voting power malicious | Agreement among organisations on each other's histories; one global order of checkpoints; members cannot equivocate | Large | **build second (M2)** |
 | Replicated SQL (M3) | Mutually distrusting writers of shared rows | Same as BFT | Shared data | Very large; determinism contract | not built; open question 1 |
@@ -220,6 +231,26 @@ witnesses and verifiers start it as a new log and record the old one as closed b
 A restored system database that forks the aggregate log (limitations.md, "The ledger") is thus
 detected, where today only anchors and monitors would notice.
 
+**Epochs (H7).** "A new epoch is a new log origin" would be a hole: an operator could rewrite
+everything and publish under a fresh origin. The rule is: a new epoch is accepted by a witness for a
+known cluster key **only** together with a **closing statement of the old log**, a note signed by the
+cluster key that names the old origin and the `(size, root)` that the witness itself holds (the
+largest it cosigned), and the new log's first checkpoint embeds that `(size, root)` and a count of
+epochs. The tail between the restored state and the witnessed size is declared lost in the statement
+(the statement is how the loss becomes visible). A witness refuses a new origin without it, rate-limits
+epoch changes, and publishes each as an event; the console and `kingres-verify` show "epoch changed
+N times, last on ...". The old epoch stays verifiable against its cosigned head, so proofs under the old
+epoch cannot be replaced by anything the new epoch says. This **makes an epoch change visible and
+countable; it does not prevent one**: an operator can still start a new epoch and lose history, and
+the auditor sees it.
+
+**Policy and downgrade (H7).** When the trust file lists a witness policy, a checkpoint with
+fewer than `k` valid cosignatures, with none (stripped), or older than `max_cosignature_age`, is a
+**failure** of `kingres-verify`, exactly as a bad signature is: the policy is the auditor's own file. Only
+when the trust file has **no** witness policy does the verifier warn that witnesses are not checked.
+The flag `--require-witnesses` is not needed for this; it remains as a way to fail a trust file that has
+no policy.
+
 **What it adds, precisely.** If an attacker with the cluster and its signing key rewrites history
 and publishes it, a verifier that requires k cosignatures rejects the rewritten checkpoints unless
 the attacker also controls k witnesses, and at least one honest witness holds proof of the fork.
@@ -267,8 +298,11 @@ Transaction kinds:
    (or equal with the same root: idempotent), and the consistency proof from the stored `(size, root)`
    verifies (the same RFC 9162 verification the verifier and `kingres_ledger` already have). On success the
    stored pair is replaced. On failure the transaction is rejected in `CheckTx` and `FinalizeBlock`
-   (no state change), and the rejection is a record: an **equivocation** event is stored when the
-   member signed two checkpoints of the same size with different roots.
+   with no state change. **Evidence of equivocation is a separate, successful transaction**
+   `report_equivocation(note1, note2)` (two notes signed by the member's key for the same size and
+   different roots): when it verifies, the member is marked equivocating in the state and both notes
+   are stored. Any member can send it, including after a rejected `submit` (a rejected transaction
+   leaves no record by itself).
 2. `register`, `rotate_key`, `retire`: membership and key changes of members, authorised by the
    members' own keys and by a vote rule (a member change needs signatures from a majority of
    members, a validator-set change needs the CometBFT validator update rules; **[Needs verification]**
@@ -313,6 +347,10 @@ snapshot of part 1 the round can read all heads **at one timestamp `S`**:
    so the block holds exactly the pending transactions committed at or below `S`).
 2. The aggregate leaf gains a format 2 field `cut_ts` (the leaf has a `format` field,
    ledger-phase7.md 5.2; format 1 leaves stay valid; the verifier prints "cut at `S`" for format 2).
+   **An old verifier must refuse a format 2 leaf explicitly** (an unknown format is an error, not a
+   skip), and the release notes say that bundles with a cut need the verifier of that release (L4).
+   The block builder is a writing transaction: under a rewritten snapshot it may meet a serialization
+   failure on the rows it updates; the increment tests that and retries the block build.
 3. The statement of 5.6 can then be made: the heads are the heads **as of one global snapshot**; a
    distributed transaction is in all its groups' blocks of this cut or in none.
 
@@ -341,7 +379,7 @@ next block", so it only needs the snapshot to be the rewritten one).
   new member: nothing special.
 - **Keys:** the server signing key is the one of phase 7; the notary uses a separate validator key
   per validator (CometBFT's `priv_validator_key.json`), kept outside PostgreSQL in the files of
-  `kingres-notary` (phase 7, principle 4), backed up as phase 7 9.2 describes. Witness keys belong
+  `kingres-notary` (phase 7, principle 4), backed up as phase 7 9.2 describes, **except `priv_validator_state.json`, which must never be restored from a backup** (an old state makes the validator double-sign, the same rule as for a witness). Witness keys belong
   to the witness.
 
 ## 6. Guarantees, in precise words
@@ -349,8 +387,8 @@ next block", so it only needs the snapshot to be the rewritten one).
 | Statement | Phase 7 (exists) | + witnesses (layer 1) | + notary (layer 2) |
 |---|---|---|---|
 | A rewritten history is detectable by a third party | Yes, if an anchor or a monitor copy exists elsewhere | Yes, and offline, if k witnesses saw the older checkpoint | Yes, by every member, and recorded as equivocation |
-| A split view (two histories to two verifiers) is detectable | Only by a monitor that saw both | Yes: at most one extension of a checkpoint can be cosigned by an honest witness | Yes: one history by consensus |
-| Collusion needed to rewrite undetected | The operator, every anchor target, every mirror and the trust file | The operator and at least k witnesses | The operator and a third (to halt) or two thirds (to rewrite) of the voting power |
+| A split view (two histories to two verifiers) is detectable | Only by a monitor that saw both | Yes, if `k > n/2 + f` and the verifier checks freshness: two forks each need `k` cosignatures, and the quorums share `2k - n` witnesses, an honest one of which refuses the second | Yes: one history by consensus |
+| Collusion needed to rewrite undetected | The operator, every anchor target, every mirror and the trust file | The operator and at least `2k - n` witnesses (to hide a fork), or `k` (to forge one history) | The operator and a third (to halt) or two thirds (to rewrite) of the voting power |
 | Agreement among organisations on each other's checkpoints | No | No (each witness is independent) | Yes |
 | Total order of checkpoints of different members | No | No | Yes (block order; not real time) |
 | Consistent cut across shard groups | No | No | Yes with the global snapshot (5.3), the same in all layers |
@@ -406,7 +444,7 @@ proof. Rule since 2026-11-28: the CLI command comes with the REST change.
 
 1. **A witness is a trust root** of the verifier: its key is pinned in the trust file; a stolen
    witness key lets an attacker forge one of k signatures. Policy: choose independent
-   operators; k at least 2; the key rotation event of phase 7, 3.3, applies.
+   operators; k above n/2 and recommended at least floor(2n/3) + 1 (the verifier rejects a policy with k <= n/2); the key rotation event of phase 7, 3.3, applies.
 2. **The witness API is a network service** that parses a checkpoint and a proof: input size
    limits (the phase 7 limits for proofs), no state change before verification, constant-time
    signature checks (standard library), rate limits per cluster key; it never writes anything but
@@ -493,9 +531,7 @@ increments that touch `kingres_shard`).
 4. **Validator model:** one validator per member organisation (default), or one per server.
 5. **Dependency exception:** accept CometBFT as a pinned third-party dependency of `kingres-notary`
    (Apache-2.0, large). Default: yes, limited to that binary, with an ADR (0034).
-6. **Name of the policy in the trust file and whether `kingres-verify` should refuse a bundle with
-   no witnesses once a cluster has configured witnesses.** Default: warn, not refuse; a flag
-   `--require-witnesses` refuses.
+6. **Name of the policy in the trust file.** Decided by the review (H7): a trust file with a witness policy makes a checkpoint below the threshold, stripped of cosignatures, or older than `max_cosignature_age` a failure; a warning only when there is no policy. No open decision remains here except the field names.
 
 ## 14. Sources
 
@@ -506,3 +542,46 @@ relational database (arXiv 1903.01919), Wuest and Gervais (ePrint 2017/375), Com
 application requirements. Background, to check before the ADRs are accepted: the Raft paper and the
 licences of `etcd-io/raft` and `hashicorp/raft`; the exact text of C2SP `tlog-witness`; the CometBFT
 light client specification and `app_version` handling.
+
+## 15. The notary after the review (M8)
+
+1. **Validator state.** The validator's signing state file must not be restored from a backup (an old
+   state makes the validator double-sign, which the notary itself would record as equivocation by that
+   validator). The backup rule for the key does not cover the state file.
+2. **Validator-set updates and long-range attacks.** A verifier that pins a validator set must verify
+   validator-set changes the way a light client does, with a **trust period**: a pinned set older than
+   the period is not trusted until the auditor refreshes it from another channel. Old keys that are
+   no longer validators could otherwise sign a rewritten history later (weak subjectivity). The trust
+   file has `notary_trust_period`.
+3. **Evidence** is a successful `report_equivocation` transaction (5.2), not a rejected one.
+4. **Freshness** of a notary proof is the same problem as for cosignatures (3.3): a proof shows that a
+   checkpoint was recorded at a block height, not that it is the latest. The verifier takes the
+   newest block it can reach (online) or fails a proof older than `max_notary_age` from the trust file.
+5. **Value, stated plainly.** Over witnesses the notary adds a **total order** of the members'
+   checkpoints and a **single recorded equivocation**; agreement among organisations on each other's
+   histories can already be had by cross-witnessing, each organisation running a witness for the
+   others. **Recommendation:** build layer 1 first and do not build layer 2 before a real counterparty
+   exists (open question 2); the design of layer 2 stays here as the next step.
+
+## 16. Open questions, revised
+
+The questions of section 13 stand with these changes: 2. has default "no layer 2 until a counterparty
+exists"; 5. the CometBFT decision is taken when a counterparty exists, as a child process over the ABCI
+socket; 6. is decided (above).
+
+## 17. Review of 2026-11-28 and where each finding is answered
+
+Findings H6 to H7, M8 and L4 of the independent review concern this document; the others are in
+[phase8-global-snapshot.md](phase8-global-snapshot.md) section 16.
+
+| Finding | Answer | Where |
+|---|---|---|
+| H6 quorum intersection, freshness | Rule `2k - n > f`, `k <= n/2` rejected, `k >= floor(2n/3) + 1` recommended; `max_cosignature_age`, a pull-based "latest checkpoint" answer for monitors; table rows corrected | 3.3, 6 |
+| H7 epochs and stripped cosignatures | Epoch change needs a closing statement at the witness's stored head and is visible and counted, not prevented; a policy in the trust file makes below-threshold a failure; warning only without a policy | 5.1 |
+| M8 (a) validator state backup | Never restore the state file | 5.4 (keys), 15 |
+| M8 (b) validator-set updates, long range | Light-client verification with a trust period | 15 |
+| M8 (c) equivocation record vs rejection | `report_equivocation` is its own successful transaction | 5.2 |
+| M8 (d) notary proof freshness | `max_notary_age`, newest block | 15 |
+| M8 (e) value over witnesses | Stated; layer 2 deferred until a counterparty | 15, 16 |
+| L4 block builder under a rewritten snapshot; format 2 | Tested and retried; an old verifier refuses a format 2 leaf explicitly | 5.3 |
+| Open question 6, 2, 5 | Revised | 16 |
