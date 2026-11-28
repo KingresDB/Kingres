@@ -33,6 +33,8 @@ in [dev/documentation.md](dev/documentation.md).
 
 - Revised after an independent review of the new plan (1 critical, 4 high, 9 medium, 5 low; the table is section 19 of the design): every new round retakes all groups, a node is `young` after a boot or promotion, `parts` holds group ids, a durable per-group recording watermark, `REPEATABLE READ` coverage dropped from the release, retention conditional on participants, `observe` is a shadow protocol, `record` only counts, sender guard and registry, `CLOCK_BOOTTIME`, project-run witnesses stated as one trust domain, mutants m14 to m21, the sentence "designed to" until the conditions are established.
 
+- Second re-review (0 critical, 1 high, 5 medium, 3 low): cluster-wide readiness and settings, the switch task for `enforce`, a recovering clock anomaly, a row cap, `av_state` privileges and promotion detection, a separate `young` budget, a repartition-avoidance setting and counter; mutants m22 to m26.
+
 ### How it was verified
 
 - Documentation only; relative links checked by script.

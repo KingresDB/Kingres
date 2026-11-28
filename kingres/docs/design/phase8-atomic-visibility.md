@@ -200,7 +200,13 @@ A statement is covered when **all** hold:
    repartitioned join** (8 of 1.1: the join ships rows through the origin's sessions to temporary
    relations in the target group's transaction session, which is not the helper snapshot).
 
-`EXPLAIN` shows the verdict (4.8). A statement that is not covered **runs exactly as today** and says
+`EXPLAIN` shows the verdict (4.8). **The planner can switch between a repartitioned plan and a complete scan with statistics**, so the same
+statement could be covered on one day and not the next; therefore (N3) the setting
+`kingres_shard.atomic_visibility_avoid_repartition` (default **on** in `enforce`) makes a statement that
+would be covered but for a repartitioned join be **planned without repartitioning** (the existing
+`enable_repartition_join` switch at `fragment_scan.c`, applied per statement; the complete scan answers,
+ADR 0022), and every statement that is not covered is counted in `av_statements_not_covered_total{reason}`.
+A statement that is not covered **runs exactly as today** and says
 why. (A statement that is covered but whose evidence is missing **fails**, section 7: that is not
 "not covered".)
 
@@ -241,14 +247,42 @@ transaction is visible at this group under that snapshot"**.
 on this node during the window.
 
 **Bounded prepare phase.** The origin measures (`CLOCK_BOOTTIME`) the time from sending the first
-`PREPARE` to having every answer. If it exceeds `kingres_shard.dtx_window` (default 1 s) the origin acts
+`PREPARE` to having every answer, **and evaluates the rule at the moment of the decision, not at the first
+prepare** (N2). If it exceeds `kingres_shard.dtx_window` (default 1 s) the origin acts
 according to `kingres_shard.dtx_window_action`: `count` (only the counter `dtx_window_overrun_total`;
 **the default in `record` and `observe`**: those modes change nothing for writers, M4) or `rollback` (roll
 the transaction back with an error before writing the decision; **the default in `enforce`**). The
 rollback happens before the decision row, so it cannot abort a transaction that any participant has
-committed.
+committed. **Switching to `enforce` while overruns exist is unsafe** (N2): in `record` and `observe` an overrun
+is only counted, so a transaction with a 3 s prepare phase may have been decided just before the switch and
+its rows at the first group are older than the seeds. The switch task therefore (a) refuses `enforce`
+unless `dtx_window_action = rollback` is in effect on **every** node, (b) first sets the action to
+`rollback` while the mode is still `observe`, then (c) waits until **no overrun was counted in the last
+`Wt + dtx_window` and no kingres prepared transaction older than `dtx_window` exists on any node**, and only
+then sets `enforce`. Mutant m23: an overrun transaction decided before the switch.
 
-**Recording watermark (H3).** `av_state.ready` is `true` only while **every distributed transaction that
+**Recording watermark (H3) and cluster-wide readiness (N1).** The rows of a transaction are written by
+the batches of its **origin**, which may be a node outside the statement's groups, so the evidence of every
+group depends on every node that can originate a distributed transaction: its version (a 0.10 origin sends
+no insert), `record`, `dtx_window`, `dtx_window_action`, and its own gaps. Readiness is therefore
+**cluster-wide**: `av_state.ready` of each group feeds a **cluster state in the catalog of the map group**
+(`kingres.av_cluster`: `ready`, the expected `settings_hash` of version, `record`, `dtx_window`,
+`dtx_window_action`, the mode, and the catalog version), pushed to every node with the catalog push. Every
+report carries `cluster_ready`, the node's own `settings_hash` and the expected one; **a statement fails as
+`evidence_missing` unless `cluster_ready` is true at every group of the statement and every `settings_hash`
+equals the expected one** (mutant m22: a gap or a different setting at a node outside the statement). Gaps
+are entered by **tasks that first set `cluster_ready = false`, push it and wait for every node to
+acknowledge the catalog version, and only then perform the gap action** (record off, restore, adding a
+node, a version change, a promotion that may have lost rows); an out-of-band gap (a restore by hand, a
+configuration file edited, rows deleted) is tampering (7.1). **The origin refuses to start a distributed
+transaction** when its database is in `observe` or `enforce` and its own `settings_hash` differs from the
+expected one (a local check of shared memory at precommit), so an origin that starts with wrong settings
+cannot write transactions without evidence. `av_state` is written only by the extension owner through
+functions that the `kingresd` service role (the tasks) and, for `av_reset_ready()`, a superuser can call,
+both audited; ordinary roles have no write privilege. A failover to a **lagging standby** can show a stale
+`ready = true` (the same class as `dtx_incident`, stated in 7.1): the failover task marks the promoted group
+not ready unless it proved that the new primary had everything (synchronous replication). A gap that falls
+inside one round's span is negligible (the round reads `ready` under its snapshot) and stated. `av_state.ready` is `true` only while **every distributed transaction that
 prepares at this group writes its row, and no prepared kingres transaction older than the last gap
 exists anywhere**. These events make a group not ready (a **gap**): `record` switched off and on again;
 an extension version change (upgrade or downgrade); a restore or point-in-time recovery of the group
@@ -261,8 +295,11 @@ removed by hand are tampering that the design cannot detect and says so (7.1). `
 by the setting's check hook while the database's mode is `observe` or `enforce`.
 
 **Clock.** `kingres.mono_us()` reads `clock_gettime(CLOCK_BOOTTIME)` and checks it against
-`CLOCK_MONOTONIC`: if the two diverge by more than 100 ms since the instance started, the node
-reports `clock_anomaly` (7.1). Nothing compares values of two nodes. `boot_id` changes at each instance
+`CLOCK_MONOTONIC`: the node measures the divergence **over a sliding window of `Wt`** (the change of the
+difference in the last `Wt`); if it exceeds 100 ms the node reports `clock_anomaly` and the alert
+`monotonicClockAnomaly`; it **recovers by itself after a full `Wt` without a further jump** (N3: one pause of
+a quarter of a second must not disable the node until restart), and a node that had an anomaly is `young`
+for `Wt + dtx_window` after the jump (rows measured across the pause have unreliable ages). Nothing compares values of two nodes. `boot_id` changes at each instance
 start, so a value is only compared within one boot.
 
 **Garbage (M1, M8).** A row is deleted only when **all** hold: it is older than
@@ -271,7 +308,13 @@ prepared on this node; and every other participant group (from `parts`) confirms
 recovery worker, that it has no prepared transaction with that `dtx_id` (recovery already connects to
 every primary). A row is therefore never removed while its transaction is in doubt at any participant.
 Size: at 5 000 distributed transactions per second, 3 participants, 60 s, about 300 000 rows per node
-plus two indexes; checked in the rollout (9.2).
+plus two indexes; checked in the rollout (9.2). **A dead or removed participant (N4):** while a participant
+does not answer, rows of every transaction it took part in accumulate at the others. The bound:
+`kingres_shard.dtx_member_max_rows` (default 5 000 000 per node); the alert `dtxMemberBacklog` fires at half of
+it; **when the cap is hit the oldest rows are removed and the cluster becomes not ready** (readers fail with
+`evidence_missing`, never read without the evidence) until the participant is back or removed. The task that
+removes a group from the cluster clears the confirmations it owed and deletes the rows that waited for it.
+A row kept too long is safe; the cap is only the size bound.
 
 ### 4.2 The report
 
@@ -279,8 +322,11 @@ plus two indexes; checked in the rollout (9.2).
 `REPEATABLE READ READ ONLY`, or SPI read-only under a candidate snapshot at the local group) and
 returns, for this group:
 
-- `mono_now`, `boot_id`, **`ready`**, **`young`** (true when the instance started, or was promoted from
-  a standby, less than `Wt + dtx_window` ago, H1), `clock_anomaly`, `recording`;
+- `mono_now`, `boot_id`, **`ready`**, **`cluster_ready`**, `settings_hash`, the expected hash, **`young`**
+  (true when the instance started, was promoted from a standby, or had a clock jump less than
+  `Wt + dtx_window` ago, H1; **promotion is detected by a worker of the extension that watches the
+  recovery state every 100 ms** (`RecoveryInProgress()` leaving true) and records the instant in shared
+  memory), `clock_anomaly`, `recording`;
 - **`cands`**: `(dtx_id, parts, age_us)` for every `dtx_member` row **visible under the snapshot**
   with `boot_id = current` and `mono_us >= mono_now - window_us`. If no distributed transaction has
   prepared on this node during the last `window_us` (`last_prepare_mono`), the table is not read;
@@ -304,9 +350,14 @@ acquisition at all groups in parallel**; the proof uses only the reports and sna
    (`CLOCK_BOOTTIME`) the **acquisition span**, from the first send to the last answer.
    `Wt = 2 * (dtx_window + slop)`, `slop = kingres_shard.av_slop` (default 500 ms), so 3 s by default.
    If the span is larger than `slop`, the round is **not trusted**: start a new round (step 4).
-2. **Evidence checks first.** If any report says `ready = false`, `young`, `clock_anomaly`, or
-   `recording = false`, or a `boot_id` differs from one seen earlier in the same statement, **the
-   statement fails** (7) after waiting for `young` to pass, within `av_wait_timeout`.
+2. **Evidence checks first.** If any report says `ready = false`, `cluster_ready = false`, a
+   `settings_hash` different from the expected one, `young`, `clock_anomaly`, or `recording = false`, or a
+   `boot_id` differs from one seen earlier in the same statement, **the statement fails** (7), after waiting
+   for `young` to pass **within its own budget `av_young_wait` (default 6 s), separate from the round budget
+   `av_wait_timeout`** (N6). **Expected behaviour after a failover:** covered statements that include the
+   promoted group wait up to about `Wt + dtx_window` (4 s by default) and then proceed, or fail
+   `unavailable` if the budget is exceeded; the operator guide says so, and the alert
+   `atomicVisibilityGroupNotReady` names the group (and node) that blocks.
 3. **Validate** (at the coordinator, no further round trip in the common case). A violation is a pair
    `(D, g)`: "D is visible at some group of `G` and not visible at `g`, a participant in `G`".
    - **Seeds.** For each `g1` and each `D` in `cands_g1` with `age <= Wt / 2`: for every group `g2` among
@@ -345,7 +396,7 @@ they are told which session to use.
 
 **Every sender goes through the helper (M5).** The point where a fragment obtains its connection is the
 pair `kingres_shard_get_conn` + `kingres_shard_begin_xact` (`node_conn.c`), used at `fragment_scan.c:521-522`
-and by the other senders (`batch_sender.c`, `copy_routed.c`, `fanout.c`; the list is to be completed in P8-S).
+and by the other senders (`batch_sender.c`, `copy_routed.c`, `fanout.c`; the reads of `remote_scan.c` and `dist_scan.c` reach their connection through the fragment start; the registry lists **reads** only and is an output of P8-S).
 Design: (1) a **session role** argument (`transaction` or `read helper`) in those two functions; a covered
 statement sets a per-statement context that makes them return the helper; (2) a **runtime guard**: while the
 context is active, any read through a connection that is not the helper is an error
@@ -463,7 +514,7 @@ measurement, with the protocol of 6.3.
 |---|---|---|
 | One `INSERT` into `dtx_member` per participant per distributed transaction, one row of about 100 bytes, plus its garbage | writers of 2PC transactions only | one more statement in the `PREPARE` batch; no extra round trip. Measured as the throughput of the existing 2PC benchmark with `record` on and off |
 | Origin's prepare-phase measurement | origin of 2PC | a clock read and a compare (`count`); a rollback only in `enforce` |
-| Acquisition and report round | every covered statement | one round trip to every group in parallel before the fragments start, plus the report function: an index range scan of the rows prepared in the last 3 s (`D rate x 3 s` entries; empty when none prepared in the window) |
+| Acquisition and report round (**also in `observe`, as the shadow**, which never waits or fails but adds the round trip and the helper connections) | every covered statement | one round trip to every group in parallel before the fragments start, plus the report function: an index range scan of the rows prepared in the last 3 s (`D rate x 3 s` entries; empty when none prepared in the window) |
 | Helper connections | readers | one more connection per node per backend; counted against `max_connections` of the nodes |
 | Unresolved lookups | covered statements while some old transaction is pending | a second round trip; rare |
 | New rounds | covered statements that overlap a distributed commit | one round trip per round **at all groups** (C1), more than a one-group retake; the probability grows with the distributed commit rate and the commit-phase skew; the metric `av_rounds` |
@@ -502,7 +553,7 @@ covered).
 | Acquisition span above `slop` in every round | `unavailable` |
 | A report is missing or a helper session breaks | the statement fails as a failed remote session does today |
 | `dtx_member`, `av_state` or `av_report` missing at a node (old version, not installed) | `evidence_missing` |
-| A group is `not ready`, `young`, or in `clock_anomaly`, or reports `recording = false` | `evidence_missing` (after waiting for `young`, within the bound) |
+| A group is `not ready`, the **cluster** is not ready, a node's settings differ from the expected ones, or a group is `young`, in `clock_anomaly` or reports `recording = false` | `evidence_missing` (after waiting for `young` within `av_young_wait`) |
 | `boot_id` of a report is not what the node reported before in the same statement | `unavailable` |
 | A monotonic value goes backward within one boot | `evidence_missing`, alert `monotonicClockAnomaly` |
 | A read through a non-helper session while a covered statement is active (M5) | `evidence_missing` (a bug, caught) |
@@ -515,8 +566,9 @@ The statement "an error rather than a fractured read" holds under these conditio
 model, the harness and the review must establish and the operator guide must state:
 
 1. The mode is `enforce` for the database and the kill switch is off.
-2. Every group in the statement is `ready`, not `young`, without `clock_anomaly`, and recording
-   (4.1).
+2. The **cluster** is ready with equal settings at every node, and every group in the statement is not
+   `young`, without `clock_anomaly`, and recording (4.1). Gaps are entered by tasks that mark the cluster
+   not ready first; a failover to a lagging standby is the `dtx_incident` class.
 3. The origin enforces `dtx_window` (`dtx_window_action = rollback`).
 4. The statement is one round with span at most `slop` (4.3).
 5. `dtx_member` rows are not deleted or truncated by hand (tampering is not detected; the setting is a
@@ -536,10 +588,10 @@ merged, the report lists the commands).
 | REST operation (new) | Purpose | `kingres-cli` |
 |---|---|---|
 | `getAtomicVisibility` | Per database: mode, scope, kill switch state, `ready` per group, counters (validations, rounds, waits, errors by SQLSTATE, shadow violations in `observe`), oldest decided-and-pending transaction | `kingres-cli atomic-visibility status [--database d]` |
-| `setAtomicVisibility` (task) | Change the mode of a database: `off`, `record`, `observe`, `enforce`, and the scope `autocommit` or `statements`; the task checks every node (version, record on, every group ready, no old transaction pending) and says what blocks; it also runs the readiness steps of 4.1 | `kingres-cli atomic-visibility set --database d --mode enforce --scope autocommit` |
+| `setAtomicVisibility` (task) | Change the mode of a database: `off`, `record`, `observe`, `enforce`, and the scope `autocommit` or `statements`; the task checks every node (version, record on, **cluster ready with equal settings**, no old transaction pending), runs the `enforce` preparation of 4.1 (action `rollback`, no overrun in the window) and says what blocks; it also runs the readiness steps of 4.1 | `kingres-cli atomic-visibility set --database d --mode enforce --scope autocommit` |
 | `killAtomicVisibility`, `unkillAtomicVisibility` | Cluster-wide kill switch, effective for new statements at once (9.2) | `kingres-cli atomic-visibility kill`, `unkill` |
-| Alerts (new kinds) | `atomicVisibilityWaitHigh`, `inDoubtDecidedTransaction` (critical after 60 s), `atomicVisibilityErrorsHigh`, `atomicVisibilityGroupNotReady`, `dtxWindowOverrun`, `dtxIncident`, `monotonicClockAnomaly`, `clockSkew` (information: wall clocks are not used for correctness) | `kingres-cli alerts` |
-| Metrics | `kingres_av_validations_total{result}`, `kingres_av_rounds`, `kingres_av_wait_seconds`, `kingres_av_errors_total{sqlstate}`, `kingres_av_shadow_violations_total`, `kingres_av_decided_pending_age_seconds`, `kingres_dtx_member_rows`, `kingres_dtx_window_overrun_total` | `kingres-cli metrics` |
+| Alerts (new kinds) | `dtxMemberBacklog`, `atomicVisibilityWaitHigh`, `inDoubtDecidedTransaction` (critical after 60 s), `atomicVisibilityErrorsHigh`, `atomicVisibilityGroupNotReady`, `dtxWindowOverrun`, `dtxIncident`, `monotonicClockAnomaly`, `clockSkew` (information: wall clocks are not used for correctness) | `kingres-cli alerts` |
+| Metrics | `kingres_av_validations_total{result}`, `kingres_av_statements_not_covered_total{reason}`, `kingres_av_rounds`, `kingres_av_wait_seconds`, `kingres_av_errors_total{sqlstate}`, `kingres_av_shadow_violations_total`, `kingres_av_decided_pending_age_seconds`, `kingres_dtx_member_rows`, `kingres_dtx_window_overrun_total` | `kingres-cli metrics` |
 
 Console: a card "Atomic visibility" on the Dashboard and a tab on the Databases page (mode, scope,
 kill, per group readiness, the counters, the examples of 3.3 in a help panel). `kingres-cli` prints the
@@ -556,7 +608,7 @@ same status.
    (to test the clock rule), failover in the middle of a transaction **and inside the prepare window**
    (H1), in-doubt 2PC at every `kingres_shard_fault_point` (`after_first_prepare`, `after_prepare`,
    `after_log`, and recovery's), **recording gaps** (record off and on, restore from backup, a node added,
-   an old extension version, rows deleted by hand: each must be detected or refused, H3), and a lock wait
+   an old extension version, rows deleted by hand: each must be detected or refused, H3; **a gap at an origin outside the statement's groups, N1**; a participant down for a long time, N4), and a lock wait
    between snapshot and executor start. The checker is the fractured-read detector of 11 plus the
    invariants of 4.6; **an increment merges only when the harness passes on PG18 and PG19 and its negative
    controls fail on the broken builds.**
@@ -590,6 +642,9 @@ same status.
      **protocol's cost and the rate at which it would have retaken**, not the fractures of the statement's
      own data; the harness's twin-row detector measures the latter in `off` and `enforce` and must agree
      with the shadow counts in order of magnitude. A writer is still not rolled back.
+  2b. **Before `enforce`:** the task sets `dtx_window_action = rollback` on every node while the mode is
+     still `observe`, waits until no overrun was counted for `Wt + dtx_window` and no kingres prepared
+     transaction older than `dtx_window` exists, and checks cluster readiness and equal settings (4.1).
   3. `enforce` with scope `autocommit` (read-only autocommit statements first). Reads come from the
      validated helper snapshots; slow prepare phases are rolled back at the origin.
   4. scope `statements` (read-only part of explicit transactions).
@@ -663,7 +718,7 @@ conditions of 7.1. Every public statement of the guarantee is the sentence of se
    old version) with a lookup miss read as "invisible" (H3); (m18) a snapshot of level 3 older than the
    statement start (H4); (m19) retention deleting a row while the transaction is in doubt at another
    participant (M1); (m20) a clock freeze or suspend between acquisitions with `CLOCK_MONOTONIC` (M6);
-   (m21) the origin not updating `last_prepare_mono` (M7).**
+   (m21) the origin not updating `last_prepare_mono` (M7); (m22) a gap or a different setting (version, `record`, `dtx_window`, `dtx_window_action`) at a node that is not in the statement (N1); (m23) an overrun transaction decided before the switch to `enforce` (N2); (m24) a sticky clock anomaly never recovering, and the opposite, an anomaly ignored (N3); (m25) a row cap that removes evidence without making the cluster not ready (N4); (m26) a stale ready after a promotion to a lagging standby (N5).**
 2. **Differential tests on stock PG18 and PG19** (no kingres code needed): the twin-row test (each
    distributed transaction sets the same counter in rows of two groups; a covered statement must read
    equal counters) with the harness's own detector, in modes `off` (must fail: the anomaly is real and
@@ -734,8 +789,10 @@ server changes, the plan is **restricted**: only remote groups are validated and
 through a loopback helper session (slower), still without core change; if neither works, the feature is not
 built and the limitation stays documented (a new ADR, the owner informed).
 
-**P8-1 may not start until** the text of 4.3 (retake all), 4.1 (group ids, boot and promotion, readiness)
-is in the model and passes: those were the findings that held back code.
+**P8-1 may not start until** the text of 4.3 (retake all), 4.1 (group ids, boot and promotion, **cluster-wide
+readiness and settings**, the origin check, the switch task of N2) is in the model and the model passes:
+those were the findings that held back code. The remaining mediums (clock recovery, retention cap,
+the `young` budget, the counters) are scheduled inside P8-2 to P8-4.
 
 ## 14. Relation to the ledger part
 
@@ -771,6 +828,8 @@ commits `3858bd7e0f`, `344375cc7f` and `f01ff9459a` (branch `p8-design`) and in
    "writers fail rather than readers" is conditional on the overrun rate measured in `record`.
 2. **Retention and window defaults** (`dtx_member_retention` 60 s, `slop` 500 ms, `av_wait_timeout` 5 s,
    `av_max_rounds` 20). Default: as stated.
+2b. **Added defaults** from the second re-review: `av_young_wait` 6 s, `dtx_member_max_rows` 5 000 000, `av_statements`
+   avoid-repartition on in `enforce`, clock-anomaly window `Wt`. Default: as stated.
 3. **Posting the upstream proposal** (15): who and when. Default: after P8-S, so that the proposal can
    cite measurements.
 4. **Acceptance numbers of 6.2.** Default: as proposed.
@@ -843,3 +902,20 @@ in the text and the model. Each finding:
 | Low: ADR consistency | ADRs updated | ADRs 0030 to 0034 |
 | "never a wrong answer" wording | Weakened to "designed to", with the conditions of 7.1, restored only when they are established | 0, 7, 7.1 |
 | Mutants m14 to m21 | Added | 11.1 |
+
+### 19.1 Re-review of 6db41363bb
+
+Of the 19 earlier items, 17 were fixed and 2 partly (H3, M6); the re-review found 0 critical, 1 high, 5
+medium and 3 low new problems. P8-1 may start once the model passes, with N1 and N2 in the text. Each item:
+
+| Finding | Status | Answer | Where |
+|---|---|---|---|
+| N1 (high) evidence is written by the origin, readiness per group | fixed | Cluster-wide readiness and settings: a cluster state in the catalog (ready, expected settings hash), carried in every report; a statement fails unless the cluster is ready and every node's settings equal the expected ones; gaps are entered by tasks that set not-ready, push, wait for every node to acknowledge, then act; an origin with a different settings hash refuses to start a distributed transaction in `observe` or `enforce`; mutant m22. Finishes H3 | 4.1, 4.2, 4.3 step 2, 7, 7.1, 11.1 |
+| N2 switch to `enforce` with overrun transactions | fixed | The rule is evaluated at the decision; the switch task sets action `rollback` while in `observe`, waits for no overrun and no old prepared transaction, then sets `enforce`, and refuses otherwise; mutant m23 | 4.1, 9.2, 8, 11.1 |
+| N3 sticky `clock_anomaly`; coverage and repartition | fixed | Sliding-window divergence that recovers after `Wt`, `young` after a jump, an alert; counter `av_statements_not_covered_total{reason}`; `atomic_visibility_avoid_repartition` (default on in `enforce`) plans covered candidates without repartitioning (the existing `enable_repartition_join`); mutant m24. Finishes M6 | 4.1, 3.4, 8, 11.1 |
+| N4 retention with a dead or removed participant | fixed | A row cap (`dtx_member_max_rows`), an alert at half, the cluster becomes not ready when the cap removes rows, the removal task clears confirmations; mutant m25 | 4.1 Garbage, 8 |
+| N5 who writes `av_state`, promotion detection, stale ready | fixed | Only the owner's functions called by the `kingresd` tasks and `av_reset_ready()` (superuser), audited; a worker watches the recovery state for promotion; the failover task marks the group not ready unless synchronous replication proved completeness; a gap inside one round's span stated; mutant m26 | 4.1, 4.2 |
+| N6 `young` shares the round budget | fixed | Its own budget `av_young_wait` (6 s); the expected behaviour after a failover is stated | 4.3 step 2 |
+| Low: observe cost | fixed | The shadow's round trip and helper connections are counted | 6.1 |
+| Low: name the blocking group | fixed | The alert and the console name the group and node | 4.3 step 2, 8 |
+| Low: reads in `remote_scan.c` and `dist_scan.c` in the registry | fixed | Stated; the registry lists reads and is a spike output | 4.4 |
