@@ -122,20 +122,20 @@ pubkey="$(sed -n 's/^public key:  //p' "${run}/keygen.txt")"
 check "a key was made for the test" test -n "${pubkey}"
 check "release.sh makes a signed release (a dry run: this tree is not a tagged clean checkout)" bash "${ver}/scripts/release.sh" --version "${version}" --out "${rel}" \
     --key-file "${keyfile}" --dry-run --targets "linux/amd64 windows/amd64"
-check "the release has the note" test -f "${rel}/SHA256SUMS.note"
+check "the release has the note" test -f "${rel}/kingres-verify-SHA256SUMS.note"
 check "the packaged binary is the release file of the same version, byte for byte" \
     cmp "${root}${prefix}/bin/kingres-verify" "${rel}/kingres-verify-linux-amd64"
 packaged="${root}${prefix}/bin/kingres-verify"
 check "the packaged copy accepts the release and its binary" "${packaged}" release verify \
-    --sums "${rel}/SHA256SUMS" --note "${rel}/SHA256SUMS.note" --key "${pubkey}" --binary "${rel}/kingres-verify-linux-amd64"
+    --sums "${rel}/kingres-verify-SHA256SUMS" --note "${rel}/kingres-verify-SHA256SUMS.note" --key "${pubkey}" --binary "${rel}/kingres-verify-linux-amd64"
 cp "${rel}/kingres-verify-linux-amd64" "${run}/kingres-verify-linux-amd64"
 printf 'x' >>"${run}/kingres-verify-linux-amd64"
 status=0
-"${packaged}" release verify --sums "${rel}/SHA256SUMS" --note "${rel}/SHA256SUMS.note" --key "${pubkey}" \
+"${packaged}" release verify --sums "${rel}/kingres-verify-SHA256SUMS" --note "${rel}/kingres-verify-SHA256SUMS.note" --key "${pubkey}" \
     --binary "${run}/kingres-verify-linux-amd64" >/dev/null 2>&1 || status=$?
 check_eq "a changed binary is status 1" 1 "${status}"
 status=0
-"${packaged}" release verify --sums "${rel}/SHA256SUMS" --note "${rel}/SHA256SUMS.note" \
+"${packaged}" release verify --sums "${rel}/kingres-verify-SHA256SUMS" --note "${rel}/kingres-verify-SHA256SUMS.note" \
     --key "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" >/dev/null 2>&1 || status=$?
 check_eq "another key is status 1" 1 "${status}"
 
@@ -169,12 +169,12 @@ if command -v git >/dev/null; then
     check "its RELEASE file records no commit" grep -qx 'commit: unknown' "${run}/r-dry/RELEASE"
     # release verify of that set is not a plain pass: status 5 and the words NOT A RELEASE, unless --accept-dry-run asks for status 0
     dstatus=0
-    "${packaged}" release verify --sums "${run}/r-dry/SHA256SUMS" --note "${run}/r-dry/SHA256SUMS.note" --key "${pubkey}" \
+    "${packaged}" release verify --sums "${run}/r-dry/kingres-verify-SHA256SUMS" --note "${run}/r-dry/kingres-verify-SHA256SUMS.note" --key "${pubkey}" \
         --binary "${run}/r-dry/RELEASE" >"${run}/r-dry-verify.log" 2>&1 || dstatus=$?
     check_eq "release verify of a dry-run set ends with status 5" 5 "${dstatus}"
     check "and says NOT A RELEASE" grep -q '^VERIFIED (NOT A RELEASE):' "${run}/r-dry-verify.log"
     dstatus=0
-    "${packaged}" release verify --accept-dry-run --sums "${run}/r-dry/SHA256SUMS" --note "${run}/r-dry/SHA256SUMS.note" --key "${pubkey}" \
+    "${packaged}" release verify --accept-dry-run --sums "${run}/r-dry/kingres-verify-SHA256SUMS" --note "${run}/r-dry/kingres-verify-SHA256SUMS.note" --key "${pubkey}" \
         --binary "${run}/r-dry/RELEASE" >/dev/null 2>&1 || dstatus=$?
     check_eq "and with --accept-dry-run ends with status 0" 0 "${dstatus}"
     # an empty array under set -u is an unbound variable on bash before 4.4: release.sh expands it in the form that those accept (P7H-05)
@@ -186,9 +186,9 @@ if command -v git >/dev/null; then
     rtry "${run}/r-ok" "${run}/r-ok.log"
     check_eq "a signed release from the tagged clean commit is made" 0 "${rstatus}"
     check "its RELEASE file names the version and the commit" sh -c "grep -qx 'version: 9.9.9' '${run}/r-ok/RELEASE' && grep -qx 'commit: ${head}' '${run}/r-ok/RELEASE'"
-    check "RELEASE is in the signed sums" grep -q '  RELEASE$' "${run}/r-ok/SHA256SUMS"
+    check "RELEASE is in the signed sums" grep -q '  RELEASE$' "${run}/r-ok/kingres-verify-SHA256SUMS"
     pub2="$(cd "${ver}" && go run -trimpath ./cmd/kingres-release-tool pub --key-file "${keyfile}" | sed -n 's/^public key:  //p')"
-    check "release verify shows the signed version and commit" sh -c "'${root}${prefix}/bin/kingres-verify' release verify --sums '${run}/r-ok/SHA256SUMS' --note '${run}/r-ok/SHA256SUMS.note' --key '${pub2}' --binary '${run}/r-ok/RELEASE' | grep -q 'version 9.9.9, commit ${head}'"
+    check "release verify shows the signed version and commit" sh -c "'${root}${prefix}/bin/kingres-verify' release verify --sums '${run}/r-ok/kingres-verify-SHA256SUMS' --note '${run}/r-ok/kingres-verify-SHA256SUMS.note' --key '${pub2}' --binary '${run}/r-ok/RELEASE' | grep -q 'version 9.9.9, commit ${head}'"
     echo "a change that is not committed" >"${g}/kingres/verifier/scripts/untracked.txt"
     rtry "${run}/r-dirty" "${run}/r-dirty.log"
     check_eq "a signed release from a dirty tree is refused" 1 "${rstatus}"

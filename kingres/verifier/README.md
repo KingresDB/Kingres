@@ -80,7 +80,7 @@ check out the tag, and build with the Go release that `go.mod` names (`go 1.27.3
 ```
 cd kingres/verifier
 scripts/build-one.sh linux amd64 0.1.0 ./kingres-verify    # GOOS GOARCH VERSION OUTPUT
-sha256sum kingres-verify                                   # compare with the line of SHA256SUMS
+sha256sum kingres-verify                                   # compare with the line of kingres-verify-SHA256SUMS
 ```
 
 `scripts/build-one.sh` is the one place that holds the flags: `CGO_ENABLED=0 go build -trimpath
@@ -96,16 +96,16 @@ release and at each later one (no tag exists before the first):
 | File | What it is |
 |---|---|
 | `kingres-verify-linux-amd64`, `kingres-verify-linux-arm64`, `kingres-verify-darwin-arm64`, `kingres-verify-windows-amd64.exe` | the binaries |
-| `SHA256SUMS` | one line per binary in the form `sha256sum -c` reads: 64 lower case hex characters, two spaces, the file name |
-| `RELEASE` | which release this is: the version, the commit, the commit date (UTC) and the Go release that built the files, five lines; it is listed in `SHA256SUMS` like a binary, so the signature covers it (P7R-07) |
-| `SHA256SUMS.note` | a signed note (the format of the checkpoints) whose text is exactly `SHA256SUMS`, signed with the release key: Ed25519, key name `kingres-verify-release` |
+| `kingres-verify-SHA256SUMS` | one line per binary in the form `sha256sum -c` reads: 64 lower case hex characters, two spaces, the file name |
+| `RELEASE` | which release this is: the version, the commit, the commit date (UTC) and the Go release that built the files, five lines; it is listed in `kingres-verify-SHA256SUMS` like a binary, so the signature covers it (P7R-07) |
+| `kingres-verify-SHA256SUMS.note` | a signed note (the format of the checkpoints) whose text is exactly `kingres-verify-SHA256SUMS`, signed with the release key: Ed25519, key name `kingres-verify-release` |
 
 Check them **before you run anything**, with a verifier you already trust (a build of your own, or
 one from an earlier release) and the release key **that you got from the documentation, a printout
 or a colleague, not from the place you downloaded the files from**:
 
 ```
-kingres-verify release verify --sums SHA256SUMS --note SHA256SUMS.note \
+kingres-verify release verify --sums kingres-verify-SHA256SUMS --note kingres-verify-SHA256SUMS.note \
     --key <release key> --binary kingres-verify-linux-amd64
 ```
 
@@ -117,6 +117,8 @@ Statuses: 0 verified; 1 a check failed, the step is named (`note-parse`, `note-s
 `note-text`, `sums-format`, `binary`, `release-info`) and `VERIFIED` is not printed; 2 a flag or file is wrong, or
 the key cannot be read. Status 3 is not used: every check that is asked for is made or fails.
 With no `--binary` the note alone is checked, and the output says that no binary was.
+
+**The files of the product use the same key and the same command.** From the release after 0.1.0 the checksums of the Debian packages and container images of KingresDB are signed with this release key too (`packaging/release/release.sh --key-file`): `kingres-SHA256SUMS` lists the plain names of the files of both majors and `kingres-SHA256SUMS.note` is the signed note over it. The two sets are on the same release page and their names differ (`kingres-verify-SHA256SUMS` for the verifier, `kingres-SHA256SUMS` for the product). `release verify` checks any file by its name against whichever set you give it: `--binary kingres_0.1.0+pg18-1_amd64.deb` or `--binary kingres-0.1.0-pg18-image.tar.gz` work as they do for a verifier binary (a name may hold letters, digits and `. - _ +`; a file may be up to 1 GiB; the sums file lists plain names, never paths). A package is checked against the product sums, a verifier binary against the verifier sums; a file listed in the other set is not found. The product sums have no `RELEASE` file, so the version is the one in the file names. Only the checksums are signed, not the packages and images. 0.1.0 was published with the verifier's sums renamed by hand to these names and an unsigned product `SHA256SUMS` with `pg18/...` paths, which `release verify` cannot read.
 
 **The release key.** The project's public release key (Ed25519, key name `kingres-verify-release`),
 held by the project owner:
@@ -146,7 +148,7 @@ scripts/release.sh --version 0.1.0 --out ../../release-0.1.0 --key-file /path/to
 installs is the same file as `kingres-verify-linux-amd64`); it is never guessed. The script
 refuses a Go release other than the one of `go.mod` (`KINGRES_ALLOW_TOOL_MISMATCH=1` for a trial),
 an output directory that is not empty, and a key file that others can read. It builds the four
-files, writes `SHA256SUMS`, checks it with `sha256sum -c`, signs it, and verifies the note it just
+files, writes `kingres-verify-SHA256SUMS`, checks it with `sha256sum -c`, signs it, and verifies the note it just
 made with `release verify` before it prints anything. `--unsigned` builds and sums without a note
 and says in capitals that the result is not a release.
 

@@ -75,7 +75,7 @@ Read this before you decide what to run on KingresDB. Each item is a boundary th
 ## Packaging and distribution
 
 - Debian package and container image, amd64, Ubuntu 24.04 only. No RPM, no arm64, no Windows server. No `-dbgsym` package, no `kingres-dev` package.
-- The packages and images are not signed, there is no apt repository, no SBOM, and no published image registry. Checksums are in `SHA256SUMS`, not signed.
+- The packages and images are not signed, there is no apt repository, no SBOM, and no published image registry. The checksums of the packages and images (`kingres-SHA256SUMS`) are signed with the release key from the release after 0.1.0 on; 0.1.0 has an unsigned `SHA256SUMS`.
 - No Patroni, no etcd and no bundled metrics store (by design: [../adr/0021-failover-in-kingresd.md](../adr/0021-failover-in-kingresd.md), [../adr/0020-no-bundled-metrics-store.md](../adr/0020-no-bundled-metrics-store.md)).
 - No automated backup, no point-in-time recovery archive configuration, and no backup of the certificate authority key ([operator-guide.md](operator-guide.md), section 7).
 - The compose cluster is for development; its test does not exercise removing a server, failover, switchover or rebalance.

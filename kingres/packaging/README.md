@@ -16,7 +16,7 @@ package, and tests each of them.
 | Debian package | `deb/` | `kingres_<version>+pg18-<revision>_amd64.deb` or `kingres_<version>+pg19-<revision>_amd64.deb` with the `kingres.service` unit |
 | Artifact tests | `test/` | Image, compose and package tests (the package test runs systemd in a container); each is run once per major |
 | Where the checks run | developer machines | Every check of this directory runs on a developer's machine (see [Tests of the artifacts](#tests-of-the-artifacts)); no CI workflow of this project exists, runs or is published on GitHub, by decision of the project owner |
-| Release script | `release/release.sh` | Checks the two product branches, requires the record of the final checks, builds the package and the image per major, writes `SHA256SUMS` and the release notes and prepares (never pushes) the two tags; see [../docs/dev/releases.md](../docs/dev/releases.md), "The release script" |
+| Release script | `release/release.sh` | Checks the two product branches, requires the record of the final checks, builds the package and the image per major, writes `kingres-SHA256SUMS` with its note signed by the release key (`--key-file`) and the release notes and prepares (never pushes) the two tags; see [../docs/dev/releases.md](../docs/dev/releases.md), "The release script" |
 
 ## One release per PostgreSQL major
 
@@ -45,6 +45,33 @@ either from **the source it is given**; the major is never typed a second time:
 `kingres:<version>` without a suffix is not produced.
 
 `<version>` is `kingres_version` in the top-level `meson.build`, `0.1.0` for the first release. If it changes, every file name, tag, label and command below that names `0.1.0` stands for the new value; the numbers of the runs further down are the versions that were built then.
+
+### Checking the files of a release
+
+From the next release after 0.1.0, `release/release.sh` signs the checksums of the packages and
+images with the release key of the verifier (`kingres/verifier`), in the same signed note format.
+A release page of a tag holds these files, next to the packages and images of its major:
+
+| File | What it is |
+|---|---|
+| `kingres-SHA256SUMS` | one line per package and image file of **both** majors, by the plain name of the file (`kingres_0.1.0+pg18-1_amd64.deb`, `kingres-0.1.0-pg18-image.tar.gz`), so that `sha256sum -c kingres-SHA256SUMS` works in the folder that holds the downloaded files you have |
+| `kingres-SHA256SUMS.note` | the signed note over exactly that text, signed with the release key |
+
+The verifier's own files are on the same page under other names (`kingres-verify-SHA256SUMS`,
+`kingres-verify-SHA256SUMS.note`, see its README), so no name is used twice. Check a file you
+downloaded with a verifier you already trust and the release key you got from the documentation, not
+from the download:
+
+```
+kingres-verify release verify --sums kingres-SHA256SUMS --note kingres-SHA256SUMS.note \
+    --key <release key> --binary kingres_0.1.0+pg18-1_amd64.deb
+```
+
+`--binary` takes any file by its name (the line of the sums with that name is used; `--name` names
+a renamed file), so it checks a package or an image the same way it checks a verifier binary.
+Only the checksums are signed: the packages and images are not, and the product's sums have no
+`RELEASE` file. 0.1.0 itself was published with an unsigned `SHA256SUMS` whose lines carry the
+directory (`pg18/...`); it cannot be checked with `release verify`.
 
 Target: Ubuntu 24.04, amd64. Everything below was run on Windows 11 with WSL2
 (Ubuntu 24.04, Docker Engine installed inside the distribution); see
