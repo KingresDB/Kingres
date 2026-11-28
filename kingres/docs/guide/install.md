@@ -37,6 +37,8 @@ sudo apt install ./pg18/kingres_0.1.0+pg18-1_amd64.deb
 
 `SHA256SUMS` protects against a damaged download. It is not signed in 0.1.0 (later releases sign it), and there is no apt repository, so it does not protect against a release page that someone else controls.
 
+From the release after 0.1.0, the sums of the packages and images are named `kingres-SHA256SUMS`, list the files without a folder, and come with `kingres-SHA256SUMS.note`, a note signed with the same release key as the verifier's files; check them with `kingres-verify release verify` as below ([../../packaging/README.md](../../packaging/README.md#checking-the-files-of-a-release)).
+
 The verifier files are signed. Check them with a verifier you already trust (a build of your own, or one from an earlier release) and with the release key printed in [../../verifier/README.md](../../verifier/README.md) and on the wiki page of the verifier, not with a key from the place you downloaded the files:
 
 ```
